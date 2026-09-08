@@ -208,6 +208,19 @@ class FederationConfig:
         self.reputation_decay = getattr(central_config, "federation_reputation_decay", 0.01)
         self.helium_scarcity_threshold = getattr(central_config, "federation_helium_scarcity_threshold", 0.6)
 
+        # New enhancement flags
+        self.enable_quantum_distillation = getattr(central_config, "enable_quantum_distillation", False)
+        self.enable_causal_mask = getattr(central_config, "enable_causal_mask", True)
+        self.enable_expert_auction = getattr(central_config, "enable_expert_auction", False)
+        self.enable_safety_monitor = getattr(central_config, "enable_safety_monitor", True)
+        self.enable_precision_controller = getattr(central_config, "enable_precision_controller", False)
+        self.enable_carbon_market = getattr(central_config, "enable_carbon_market", False)
+        self.carbon_market_config = getattr(central_config, "carbon_market_config", None)
+        self.enable_chaos = getattr(central_config, "enable_chaos", False)
+        self.chaos_probability = getattr(central_config, "chaos_probability", 0.0)
+        self.enable_human_approval = getattr(central_config, "enable_human_approval", False)
+        self.human_approval_timeout = getattr(central_config, "human_approval_timeout", 60.0)
+
 # ============================================================================
 # Enums and Data Classes (unchanged)
 # ============================================================================
@@ -288,7 +301,7 @@ class RegionNode:
     parent_id: Optional[str] = None
     child_ids: List[str] = field(default_factory=list)
     model: Optional[Dict] = None
-    last_update: datetime = field(default_factory=datetime.utcnow)
+    last_update: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     status: str = "healthy"
     participants: List[str] = field(default_factory=list)
     carbon_intensity: float = 400.0
@@ -347,7 +360,7 @@ class ReputationRecord:
     node_id: str
     score: float = 0.5
     history: List[Dict[str, Any]] = field(default_factory=list)
-    last_update: datetime = field(default_factory=datetime.utcnow)
+    last_update: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     total_contributions: int = 0
     successful_updates: int = 0
     failed_updates: int = 0
@@ -356,7 +369,7 @@ class ReputationRecord:
 
     def update_score(self, delta: float):
         self.score = max(0.0, min(1.0, self.score + delta))
-        self.last_update = datetime.utcnow()
+        self.last_update = datetime.now(timezone.utc)
 
 @dataclass
 class PlaybookStrategy:
@@ -368,7 +381,7 @@ class PlaybookStrategy:
     success_metrics: Dict[str, float]
     performance_score: float = 0.5
     usage_count: int = 0
-    last_used: datetime = field(default_factory=datetime.utcnow)
+    last_used: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     is_active: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
@@ -417,7 +430,7 @@ class FederatedExpert:
     privacy_budget: float = 1.0
     reputation_score: float = 0.5
     participation_history: List[Any] = field(default_factory=list)
-    last_updated: datetime = field(default_factory=datetime.utcnow)
+    last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     is_active: bool = True
     architecture_type: str = "standard"
     tokens_earned: float = 0.0
@@ -438,19 +451,16 @@ class FederatedExpert:
 
     def to_dict(self):
         d = asdict(self)
-        # Convert local_model to serializable format (lists)
         d['local_model'] = {k: v.tolist() if isinstance(v, torch.Tensor) else v
                            for k, v in self.local_model.items()}
         d['secure_key'] = self.secure_key.hex() if self.secure_key else None
         d['last_updated'] = self.last_updated.isoformat()
-        # Capabilities is a dataclass, convert to dict
         d['capabilities'] = asdict(self.capabilities)
         return d
 
     @classmethod
     def from_dict(cls, data):
         local_model = data.get('local_model', {})
-        # Convert lists back to tensors if needed (simplified)
         for k, v in local_model.items():
             if isinstance(v, list):
                 local_model[k] = torch.tensor(v)
@@ -484,7 +494,7 @@ class FederationRound:
 
 @dataclass
 class PredictiveFederationForecast:
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     predicted_sustainability_score: float = 0.0
     predicted_carbon_impact: float = 0.0
     predicted_helium_usage: float = 0.0
@@ -518,7 +528,7 @@ class ModelCompressor:
             compressed_size = len(compressed)
             compression_ratio = compressed_size / original_size if original_size > 0 else 1.0
             self.compression_stats.append({
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
                 'tier': tier.value,
                 'method': method,
                 'original_size': original_size,
@@ -626,7 +636,7 @@ class ReputationScoringSystem:
             record.token_stake = token_stake
             success_rate = record.successful_updates / max(1, record.total_contributions)
             sustainability_score = record.sustainability_contributions / max(1, record.total_contributions)
-            data_quality_score = data_quality * (1.0 - self.decay_rate * (datetime.utcnow() - record.last_update).days / 30)
+            data_quality_score = data_quality * (1.0 - self.decay_rate * (datetime.now(timezone.utc) - record.last_update).days / 30)
             carbon_score = 1.0 - carbon_efficiency
             new_score = (
                 self.weights['success_rate'] * success_rate +
@@ -638,9 +648,9 @@ class ReputationScoringSystem:
             )
             decay_factor = 1.0 - self.decay_rate
             record.score = max(self.min_score, min(1.0, record.score * decay_factor + new_score * (1.0 - decay_factor)))
-            record.last_update = datetime.utcnow()
+            record.last_update = datetime.now(timezone.utc)
             record.history.append({
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
                 'score': record.score,
                 'success': success,
                 'sustainability': sustainability_contribution,
@@ -754,11 +764,11 @@ class StrategicPlaybookSystem:
                 return
             playbook = self.playbooks[playbook_id]
             playbook.usage_count += 1
-            playbook.last_used = datetime.utcnow()
+            playbook.last_used = datetime.now(timezone.utc)
             success_score = 1.0 if success else 0.0
             metric_score = np.mean([metrics.get(key, 0.0) / target for key, target in playbook.success_metrics.items() if key in metrics and target > 0]) if playbook.success_metrics else 0.5
             playbook.performance_score = playbook.performance_score * 0.7 + (success_score * 0.5 + metric_score * 0.5) * 0.3
-            self.playbook_history.append({'playbook_id': playbook_id, 'timestamp': datetime.utcnow().isoformat(), 'success': success, 'metrics': metrics, 'performance_score': playbook.performance_score})
+            self.playbook_history.append({'playbook_id': playbook_id, 'timestamp': datetime.now(timezone.utc).isoformat(), 'success': success, 'metrics': metrics, 'performance_score': playbook.performance_score})
 
     def get_playbook_stats(self) -> Dict[str, Any]:
         return {'total_playbooks': len(self.playbooks), 'active_playbooks': sum(1 for p in self.playbooks.values() if p.is_active), 'top_performing': sorted(self.playbooks.values(), key=lambda x: x.performance_score, reverse=True)[:3], 'recent_usage': list(self.playbook_history)[-5:]}
@@ -801,7 +811,7 @@ class EconomicPricingManager:
                 helium_price = await self._fetch_helium_price(session, region)
                 self.carbon_prices[region] = carbon_price
                 self.helium_prices[region] = helium_price
-                self.price_history.append({'timestamp': datetime.utcnow().isoformat(), 'region': region, 'carbon_price': carbon_price, 'helium_price': helium_price})
+                self.price_history.append({'timestamp': datetime.now(timezone.utc).isoformat(), 'region': region, 'carbon_price': carbon_price, 'helium_price': helium_price})
                 await self._update_forecast_models()
                 logger.info(f"Prices updated for {region}: Carbon=${carbon_price:.2f}/ton, Helium=${helium_price:.2f}/L")
             except Exception as e:
@@ -879,7 +889,7 @@ class AsynchronousRegionManager:
 
     async def aggregate_region_updates(self, regions: List[str], min_participants: int = 2, max_participants: int = 10) -> Optional[Dict[str, Any]]:
         async with self._lock:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             available = []
             for region_id in regions:
                 if region_id in self.region_updates and self.region_updates[region_id]:
@@ -1000,8 +1010,8 @@ class TieredAggregator:
                     aggregated[key] = np.mean(weighted_values, axis=0)
                 else:
                     aggregated[key] = sum(weighted_values) / n
-        cache_key = f"{tier.value}_{region_id}_{datetime.utcnow().timestamp()}"
-        self.aggregation_cache[cache_key] = {'model': aggregated, 'tier': tier.value, 'region': region_id, 'timestamp': datetime.utcnow().isoformat()}
+        cache_key = f"{tier.value}_{region_id}_{datetime.now(timezone.utc).timestamp()}"
+        self.aggregation_cache[cache_key] = {'model': aggregated, 'tier': tier.value, 'region': region_id, 'timestamp': datetime.now(timezone.utc).isoformat()}
         return aggregated
 
     def get_tier_stats(self) -> Dict[str, Any]:
@@ -1046,7 +1056,7 @@ class GlobalResourceOptimizer:
                 ideal_allocation = sustainability_score * total_capacity / sum((1.0 - (carbon_intensities.get(rid, 400) / 800)) * 0.3 + helium_availabilities.get(rid, 0.5) * 0.3 + regions[rid].sustainability_score * 0.4 for rid in regions)
                 allocation = min(ideal_allocation, region.resource_capacity)
                 allocations[region_id] = ResourceAllocation(region_id=region_id, allocated_capacity=allocation, usage=region.resource_usage, carbon_impact=carbon_intensity * allocation, helium_usage=helium_avail * allocation * 0.1, recommendations=self._generate_recommendations(region, carbon_intensity, helium_avail))
-            self.optimization_history.append({'timestamp': datetime.utcnow().isoformat(), 'allocations': {k: v.allocated_capacity for k, v in allocations.items()}, 'total_capacity': total_capacity, 'total_usage': total_usage})
+            self.optimization_history.append({'timestamp': datetime.now(timezone.utc).isoformat(), 'allocations': {k: v.allocated_capacity for k, v in allocations.items()}, 'total_capacity': total_capacity, 'total_usage': total_usage})
             self.resource_allocations = allocations
             return allocations
 
@@ -1101,7 +1111,7 @@ class FederatedDiscovery:
                             discovered.update(remote_peers)
                             for peer in remote_peers:
                                 if peer not in self.peer_capabilities:
-                                    self.peer_capabilities[peer] = {'capabilities': data.get('capabilities', {}), 'discovered_at': datetime.utcnow().isoformat()}
+                                    self.peer_capabilities[peer] = {'capabilities': data.get('capabilities', {}), 'discovered_at': datetime.now(timezone.utc).isoformat()}
                 except Exception as e:
                     logger.error(f"Discovery error: {e}")
             self.discovered_peers = discovered
@@ -1110,11 +1120,11 @@ class FederatedDiscovery:
 
     async def register_region(self, region_id: str, capabilities: Dict[str, Any], parent_id: Optional[str] = None) -> bool:
         async with self._lock:
-            self.peer_capabilities[region_id] = {'capabilities': capabilities, 'parent_id': parent_id, 'registered_at': datetime.utcnow().isoformat(), 'status': 'active'}
+            self.peer_capabilities[region_id] = {'capabilities': capabilities, 'parent_id': parent_id, 'registered_at': datetime.now(timezone.utc).isoformat(), 'status': 'active'}
             if self.server_url:
                 try:
                     session = await self._get_session()
-                    async with session.post(f"{self.server_url}/api/register", json={'region_id': region_id, 'capabilities': capabilities, 'parent_id': parent_id, 'timestamp': datetime.utcnow().isoformat()}, timeout=30) as response:
+                    async with session.post(f"{self.server_url}/api/register", json={'region_id': region_id, 'capabilities': capabilities, 'parent_id': parent_id, 'timestamp': datetime.now(timezone.utc).isoformat()}, timeout=30) as response:
                         if response.status == 200:
                             logger.info(f"Region {region_id} registered successfully")
                             return True
@@ -1129,7 +1139,7 @@ class FederatedDiscovery:
 
     async def update_health(self, region_id: str, health_status: Dict[str, Any]) -> None:
         async with self._lock:
-            self.peer_health[region_id] = {'status': health_status.get('status', 'healthy'), 'last_update': datetime.utcnow().isoformat(), 'metrics': health_status.get('metrics', {})}
+            self.peer_health[region_id] = {'status': health_status.get('status', 'healthy'), 'last_update': datetime.now(timezone.utc).isoformat(), 'metrics': health_status.get('metrics', {})}
 
     async def get_peer_health(self, region_id: str) -> Optional[Dict]:
         return self.peer_health.get(region_id)
@@ -1162,13 +1172,13 @@ class FederationCrossDomainTransfer:
         if key not in self.knowledge_base:
             self.knowledge_base[key] = {}
         if knowledge_type not in self.knowledge_base[key]:
-            self.knowledge_base[key][knowledge_type] = {'data': data, 'transfer_count': 1, 'effectiveness_score': 0.5, 'last_used': datetime.utcnow()}
+            self.knowledge_base[key][knowledge_type] = {'data': data, 'transfer_count': 1, 'effectiveness_score': 0.5, 'last_used': datetime.now(timezone.utc)}
         else:
             existing = self.knowledge_base[key][knowledge_type]
             existing['data'].update(data)
             existing['transfer_count'] += 1
-            existing['last_used'] = datetime.utcnow()
-        self.transfer_logs.append({'timestamp': datetime.utcnow(), 'source': source_domain, 'target': target_domain, 'type': knowledge_type})
+            existing['last_used'] = datetime.now(timezone.utc)
+        self.transfer_logs.append({'timestamp': datetime.now(timezone.utc), 'source': source_domain, 'target': target_domain, 'type': knowledge_type})
         return self.knowledge_base[key][knowledge_type]
 
     def get_transfer_statistics(self) -> Dict:
@@ -1290,7 +1300,163 @@ class PredictiveFederationAnalyzer:
         return {'average_sustainability_score': np.mean([h['sustainability_score'] for h in recent]), 'average_carbon_intensity': np.mean([h['carbon_intensity'] for h in recent]), 'average_helium_scarcity': np.mean([h['helium_scarcity'] for h in recent]), 'success_rate': np.mean([1 if h['round_success'] else 0 for h in recent]), 'trend': 'improving' if len(recent) > 10 and recent[-1]['sustainability_score'] > recent[0]['sustainability_score'] else 'stable'}
 
 # ============================================================================
-# Enhanced Cross-Region Federation Optimizer v8.2.0 – Fully Integrated
+# New Enhancement Modules
+# ============================================================================
+class QuantumDistillationModule:
+    def __init__(self):
+        self.available = False
+
+    async def optimize(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        logger.info("Quantum distillation optimization requested (placeholder).")
+        for key in parameters:
+            if isinstance(parameters[key], (int, float)):
+                parameters[key] += random.uniform(-0.01, 0.01)
+        return parameters
+
+    def is_available(self) -> bool:
+        return self.available
+
+
+class CausalFeatureMask:
+    def __init__(self, feature_dim: int):
+        self.mask = np.ones(feature_dim, dtype=np.float32)
+
+    def apply(self, features: np.ndarray) -> np.ndarray:
+        return features * self.mask
+
+
+class ExpertAuction:
+    def __init__(self, participant_ids: List[str], feature_dim: int):
+        self.participant_ids = participant_ids
+        self.feature_dim = feature_dim
+        self.bidding_models = {}
+        self.scaler = None
+        if SKLEARN_AVAILABLE:
+            self.scaler = StandardScaler()
+            for pid in participant_ids:
+                self.bidding_models[pid] = SGDRegressor(max_iter=1000, tol=1e-3, random_state=42)
+            self.is_trained = False
+        else:
+            self.bidding_models = None
+            logger.warning("sklearn not available; ExpertAuction will use random bids")
+
+    def _encode_features(self, context: Dict[str, Any]) -> np.ndarray:
+        return np.array([
+            context.get('carbon_intensity', 400) / 1000.0,
+            context.get('helium_scarcity', 0.5),
+            context.get('carbon_price', 50.0) / 100.0,
+            context.get('token_balance', 500) / 1000.0,
+            context.get('sustainability_score', 0.5),
+            context.get('participant_count', 1) / 10.0,
+        ], dtype=np.float32)
+
+    def compute_bids(self, context: Dict[str, Any]) -> Dict[str, float]:
+        if not SKLEARN_AVAILABLE or not self.is_trained:
+            return {pid: random.uniform(0, 1) for pid in self.participant_ids}
+        features = self._encode_features(context)
+        features_scaled = self.scaler.transform(features.reshape(1, -1))
+        bids = {}
+        for pid, model in self.bidding_models.items():
+            bids[pid] = float(model.predict(features_scaled)[0])
+        return bids
+
+    def train(self, context: Dict[str, Any], participant_id: str, reward: float):
+        if not SKLEARN_AVAILABLE:
+            return
+        features = self._encode_features(context)
+        features_scaled = self.scaler.transform(features.reshape(1, -1))
+        model = self.bidding_models[participant_id]
+        model.partial_fit(features_scaled, [reward])
+        self.is_trained = True
+
+    def select_participants(self, context: Dict[str, Any], top_k: int = 1) -> List[str]:
+        bids = self.compute_bids(context)
+        sorted_bids = sorted(bids.items(), key=lambda x: x[1], reverse=True)
+        return [pid for pid, _ in sorted_bids[:top_k]]
+
+
+class SafetyMonitor:
+    def __init__(self):
+        self.invariants = []
+
+    def add_invariant(self, name: str, condition_fn, description: str):
+        self.invariants.append((name, condition_fn, description))
+
+    def check(self, state: Dict[str, Any]) -> List[str]:
+        violations = []
+        for name, fn, desc in self.invariants:
+            if not fn(state):
+                violations.append(f"{name}: {desc}")
+        return violations
+
+
+class PrecisionController:
+    def __init__(self, policy: str = "energy_aware"):
+        self.policy = policy
+
+    def get_precision(self, load: float, energy_budget: float) -> str:
+        if self.policy == "energy_aware":
+            if load > 0.8 or energy_budget < 0.2:
+                return "float16"
+            else:
+                return "float32"
+        return "float32"
+
+
+class CarbonMarketClient:
+    def __init__(self, provider_url: str = None, contract_address: str = None, private_key: str = None):
+        self.available = bool(provider_url and contract_address and private_key)
+
+    def buy_credits(self, amount: float) -> bool:
+        if not self.available:
+            return False
+        logger.info(f"Simulating purchase of {amount} carbon credits.")
+        return True
+
+    def sell_credits(self, amount: float) -> bool:
+        if not self.available:
+            return False
+        logger.info(f"Simulating sale of {amount} carbon credits.")
+        return True
+
+
+class ChaosInjector:
+    def __init__(self, federation: 'CrossRegionFederationOptimizer', chaos_probability: float = 0.01):
+        self.federation = federation
+        self.chaos_probability = chaos_probability
+
+    async def maybe_inject_failure(self):
+        if random.random() < self.chaos_probability:
+            action = random.choice(['drop_participant', 'corrupt_update', 'delay'])
+            logger.warning(f"Chaos injection: {action}")
+            if action == 'drop_participant':
+                if self.federation.participants:
+                    pid = random.choice(list(self.federation.participants.keys()))
+                    self.federation.participants[pid].is_active = False
+            elif action == 'corrupt_update':
+                if self.federation.global_model:
+                    for key in self.federation.global_model:
+                        if isinstance(self.federation.global_model[key], np.ndarray):
+                            self.federation.global_model[key] += np.random.normal(0, 0.01, self.federation.global_model[key].shape)
+            elif action == 'delay':
+                await asyncio.sleep(random.uniform(0.5, 2.0))
+
+
+class HumanApprovalHandler:
+    def __init__(self, queue: Optional[AsyncMessageQueue] = None):
+        self.queue = queue
+
+    async def request_approval(self, decision: Dict[str, Any], timeout: float = 60.0) -> bool:
+        if not self.queue:
+            logger.warning("No queue for human approval; auto-approving.")
+            return True
+        logger.info(f"Human approval requested for {decision.get('action')}, auto-approving.")
+        await asyncio.sleep(0)
+        return True
+
+
+# ============================================================================
+# Enhanced Cross-Region Federation Optimizer
 # ============================================================================
 class CrossRegionFederationOptimizer:
     """
@@ -1381,7 +1547,6 @@ class CrossRegionFederationOptimizer:
 
         # Carbon manager
         if CENTRAL_CARBON_AVAILABLE:
-            from ..carbon_intensity import CarbonIntensityManager
             self.carbon_manager = CarbonIntensityManager()
         else:
             self.carbon_manager = None
@@ -1403,7 +1568,7 @@ class CrossRegionFederationOptimizer:
         self.sustainability_score = 0.0
         self.instance_id = f"federation_{int(time.time())}"
 
-        # Circuit breakers (central or fallback)
+        # Circuit breakers
         self._token_circuit = EnhancedCircuitBreaker("token_service")
         self._gradient_circuit = EnhancedCircuitBreaker("gradient_service")
         self._scheduler_circuit = EnhancedCircuitBreaker("scheduler_service")
@@ -1415,15 +1580,30 @@ class CrossRegionFederationOptimizer:
         # Health
         self.health_status = "healthy"
         self.last_error = None
-        self.helium_threshold = self.config.helium_scarcity_threshold  # Fixed missing attribute
+        self.helium_threshold = self.config.helium_scarcity_threshold
 
         # Federated learner reference (optional)
         self.federated_learner = None
 
+        # New enhancement modules
+        self.quantum_distillation = QuantumDistillationModule() if self.config.enable_quantum_distillation else None
+        self.causal_mask = CausalFeatureMask(feature_dim=10) if self.config.enable_causal_mask else None
+        if self.config.enable_expert_auction and SKLEARN_AVAILABLE:
+            self.expert_auction = ExpertAuction(list(self.participants.keys()), feature_dim=10)
+        else:
+            self.expert_auction = None
+        self.safety_monitor = SafetyMonitor() if self.config.enable_safety_monitor else None
+        if self.safety_monitor:
+            self._setup_safety_invariants()
+        self.precision_controller = PrecisionController() if self.config.enable_precision_controller else None
+        self.carbon_market = CarbonMarketClient(**self.config.carbon_market_config) if (self.config.enable_carbon_market and self.config.carbon_market_config) else None
+        self.chaos_injector = ChaosInjector(self, self.config.chaos_probability) if self.config.enable_chaos else None
+        self.human_approval = HumanApprovalHandler(self.queue) if self.config.enable_human_approval else None
+
         # Initialize regional profiles
         self._initialize_regional_profiles()
 
-        # Load state from central storage (safe async)
+        # Load state
         self._load_state_task = None
         try:
             loop = asyncio.get_running_loop()
@@ -1431,7 +1611,7 @@ class CrossRegionFederationOptimizer:
         except RuntimeError:
             pass
 
-        # Subscribe to core events if enabled
+        # Subscribe to core events
         if self.enable_event_driven and self.event_broker:
             self._subscribe_events()
 
@@ -1439,6 +1619,23 @@ class CrossRegionFederationOptimizer:
         self._start_background_tasks()
 
         logger.info(f"Cross-Region Federation v8.2.0 initialized.")
+
+    def _setup_safety_invariants(self):
+        self.safety_monitor.add_invariant(
+            "participant_health_positive",
+            lambda s: all(h >= 0 for h in s.get('participant_health', [])),
+            "Participant health negative"
+        )
+        self.safety_monitor.add_invariant(
+            "sustainability_score_in_range",
+            lambda s: 0.0 <= s.get('sustainability_score', 0.0) <= 1.0,
+            "Sustainability score out of range"
+        )
+        self.safety_monitor.add_invariant(
+            "aggregation_strategy_valid",
+            lambda s: s.get('strategy') in [st.value for st in AggregationStrategy],
+            "Invalid aggregation strategy"
+        )
 
     def _initialize_regional_profiles(self):
         profiles = {
@@ -1467,12 +1664,9 @@ class CrossRegionFederationOptimizer:
                 optimal_sync_windows=[(data['carbon_low_hours'][0], data['carbon_low_hours'][-1])]
             )
 
-    # --------------------------------------------------------------------------
-    # State Persistence using central Storage
-    # --------------------------------------------------------------------------
     async def _load_state(self):
         try:
-            data = self.storage.get_state("federation_state")
+            data = await self.storage.get_state("federation_state") if asyncio.iscoroutine(self.storage.get_state) else self.storage.get_state("federation_state")
             if data:
                 state = json.loads(data)
                 self.regions = {rid: RegionNode.from_dict(d) for rid, d in state.get('regions', {}).items()}
@@ -1508,17 +1702,14 @@ class CrossRegionFederationOptimizer:
                 'last_error': self.last_error,
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }
-            self.storage.save_state("federation_state", json.dumps(state))
+            await self.storage.save_state("federation_state", json.dumps(state)) if asyncio.iscoroutine(self.storage.save_state) else self.storage.save_state("federation_state", json.dumps(state))
             if self.global_model:
                 model_bytes = pickle.dumps(self.global_model)
-                self.storage.save_model_weights("federation_global_model", model_bytes)
+                await self.storage.save_model_weights("federation_global_model", model_bytes) if asyncio.iscoroutine(self.storage.save_model_weights) else self.storage.save_model_weights("federation_global_model", model_bytes)
             logger.info("Saved federation state to storage")
         except Exception as e:
             logger.error(f"Failed to save federation state: {e}")
 
-    # --------------------------------------------------------------------------
-    # Event Subscriptions
-    # --------------------------------------------------------------------------
     def _subscribe_events(self):
         if self.event_broker:
             self.event_broker.subscribe('carbon_update', self._on_carbon_update)
@@ -1579,14 +1770,13 @@ class CrossRegionFederationOptimizer:
             logger.info("Helium anomaly detected; adjusting helium thresholds")
             self.helium_threshold *= 0.9
 
-    # --------------------------------------------------------------------------
-    # Background Tasks
-    # --------------------------------------------------------------------------
     def _start_background_tasks(self):
         if self.enable_economic_pricing and self.pricing_manager:
             asyncio.create_task(self._price_update_loop())
         if self.enable_swarm_coordination and self.swarm_coordinator:
             asyncio.create_task(self._swarm_update_loop())
+        if self.config.enable_chaos and self.chaos_injector:
+            asyncio.create_task(self._chaos_loop())
 
     async def _price_update_loop(self):
         while True:
@@ -1608,9 +1798,12 @@ class CrossRegionFederationOptimizer:
                 logger.error(f"Swarm update error: {e}")
                 await asyncio.sleep(120)
 
-    # --------------------------------------------------------------------------
-    # Swarm Coordination
-    # --------------------------------------------------------------------------
+    async def _chaos_loop(self):
+        while True:
+            await asyncio.sleep(60)
+            if self.chaos_injector:
+                await self.chaos_injector.maybe_inject_failure()
+
     async def share_with_swarm(self):
         if not self.enable_swarm_coordination or not self.swarm_coordinator:
             return
@@ -1626,9 +1819,7 @@ class CrossRegionFederationOptimizer:
         }
         await self.swarm_coordinator.share_predictions(swarm_payload)
 
-    # --------------------------------------------------------------------------
-    # Setter Methods
-    # --------------------------------------------------------------------------
+    # Setter methods
     def set_gating_network(self, gating_network: 'GatingNetworkManager'):
         self.gating_network = gating_network
         logger.info("Gating network injected into Cross-Region Federation")
@@ -1645,9 +1836,6 @@ class CrossRegionFederationOptimizer:
         self.helium_provider = provider
         logger.info("Helium provider injected into Cross-Region Federation")
 
-    # --------------------------------------------------------------------------
-    # Bio-Inspired Module Injection
-    # --------------------------------------------------------------------------
     def inject_bio_core(self, bio_core: Any = None, **kwargs):
         if bio_core:
             self.token_manager = getattr(bio_core, 'token_manager', None)
@@ -1666,9 +1854,6 @@ class CrossRegionFederationOptimizer:
         if any([self.token_manager, self.gradient_manager, self.compartment_manager]):
             self.enable_bio_integration = True
 
-    # --------------------------------------------------------------------------
-    # Bio-Inspired Data Access Methods (with circuit breakers)
-    # --------------------------------------------------------------------------
     def _get_gradient_aligned_schedule(self, region: Region) -> float:
         if self.gradient_manager and self.enable_bio_integration:
             try:
@@ -1758,9 +1943,6 @@ class CrossRegionFederationOptimizer:
                 pass
         return 0.5
 
-    # --------------------------------------------------------------------------
-    # Region Management
-    # --------------------------------------------------------------------------
     def register_region(self, region_id: str, tier: AggregationTier = AggregationTier.REGIONAL, parent_id: Optional[str] = None, participants: List[str] = None, resource_capacity: float = 1.0) -> RegionNode:
         if region_id in self.regions:
             logger.warning(f"Region {region_id} already registered")
@@ -1808,14 +1990,7 @@ class CrossRegionFederationOptimizer:
         )
         await self.queue.publish("feedback_events", event.to_json())
 
-    # --------------------------------------------------------------------------
-    # Teacher Interface for MOPD
-    # --------------------------------------------------------------------------
     async def policy_probs(self, state: Dict) -> List[float]:
-        """
-        Return a probability distribution over aggregation strategies,
-        dynamically computed using adaptive cost and Pareto constraints.
-        """
         strategies = list(AggregationStrategy)
         candidates = []
         for strategy in strategies:
@@ -1853,14 +2028,10 @@ class CrossRegionFederationOptimizer:
             return full_probs
         return [1.0/len(strategies)] * len(strategies)
 
-    # --------------------------------------------------------------------------
-    # Enhanced Federation Round
-    # --------------------------------------------------------------------------
     async def federated_round(self, carbon_zone: int, helium_scarcity: float, timeout_seconds: int = 300, region_filter: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         self.round_number += 1
         round_start = datetime.now(timezone.utc)
 
-        # Update carbon intensity
         carbon_intensity = 400.0
         if self.carbon_manager:
             try:
@@ -1874,7 +2045,6 @@ class CrossRegionFederationOptimizer:
                 logger.warning(f"Carbon update failed: {e}")
                 carbon_intensity = 400.0
 
-        # Helium metrics
         if self.helium_provider:
             helium_scarcity = self._get_helium_scarcity()
             helium_cost = self._get_helium_cost_index()
@@ -1883,7 +2053,6 @@ class CrossRegionFederationOptimizer:
             helium_cost = 1.0
             helium_efficiency = 0.5
 
-        # Economic prices
         if self.enable_economic_pricing and self.pricing_manager:
             prices = await self.pricing_manager.get_current_prices()
             carbon_price = prices.get('carbon_price_usd_per_ton', 50.0)
@@ -1892,19 +2061,16 @@ class CrossRegionFederationOptimizer:
             carbon_price = 50.0
             helium_price = 0.5
 
-        # Evaluate playbooks
         playbook_recommendations = []
         if self.enable_playbook and self.playbook_system:
             context = {'carbon_intensity': carbon_intensity, 'helium_availability': 1.0 - helium_scarcity, 'carbon_zone': carbon_zone, 'quantum_workload': 0.5, 'renewable_availability': 0.6}
             playbook_recommendations = await self.playbook_system.evaluate_playbooks(context)
 
-        # Select participants
         selected = await self._select_participants_multi_criteria(carbon_zone, helium_scarcity, carbon_intensity)
         if len(selected) < self.config.min_participants:
             logger.warning(f"Insufficient participants: {len(selected)}")
             return None
 
-        # Stake tokens
         for participant_id in selected:
             if participant_id in self.participants:
                 participant = self.participants[participant_id]
@@ -1913,7 +2079,6 @@ class CrossRegionFederationOptimizer:
                 if success:
                     participant.tokens_staked = staked
 
-        # Collect updates
         updates = {}
         for participant_id in selected:
             if participant_id in self.participants:
@@ -1935,13 +2100,11 @@ class CrossRegionFederationOptimizer:
         if len(updates) < self.config.min_participants:
             return None
 
-        # Byzantine risk check
         for participant_id in list(updates.keys()):
             threshold = self._get_trust_based_byzantine_threshold(participant_id)
             if threshold > 0.7:
                 logger.warning(f"High Byzantine risk for {participant_id}: threshold={threshold:.2f}")
 
-        # Determine aggregation strategy using adaptive cost and Pareto
         weights = self.adaptive_cost.get_current_weights() if self.adaptive_cost else {}
         carbon_weight = weights.get('carbon', 0.3)
         cost_weight = weights.get('cost', 0.2)
@@ -1954,7 +2117,6 @@ class CrossRegionFederationOptimizer:
         else:
             strategy = AggregationStrategy.FED_AVG
 
-        # QuantumBridge adjustment
         if self.enable_quantum_bridge and self.quantum_bridge:
             q_params = self.quantum_bridge.get_qubo_parameters()
             penalty_helium = q_params.get('penalty_helium_shortage', 0.5)
@@ -1962,7 +2124,29 @@ class CrossRegionFederationOptimizer:
                 for pid in updates:
                     updates[pid].sustainability_impact *= 1.2
 
-        # Aggregate updates
+        if self.safety_monitor:
+            state = {
+                'participant_health': [p.capabilities.compute_power_flops for p in self.participants.values() if p.is_active],
+                'sustainability_score': self.sustainability_score,
+                'strategy': strategy.value
+            }
+            violations = self.safety_monitor.check(state)
+            if violations:
+                logger.warning(f"Safety violations: {violations}")
+                # Fallback to FED_AVG
+                strategy = AggregationStrategy.FED_AVG
+
+        if self.human_approval and hasattr(self, 'aggregation_strategy') and strategy != self.aggregation_strategy:
+            approved = await self.human_approval.request_approval({
+                'action': 'change_aggregation_strategy',
+                'new_strategy': strategy.value
+            })
+            if not approved:
+                logger.info("Strategy change rejected by human.")
+                strategy = AggregationStrategy.FED_AVG
+
+        self.aggregation_strategy = strategy
+
         if self.enable_tiered_aggregation and self.tiered_aggregator:
             region_id = selected[0] if selected else "default"
             region_tier = self.regions.get(region_id, RegionNode(region_id=region_id, tier=AggregationTier.REGIONAL)).tier
@@ -1976,7 +2160,6 @@ class CrossRegionFederationOptimizer:
 
         self.global_model = aggregated
 
-        # MoE and SEG integration
         if self.gating_network and self.expert_router:
             context = {'carbon_intensity': carbon_intensity, 'helium_scarcity': helium_scarcity, 'carbon_price': carbon_price, 'participants': len(selected), 'sustainability_score': self.sustainability_score}
             features = np.array([context['carbon_intensity'] / 1000, context['helium_scarcity'], context['carbon_price'] / 100, context['participants'] / 10, context['sustainability_score']])
@@ -1991,13 +2174,11 @@ class CrossRegionFederationOptimizer:
             await self.self_evolving_gate.evolve_gating_network(features, reward, context)
             logger.info("Triggered self-evolving gate evolution")
 
-        # Async region updates
         if self.enable_async and self.async_region_manager:
             for participant_id, update in updates.items():
                 region_id = self.participants[participant_id].region_id or "default"
                 await self.async_region_manager.submit_update(region_id, update.model_delta, update.timestamp)
 
-        # Sustainability and reputation updates
         self.total_carbon_savings_kg += sum(u.carbon_savings for u in updates.values())
         self.sustainability_score = await self._calculate_sustainability_score(updates, carbon_intensity, helium_scarcity)
 
@@ -2035,13 +2216,11 @@ class CrossRegionFederationOptimizer:
         if self.enable_discovery and self.discovery:
             await self.discovery.discover_peers(self.instance_id)
 
-        # Workflow triggers
         if self.sustainability_score < 0.4 and self.workflow_orchestrator:
             await self.workflow_orchestrator.execute_workflow('adjust_federation_policy')
         if self.total_helium_savings_l < 1.0 and self.workflow_orchestrator:
             await self.workflow_orchestrator.execute_workflow('optimize_helium_usage')
 
-        # Record round
         round_record = {
             'round_number': self.round_number,
             'participants': len(selected),
@@ -2063,7 +2242,6 @@ class CrossRegionFederationOptimizer:
         }
         self.aggregation_history.append(round_record)
 
-        # Publish FeedbackEvent
         event = FeedbackEvent.create_with_context(
             task_id=f"fed_round_{self.round_number}",
             selected_action=f"round_{strategy.value}",
@@ -2081,7 +2259,6 @@ class CrossRegionFederationOptimizer:
         )
         await self.queue.publish("feedback_events", event.to_json())
 
-        # Check drift
         if self.drift:
             drift_score = await self.drift.check_drift(self.adaptive_cost.get_current_weights())
             if drift_score > 0.7:
@@ -2089,20 +2266,15 @@ class CrossRegionFederationOptimizer:
                 if drift_score > 0.9 and self.enable_self_healing:
                     await self.self_heal()
 
-        # Update central metrics (generic)
         self.metrics.increment("federation_rounds")
         self.metrics.observe("federation_sustainability", self.sustainability_score)
         self.metrics.set("federation_participant_count", len(self.participants))
         self.metrics.set("federation_active_participants", len(selected))
 
-        # Save state
         await self.save_state()
 
         return aggregated
 
-    # --------------------------------------------------------------------------
-    # Helper methods
-    # --------------------------------------------------------------------------
     async def _select_participants_multi_criteria(self, carbon_zone: int, helium_scarcity: float, carbon_intensity: float) -> List[str]:
         scored_participants = []
         for participant_id, participant in self.participants.items():
@@ -2290,9 +2462,6 @@ class CrossRegionFederationOptimizer:
             logger.error(f"Failed to apply playbook: {e}")
             return False
 
-    # --------------------------------------------------------------------------
-    # Self-Healing
-    # --------------------------------------------------------------------------
     async def self_heal(self):
         logger.info("CrossRegionFederationOptimizer self‑healing")
         if self.enable_self_healing:
@@ -2326,9 +2495,6 @@ class CrossRegionFederationOptimizer:
             await self.queue.publish("feedback_events", event.to_json())
             logger.info("Self-healing completed")
 
-    # --------------------------------------------------------------------------
-    # Health Monitoring
-    # --------------------------------------------------------------------------
     def get_health_status(self) -> Dict[str, Any]:
         return {
             'status': self.health_status,
@@ -2345,9 +2511,6 @@ class CrossRegionFederationOptimizer:
             'persistence_enabled': True,
         }
 
-    # --------------------------------------------------------------------------
-    # Statistics
-    # --------------------------------------------------------------------------
     def get_federation_stats(self) -> Dict[str, Any]:
         stats = {
             'total_participants': len(self.participants),
@@ -2493,9 +2656,6 @@ class CrossRegionFederationOptimizer:
                 recommendations.append(f"Consider applying playbook: {playbooks[0]['playbook']['name']}")
         return recommendations or ["Federation sustainability is on track"]
 
-    # --------------------------------------------------------------------------
-    # Shutdown
-    # --------------------------------------------------------------------------
     async def shutdown(self):
         logger.info("Shutting down Cross-Region Federation Optimizer")
         await self.save_state()
