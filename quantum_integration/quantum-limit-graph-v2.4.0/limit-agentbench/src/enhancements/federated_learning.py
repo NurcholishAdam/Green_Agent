@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
 # File: src/enhancements/federated_learning_enhanced.py
-# Version 9.2 – Full Green Agent MOPD Integration + bio_inspired, moe_system, MODP, LIMIT Graph, RLHF, Multi‑Teacher Policy Distillation
+# Version 9.3 – Enhanced with XAI, temporal safety, human approval, chaos testing, and robustness fixes.
 
 """
-Enhanced Federated Learning Orchestrator - Version 9.2
+Enhanced Federated Learning Orchestrator - Version 9.3
 Enterprise Quantum Resilience + MTOP + MOPD Integration
 
-ENHANCEMENTS OVER v9.1:
-- Integrated bio_inspired, moe_system, MODP, ContextualBandit.
-- Strategy selection now uses ContextualBandit and ExpertRouter.
-- Multi‑objective strategy evaluation uses ParetoOptimizer.
-- Strategy population evolves via GeneticPolicyGenerator.
-- Persistence of learned state via central Storage.
-- policy_probs returns learned probabilities from the bandit.
-- Added background task for periodic bio‑evolution.
-
-NEW IN v9.2+:
-- Integrated LIMIT Graph for constraint enforcement.
-- Integrated RLHF Optimizer for preference‑based strategy updates.
-- Integrated Multi‑Teacher Policy Distillation for combining multiple policy teachers.
-- Enhanced strategy selection logic to use distillation, RLHF, bandit, and fallback in a hierarchy.
-- Added feedback recording for RLHF and LIMIT Graph.
+ENHANCEMENTS OVER v9.2:
+- Added missing central config fallbacks.
+- Improved numerical stability of policy_probs (softmax with normalization).
+- Safe async task creation (deferred to start()).
+- Added XAI explanation for strategy selection.
+- Added temporal safety invariant checks via LimitGraph.
+- Added human-in-the-loop approval hook for critical decisions.
+- Added chaos testing methods (inject_fault, run_chaos_test).
+- Fixed fallback stubs to be more robust.
+- Use DriftDetector result to adjust exploration rate.
+- RLHF stub now interactive (method to submit human preferences).
+- Update Fitness and Strategy evolution to handle new strategies.
 """
 
 import asyncio
@@ -57,11 +54,19 @@ try:
 except ImportError:
     ENHANCEMENTS_AVAILABLE = False
     ADDITIONAL_ENHANCEMENTS_AVAILABLE = False
-    # Fallback stubs
+    # Fallback stubs with improved behavior
     class GeneticPolicyGenerator:
         def __init__(self, *args, **kwargs): pass
         def evolve(self, population, fitness_fn, generations=10, population_size=20):
-            return population[0] if population else {}
+            if not population:
+                return []
+            # Simple random mutation
+            new_pop = []
+            for _ in range(population_size):
+                candidate = random.choice(population).copy()
+                candidate['params'] = {k: v + random.uniform(-0.1, 0.1) for k, v in candidate.get('params', {}).items()}
+                new_pop.append(candidate)
+            return new_pop
     class ExpertRouter:
         def __init__(self, *args, **kwargs): pass
         def encode(self, context): return [0.0]*5
@@ -73,8 +78,10 @@ except ImportError:
     class ContextualBandit:
         def __init__(self, action_space, fallback_solver, *args, **kwargs):
             self.actions = action_space
+            self.fallback = fallback_solver
         def select_action(self, context):
-            return self.actions[0], 0.0, "fallback"
+            action = self.fallback(context)
+            return action, 1.0, "fallback"
         def update(self, context, action, reward): pass
         def seed_safe_policy(self, context, policy): pass
     class LimitGraph:
@@ -83,12 +90,22 @@ except ImportError:
         def get_limits(self, context): return {}
         def update_from_feedback(self, feedback): pass
     class RLHFOptimizer:
-        def __init__(self, action_space, *args, **kwargs): self.actions = action_space
+        def __init__(self, action_space, *args, **kwargs): self.actions = action_space; self.preferences = []
         def update(self, context, action, reward): pass
-        def sample_action(self, context): return self.actions[0] if self.actions else None
+        def sample_action(self, context):
+            if self.actions:
+                return random.choice(self.actions)
+            return None
+        def add_human_feedback(self, context, chosen_action, rejected_action):
+            self.preferences.append((context, chosen_action, rejected_action))
     class MultiTeacherDistiller:
         def __init__(self, teachers, *args, **kwargs): self.teachers = teachers
-        def distill(self, context): return self.teachers[0](context) if self.teachers else None
+        def distill(self, context):
+            if not self.teachers:
+                return 'fedavg'
+            # Simple majority vote
+            votes = [teacher(context) for teacher in self.teachers]
+            return max(set(votes), key=votes.count) if votes else 'fedavg'
 
 # ============================================================
 # IMPORT CENTRAL GREEN AGENT COMPONENTS
@@ -106,27 +123,23 @@ from ..logger import logger
 # ============================================================
 # OPTIONAL IMPORTS (graceful degradation)
 # ============================================================
-# Post-quantum cryptography (pqcrypto)
 try:
     from pqcrypto.sign import dilithium, falcon, sphincs
     PQC_AVAILABLE = True
 except ImportError:
     PQC_AVAILABLE = False
 
-# Cryptography for AES-GCM
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
-# Web3
 try:
     from web3 import Web3, Account
     WEB3_AVAILABLE = True
 except ImportError:
     WEB3_AVAILABLE = False
 
-# Cloud storage (optional) – can reuse central cloud storage if needed
 try:
     import boto3
     AWS_AVAILABLE = True
@@ -145,7 +158,6 @@ try:
 except ImportError:
     GCP_AVAILABLE = False
 
-# FastAPI (optional)
 try:
     from fastapi import FastAPI, Depends, HTTPException, status, Request
     from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -155,7 +167,6 @@ try:
 except ImportError:
     FASTAPI_AVAILABLE = False
 
-# JWT
 try:
     from jose import JWTError, jwt
     from jose.constants import ALGORITHMS
@@ -164,42 +175,20 @@ except ImportError:
     JOSE_AVAILABLE = False
 
 # ============================================================
-# CENTRAL METRICS REGISTRY – we reuse the central one
+# CUSTOM EXCEPTIONS (unchanged)
 # ============================================================
-# Federated‑specific metrics will be registered with central MetricsRegistry.
-
-# ============================================================
-# CUSTOM EXCEPTIONS (keep, but they now inherit from base)
-# ============================================================
-class FederatedError(Exception):
-    pass
-
-class QuantumError(FederatedError):
-    pass
-
-class BlockchainError(FederatedError):
-    pass
-
-class OptimizationError(FederatedError):
-    pass
-
-class ClientError(FederatedError):
-    pass
-
-class CircuitBreakerOpenError(FederatedError):
-    pass
-
-class RateLimitExceeded(FederatedError):
-    pass
-
-class VaultError(FederatedError):
-    pass
-
-class CloudStorageError(FederatedError):
-    pass
+class FederatedError(Exception): pass
+class QuantumError(FederatedError): pass
+class BlockchainError(FederatedError): pass
+class OptimizationError(FederatedError): pass
+class ClientError(FederatedError): pass
+class CircuitBreakerOpenError(FederatedError): pass
+class RateLimitExceeded(FederatedError): pass
+class VaultError(FederatedError): pass
+class CloudStorageError(FederatedError): pass
 
 # ============================================================
-# ENHANCED CIRCUIT BREAKER (reuses central config)
+# ENHANCED CIRCUIT BREAKER (with fallback config)
 # ============================================================
 class CircuitBreakerState(Enum):
     CLOSED = "closed"
@@ -209,8 +198,8 @@ class CircuitBreakerState(Enum):
 class EnhancedCircuitBreaker:
     def __init__(self, name: str):
         self.name = name
-        self.failure_threshold = central_config.CIRCUIT_BREAKER_FAILURE_THRESHOLD
-        self.recovery_timeout = central_config.CIRCUIT_BREAKER_RECOVERY_TIMEOUT
+        self.failure_threshold = getattr(central_config, 'CIRCUIT_BREAKER_FAILURE_THRESHOLD', 5)
+        self.recovery_timeout = getattr(central_config, 'CIRCUIT_BREAKER_RECOVERY_TIMEOUT', 30.0)
         self.half_open_max_requests = 3
         self.state = CircuitBreakerState.CLOSED
         self.failure_count = 0
@@ -273,12 +262,12 @@ class EnhancedCircuitBreaker:
             raise
 
 # ============================================================
-# ENHANCED RATE LIMITER (reuses central config)
+# ENHANCED RATE LIMITER
 # ============================================================
 class EnhancedRateLimiter:
     def __init__(self):
-        self.rate = central_config.rate_limit_requests if hasattr(central_config, 'rate_limit_requests') else 100
-        self.per_seconds = central_config.rate_limit_window if hasattr(central_config, 'rate_limit_window') else 60
+        self.rate = getattr(central_config, 'rate_limit_requests', 100)
+        self.per_seconds = getattr(central_config, 'rate_limit_window', 60)
         self.tokens = self.rate
         self.last_refill = time.time()
         self._lock = asyncio.Lock()
@@ -299,7 +288,7 @@ class EnhancedRateLimiter:
             await asyncio.sleep(0.1)
 
 # ============================================================
-# DATA CLASSES (unchanged)
+# DATA CLASSES (unchanged, added explanation field)
 # ============================================================
 @dataclass
 class FederatedClient:
@@ -327,6 +316,7 @@ class FederatedRoundResult:
     quantum_signature: Optional[Dict] = None
     blockchain_tx_hash: Optional[str] = None
     cloud_deployment: Optional[Dict] = None
+    explanation: str = ""  # XAI
     timestamp: datetime = field(default_factory=datetime.now)
 
 # ============================================================
@@ -339,7 +329,6 @@ class PostQuantumCrypto:
 
     async def sign_data(self, data: Dict) -> Dict:
         if PQC_AVAILABLE:
-            # Simplified: return empty signature
             return {'algorithm': 'dilithium', 'signature': ''}
         return {'algorithm': 'none', 'signature': ''}
 
@@ -348,26 +337,13 @@ class PostQuantumCrypto:
 # ============================================================
 class MultiCloudStorage:
     async def store(self, data: Dict, filename: str) -> Dict:
-        # Simplified: just log
         logger.info(f"Storing {filename}")
         return {'status': 'ok'}
 
 # ============================================================
-# ENHANCED FEDERATED LEARNER – FULLY INTEGRATED
+# ENHANCED FEDERATED LEARNER – WITH FIXES AND NEW FEATURES
 # ============================================================
 class EnhancedFederatedLearner:
-    """
-    Federated Learning Orchestrator with full Green Agent MOPD integration.
-    Exposes a teacher interface (`policy_probs`) for MTPD optimizer.
-
-    NEW ENHANCEMENTS:
-    - Strategy selection uses ContextualBandit and ExpertRouter.
-    - Multi‑objective utility via ParetoOptimizer.
-    - Strategy population evolves via GeneticPolicyGenerator.
-    - Persistence of learned state.
-    - Integrated LIMIT Graph, RLHF, and Multi‑Teacher Policy Distillation.
-    """
-
     def __init__(self, storage: Storage, message_queue: AsyncMessageQueue,
                  adaptive_cost: AdaptiveCostFunction, pareto_gating: ParetoGating,
                  drift_detector: DriftDetector, metrics: MetricsRegistry):
@@ -381,11 +357,9 @@ class EnhancedFederatedLearner:
         self.instance_id = str(uuid.uuid4())[:8]
         self._start_time = datetime.now()
 
-        # Sub‑modules
         self.pqc = PostQuantumCrypto(storage)
         self.cloud_storage = MultiCloudStorage()
 
-        # Federated state
         self.clients: Dict[str, FederatedClient] = {}
         self.round_count: int = 0
         self.global_model: Any = None
@@ -393,8 +367,14 @@ class EnhancedFederatedLearner:
         self._lock = asyncio.Lock()
         self._shutdown_event = asyncio.Event()
         self._background_tasks = []
+        self._started = False  # NEW: flag to track start state
 
-        # ===== ENHANCED MODULES =====
+        # Config fallbacks
+        self.federated_interval = getattr(central_config, 'federated_interval', 1800)
+        self.data_retention_days = getattr(central_config, 'data_retention_days', 365)
+        self.modp_weights = getattr(central_config, 'modp_weights', {'accuracy':0.4, 'energy':0.3, 'carbon':0.2, 'latency':0.1})
+
+        # Sub-modules
         if ENHANCEMENTS_AVAILABLE:
             self.modp = ParetoOptimizer()
             self.moe = ExpertRouter()
@@ -417,19 +397,16 @@ class EnhancedFederatedLearner:
             self.strategy_population = []
             self.strategy_fitness = deque(maxlen=100)
 
-        # NEW: LIMIT Graph
         if ADDITIONAL_ENHANCEMENTS_AVAILABLE:
             self.limit_graph = LimitGraph()
         else:
             self.limit_graph = None
 
-        # NEW: RLHF
         if ADDITIONAL_ENHANCEMENTS_AVAILABLE:
             self.rlhf = RLHFOptimizer(action_space=self.strategies)
         else:
             self.rlhf = None
 
-        # NEW: Multi‑Teacher Distillation
         if ADDITIONAL_ENHANCEMENTS_AVAILABLE:
             self.distiller = MultiTeacherDistiller([
                 self._bandit_teacher,
@@ -439,18 +416,17 @@ class EnhancedFederatedLearner:
         else:
             self.distiller = None
 
-        # For fallback epsilon-greedy (if bandit not available)
+        # For fallback ε‑greedy
         self.strategy_usage = {s: 0 for s in self.strategies}
         self.strategy_rewards = {s: 0.0 for s in self.strategies}
         self.epsilon = 0.1
+        self._drift_score = 0.0  # NEW: store latest drift score
 
-        # Load persisted state
         self._load_state()
+        logger.info(f"EnhancedFederatedLearner v9.3 initialized (instance: {self.instance_id})")
 
-        logger.info(f"EnhancedFederatedLearner v9.2 initialized (instance: {self.instance_id})")
-
+    # Teacher functions (unchanged, but robust)
     def _bandit_teacher(self, context: Dict) -> str:
-        """Teacher: bandit selection."""
         if self.bandit:
             encoded = self.moe.encode(context) if self.moe else context
             strategy, _, _ = self.bandit.select_action(encoded)
@@ -458,30 +434,24 @@ class EnhancedFederatedLearner:
         return 'fedavg'
 
     def _modp_teacher(self, context: Dict) -> str:
-        """Teacher: MODP-based strategy selection using heuristics."""
-        # Use MODP to rank strategies based on simple objectives
         if not self.modp:
             return 'fedavg'
-        # For simplicity, compute a score per strategy using context
         scores = {}
         for s in self.strategies:
-            # Mock objectives
             objectives = {
-                'accuracy': 0.7,  # placeholder
+                'accuracy': 0.7,
                 'carbon': 1.0 - (context.get('avg_carbon', 400) / 800),
                 'energy': 0.5,
                 'latency': 0.8,
             }
-            utility = self.modp.evaluate(objectives, central_config.modp_weights if hasattr(central_config, 'modp_weights') else {'accuracy':0.4, 'carbon':0.2, 'energy':0.2, 'latency':0.2})
+            utility = self.modp.evaluate(objectives, self.modp_weights)
             scores[s] = utility
         return max(scores, key=scores.get)
 
     def _static_teacher(self, context: Dict) -> str:
-        """Teacher: always returns fedavg as baseline."""
         return 'fedavg'
 
     def _load_state(self):
-        """Load bandit, MODP, bio, and new module state from central storage."""
         try:
             state = self.storage.get_federated_optimizer_state()
             if state:
@@ -490,12 +460,10 @@ class EnhancedFederatedLearner:
                 self.strategy_usage = state.get('strategy_usage', {s: 0 for s in self.strategies})
                 self.strategy_population = state.get('strategy_population', [])
                 self.strategy_fitness = deque(state.get('strategy_fitness', []), maxlen=100)
-                # In a real implementation, we would also restore bandit weights.
         except Exception as e:
             logger.warning(f"Failed to load optimizer state: {e}")
 
     def _save_state(self):
-        """Persist optimizer state to central storage."""
         try:
             state = {
                 'epsilon': self.epsilon,
@@ -508,44 +476,31 @@ class EnhancedFederatedLearner:
         except Exception as e:
             logger.warning(f"Failed to save optimizer state: {e}")
 
-    # ----------------------------------------------------------------------
-    # Teacher interface for MOPD
-    # ----------------------------------------------------------------------
+    # ------------------ Teacher interface with improved stability ------------------
     async def policy_probs(self, state: Dict) -> List[float]:
-        """
-        Return a probability distribution over federated aggregation strategies.
-        If distillation is available, we use its output; otherwise fallback to bandit or rewards.
-        """
         if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.distiller:
-            # Use a dummy context; in real, would use provided state
             context = {'num_clients': len(self.clients), 'avg_carbon': 400}
             selected_strategy = self.distiller.distill(context)
-            # Return a softmax with high probability on selected strategy
+            if selected_strategy is None:
+                selected_strategy = 'fedavg'
             probs = [0.01] * len(self.strategies)
             idx = self.strategies.index(selected_strategy) if selected_strategy in self.strategies else 0
             probs[idx] = 1.0 - 0.01 * (len(self.strategies) - 1)
             return probs
-        elif ENHANCEMENTS_AVAILABLE and self.bandit:
-            rewards = [self.strategy_rewards.get(s, 0.0) for s in self.strategies]
-            exp_rewards = np.exp(rewards)
-            probs = exp_rewards / np.sum(exp_rewards)
-            return probs.tolist()
         else:
-            rewards = [self.strategy_rewards.get(s, 0.0) for s in self.strategies]
+            # Use softmax with temperature to avoid overflow
+            rewards = np.array([self.strategy_rewards.get(s, 0.0) for s in self.strategies])
+            # Normalize to prevent overflow: subtract max
+            rewards = rewards - np.max(rewards)
             exp_rewards = np.exp(rewards)
             probs = exp_rewards / np.sum(exp_rewards)
             return probs.tolist()
 
-    # ----------------------------------------------------------------------
-    # Core federated methods
-    # ----------------------------------------------------------------------
+    # ------------------ Client registration (unchanged) ------------------
     async def register_client(self, client_id: str, initial_data: Dict = None,
                               data_size: int = 1000, compute_power: float = 1000,
                               carbon_intensity: float = 400, renewable_percent: float = 0,
                               trust_score: float = 0.5, region: str = "global") -> bool:
-        """
-        Register a new client and emit a FeedbackEvent.
-        """
         async with self._lock:
             if client_id in self.clients:
                 return False
@@ -561,39 +516,32 @@ class EnhancedFederatedLearner:
             self.clients[client_id] = client
             logger.info(f"Registered client {client_id}")
 
-        # Publish FeedbackEvent
         event = FeedbackEvent.create_with_context(
             task_id=f"fl_register_{client_id}",
             selected_action="register_client",
             quality_score=trust_score,
             latency_ms=0.0,
             energy_joules=0.0,
-            carbon_g=carbon_intensity * 0.1,  # placeholder
+            carbon_g=carbon_intensity * 0.1,
             feedback_type="federated",
             adaptive_cost_value=0.0,
             state={'client_id': client_id, 'region': region},
             candidates=[{'action': 'register'}],
             source="federated_learner",
-            environment=central_config.ENVIRONMENT,
+            environment=getattr(central_config, 'ENVIRONMENT', 'production'),
             tags=["federated", "client"]
         )
         await self.queue.publish("feedback_events", event.to_json())
-
-        # Update metrics
         self.metrics.increment_federated_clients(len(self.clients))
-
         return True
 
+    # ------------------ Federated round with XAI, safety, approval ------------------
     async def federated_round(self, strategy: str = None) -> Optional[FederatedRoundResult]:
-        """
-        Run a federated aggregation round and emit a FeedbackEvent.
-        """
         async with self._lock:
             if len(self.clients) < 1:
                 logger.warning("No clients registered")
                 return None
 
-            # Build context for MoE/Bandit
             context = {
                 'num_clients': len(self.clients),
                 'avg_trust': np.mean([c.trust_score for c in self.clients.values()]),
@@ -603,64 +551,74 @@ class EnhancedFederatedLearner:
                 'hour': datetime.now().hour,
             }
 
-            # ===== Strategy selection: hierarchical approach =====
+            # Strategy selection with hierarchy and explanation
+            explanation = "Strategy selection: "
             if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.distiller:
-                # Use distillation
                 strategy = self.distiller.distill(context)
                 source = "distilled"
+                explanation += "multi-teacher distillation"
             elif ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.rlhf:
-                # Use RLHF
                 strategy = self.rlhf.sample_action(context)
                 if strategy is None:
                     strategy = 'fedavg'
                 source = "rlhf"
+                explanation += "RLHF optimizer"
             elif ENHANCEMENTS_AVAILABLE and self.bandit:
-                # Use bandit
                 encoded = self.moe.encode(context) if self.moe else context
                 strategy, confidence, source = self.bandit.select_action(encoded)
                 if strategy is None:
                     strategy = 'fedavg'
-                source = "bandit"
+                explanation += f"contextual bandit (confidence={confidence:.2f})"
             else:
-                # Fallback ε‑greedy
                 if strategy is None:
                     if random.random() < self.epsilon:
                         strategy = random.choice(self.strategies)
                     else:
                         strategy = max(self.strategies, key=lambda s: self.strategy_rewards.get(s, 0.0))
                 source = "fallback"
+                explanation += f"ε‑greedy (ε={self.epsilon:.3f})"
 
-            # ===== Apply LIMIT Graph constraints =====
+            # Apply LIMIT Graph constraints
             if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.limit_graph:
                 limits = self.limit_graph.get_limits(context)
-                # Example: if carbon intensity is high, force 'carbon_aware' strategy
                 if limits.get('force_carbon_aware') and context.get('avg_carbon', 400) > 600:
                     strategy = 'carbon_aware'
                     source = "limit_graph"
+                    explanation += " (overridden by LIMIT Graph: high carbon)"
 
-            # Simulate round (in real, would aggregate models)
+            # Temporal safety check before proceeding
+            if not await self.check_invariants(context, strategy):
+                logger.warning("Temporal safety check failed; aborting round.")
+                return None
+
+            # Human approval if required (config flag)
+            if getattr(central_config, 'REQUIRE_HUMAN_APPROVAL', False):
+                if not await self.request_approval(strategy, context):
+                    logger.info("Human approval not granted for strategy; using default.")
+                    strategy = 'fedavg'
+
+            # Simulate round
             self.round_count += 1
-            selected_clients = list(self.clients.values())[:min(5, len(self.clients))]  # placeholder
+            selected_clients = list(self.clients.values())[:min(5, len(self.clients))]
             num_clients = len(selected_clients)
             global_accuracy = 0.7 + 0.2 * random.random()
             aggregated_loss = 0.5 * random.random()
             energy_used = num_clients * 0.1
-            carbon_footprint = energy_used * 0.2  # placeholder
+            carbon_footprint = energy_used * 0.2
 
-            # Compute multi‑objective utility if MODP available
             if self.modp:
                 objectives = {
                     'accuracy': global_accuracy,
                     'energy': 1.0 - (energy_used / (num_clients * 0.1 + 1e-8)),
                     'carbon': 1.0 - (carbon_footprint / (num_clients * 0.2 + 1e-8)),
-                    'latency': 0.9,  # placeholder
+                    'latency': 0.9,
                 }
-                utility = self.modp.evaluate(objectives, central_config.modp_weights if hasattr(central_config, 'modp_weights') else {'accuracy':0.4, 'energy':0.3, 'carbon':0.2, 'latency':0.1})
+                utility = self.modp.evaluate(objectives, self.modp_weights)
                 reward = utility
             else:
                 reward = global_accuracy
 
-            # Update strategy rewards and learners
+            # Update learners
             if ENHANCEMENTS_AVAILABLE and self.bandit:
                 encoded = self.moe.encode(context) if self.moe else context
                 await self.bandit.update(encoded, strategy, reward)
@@ -670,11 +628,9 @@ class EnhancedFederatedLearner:
                 self.strategy_rewards[strategy] += (reward - self.strategy_rewards[strategy]) / count
                 self.epsilon = max(0.01, self.epsilon * 0.99)
 
-            # Update RLHF if available
             if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.rlhf:
                 self.rlhf.update(context, strategy, reward)
 
-            # Update LIMIT Graph if available
             if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.limit_graph:
                 self.limit_graph.update_from_feedback({
                     'context': context,
@@ -683,9 +639,16 @@ class EnhancedFederatedLearner:
                     'success': reward > 0.7
                 })
 
-            # Record fitness for bio evolution
             if ENHANCEMENTS_AVAILABLE and self.bio:
                 self.strategy_fitness.append(reward)
+
+            # Drift update: use drift score to adjust epsilon
+            if self.drift:
+                drift_score = await self.drift.check_drift(self.adaptive_cost.get_current_weights())
+                if drift_score and drift_score > 0.7:
+                    self._drift_score = drift_score
+                    self.epsilon = min(0.2, self.epsilon * 1.5)
+                    logger.warning(f"High drift {drift_score:.2f}; increasing exploration.")
 
             result = FederatedRoundResult(
                 round_id=self.round_count,
@@ -694,63 +657,147 @@ class EnhancedFederatedLearner:
                 aggregated_loss=aggregated_loss,
                 strategy=strategy,
                 carbon_footprint=carbon_footprint,
-                energy_used=energy_used
+                energy_used=energy_used,
+                explanation=explanation,
             )
 
-            # Quantum signing
             signature = await self.pqc.sign_data(asdict(result))
             result.quantum_signature = signature
-
-            # Cloud backup
-            backup_data = asdict(result)
-            await self.cloud_storage.store(backup_data, f"fl_round_{self.round_count}.json")
-
-            # Store in central storage
+            await self.cloud_storage.store(asdict(result), f"fl_round_{self.round_count}.json")
             self.storage.store_federated_round(result)
-
-            # Update history
             self.history.append(result)
 
-            # Publish FeedbackEvent
             event = FeedbackEvent.create_with_context(
                 task_id=f"fl_round_{self.round_count}",
                 selected_action=f"round_{strategy}",
                 quality_score=global_accuracy,
                 latency_ms=0.0,
-                energy_joules=energy_used * 3.6e6,  # kWh to joules
-                carbon_g=carbon_footprint * 1000,  # kg to g
+                energy_joules=energy_used * 3.6e6,
+                carbon_g=carbon_footprint * 1000,
                 feedback_type="federated",
                 adaptive_cost_value=0.0,
-                state={'num_clients': num_clients, 'strategy': strategy, 'source': source},
+                state={'num_clients': num_clients, 'strategy': strategy, 'source': source, 'explanation': explanation},
                 candidates=[{'action': s} for s in self.strategies],
                 source="federated_learner",
-                environment=central_config.ENVIRONMENT,
+                environment=getattr(central_config, 'ENVIRONMENT', 'production'),
                 tags=["federated", "aggregation"]
             )
             await self.queue.publish("feedback_events", event.to_json())
 
-            # Check drift
-            if self.drift:
-                await self.drift.check_drift(self.adaptive_cost.get_current_weights())
-
-            # Update metrics
             self.metrics.increment_federated_rounds()
             self.metrics.set_federated_accuracy(global_accuracy)
 
-            logger.info(f"Federated round {self.round_count} completed: strategy={strategy} (source={source}), accuracy={global_accuracy:.3f}")
+            logger.info(f"Federated round {self.round_count}: strategy={strategy} (source={source}), accuracy={global_accuracy:.3f}, explanation={explanation}")
             return result
 
-        return None
+    # ------------------ Temporal safety check ------------------
+    async def check_invariants(self, context: Dict, strategy: str) -> bool:
+        """Check temporal safety invariants before running a round."""
+        # Use LimitGraph if available, else basic checks
+        if ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.limit_graph:
+            limits = self.limit_graph.get_limits(context)
+            # Example: if carbon intensity is critical and strategy is not carbon_aware, fail
+            if limits.get('carbon_critical') and strategy != 'carbon_aware':
+                logger.warning("Temporal safety: carbon critical but strategy not carbon_aware")
+                return False
+        # Basic invariant: no strategy if no clients
+        if len(self.clients) == 0:
+            return False
+        return True
 
-    # ----------------------------------------------------------------------
-    # Bio‑inspired evolution of strategy population
-    # ----------------------------------------------------------------------
+    # ------------------ Human approval ------------------
+    async def request_approval(self, strategy: str, context: Dict) -> bool:
+        """Request human approval for a critical strategy decision."""
+        # In a real system, this would interact with a queue or UI.
+        # For now, just log and return False to simulate denial.
+        logger.warning(f"Human approval required for strategy {strategy}; auto-denying.")
+        return False
+
+    # ------------------ Chaos testing ------------------
+    async def inject_fault(self, fault_type: str, **params):
+        """Inject a fault for resilience testing."""
+        if fault_type == 'storage_failure':
+            self.storage = None
+            logger.warning("Injected storage_failure")
+        elif fault_type == 'high_carbon':
+            for c in self.clients.values():
+                c.carbon_intensity = 800.0
+            logger.warning("Injected high_carbon")
+        elif fault_type == 'circuit_open':
+            # Simulate circuit breaker open by raising exception
+            raise CircuitBreakerOpenError("Simulated circuit open")
+        else:
+            logger.warning(f"Unknown fault type: {fault_type}")
+
+    async def run_chaos_test(self) -> Dict[str, Any]:
+        """Run a simple chaos test to verify resilience."""
+        report = {'faults': [], 'results': {}}
+        # Test storage failure
+        await self.inject_fault('storage_failure')
+        report['faults'].append('storage_failure')
+        try:
+            await self.federated_round()
+            report['results']['storage_failure'] = 'unexpected_success'
+        except Exception as e:
+            report['results']['storage_failure'] = f'failed_as_expected: {type(e).__name__}'
+        # Reset storage
+        self.storage = Storage()
+        # Test high carbon
+        await self.inject_fault('high_carbon')
+        report['faults'].append('high_carbon')
+        # Run round and see if carbon_aware is selected
+        result = await self.federated_round()
+        if result:
+            report['results']['high_carbon'] = f"strategy={result.strategy}"
+        else:
+            report['results']['high_carbon'] = 'round_not_run'
+        # Reset carbon
+        for c in self.clients.values():
+            c.carbon_intensity = 400.0
+        return report
+
+    # ------------------ Background tasks (safe start) ------------------
+    async def start(self):
+        if self._started:
+            return
+        self._started = True
+        loop = asyncio.get_running_loop()
+        self._background_tasks.extend([
+            loop.create_task(self._optimization_loop()),
+            loop.create_task(self._evolution_loop()),
+            loop.create_task(self._cleanup_loop()),
+        ])
+        logger.info("Federated Learner background tasks started")
+
+    async def _optimization_loop(self):
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(self.federated_interval)
+            try:
+                await self.federated_round()
+            except Exception as e:
+                logger.error(f"Optimization loop error: {e}")
+
+    async def _evolution_loop(self):
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(3600)
+            try:
+                if ENHANCEMENTS_AVAILABLE:
+                    await self._evolve_strategies()
+            except Exception as e:
+                logger.error(f"Evolution loop error: {e}")
+
+    async def _cleanup_loop(self):
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(86400)
+            try:
+                self.storage.clean_old_federated_rounds(days=self.data_retention_days)
+            except Exception as e:
+                logger.error(f"Cleanup error: {e}")
+
     async def _evolve_strategies(self):
-        """Run a bio‑inspired evolution cycle on the strategy population."""
         if not self.bio or not self.strategy_population:
             return
         if len(self.strategy_fitness) < 10:
-            logger.debug("Not enough fitness data to evolve strategies.")
             return
 
         def fitness(strategy_config):
@@ -763,59 +810,20 @@ class EnhancedFederatedLearner:
             generations=10,
             population_size=20,
         )
-        if new_population:
+        if new_population and isinstance(new_population, list):
             self.strategy_population = new_population
             new_names = [p['name'] for p in new_population]
-            if self.bandit:
-                for name in new_names:
-                    if name not in self.strategies:
-                        self.strategies.append(name)
+            for name in new_names:
+                if name not in self.strategies:
+                    self.strategies.append(name)
+                    if self.bandit:
                         self.bandit.actions = self.strategies
-                        self.strategy_rewards[name] = 0.0
-                        self.strategy_usage[name] = 0
-                # Also update RLHF action space if available
-                if self.rlhf:
-                    self.rlhf.actions = self.strategies
+                    if self.rlhf:
+                        self.rlhf.actions = self.strategies
+                    self.strategy_rewards[name] = 0.0
+                    self.strategy_usage[name] = 0
             self._save_state()
             logger.info(f"Evolved strategy population: {len(new_population)} strategies")
-
-    # ----------------------------------------------------------------------
-    # Lifecycle management
-    # ----------------------------------------------------------------------
-    async def start(self):
-        """Start background tasks."""
-        logger.info("Starting Federated Learner...")
-        loop = asyncio.get_running_loop()
-        self._background_tasks.extend([
-            loop.create_task(self._optimization_loop()),
-            loop.create_task(self._evolution_loop()),
-            loop.create_task(self._cleanup_loop()),
-        ])
-
-    async def _optimization_loop(self):
-        while not self._shutdown_event.is_set():
-            await asyncio.sleep(central_config.federated_interval or 1800)
-            try:
-                await self.federated_round()
-            except Exception as e:
-                logger.error(f"Optimization loop error: {e}")
-
-    async def _evolution_loop(self):
-        while not self._shutdown_event.is_set():
-            await asyncio.sleep(3600)  # every hour
-            try:
-                if ENHANCEMENTS_AVAILABLE:
-                    await self._evolve_strategies()
-            except Exception as e:
-                logger.error(f"Evolution loop error: {e}")
-
-    async def _cleanup_loop(self):
-        while not self._shutdown_event.is_set():
-            await asyncio.sleep(86400)
-            try:
-                self.storage.clean_old_federated_rounds(days=central_config.data_retention_days or 365)
-            except Exception as e:
-                logger.error(f"Cleanup error: {e}")
 
     async def shutdown(self):
         logger.info("Shutting down Federated Learner...")
@@ -827,7 +835,7 @@ class EnhancedFederatedLearner:
         logger.info("Shutdown complete")
 
 # ============================================================
-# SINGLETON ACCESSOR (unchanged)
+# SINGLETON ACCESSOR (unchanged, but safe start)
 # ============================================================
 _federated_learner_instance = None
 _federated_learner_lock = asyncio.Lock()
@@ -851,8 +859,6 @@ async def get_federated_learner(storage: Storage, queue: AsyncMessageQueue,
 # MAIN ENTRY POINT (for standalone testing)
 # ============================================================
 async def main():
-    # For standalone testing, we need to instantiate central components.
-    # In real deployment, these would be provided by LifecycleManager.
     from ..storage import Storage
     from ..scaling.message_queue import AsyncMessageQueue
     from ..feedback.adaptive_cost import AdaptiveCostFunction
@@ -868,15 +874,9 @@ async def main():
     metrics = MetricsRegistry()
 
     learner = await get_federated_learner(storage, queue, adaptive_cost, pareto, drift, metrics)
-
-    # Register a test client
     await learner.register_client("client_1", data_size=1000, compute_power=2000, trust_score=0.8)
-
-    # Run a federated round
     result = await learner.federated_round()
-    print(f"Round {result.round_id}: accuracy={result.global_accuracy:.3f}, strategy={result.strategy}")
-
-    # Shutdown
+    print(f"Round {result.round_id}: accuracy={result.global_accuracy:.3f}, strategy={result.strategy}, explanation={result.explanation}")
     await learner.shutdown()
 
 if __name__ == "__main__":
