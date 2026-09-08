@@ -1,26 +1,19 @@
 #!/usr/bin/env python3
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/experts/iot_expert.py
-# Version 8.3.0 – Full Green Agent MODP Integration
-
-"""
-Enhanced IoT Expert v8.3.0 – Full Green Agent MODP Integration
-Complete metabolic edge decomposer with full bio‑inspired integration,
-digital twin simulation, what‑if analysis, natural language explanations,
-federated reflexive learning, cross‑domain knowledge transfer,
-predictive sustainability, self‑healing mesh, weather API,
-real‑time telemetry, differential privacy, carbon intensity forecasting,
-and BaseExpert.propose_async() implementation.
-
-ENHANCEMENTS OVER v8.2.0:
-1. FIXED critical bugs: safe async task creation, generic metric methods, async get_metrics,
-   dataclass config serialization, robust circuit breaker fallback, missing MembranePermeability,
-   undefined thresholds, carbon intensity conversion, stubs for simulation/comparison.
-2. DEEP bio‑inspired integration: ATP spend/earn, gradient pumping, compartment usage.
-3. REAL MODP: multi‑objective metrics, adaptive cost compute, Pareto filtering in policy_probs and device/strategy selection.
-4. ENHANCED teacher policy (`policy_probs`) as a true context‑aware MoE teacher distribution.
-5. IMPROVED persistence and observability.
-6. All optional dependencies still gracefully degrade.
-"""
+# Version 8.4.0 – Enhanced Green Agent MODP Integration
+#
+# ENHANCEMENTS OVER v8.3.0:
+# 1. Fixed undefined `carbon_intensity` in `optimize_edge_deployment`.
+# 2. Made `get_metrics` async.
+# 3. Robust state serialisation (JSON‑safe, includes datetime and enum conversions).
+# 4. Guarded `aiohttp` import in `FederatedIoTLearner`.
+# 5. Fixed `MembranePermeability` comparison.
+# 6. Initialised `self._last_context`.
+# 7. Removed arbitrary carbon scaling; consistent default 400 g/kWh.
+# 8. Added human‑in‑the‑loop flag for critical recommendations.
+# 9. Added temporal safety cooldown for drastic actions.
+# 10. Made `policy_probs` context‑aware.
+# 11. Minor cleanup and error handling.
 
 import asyncio
 import json
@@ -118,7 +111,7 @@ except ImportError:
             raise NotImplementedError()
         def get_capabilities(self) -> Dict[str, Any]:
             return {'name': self.expert_name, 'supported_tasks': self.supported_task_types, 'health': self.health_status}
-        def get_metrics(self) -> Dict[str, Any]:
+        async def get_metrics(self) -> Dict[str, Any]:
             return {}
 
 # Optional: bio-inspired core
@@ -382,7 +375,7 @@ class MeshNetwork:
         }
 
 # ============================================================================
-# DeviceTelemetryCollector (unchanged, uses central logger)
+# DeviceTelemetryCollector (unchanged)
 # ============================================================================
 class DeviceTelemetryCollector:
     def __init__(self):
@@ -440,7 +433,7 @@ class DeviceTelemetryCollector:
         }
 
 # ============================================================================
-# SelfHealingMeshManager (unchanged, uses central logger)
+# SelfHealingMeshManager (unchanged)
 # ============================================================================
 class SelfHealingMeshManager:
     def __init__(self):
@@ -591,7 +584,7 @@ class SelfHealingMeshManager:
         }
 
 # ============================================================================
-# WeatherAPIClient (uses central config, circuit breaker)
+# WeatherAPIClient (unchanged)
 # ============================================================================
 class WeatherAPIClient:
     def __init__(self):
@@ -608,6 +601,8 @@ class WeatherAPIClient:
         pass
 
     async def _get_session(self) -> aiohttp.ClientSession:
+        if not AIOHTTP_AVAILABLE:
+            raise RuntimeError("aiohttp not installed")
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
         return self._session
@@ -694,7 +689,7 @@ class WeatherAPIClient:
             await self._session.close()
 
 # ============================================================================
-# FederatedIoTLearner (unchanged)
+# FederatedIoTLearner (with aiohttp guard)
 # ============================================================================
 class FederatedIoTLearner:
     def __init__(self, expert_id: str, server_url: Optional[str] = None, privacy_epsilon: float = 1.0):
@@ -744,7 +739,9 @@ class FederatedIoTLearner:
         return private_weights
 
     async def _get_session(self):
-        if self._session is None and self.server_url:
+        if not AIOHTTP_AVAILABLE or not self.server_url:
+            return None
+        if self._session is None:
             self._session = aiohttp.ClientSession()
         return self._session
 
@@ -791,6 +788,8 @@ class FederatedIoTLearner:
         if not self.server_url or not TORCH_AVAILABLE: return {'status': 'disabled'}
         async with self._lock:
             session = await self._get_session()
+            if not session:
+                return {'status': 'error', 'error': 'aiohttp not available'}
             try:
                 weights = self.local_model.state_dict()
                 private_weights = self._add_differential_privacy(weights)
@@ -821,6 +820,8 @@ class FederatedIoTLearner:
         if not self.server_url or not TORCH_AVAILABLE: return None
         async with self._lock:
             session = await self._get_session()
+            if not session:
+                return None
             try:
                 async with session.get(f"{self.server_url}/federated/global/iot", timeout=30) as response:
                     if response.status == 200:
@@ -1082,11 +1083,11 @@ class PredictiveIoTSustainability:
         }
 
 # ============================================================================
-# IoTExpert (Main Class) – Fully Integrated v8.3.0
+# IoTExpert (Main Class) – Enhanced v8.4.0
 # ============================================================================
 class IoTExpert(BaseExpert):
     """
-    Enhanced IoT Expert v8.3.0 with full bio‑inspired integration and MOPD integration.
+    Enhanced IoT Expert v8.4.0 with fixed bugs and added human‑in‑the‑loop.
     """
 
     def __init__(
@@ -1120,10 +1121,9 @@ class IoTExpert(BaseExpert):
         self.carbon_manager = carbon_manager
         self.helium_manager = helium_manager
 
-        # Configuration – built from central_config
         self.config = IoTExpertConfig()
         self.expert_id = self.config.expert_id
-        self.version = "8.3.0"
+        self.version = "8.4.0"
 
         # Feature flags
         self.enable_mesh = self.config.enable_mesh
@@ -1203,6 +1203,13 @@ class IoTExpert(BaseExpert):
         self.last_error: Optional[str] = None
         self.correlation_id = str(uuid.uuid4())
 
+        # NEW: initialise _last_context
+        self._last_context: Dict[str, Any] = {}
+
+        # Temporal safety: track last drastic action time
+        self._last_drastic_action_time: Optional[datetime] = None
+        self._drastic_action_cooldown_seconds = 300  # 5 minutes
+
         # Load state from central storage (safe)
         self._load_state_task = self._create_task(self._load_state())
 
@@ -1221,38 +1228,42 @@ class IoTExpert(BaseExpert):
             return None
 
     # --------------------------------------------------------------------------
-    # State Persistence using central Storage
+    # State Persistence (JSON-safe)
     # --------------------------------------------------------------------------
-    async def _load_state(self):
-        try:
-            data = self.storage.get_state("iot_expert_state")
-            if data:
-                state = json.loads(data)
-                self.mesh_networks = {mid: MeshNetwork(**data) for mid, data in state.get('mesh_networks', {}).items()}
-                self.devices = {did: EdgeDevice(**data) for did, data in state.get('devices', {}).items()}
-                self.total_tasks_processed = state.get('total_tasks_processed', 0)
-                self.total_energy_harvested_kwh = state.get('total_energy_harvested_kwh', 0.0)
-                self.total_carbon_saved_kg = state.get('total_carbon_saved_kg', 0.0)
-                self.total_helium_saved_l = state.get('total_helium_saved_l', 0.0)
-                self.sustainability_score = state.get('sustainability_score', 0.0)
-                # Rebuild mesh networks' topology_graph and device references
-                for mesh in self.mesh_networks.values():
-                    mesh.topology_graph = nx.Graph()
-                    for device_id, device in self.devices.items():
-                        if device.mesh_id == mesh.mesh_id:
-                            mesh.add_device(device)
-                    for d1_id, conns in mesh.devices.items():
-                        for d2_id in conns.connections:
-                            mesh.topology_graph.add_edge(d1_id, d2_id)
-                logger.info("IoT Expert state loaded from central storage")
-        except Exception as e:
-            logger.error(f"Failed to load IoT Expert state: {e}")
+    def _serialize_mesh(self, mesh: MeshNetwork) -> Dict[str, Any]:
+        """Convert MeshNetwork to JSON-safe dict."""
+        mesh_dict = asdict(mesh)
+        # Remove topology_graph (can be rebuilt)
+        mesh_dict.pop('topology_graph', None)
+        # Convert devices dict to JSON-safe dicts
+        mesh_dict['devices'] = {did: self._serialize_device(dev) for did, dev in mesh.devices.items()}
+        # Convert datetime fields
+        mesh_dict['created_at'] = mesh.created_at.isoformat()
+        mesh_dict['last_topology_update'] = mesh.last_topology_update.isoformat()
+        return mesh_dict
+
+    def _serialize_device(self, device: EdgeDevice) -> Dict[str, Any]:
+        """Convert EdgeDevice to JSON-safe dict."""
+        device_dict = asdict(device)
+        # Convert enum fields to strings
+        device_dict['device_type'] = device.device_type.value
+        device_dict['mesh_role'] = device.mesh_role.value
+        device_dict['energy_source'] = device.energy_source.value
+        device_dict['connection_types'] = [ct.value for ct in device.connection_types]
+        # Convert datetime fields
+        device_dict['last_heartbeat'] = device.last_heartbeat.isoformat()
+        if device.last_self_healing:
+            device_dict['last_self_healing'] = device.last_self_healing.isoformat()
+        if device.telemetry:
+            device_dict['telemetry'] = asdict(device.telemetry)
+            device_dict['telemetry']['timestamp'] = device.telemetry.timestamp.isoformat()
+        return device_dict
 
     async def _save_state(self):
         try:
             state = {
-                'mesh_networks': {mid: asdict(m) for mid, m in self.mesh_networks.items()},
-                'devices': {did: asdict(d) for did, d in self.devices.items()},
+                'mesh_networks': {mid: self._serialize_mesh(m) for mid, m in self.mesh_networks.items()},
+                'devices': {did: self._serialize_device(d) for did, d in self.devices.items()},
                 'total_tasks_processed': self.total_tasks_processed,
                 'total_energy_harvested_kwh': self.total_energy_harvested_kwh,
                 'total_carbon_saved_kg': self.total_carbon_saved_kg,
@@ -1265,8 +1276,58 @@ class IoTExpert(BaseExpert):
         except Exception as e:
             logger.error(f"Failed to save IoT Expert state: {e}")
 
+    async def _load_state(self):
+        try:
+            data = self.storage.get_state("iot_expert_state")
+            if data:
+                state = json.loads(data)
+                # Reconstruct devices
+                for did, d_dict in state.get('devices', {}).items():
+                    # Convert strings back to enums
+                    d_dict['device_type'] = DeviceType(d_dict['device_type'])
+                    d_dict['mesh_role'] = MeshRole(d_dict['mesh_role'])
+                    d_dict['energy_source'] = EnergySource(d_dict['energy_source'])
+                    d_dict['connection_types'] = [ConnectionType(ct) for ct in d_dict.get('connection_types', [])]
+                    # Convert datetime strings back to datetime
+                    d_dict['last_heartbeat'] = datetime.fromisoformat(d_dict['last_heartbeat'])
+                    if 'last_self_healing' in d_dict and d_dict['last_self_healing']:
+                        d_dict['last_self_healing'] = datetime.fromisoformat(d_dict['last_self_healing'])
+                    if 'telemetry' in d_dict and d_dict['telemetry']:
+                        d_dict['telemetry']['timestamp'] = datetime.fromisoformat(d_dict['telemetry']['timestamp'])
+                        d_dict['telemetry'] = DeviceTelemetry(**d_dict['telemetry'])
+                    self.devices[did] = EdgeDevice(**d_dict)
+                # Reconstruct meshes
+                for mid, m_dict in state.get('mesh_networks', {}).items():
+                    # Remove devices key (will be re-added after graph rebuild)
+                    devices_data = m_dict.pop('devices', {})
+                    # Convert datetime fields
+                    m_dict['created_at'] = datetime.fromisoformat(m_dict['created_at'])
+                    m_dict['last_topology_update'] = datetime.fromisoformat(m_dict['last_topology_update'])
+                    # Create mesh without devices first
+                    mesh = MeshNetwork(**m_dict)
+                    # Add devices and rebuild graph
+                    for did, d_dict in devices_data.items():
+                        if did in self.devices:
+                            device = self.devices[did]
+                            mesh.add_device(device)
+                    # Rebuild connections from device.connections
+                    for did, device in mesh.devices.items():
+                        for other_id, conn in device.connections.items():
+                            if other_id in mesh.devices:
+                                mesh.add_connection(did, other_id, conn.get('quality', 0.5), conn.get('bandwidth', 50), conn.get('latency', 30))
+                    self.mesh_networks[mid] = mesh
+                # Load metrics
+                self.total_tasks_processed = state.get('total_tasks_processed', 0)
+                self.total_energy_harvested_kwh = state.get('total_energy_harvested_kwh', 0.0)
+                self.total_carbon_saved_kg = state.get('total_carbon_saved_kg', 0.0)
+                self.total_helium_saved_l = state.get('total_helium_saved_l', 0.0)
+                self.sustainability_score = state.get('sustainability_score', 0.0)
+                logger.info("IoT Expert state loaded from central storage")
+        except Exception as e:
+            logger.error(f"Failed to load IoT Expert state: {e}")
+
     # --------------------------------------------------------------------------
-    # Event Subscriptions
+    # Event Subscriptions (unchanged)
     # --------------------------------------------------------------------------
     def _subscribe_events(self):
         if self.event_broker:
@@ -1314,6 +1375,11 @@ class IoTExpert(BaseExpert):
     # Teacher Interface for MOPD (context-aware soft policy)
     # --------------------------------------------------------------------------
     async def policy_probs(self, state: Dict) -> List[float]:
+        # Use current context: helium_scarcity, network_latency, battery_level
+        helium_scarcity = self._last_context.get('helium_scarcity', 0.5)
+        network_latency = self._last_context.get('network_latency_ms', 50.0)
+        battery_level = self._last_context.get('battery_level', 0.8)
+
         strategies = ['sampling_high', 'sampling_low', 'compressed', 'adaptive', 'power_saving']
         candidates = []
         for strategy in strategies:
@@ -1347,6 +1413,12 @@ class IoTExpert(BaseExpert):
                 carbon_g = 2.0
                 latency_ms = 60.0
                 energy_joules = 25.0
+
+            # Adjust based on context
+            if strategy == 'sampling_high':
+                quality -= helium_scarcity * 0.2  # less effective when helium scarce
+            elif strategy == 'power_saving':
+                quality += (1 - battery_level) * 0.3  # more valuable when battery low
 
             cost = self.adaptive_cost.compute(
                 quality=quality,
@@ -1383,7 +1455,7 @@ class IoTExpert(BaseExpert):
         return [0.2] * 5
 
     # --------------------------------------------------------------------------
-    # Core Expert Interface
+    # Core Expert Interface (async get_metrics fixed)
     # --------------------------------------------------------------------------
     async def handle_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
         task_type = task.get('type', 'unknown')
@@ -1395,7 +1467,8 @@ class IoTExpert(BaseExpert):
                 carbon_zone=task.get('carbon_zone', 0),
                 helium_scarcity=task.get('helium_scarcity', 0.5),
                 task_config=task.get('task_config'),
-                location=task.get('location')
+                location=task.get('location'),
+                carbon_intensity=task.get('carbon_intensity')
             )
         elif task_type == 'register_device':
             device = self.register_device(
@@ -1455,16 +1528,18 @@ class IoTExpert(BaseExpert):
         }
 
     # --------------------------------------------------------------------------
-    # Bio-Inspired Data Access
+    # Bio-Inspired Data Access (fixed MembranePermeability comparison)
     # --------------------------------------------------------------------------
     def _get_membrane_mesh_role(self, device_id: str) -> MeshRole:
         if self.compartment_manager and COMPARTMENT_AVAILABLE:
             compartment = self.compartment_manager.find_best_compartment('iot')
             if compartment:
                 perm = compartment.membrane.permeability
-                if perm == MembranePermeability.PERMEABLE:
+                # Convert to string if it's an enum
+                perm_str = getattr(perm, 'value', perm)
+                if perm_str == MembranePermeability.PERMEABLE.value if hasattr(MembranePermeability, 'value') else perm_str == MembranePermeability.PERMEABLE:
                     return MeshRole.LEADER
-                elif perm == MembranePermeability.SELECTIVE:
+                elif perm_str == MembranePermeability.SELECTIVE.value if hasattr(MembranePermeability, 'value') else perm_str == MembranePermeability.SELECTIVE:
                     return MeshRole.ROUTER
                 else:
                     return MeshRole.LEAF
@@ -1501,7 +1576,7 @@ class IoTExpert(BaseExpert):
         return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
 
     # --------------------------------------------------------------------------
-    # Device Registration (Enhanced with FeedbackEvent)
+    # Device Registration (unchanged)
     # --------------------------------------------------------------------------
     def register_device(self, device_id: str, device_type: DeviceType, capabilities: Dict[str, float],
                        location: Optional[Dict[str, float]] = None, mesh_id: Optional[str] = None) -> EdgeDevice:
@@ -1583,7 +1658,7 @@ class IoTExpert(BaseExpert):
         return mesh
 
     # --------------------------------------------------------------------------
-    # Digital Twin Simulation (with persistence)
+    # Digital Twin Simulation (unchanged)
     # --------------------------------------------------------------------------
     def simulate_mesh_scenario(self, scenario: Dict[str, Any]) -> Dict[str, Any]:
         mesh_id = scenario.get('mesh_id')
@@ -1622,7 +1697,7 @@ class IoTExpert(BaseExpert):
         }
 
     # --------------------------------------------------------------------------
-    # Natural Language Explanations
+    # Natural Language Explanations (unchanged)
     # --------------------------------------------------------------------------
     def explain_mesh_topology(self, mesh_id: str) -> Dict[str, Any]:
         if mesh_id not in self.mesh_networks:
@@ -1637,21 +1712,20 @@ class IoTExpert(BaseExpert):
         return {'mesh_id': mesh_id, 'explanation': " ".join(parts)}
 
     # --------------------------------------------------------------------------
-    # Proposal Method (Enhanced with FeedbackEvent and bio integration)
+    # Proposal Method (fixed carbon conversion, human-in-the-loop, temporal safety)
     # --------------------------------------------------------------------------
     async def propose_async(self, context: dict) -> dict:
         try:
             helium_scarcity = context.get('helium_scarcity', 0.5)
-            # Correct carbon intensity conversion
-            carbon_intensity = context.get('carbon_intensity')
-            if carbon_intensity is None:
-                carbon_intensity = 400.0
-            elif carbon_intensity < 1.0:
-                carbon_intensity = carbon_intensity * 800.0
+            # Use default carbon intensity if not provided
+            carbon_intensity = context.get('carbon_intensity', 400.0)
 
             network_latency = context.get('network_latency_ms', 50.0)
             task_type = context.get('task_type', 'general')
             location = context.get('location')
+
+            # Update _last_context
+            self._last_context.update(context)
 
             # Augment with bio‑inspired signals
             if self.enable_bio_integration:
@@ -1760,6 +1834,17 @@ class IoTExpert(BaseExpert):
                 recommendations, helium_scarcity, carbon_intensity, network_latency
             )
 
+            # Human-in-the-loop: flag critical recommendations
+            requires_approval = False
+            if sampling_rate <= self.thresholds['sampling_rate_critical'] or power_saving:
+                requires_approval = True
+                # Temporal safety: cooldown
+                now = datetime.now(timezone.utc)
+                if self._last_drastic_action_time and (now - self._last_drastic_action_time).total_seconds() < self._drastic_action_cooldown_seconds:
+                    logger.warning("Drastic action within cooldown; requiring human approval.")
+                else:
+                    self._last_drastic_action_time = now
+
             # Bio-inspired integration: ATP spend/earn and gradient pumping
             if self.token_manager:
                 atp_cost = 0.05
@@ -1780,7 +1865,7 @@ class IoTExpert(BaseExpert):
                 carbon_g=0.0,
                 feedback_type="iot",
                 adaptive_cost_value=0.0,
-                state=context,
+                state={**context, 'requires_approval': requires_approval},
                 candidates=[{'action': s} for s in ['sampling_high', 'sampling_low', 'compressed', 'adaptive', 'power_saving']],
                 source="iot_expert",
                 environment=getattr(central_config, "ENVIRONMENT", "production"),
@@ -1794,6 +1879,7 @@ class IoTExpert(BaseExpert):
             return {
                 'recommendations': recommendations,
                 'explanation': explanation,
+                'requires_approval': requires_approval,
                 'context_used': {
                     'helium_scarcity': helium_scarcity,
                     'carbon_intensity': carbon_intensity,
@@ -1818,6 +1904,7 @@ class IoTExpert(BaseExpert):
             return {
                 'recommendations': fallback,
                 'explanation': f"Due to an error ({e}), a conservative fallback recommendation has been applied.",
+                'requires_approval': False,
                 'context_used': context
             }
 
@@ -1845,7 +1932,7 @@ class IoTExpert(BaseExpert):
         return " ".join(parts)
 
     # --------------------------------------------------------------------------
-    # Primary Optimization (Enhanced with FeedbackEvent and bio integration)
+    # Primary Optimization (fixed carbon_intensity, added human-in-the-loop)
     # --------------------------------------------------------------------------
     async def optimize_edge_deployment(
         self,
@@ -1853,16 +1940,28 @@ class IoTExpert(BaseExpert):
         carbon_zone: int,
         helium_scarcity: float,
         task_config: Optional[Dict[str, Any]] = None,
-        location: Optional[Dict[str, float]] = None
+        location: Optional[Dict[str, float]] = None,
+        carbon_intensity: Optional[float] = None
     ) -> Dict[str, Any]:
         try:
+            # If carbon_intensity not provided, derive from device or default
+            if carbon_intensity is None:
+                if self.devices:
+                    suitable = [d for d in self.devices.values() if d.device_type.value == device_type or device_type == 'any']
+                    if suitable:
+                        carbon_intensity = np.mean([d.carbon_intensity_g_per_kwh for d in suitable])
+                    else:
+                        carbon_intensity = 400.0
+                else:
+                    carbon_intensity = 400.0
+
             suitable = [d for d in self.devices.values() if d.device_type.value == device_type or device_type == 'any']
             if not suitable:
                 return {'expert_id': self.expert_id, 'recommendation': 'no_suitable_devices'}
 
             if self.enable_cross_domain:
                 energy_knowledge = await self.cross_domain_transfer.apply_energy_knowledge({'device_count': len(suitable)})
-                carbon_knowledge = await self.cross_domain_transfer.apply_carbon_knowledge(carbon_intensity=400)
+                carbon_knowledge = await self.cross_domain_transfer.apply_carbon_knowledge(carbon_intensity=carbon_intensity)
                 if energy_knowledge.get('applied_pattern') != 'default':
                     logger.info(f"Applied energy knowledge: {energy_knowledge['applied_pattern']}")
                 if carbon_knowledge.get('applied_pattern') != 'default':
@@ -1986,6 +2085,14 @@ class IoTExpert(BaseExpert):
                 weather_forecast.get('harvesting_potential', 0.5) * 0.2
             ))
 
+            # Human-in-the-loop flag for critical recommendations
+            requires_approval = False
+            for rec in plan.get('recommendations', []):
+                if 'critical' in rec.lower() or 'low' in rec.lower():
+                    requires_approval = True
+                    break
+            plan['requires_approval'] = requires_approval
+
             # Bio-inspired ATP spend/earn
             if self.token_manager:
                 atp_cost = 0.1
@@ -2007,7 +2114,7 @@ class IoTExpert(BaseExpert):
                 carbon_g=0.0,
                 feedback_type="iot",
                 adaptive_cost_value=0.0,
-                state={'device_type': device_type, 'carbon_zone': carbon_zone},
+                state={'device_type': device_type, 'carbon_zone': carbon_zone, 'requires_approval': requires_approval},
                 candidates=[{'action': 'optimize'}],
                 source="iot_expert",
                 environment=getattr(central_config, "ENVIRONMENT", "production"),
@@ -2124,7 +2231,7 @@ class IoTExpert(BaseExpert):
         return status
 
     # --------------------------------------------------------------------------
-    # Self‑Healing Action (with FeedbackEvent)
+    # Self-Healing Action (with FeedbackEvent)
     # --------------------------------------------------------------------------
     async def self_heal_mesh(self, mesh_id: str) -> Dict[str, Any]:
         if not self.self_healing_manager:
