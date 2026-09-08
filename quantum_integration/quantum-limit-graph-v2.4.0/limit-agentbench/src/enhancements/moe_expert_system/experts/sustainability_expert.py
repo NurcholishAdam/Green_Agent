@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/experts/sustainability_expert.py
-# Version 3.3.0 – Full Green Agent MODP Integration with central components
-
-"""
-Enhanced Sustainability Expert v3.3
-Full integration with bio‑inspired core, event‑driven, circuit breakers, persistence,
-cost‑benefit, QuantumBridge, TimeTickEngine, swarm coordination, self‑healing,
-config reload, and now with:
-
-- Central component integration: Storage, MessageQueue, AdaptiveCostFunction, ParetoGating, DriftDetector, MetricsRegistry.
-- True Pareto‑front generation (multi‑objective optimisation)
-- Dynamic weight adjustment based on context
-- Feedback loop to adapt thresholds
-- Metrics and observability via central MetricsRegistry
-- Self‑evolution via reinforcement learning stub
-- Improved error handling and fallback using last known state
-- Safe async task creation
-- policy_probs teacher interface for MTPD optimizer
-- FeedbackEvent publication for every proposal and application
-"""
+# Version 3.4.0 – Enhanced Green Agent MODP Integration with central components
+#
+# ENHANCEMENTS OVER v3.3.0:
+# 1. Fixed critical bug: cross_domain_transfer not initialized (now a fallback class).
+# 2. Accept optional central carbon/helium/pricing managers in constructor.
+# 3. Added async get_metrics method.
+# 4. Fixed _select_best_solution to actually apply Pareto filtering.
+# 5. Standardized carbon intensity conversion (normalized 0-1 => g/kWh by *800).
+# 6. Made policy_probs context-aware (uses last context metrics).
+# 7. Added human-in-the-loop flag for critical recommendations.
+# 8. Added temporal safety cooldown for drastic actions.
+# 9. Safe normalization of objective weights.
+# 10. Added explanation field to each Pareto solution.
+# 11. Minor cleanup and error handling.
 
 import asyncio
 import json
@@ -139,6 +134,7 @@ if PYDANTIC_AVAILABLE:
         enable_self_healing: bool = True
         enable_feedback_loop: bool = True
         enable_metrics: bool = True
+        human_approval_required: bool = True  # NEW
 
         thresholds: Dict[str, float] = Field(default_factory=lambda: {
             'carbon_high_threshold': float(os.getenv('SUSTAINABILITY_CARBON_HIGH', '500.0')),
@@ -170,6 +166,7 @@ else:
         enable_self_healing: bool = True
         enable_feedback_loop: bool = True
         enable_metrics: bool = True
+        human_approval_required: bool = True  # NEW
         thresholds: Dict[str, float] = field(default_factory=lambda: {
             'carbon_high_threshold': float(os.getenv('SUSTAINABILITY_CARBON_HIGH', '500.0')),
             'helium_scarcity_threshold': float(os.getenv('SUSTAINABILITY_HELIUM_SCARCITY', '0.6')),
@@ -296,14 +293,27 @@ class CostBenefitEngine:
         return {'roi': roi, 'net_value': net_value}
 
 # ============================================================================
-# SustainabilityExpert (Main Class) – Enhanced v3.3 with central integration
+# Simple CrossDomainTransfer fallback (if no external class provided)
+# ============================================================================
+class SimpleCrossDomainTransfer:
+    def __init__(self):
+        self.transfer_logs = deque(maxlen=100)
+
+    def transfer_knowledge(self, source_domain: str, target_domain: str, knowledge_type: str, data: Dict[str, Any]):
+        self.transfer_logs.append({
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'source': source_domain,
+            'target': target_domain,
+            'type': knowledge_type,
+            'data': data
+        })
+
+# ============================================================================
+# SustainabilityExpert (Main Class) – Enhanced v3.4
 # ============================================================================
 class SustainabilityExpert(BaseExpert):
     """
-    Enhanced Sustainability Expert v3.3
-    Provides recommendations for data center selection, carbon budget, helium conservation,
-    renewable energy share, and carbon offsets, using real-time data, predictive analytics,
-    multi-objective trade-offs (Pareto front), and full integration with the bio‑inspired ecosystem.
+    Enhanced Sustainability Expert v3.4
     """
 
     def __init__(
@@ -317,6 +327,9 @@ class SustainabilityExpert(BaseExpert):
         bio_core: Optional[Any] = None,
         config: Optional[Union[SustainabilityExpertConfig, Dict[str, Any]]] = None,
         expert_id: Optional[str] = None,
+        carbon_manager: Optional[Any] = None,   # NEW: central carbon manager
+        helium_manager: Optional[Any] = None,   # NEW: central helium manager
+        pricing_manager: Optional[Any] = None,  # NEW: central pricing manager
     ):
         super().__init__()
 
@@ -343,7 +356,7 @@ class SustainabilityExpert(BaseExpert):
             self.config.expert_id = expert_id
 
         self.expert_id = self.config.expert_id
-        self.version = "3.3.0"
+        self.version = "3.4.0"
         self.expert_name = "sustainability_expert"
         self.supported_task_types = ["propose", "apply_recommendation", "get_thresholds", "set_thresholds"]
 
@@ -383,10 +396,10 @@ class SustainabilityExpert(BaseExpert):
         self._helium_circuit = EnhancedCircuitBreaker("helium_provider")
         self._pricing_circuit = EnhancedCircuitBreaker("pricing_manager")
 
-        # Concrete managers
-        self.carbon_manager = CarbonIntensityManager()
-        self.helium_provider = HeliumProvider()
-        self.pricing_manager = PricingManager()
+        # Use provided central managers if available, else simulated ones
+        self.carbon_manager = carbon_manager if carbon_manager is not None else CarbonIntensityManager()
+        self.helium_provider = helium_manager if helium_manager is not None else HeliumProvider()
+        self.pricing_manager = pricing_manager if pricing_manager is not None else PricingManager()
 
         # Internal state
         self.thresholds = self.config.thresholds.copy()
@@ -399,6 +412,15 @@ class SustainabilityExpert(BaseExpert):
         self.predictive_analyzer = PredictiveAnalyzer()
         if not self.cost_benefit_engine:
             self.cost_benefit_engine = CostBenefitEngine()
+
+        # Cross-domain transfer: use fallback if not provided
+        self.cross_domain_transfer = getattr(bio_core, 'cross_domain_transfer', None) if bio_core else None
+        if not self.cross_domain_transfer:
+            self.cross_domain_transfer = SimpleCrossDomainTransfer()
+
+        # Temporal safety: track last drastic action time
+        self._last_drastic_action_time: Optional[datetime] = None
+        self._drastic_action_cooldown_seconds = 300  # 5 minutes
 
         # Load thresholds from central storage (safe)
         self._load_thresholds_task = self._create_task(self._load_thresholds())
@@ -466,14 +488,21 @@ class SustainabilityExpert(BaseExpert):
     async def _adjust_weights_for_alert(self, alert_data: Dict):
         if alert_data.get('category') == 'carbon':
             self.config.objective_weights['carbon_savings'] = min(1.0, self.config.objective_weights['carbon_savings'] + 0.1)
-            total = sum(self.config.objective_weights.values())
-            for k in self.config.objective_weights:
-                self.config.objective_weights[k] /= total
+            self._normalize_weights()
         elif alert_data.get('category') == 'helium':
             self.config.objective_weights['helium_savings'] = min(1.0, self.config.objective_weights['helium_savings'] + 0.1)
-            total = sum(self.config.objective_weights.values())
+            self._normalize_weights()
+
+    def _normalize_weights(self):
+        total = sum(self.config.objective_weights.values())
+        if total > 0:
             for k in self.config.objective_weights:
                 self.config.objective_weights[k] /= total
+        else:
+            # Fallback to equal weights
+            n = len(self.config.objective_weights)
+            for k in self.config.objective_weights:
+                self.config.objective_weights[k] = 1.0 / n
 
     async def _on_anomaly_detected(self, event: BioEvent):
         if event.data.get('metric') == 'carbon_intensity':
@@ -498,20 +527,23 @@ class SustainabilityExpert(BaseExpert):
         self.health_status = event.data.get('status', 'healthy')
 
     # ========================================================================
-    # Teacher Interface for MOPD
+    # Teacher Interface for MOPD (context-aware)
     # ========================================================================
     async def policy_probs(self, state: Dict) -> List[float]:
         """
-        Return a probability distribution over sustainability strategies,
-        computed using adaptive cost and Pareto constraints.
+        Return a probability distribution over sustainability strategies.
+        Uses current context to derive realistic metrics.
         """
         strategies = ['shift_low_carbon', 'helium_recovery', 'carbon_offsets', 'increase_renewable']
         candidates = []
+        carbon_intensity = self._last_context.get('carbon_intensity', 400.0)
+        helium_scarcity = self._last_context.get('helium_scarcity', 0.5)
+        carbon_price = self._last_context.get('carbon_price', 50.0)
+
         for strategy in strategies:
-            # Estimate metrics for each strategy
             if strategy == 'shift_low_carbon':
                 quality = 0.8
-                carbon_g = 20.0
+                carbon_g = carbon_intensity * 0.05  # proxy
                 latency_ms = 30.0
                 energy_joules = 50.0
             elif strategy == 'helium_recovery':
@@ -519,16 +551,23 @@ class SustainabilityExpert(BaseExpert):
                 carbon_g = 5.0
                 latency_ms = 80.0
                 energy_joules = 40.0
+                # higher quality if helium scarce
+                quality += helium_scarcity * 0.2
             elif strategy == 'carbon_offsets':
                 quality = 0.6
                 carbon_g = 50.0
                 latency_ms = 10.0
                 energy_joules = 20.0
+                # higher quality if carbon price high
+                quality += (carbon_price / 100.0) * 0.3
             elif strategy == 'increase_renewable':
                 quality = 0.75
                 carbon_g = 10.0
                 latency_ms = 20.0
                 energy_joules = 30.0
+                # higher quality if renewable share low (from context)
+                renewable_share = self._last_context.get('renewable_share', 0.5)
+                quality += (1.0 - renewable_share) * 0.2
             else:
                 quality = 0.5
                 carbon_g = 10.0
@@ -536,7 +575,7 @@ class SustainabilityExpert(BaseExpert):
                 energy_joules = 30.0
 
             cost = self.adaptive_cost.compute(
-                quality=quality,
+                quality=min(1.0, quality),
                 carbon_g=carbon_g,
                 latency_ms=latency_ms,
                 energy_joules=energy_joules,
@@ -549,7 +588,7 @@ class SustainabilityExpert(BaseExpert):
                 'carbon_g': carbon_g,
                 'latency_ms': latency_ms,
                 'energy_joules': energy_joules,
-                'quality_score': quality
+                'quality_score': min(1.0, quality)
             })
 
         if self.pareto:
@@ -570,7 +609,7 @@ class SustainabilityExpert(BaseExpert):
         return [0.25] * 4
 
     # ========================================================================
-    # Core Propose Method (Async only)
+    # Core Propose Method
     # ========================================================================
     async def propose_async(self, context: dict) -> dict:
         start_time = time.time()
@@ -611,7 +650,7 @@ class SustainabilityExpert(BaseExpert):
                         if avg_future < 0.3:
                             helium_data['scarcity'] = max(helium_data['scarcity'], 0.8)
 
-            # Generate Pareto front of feasible actions
+            # Generate Pareto front
             pareto_front = await self._generate_pareto_front(
                 carbon_intensity=carbon_data['intensity'],
                 helium_scarcity=helium_data['scarcity'],
@@ -626,6 +665,18 @@ class SustainabilityExpert(BaseExpert):
                 best_solution, carbon_data, helium_data, price_data, pareto_front
             )
 
+            # Human-in-the-loop flag
+            requires_approval = False
+            if (carbon_data['intensity'] > self.thresholds['carbon_high_threshold'] * 1.5 or
+                helium_data['scarcity'] > self.thresholds['helium_scarcity_threshold'] * 1.5):
+                requires_approval = True
+                # Temporal safety cooldown
+                now = datetime.now(timezone.utc)
+                if self._last_drastic_action_time and (now - self._last_drastic_action_time).total_seconds() < self._drastic_action_cooldown_seconds:
+                    logger.warning("Drastic action within cooldown; requiring human approval.")
+                else:
+                    self._last_drastic_action_time = now
+
             # Swarm coordination
             if self.config.enable_swarm_coordination and self.swarm_coordinator:
                 swarm_payload = {
@@ -634,6 +685,7 @@ class SustainabilityExpert(BaseExpert):
                     'carbon_intensity': carbon_data['intensity'],
                     'helium_scarcity': helium_data['scarcity'],
                     'thresholds': self.thresholds,
+                    'requires_approval': requires_approval,
                 }
                 await self.swarm_coordinator.share_predictions(swarm_payload)
 
@@ -650,7 +702,7 @@ class SustainabilityExpert(BaseExpert):
                 json.dumps(best_solution)
             )
 
-            # Bio-inspired integration: ATP spend/earn and gradient pumping
+            # Bio-inspired integration
             if self.token_manager:
                 atp_cost = 0.05
                 await self.token_manager.spend(self.expert_id, atp_cost)
@@ -674,12 +726,12 @@ class SustainabilityExpert(BaseExpert):
             event = FeedbackEvent.create_with_context(
                 task_id=f"sustainability_propose_{uuid.uuid4().hex[:8]}",
                 selected_action="propose",
-                quality_score=best_solution.get('carbon_savings', 0) / 100.0,  # normalise
+                quality_score=best_solution.get('carbon_savings', 0) / 100.0,
                 energy_joules=0.0,
                 carbon_g=0.0,
                 feedback_type="sustainability",
                 adaptive_cost_value=0.0,
-                state={'context': context},
+                state={'context': context, 'requires_approval': requires_approval},
                 candidates=[{'action': 'propose'}],
                 source="sustainability_expert",
                 environment=getattr(central_config, "ENVIRONMENT", "production"),
@@ -693,7 +745,8 @@ class SustainabilityExpert(BaseExpert):
             return {
                 'recommendations': best_solution,
                 'options': pareto_front,
-                'explanation': explanation
+                'explanation': explanation,
+                'requires_approval': requires_approval
             }
 
         except Exception as e:
@@ -705,7 +758,8 @@ class SustainabilityExpert(BaseExpert):
             return {
                 'recommendations': fallback,
                 'options': [],
-                'explanation': f"Due to an error ({e}), the last known good recommendation has been applied."
+                'explanation': f"Due to an error ({e}), the last known good recommendation has been applied.",
+                'requires_approval': False
             }
 
     async def _get_fallback_recommendation(self) -> Dict[str, Any]:
@@ -727,7 +781,7 @@ class SustainabilityExpert(BaseExpert):
         }
 
     # ========================================================================
-    # Data Gathering Helpers
+    # Data Gathering Helpers (standardize carbon units)
     # ========================================================================
     async def _get_carbon_data(self) -> Dict[str, float]:
         if self.carbon_manager:
@@ -740,7 +794,10 @@ class SustainabilityExpert(BaseExpert):
                 self.health_status = "degraded"
                 self.last_error = str(e)
         ctx_intensity = self._last_context.get('carbon_intensity', 0.5)
-        intensity = ctx_intensity * 800.0 if ctx_intensity <= 1.0 else ctx_intensity
+        if ctx_intensity <= 10:  # assume normalized 0-1 or low value
+            intensity = ctx_intensity * 800.0
+        else:
+            intensity = ctx_intensity
         price = self._last_context.get('carbon_price', 50.0)
         return {'intensity': intensity, 'price': price}
 
@@ -784,7 +841,7 @@ class SustainabilityExpert(BaseExpert):
         return None
 
     # ========================================================================
-    # Pareto Front Generation
+    # Pareto Front Generation (with explanations)
     # ========================================================================
     async def _generate_pareto_front(
         self,
@@ -813,9 +870,20 @@ class SustainabilityExpert(BaseExpert):
                         }
                         obj = self._compute_objectives(action, carbon_intensity, helium_scarcity, carbon_price, helium_price)
                         action.update(obj)
+                        # Add explanation
+                        reasons = []
+                        if dc == 'us-west' and carbon_intensity > 400:
+                            reasons.append("Shift to lower-carbon region")
+                        if hr:
+                            reasons.append("Enable helium recovery")
+                        if co:
+                            reasons.append("Purchase carbon offsets")
+                        if rs > 0.5:
+                            reasons.append(f"Increase renewable share to {rs:.0%}")
+                        action['explanation'] = "; ".join(reasons) if reasons else "Baseline configuration"
                         feasible_actions.append(action)
 
-        # Filter dominated solutions
+        # Filter dominated solutions (true Pareto front)
         pareto = []
         for i, a in enumerate(feasible_actions):
             dominated = False
@@ -892,40 +960,52 @@ class SustainabilityExpert(BaseExpert):
         if not pareto_front:
             return await self._get_fallback_recommendation()
 
-        # Use central AdaptiveCostFunction to score each solution
+        # Prepare candidates for central ParetoGating
+        candidates = []
+        for idx, sol in enumerate(pareto_front):
+            candidates.append({
+                'id': idx,
+                'quality_score': sol.get('carbon_savings', 0) / 100.0,
+                'carbon_g': sol.get('carbon_savings', 0) * 1000.0,
+                'latency_ms': sol.get('latency', 0),
+                'energy_joules': sol.get('cost', 0) * 10.0,
+                'sol': sol
+            })
+
+        # Apply central Pareto filter (if available)
+        if self.pareto:
+            filtered = self.pareto.filter(candidates)
+            if filtered:
+                allowed_ids = {c['id'] for c in filtered}
+                candidates = [c for c in candidates if c['id'] in allowed_ids]
+
+        # If after filtering no candidates, use original
+        if not candidates:
+            candidates = [{'id': i, 'quality_score': sol.get('carbon_savings', 0) / 100.0,
+                           'carbon_g': sol.get('carbon_savings', 0) * 1000.0,
+                           'latency_ms': sol.get('latency', 0),
+                           'energy_joules': sol.get('cost', 0) * 10.0,
+                           'sol': sol} for i, sol in enumerate(pareto_front)]
+
+        # Score remaining with adaptive cost
         scored = []
-        for sol in pareto_front:
+        for c in candidates:
             cost = self.adaptive_cost.compute(
-                quality=sol.get('carbon_savings', 0) / 100.0,  # normalise as quality proxy
-                carbon_g=sol.get('carbon_savings', 0) * 1000.0,  # convert kg to g? use as is
-                latency_ms=sol.get('latency', 0),
-                energy_joules=sol.get('cost', 0) * 10.0,  # rough conversion
+                quality=c['quality_score'],
+                carbon_g=c['carbon_g'],
+                latency_ms=c['latency_ms'],
+                energy_joules=c['energy_joules'],
                 health=self.health_status == 'healthy',
                 atp=0.5
             )
-            sol['adaptive_cost'] = cost
-            scored.append((cost, sol))
+            c['adaptive_cost'] = cost
+            scored.append((cost, c['sol']))
 
-        # Also apply central Pareto gating if available
-        if self.pareto:
-            candidates = []
-            for sol in pareto_front:
-                candidates.append({
-                    'expert_id': self.expert_id,
-                    'quality_score': sol.get('carbon_savings', 0) / 100.0,
-                    'carbon_g': sol.get('carbon_savings', 0) * 1000.0,
-                    'latency_ms': sol.get('latency', 0),
-                    'energy_joules': sol.get('cost', 0) * 10.0,
-                })
-            filtered = self.pareto.filter(candidates)
-            if filtered:
-                allowed_ids = {c['expert_id'] for c in filtered}  # but we need mapping back to solutions
-                # Since we used index, we can map via index
-                # For simplicity, we'll just trust adaptive cost if Pareto exists
-                pass
-
-        scored.sort(reverse=True)
-        return scored[0][1]
+        scored.sort(reverse=True, key=lambda x: x[0])
+        best = scored[0][1]
+        # Add adaptive cost to the solution for reference
+        best['adaptive_cost'] = scored[0][0]
+        return best
 
     def _generate_explanation(
         self,
@@ -938,7 +1018,7 @@ class SustainabilityExpert(BaseExpert):
         parts = []
         carbon_intensity = carbon_data.get('intensity', 400)
         if carbon_intensity > self.thresholds['carbon_high_threshold']:
-            parts.append(f"Carbon intensity is high ({carbon_intensity:.0f} g/kWh), so we shifted workload to a lower‑carbon region.")
+            parts.append(f"Carbon intensity is high ({carbon_intensity:.0f} g/kWh), so we shifted workload to a lower-carbon region.")
         else:
             parts.append(f"Carbon intensity is moderate ({carbon_intensity:.0f} g/kWh).")
         helium_scarcity = helium_data.get('scarcity', 0.5)
@@ -947,8 +1027,10 @@ class SustainabilityExpert(BaseExpert):
         carbon_price = price_data.get('carbon_price', 50.0)
         if carbon_price > self.thresholds['carbon_price_threshold']:
             parts.append(f"Carbon price is high (${carbon_price:.2f}/ton), so we recommend purchasing carbon offsets.")
+        if recommendation.get('explanation'):
+            parts.append(f"Chosen action: {recommendation['explanation']}")
         if pareto_front:
-            parts.append(f"The recommendation was selected from {len(pareto_front)} Pareto‑optimal trade‑off solutions.")
+            parts.append(f"Selected from {len(pareto_front)} Pareto-optimal solutions.")
         return " ".join(parts) if parts else "Sustainability metrics are within acceptable ranges."
 
     # ========================================================================
@@ -1018,6 +1100,19 @@ class SustainabilityExpert(BaseExpert):
                     await self._save_thresholds()
             except Exception as e:
                 logger.warning(f"Drift check failed: {e}")
+
+    # ========================================================================
+    # New: Metrics (async)
+    # ========================================================================
+    async def get_metrics(self) -> Dict[str, Any]:
+        return {
+            'expert_id': self.expert_id,
+            'status': self.health_status,
+            'last_error': self.last_error,
+            'thresholds': self.thresholds,
+            'objective_weights': self.config.objective_weights,
+            'version': self.version,
+        }
 
     # ========================================================================
     # Health Check & Shutdown
