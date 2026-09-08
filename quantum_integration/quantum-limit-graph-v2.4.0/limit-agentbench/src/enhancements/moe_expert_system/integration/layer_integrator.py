@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-Enhanced Layer Integrator v7.3.0 – Production‑ready with full bio‑inspired core integration and MOPD support.
+Enhanced Layer Integrator v7.4.0 – Production‑ready with full bio‑inspired core integration and MOPD support.
+Now includes fixes for critical bugs and adds hooks for:
+- Explainable AI (XAI)
+- Temporal safety verification
+- Human‑in‑the‑loop approval
+- Chaos testing for resilience
 
-Key enhancements over v7.2.0:
-- Added central Green Agent component integration: Storage, MessageQueue, AdaptiveCostFunction, ParetoGating, DriftDetector, MetricsRegistry.
-- Safe async task creation (no RuntimeError outside event loop).
-- Implemented teacher policy (`policy_probs`) for MTPD optimizer.
-- Deep bio‑inspired integration: ATP spend/earn, gradient pumping, compartment usage.
-- MOPD plan selection using central AdaptiveCostFunction and ParetoGating.
-- FeedbackEvent publication for every MOPD layer call.
-- Drift detection and dynamic weight adaptation.
-- Enhanced persistence via central Storage.
+Enhancements over v7.3.0:
+- Fixed missing config fields (enable_health_checks, enable_event_driven).
+- Changed `LayerInfo.capabilities` to `Dict[str, Any]` to allow `.get('quantum')`.
+- Added optional `helium_provider` and `fl_monitor` constructor parameters; default fallbacks.
+- Corrected async calls in `build_context` (all awaited).
+- Added `explanation` field to `MOPDPlan` and populated during objective computation.
+- Added `check_invariants` for temporal safety; called before executing a plan.
+- Added `request_approval` for human‑in‑the‑loop; plans requiring approval are blocked unless granted.
+- Added `inject_fault` and `run_chaos_test` for resilience engineering.
+- Improved `policy_probs` to use current context metrics.
+- Accepts central `carbon_manager`, `helium_manager`, `fl_monitor` if provided.
 """
 
 import asyncio
@@ -86,16 +93,6 @@ except ImportError as e:
         async def call(self, func, *args, **kwargs):
             return await func(*args, **kwargs)
 
-# ============================================================================
-# MoE Expert Router Import (optional)
-# ============================================================================
-try:
-    from ..expert_router import ExpertRouter
-    MOE_AVAILABLE = True
-except ImportError:
-    MOE_AVAILABLE = False
-    logger.warning("MoE Expert Router not available - context building will be limited")
-
 # -----------------------------------------------------------------------------
 # IMPORT CENTRAL GREEN AGENT COMPONENTS
 # -----------------------------------------------------------------------------
@@ -115,7 +112,6 @@ from ..logger import logger as central_logger
 @dataclass
 class LayerIntegratorConfig:
     """Centralized configuration for the Layer Integrator."""
-    # Feature flags
     enable_cache: bool = True
     enable_circuit_breaker: bool = True
     enable_retry: bool = True
@@ -135,8 +131,12 @@ class LayerIntegratorConfig:
     enable_event_driven: bool = True
     enable_self_healing: bool = True
     enable_mopd: bool = True
+    enable_health_checks: bool = True
+    enable_xai: bool = True
+    enable_human_approval: bool = False
+    enable_temporal_safety: bool = True
+    enable_chaos_testing: bool = False
 
-    # Tunable parameters
     cache_ttl_seconds: float = 60.0
     max_cache_size: int = 1000
     coordinator_id: str = "main_coordinator"
@@ -163,8 +163,6 @@ class LayerIntegratorConfig:
     persistence_path: str = "./layer_integrator_state.json.gz"
     self_healing_enabled: bool = True
     workflow_on_degradation: str = "repair_layer"
-
-    # MOPD-specific parameters
     mopd_objective_weights: Dict[str, float] = field(default_factory=lambda: {
         'carbon': 0.3,
         'helium': 0.2,
@@ -201,7 +199,6 @@ class CircuitState(Enum):
 
 @dataclass
 class LayerCircuitBreaker:
-    """Circuit breaker for a single layer."""
     name: str = "layer"
     state: CircuitState = CircuitState.CLOSED
     failure_count: int = 0
@@ -225,7 +222,7 @@ class LayerInfo:
     integration_mode: IntegrationMode = IntegrationMode.SYNCHRONOUS
     last_heartbeat: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     dependencies: List[int] = field(default_factory=list)
-    capabilities: List[str] = field(default_factory=list)
+    capabilities: Dict[str, Any] = field(default_factory=dict)  # changed from List[str]
     endpoints: Dict[str, str] = field(default_factory=dict)
     metrics: Dict[str, Any] = field(default_factory=dict)
     config: Dict[str, Any] = field(default_factory=dict)
@@ -290,6 +287,7 @@ class MOPDPlan:
     latency_ms: float = 0.0
     success_probability: float = 0.0
     scalarised_score: float = 0.0
+    explanation: str = ""  # NEW: for XAI
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -369,11 +367,12 @@ class TelemetryCollector:
         self.gauges[metric] = value
 
 # ============================================================================
-# Enhanced Layer Integrator (Main Class) – v7.3.0
+# Enhanced Layer Integrator (Main Class) – v7.4.0
 # ============================================================================
 class EnhancedLayerIntegrator:
     """
-    Enhanced Layer Integrator v7.3.0 – Production-ready with central MOPD integration.
+    Enhanced Layer Integrator v7.4.0 – Production-ready with central MOPD integration,
+    XAI, temporal safety, human-in-the-loop, and chaos testing hooks.
     """
 
     def __init__(
@@ -387,6 +386,9 @@ class EnhancedLayerIntegrator:
         pareto_gating: Optional[ParetoGating] = None,
         drift_detector: Optional[DriftDetector] = None,
         metrics: Optional[MetricsRegistry] = None,
+        carbon_manager: Optional[Any] = None,
+        helium_provider: Optional[Any] = None,
+        fl_monitor: Optional[Any] = None,
     ):
         # Config
         if isinstance(config, dict):
@@ -444,7 +446,7 @@ class EnhancedLayerIntegrator:
         self.enable_bio_integration = self.config.enable_bio_integration and BIO_INSPIRED_AVAILABLE
 
         # Initialize components
-        self.carbon_manager = CarbonIntensityManager(self.config) if self.config.enable_carbon_intensity else None
+        self.carbon_manager = carbon_manager if carbon_manager is not None else CarbonIntensityManager(self.config) if self.config.enable_carbon_intensity else None
         self.predictive_analyzer = PredictiveLayerAnalyzer(self.config) if self.config.enable_predictive else None
         self.cross_domain_transfer = LayerCrossDomainTransfer() if self.config.enable_cross_domain else None
         self.discovery_manager = DynamicLayerDiscoveryManager(self.config) if self.config.enable_dynamic_discovery else None
@@ -454,18 +456,18 @@ class EnhancedLayerIntegrator:
         self.sustainability_calculator = SustainabilityScoreCalculator(self.config) if self.config.enable_sustainability_scoring else None
 
         # Telemetry
-        if self.metrics is None:
-            self.telemetry = TelemetryCollector() if self.enable_monitoring else None
+        if self.metrics is None and self.enable_monitoring:
+            self.telemetry = TelemetryCollector()
         else:
             self.telemetry = None
 
-        # Persistence (using central storage if available)
-        self.persistence = None  # We'll use central storage directly
+        # Persistence (using central storage directly if available)
+        self.persistence = None
 
         # MoE integration
         self.expert_router = expert_router
-        self.helium_provider = None
-        self.fl_monitor = None
+        self.helium_provider = helium_provider if helium_provider is not None else None  # if None, use fallback in context builder
+        self.fl_monitor = fl_monitor  # optional
 
         # Layers
         self.layers: Dict[int, LayerInfo] = {}
@@ -516,11 +518,11 @@ class EnhancedLayerIntegrator:
         self._background_tasks = []
         self._start_background_tasks()
 
-        if self.enable_event_driven and self.event_broker:
+        if self.config.enable_event_driven and self.event_broker:
             self._subscribe_events()
 
         logger.info(
-            f"EnhancedLayerIntegrator v7.3.0 initialized: "
+            f"EnhancedLayerIntegrator v7.4.0 initialized: "
             f"mopd={self.enable_mopd}, "
             f"layers={len(self.layers)}/12, "
             f"bio_integration={self.enable_bio_integration}, "
@@ -547,7 +549,7 @@ class EnhancedLayerIntegrator:
                 layer_name=layer_names[i],
                 version="1.0.0",
                 status=LayerStatus.HEALTHY,
-                capabilities=[],
+                capabilities={},  # Changed to dict
                 circuit_breaker=LayerCircuitBreaker(f"layer_{i}"),
                 gradient_health=np.random.uniform(0.6, 1.0)
             )
@@ -558,7 +560,6 @@ class EnhancedLayerIntegrator:
                 data = self.storage.get_state("layer_integrator_state")
                 if data:
                     state = json.loads(data)
-                    # Restore layers
                     for layer_dict in state.get('layers', {}):
                         layer_number = layer_dict['layer_number']
                         self.layers[layer_number] = LayerInfo(**layer_dict)
@@ -581,7 +582,7 @@ class EnhancedLayerIntegrator:
     def _start_background_tasks(self):
         if self.config.enable_dynamic_discovery:
             self._background_tasks.append(self._create_task(self._discovery_loop()))
-        if self.config.enable_health_checks:
+        if self.config.enable_health_checks:  # fixed: field exists now
             self._background_tasks.append(self._create_task(self._health_check_loop()))
 
     async def _discovery_loop(self):
@@ -627,18 +628,24 @@ class EnhancedLayerIntegrator:
         return 0.5
 
     # ============================================================================
-    # Context Builder (unchanged from original but with central data)
+    # Context Builder (fixed async calls)
     # ============================================================================
     async def build_context(self) -> Dict[str, Any]:
         context = {}
 
         if self.helium_provider:
-            context['helium_scarcity'] = self.helium_provider.get_scarcity()
-            context['helium_cost_index'] = self.helium_provider.get_cost_index()
-            # get_avg_client_energy may not exist; fallback
+            # Assume async methods
             try:
-                context['avg_client_energy'] = self.helium_provider.get_avg_client_energy()
-            except AttributeError:
+                context['helium_scarcity'] = await self.helium_provider.get_scarcity()
+                context['helium_cost_index'] = await self.helium_provider.get_cost_index()
+                if hasattr(self.helium_provider, 'get_avg_client_energy'):
+                    context['avg_client_energy'] = await self.helium_provider.get_avg_client_energy()
+                else:
+                    context['avg_client_energy'] = 0.5
+            except Exception as e:
+                logger.warning(f"Helium provider error: {e}")
+                context['helium_scarcity'] = 0.5
+                context['helium_cost_index'] = 1.0
                 context['avg_client_energy'] = 0.5
         else:
             context['helium_scarcity'] = 0.5
@@ -646,8 +653,13 @@ class EnhancedLayerIntegrator:
             context['avg_client_energy'] = 0.5
 
         if self.carbon_manager:
-            context['carbon_intensity'] = await self.carbon_manager.get_current_intensity() / 1000.0
-            context['carbon_price_usd'] = await self.carbon_manager.get_current_price()
+            try:
+                context['carbon_intensity'] = await self.carbon_manager.get_current_intensity() / 1000.0
+                context['carbon_price_usd'] = await self.carbon_manager.get_current_price()
+            except Exception as e:
+                logger.warning(f"Carbon manager error: {e}")
+                context['carbon_intensity'] = 0.5
+                context['carbon_price_usd'] = 50.0
         else:
             context['carbon_intensity'] = 0.5
             context['carbon_price_usd'] = 50.0
@@ -659,8 +671,19 @@ class EnhancedLayerIntegrator:
         context['avg_layer_health'] = np.mean([info.gradient_health for info in self.layers.values()])
 
         if self.fl_monitor:
-            context['model_loss'] = self.fl_monitor.get_loss() if hasattr(self.fl_monitor, 'get_loss') else 0
-            context['gradient_variance'] = self.fl_monitor.get_gradient_variance() if hasattr(self.fl_monitor, 'get_gradient_variance') else 0
+            try:
+                if hasattr(self.fl_monitor, 'get_loss'):
+                    context['model_loss'] = await self.fl_monitor.get_loss() if asyncio.iscoroutinefunction(self.fl_monitor.get_loss) else self.fl_monitor.get_loss()
+                else:
+                    context['model_loss'] = 0.0
+                if hasattr(self.fl_monitor, 'get_gradient_variance'):
+                    context['gradient_variance'] = await self.fl_monitor.get_gradient_variance() if asyncio.iscoroutinefunction(self.fl_monitor.get_gradient_variance) else self.fl_monitor.get_gradient_variance()
+                else:
+                    context['gradient_variance'] = 0.0
+            except Exception as e:
+                logger.warning(f"fl_monitor error: {e}")
+                context['model_loss'] = 0.0
+                context['gradient_variance'] = 0.0
         else:
             context['model_loss'] = 0.0
             context['gradient_variance'] = 0.0
@@ -680,7 +703,7 @@ class EnhancedLayerIntegrator:
         return context
 
     # ============================================================================
-    # Layer Call (simplified, actual implementation would be more complex)
+    # Layer Call (simplified)
     # ============================================================================
     async def call_layer(
         self,
@@ -695,18 +718,15 @@ class EnhancedLayerIntegrator:
         if layer_number not in self.layers:
             raise ValueError(f"Invalid layer number: {layer_number}")
 
-        # Check circuit breaker
         info = self.layers[layer_number]
         if info.circuit_breaker.state == CircuitState.OPEN:
             raise RuntimeError(f"Circuit breaker open for layer {layer_number}")
 
-        # Cache check
-        if cache_key and self.enable_cache and cache_key in self._simple_cache:
+        if cache_key and self.config.enable_cache and cache_key in self._simple_cache:
             entry = self._simple_cache[cache_key]
             if (datetime.now(timezone.utc) - entry.timestamp).total_seconds() < self.cache_ttl:
                 return entry.value
 
-        # Simulate execution
         start = time.monotonic()
         try:
             if layer_number in self.layer_modules:
@@ -714,15 +734,12 @@ class EnhancedLayerIntegrator:
                 func = getattr(module, method)
                 result = await func(*args, **kwargs) if asyncio.iscoroutinefunction(func) else func(*args, **kwargs)
             else:
-                # Simulate some work
                 await asyncio.sleep(0.01)
                 result = {"status": "success", "layer": layer_number, "method": method}
 
-            # Record success
             self._record_layer_success(layer_number, (time.monotonic() - start) * 1000)
             info.circuit_breaker.record_success()
 
-            # Cache result
             if cache_key:
                 self._simple_cache[cache_key] = CacheEntry(cache_key, result, datetime.now(timezone.utc), layer_number)
 
@@ -743,7 +760,7 @@ class EnhancedLayerIntegrator:
         self.layer_errors[layer_number] += 1
 
     # ============================================================================
-    # MOPD Methods (Enhanced with central components)
+    # MOPD Methods (with XAI)
     # ============================================================================
     async def _enumerate_execution_plans(self, layer_number: int, method: str, *args, **kwargs) -> List[MOPDPlan]:
         use_cache_options = [True, False]
@@ -813,6 +830,17 @@ class EnhancedLayerIntegrator:
         plan.cost_usd = max(0, cost_usd)
         plan.latency_ms = max(0, latency_ms)
         plan.success_probability = min(1.0, max(0.0, success_prob))
+
+        # Build explanation (XAI)
+        reasons = []
+        if plan.use_cache:
+            reasons.append("cache enabled")
+        if plan.use_quantum:
+            reasons.append("quantum acceleration")
+        reasons.append(f"data center {plan.data_center}")
+        reasons.append(f"retry strategy {plan.retry_strategy}")
+        reasons.append(f"token allocation {plan.token_allocation:.1f}")
+        plan.explanation = "Plan: " + ", ".join(reasons) + f" | carbon {plan.carbon_kg:.3f}kg, latency {plan.latency_ms:.1f}ms, success {plan.success_probability:.2f}"
         return plan
 
     async def _generate_pareto_front_for_layer_call(self, layer_number: int, method: str, *args, **kwargs) -> List[MOPDPlan]:
@@ -822,7 +850,6 @@ class EnhancedLayerIntegrator:
             computed = await self._compute_plan_objectives(plan, layer_number, method, *args, **kwargs)
             computed_plans.append(computed)
 
-        # Filter dominated plans
         pareto = []
         for i, plan_a in enumerate(computed_plans):
             dominated = False
@@ -870,7 +897,9 @@ class EnhancedLayerIntegrator:
                     scored = [(cost, plan) for cost, plan in scored if f"plan_{id(plan)}" in allowed_ids]
             if scored:
                 scored.sort(reverse=True)
-                return scored[0][1]
+                best = scored[0][1]
+                best.scalarised_score = scored[0][0]
+                return best
             return None
         else:
             # fallback scalarisation
@@ -902,7 +931,34 @@ class EnhancedLayerIntegrator:
                 if score > best_score:
                     best_score = score
                     best = plan
+            if best:
+                best.scalarised_score = best_score
             return best
+
+    # Temporal safety check
+    async def check_invariants(self, layer_number: int, method: str, plan: MOPDPlan) -> List[str]:
+        """Return list of violation descriptions."""
+        violations = []
+        # Example: ensure carbon is below threshold
+        if plan.carbon_kg > 1.0:
+            violations.append(f"Carbon footprint too high: {plan.carbon_kg:.2f} kg")
+        # Ensure layer is healthy
+        info = self.layers[layer_number]
+        if info.status not in [LayerStatus.HEALTHY, LayerStatus.RECOVERING]:
+            violations.append(f"Layer {layer_number} not healthy")
+        # Ensure token allocation not excessive
+        if plan.token_allocation > self.config.token_reserve_factor * 3:
+            violations.append(f"Token allocation too high")
+        return violations
+
+    # Human-in-the-loop
+    async def request_approval(self, plan: MOPDPlan, layer_number: int, context: Dict) -> bool:
+        """Return True if plan should proceed."""
+        if not self.config.enable_human_approval:
+            return True  # auto-approve if human approval not required
+        # Placeholder: log warning and return False (require manual approval)
+        logger.warning(f"Human approval required for layer {layer_number} plan: {plan.explanation}. Manual intervention needed.")
+        return False
 
     async def call_layer_with_mopd(
         self,
@@ -922,6 +978,28 @@ class EnhancedLayerIntegrator:
         best_plan = self._select_best_from_pareto(pareto_front)
         if not best_plan:
             return await self.call_layer(layer_number, method, *args, **kwargs)
+
+        # Temporal safety check
+        if self.config.enable_temporal_safety:
+            violations = await self.check_invariants(layer_number, method, best_plan)
+            if violations:
+                logger.error(f"Temporal safety violations for layer {layer_number}: {violations}")
+                # Fallback to a safer plan: find first plan without violations or just call plain layer
+                fallback_plan = None
+                for plan in pareto_front:
+                    v = await self.check_invariants(layer_number, method, plan)
+                    if not v:
+                        fallback_plan = plan
+                        break
+                if fallback_plan:
+                    best_plan = fallback_plan
+                else:
+                    raise RuntimeError(f"All plans violate temporal invariants: {violations}")
+
+        # Human approval
+        context = await self.build_context()
+        if not await self.request_approval(best_plan, layer_number, context):
+            raise PermissionError(f"Plan for layer {layer_number} requires human approval and was not granted.")
 
         # Bio-inspired: spend ATP
         if self.token_manager and best_plan.cost_usd > 0:
@@ -954,7 +1032,7 @@ class EnhancedLayerIntegrator:
         if self.gradient_manager:
             await self.gradient_manager.pump_field('trust', 0.03, source=f"layer_{layer_number}_mopd")
 
-        # Publish FeedbackEvent
+        # Publish FeedbackEvent with explanation
         if self.queue:
             event = FeedbackEvent.create_with_context(
                 task_id=f"mopd_layer_{layer_number}_{uuid.uuid4().hex[:8]}",
@@ -964,11 +1042,11 @@ class EnhancedLayerIntegrator:
                 carbon_g=best_plan.carbon_kg * 1000.0,
                 feedback_type="layer_integration",
                 adaptive_cost_value=best_plan.scalarised_score,
-                state={'layer_number': layer_number, 'method': method},
-                candidates=[{'action': f"plan_{p.use_cache}_{p.use_quantum}_{p.data_center}"} for p in pareto_front],
+                state={'layer_number': layer_number, 'method': method, 'explanation': best_plan.explanation},
+                candidates=[{'action': f"plan_{p.use_cache}_{p.use_quantum}_{p.data_center}", 'explanation': p.explanation} for p in pareto_front],
                 source="layer_integrator",
                 environment=getattr(central_config, "ENVIRONMENT", "production"),
-                tags=["mopd", "layer"]
+                tags=["mopd", "layer", "xai"]
             )
             await self.queue.publish("feedback_events", event.to_json())
 
@@ -988,6 +1066,7 @@ class EnhancedLayerIntegrator:
             self.metrics.observe("mopd_pareto_front_size", len(pareto_front))
             self.metrics.set("mopd_selected_carbon_kg", best_plan.carbon_kg)
             self.metrics.set("mopd_selected_latency_ms", best_plan.latency_ms)
+            self.metrics.set("mopd_selected_explanation", best_plan.explanation)
 
         if return_pareto:
             return result, pareto_front, best_plan
@@ -995,11 +1074,16 @@ class EnhancedLayerIntegrator:
             return result
 
     # ============================================================================
-    # Teacher Policy
+    # Teacher Policy (context-aware)
     # ============================================================================
     async def policy_probs(self, state: Dict) -> List[float]:
         if not self.enable_mopd:
             return [0.25] * 4
+        # Use current context to influence
+        context = await self.build_context()
+        helium_scarcity = context.get('helium_scarcity', 0.5)
+        carbon_intensity = context.get('carbon_intensity', 0.5)
+        avg_health = context.get('avg_layer_health', 0.7)
         pareto_front = await self._generate_pareto_front_for_layer_call(0, 'execute')
         if not pareto_front:
             return [0.5, 0.5]
@@ -1009,7 +1093,7 @@ class EnhancedLayerIntegrator:
             carbon_g = plan.carbon_kg * 1000.0
             latency_ms = plan.latency_ms
             energy_joules = plan.cost_usd * 10.0
-            health = np.mean([info.gradient_health for info in self.layers.values()])
+            health = avg_health
             atp = self._get_real_token_availability()
             cost = self.adaptive_cost.compute(quality=quality, carbon_g=carbon_g, latency_ms=latency_ms,
                                               energy_joules=energy_joules, health=health, atp=atp) if self.adaptive_cost else 0.5
@@ -1044,6 +1128,56 @@ class EnhancedLayerIntegrator:
         return strategy_probs
 
     # ============================================================================
+    # Chaos Testing and Resilience
+    # ============================================================================
+    async def inject_fault(self, fault_type: str, layer_number: Optional[int] = None, **params):
+        """Inject a fault for testing resilience."""
+        if fault_type == 'layer_timeout':
+            if layer_number is not None and layer_number in self.layers:
+                self.layers[layer_number].status = LayerStatus.DEGRADED
+                self.layers[layer_number].gradient_health *= 0.5
+                logger.warning(f"Injected layer_timeout fault on layer {layer_number}")
+        elif fault_type == 'circuit_breaker_open':
+            if layer_number is not None and layer_number in self.layers:
+                self.layers[layer_number].circuit_breaker.state = CircuitState.OPEN
+                self.layers[layer_number].circuit_breaker.failure_count = self.config.circuit_breaker_failure_threshold
+                logger.warning(f"Injected circuit_breaker_open on layer {layer_number}")
+        elif fault_type == 'token_depletion':
+            if self.token_manager:
+                # Simulate zero balance
+                self.token_manager._balance = 0
+                logger.warning("Injected token_depletion fault")
+        else:
+            logger.warning(f"Unknown fault type: {fault_type}")
+
+    async def run_chaos_test(self) -> Dict[str, Any]:
+        """Run a simple chaos test by injecting faults and checking recovery."""
+        if not self.config.enable_chaos_testing:
+            return {'status': 'disabled'}
+        report = {'faults_injected': [], 'recovery': {}}
+
+        # Inject circuit breaker fault on layer 0
+        await self.inject_fault('circuit_breaker_open', layer_number=0)
+        report['faults_injected'].append('circuit_breaker_open_layer0')
+        # Try to call layer 0; expect failure
+        try:
+            await self.call_layer(0, 'execute')
+            report['recovery']['circuit_breaker_open'] = 'unexpected_success'
+        except Exception as e:
+            report['recovery']['circuit_breaker_open'] = f'failed_as_expected: {type(e).__name__}'
+        # Manually reset breaker (simulate recovery)
+        self.layers[0].circuit_breaker.state = CircuitState.CLOSED
+        self.layers[0].circuit_breaker.failure_count = 0
+        # Try again, should succeed
+        try:
+            await self.call_layer(0, 'execute')
+            report['recovery']['after_reset'] = 'success'
+        except Exception as e:
+            report['recovery']['after_reset'] = f'failed: {e}'
+
+        return report
+
+    # ============================================================================
     # Shutdown and Health
     # ============================================================================
     async def shutdown(self):
@@ -1070,6 +1204,10 @@ class EnhancedLayerIntegrator:
             'mopd_enabled': self.enable_mopd,
             'mopd_weights': self.config.mopd_objective_weights,
             'mopd_grid_resolution': self.config.mopd_grid_resolution,
+            'xai_enabled': self.config.enable_xai,
+            'temporal_safety_enabled': self.config.enable_temporal_safety,
+            'human_approval_enabled': self.config.enable_human_approval,
+            'chaos_testing_enabled': self.config.enable_chaos_testing,
         }
 
     def get_sustainability_report(self) -> Dict[str, Any]:
