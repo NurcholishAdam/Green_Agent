@@ -23,7 +23,7 @@ class QuantizationMethod(str, Enum):
     FP16 = "fp16"
 
 # ==============================================
-# MOPD Configuration (NEW)
+# MOPD Configuration (Enhanced)
 # ==============================================
 
 class MOPDConfig(BaseModel):
@@ -51,6 +51,37 @@ class MOPDConfig(BaseModel):
     enable_cost_benefit: bool = Field(True)
     enable_predictive: bool = Field(True)
 
+    # ========== XAI, Safety, Human Approval (NEW) ==========
+    enable_xai: bool = Field(
+        True,
+        description="Generate explanations for compression decisions"
+    )
+    enable_temporal_safety: bool = Field(
+        True,
+        description="Perform temporal safety checks before applying compression"
+    )
+    require_human_approval: bool = Field(
+        False,
+        description="Require human approval for aggressive compression (accuracy drop above threshold)"
+    )
+    aggressive_threshold: float = Field(
+        0.2,
+        ge=0,
+        le=1,
+        description="Absolute accuracy drop above which human approval is required if require_human_approval is True"
+    )
+
+    # ========== Chaos Testing (NEW) ==========
+    enable_chaos_testing: bool = Field(
+        False,
+        description="Enable chaos testing hooks for resilience verification"
+    )
+    chaos_test_interval_seconds: int = Field(
+        3600,
+        ge=60,
+        description="Interval between automatic chaos tests (if enabled)"
+    )
+
     @model_validator(mode='after')
     def check_weights(self):
         """Ensure objective weights sum to 1."""
@@ -58,6 +89,21 @@ class MOPDConfig(BaseModel):
         if abs(total - 1.0) > 1e-6:
             raise ValueError(f"MOPD objective weights must sum to 1, got {total}")
         return self
+
+# ==============================================
+# Federated Learning Configuration (NEW)
+# ==============================================
+
+class FederatedConfig(BaseModel):
+    """
+    Configuration for federated green learning across deployments.
+    """
+    enabled: bool = Field(False, description="Enable federated learning integration")
+    server_url: Optional[str] = Field(None, description="URL of federated aggregation server")
+    sparsity_ratio: float = Field(0.1, ge=0, le=1, description="Sparsity ratio for compressed metrics sharing")
+    privacy_epsilon: float = Field(1.0, ge=0, description="Differential privacy epsilon (0 = no privacy)")
+    sync_interval_seconds: int = Field(3600, ge=60, description="Interval between federated syncs")
+    max_retries: int = Field(3, ge=0)
 
 # ==============================================
 # Enhanced Sustainability Configuration
@@ -102,9 +148,9 @@ class SustainabilityConfig(BaseModel):
     )
 
     # ========== Fitness Scoring ==========
-    fitness_accuracy_weight: float = Field(0.6, ge=0, le=1)
-    fitness_energy_weight: float = Field(0.4, ge=0, le=1)
-    fitness_carbon_weight: float = Field(0.1, ge=0, le=1)
+    fitness_accuracy_weight: float = Field(0.5, ge=0, le=1)   # adjusted to sum to 1 with others
+    fitness_energy_weight: float = Field(0.3, ge=0, le=1)
+    fitness_carbon_weight: float = Field(0.15, ge=0, le=1)
     fitness_material_weight: float = Field(0.05, ge=0, le=1)
     compression_bonus: float = Field(0.05, ge=0, le=0.5)
 
@@ -139,7 +185,7 @@ class SustainabilityConfig(BaseModel):
             CompressionMethod.HYBRID,
             CompressionMethod.SVD,
         ],
-        description="Order in which compression methods are tried"
+        description="Order in which compression methods are tried (used when MOPD is disabled or for initial candidate set)"
     )
 
     # ========== Carbon & Sustainability ==========
@@ -147,9 +193,18 @@ class SustainabilityConfig(BaseModel):
     carbon_offset_enabled: bool = Field(False)
     carbon_intensity_api_key: Optional[str] = Field(
         None,
-        description="API key for Electricity Map (required if carbon_aware_enabled)"
+        description="API key for Electricity Map (optional if fallback is allowed)"
     )
     carbon_region: str = Field("global", description="Region code for carbon intensity API")
+    carbon_intensity_fallback_enabled: bool = Field(
+        True,
+        description="Allow fallback to default carbon intensity if API key missing or API fails"
+    )
+    default_carbon_intensity_g_per_kwh: float = Field(
+        400.0,
+        ge=0,
+        description="Fallback carbon intensity when API unavailable"
+    )
 
     # ========== Persistence ==========
     compressed_model_dir: str = Field("./compressed_models")
@@ -173,12 +228,18 @@ class SustainabilityConfig(BaseModel):
     recompress_interval_seconds: int = Field(3600, ge=60)
 
     # ========== Versioning ==========
-    version: str = Field("1.1", description="Configuration schema version")
+    version: str = Field("1.2", description="Configuration schema version")
 
-    # ========== MOPD Configuration (NEW) ==========
+    # ========== MOPD Configuration ==========
     mopd: MOPDConfig = Field(
         default_factory=MOPDConfig,
         description="Multi‑Objective Pareto Decision settings"
+    )
+
+    # ========== Federated Learning Configuration (NEW) ==========
+    federated: FederatedConfig = Field(
+        default_factory=FederatedConfig,
+        description="Federated learning settings"
     )
 
     # Pydantic v2 configuration
@@ -187,9 +248,9 @@ class SustainabilityConfig(BaseModel):
     # ---------- Validation ----------
     @model_validator(mode='after')
     def validate_carbon_api_key(self):
-        """Ensure API key is provided when carbon awareness is enabled."""
-        if self.carbon_aware_enabled and not self.carbon_intensity_api_key:
-            raise ValueError("carbon_intensity_api_key is required when carbon_aware_enabled is True")
+        """Allow fallback if API key missing but fallback is enabled."""
+        if self.carbon_aware_enabled and not self.carbon_intensity_api_key and not self.carbon_intensity_fallback_enabled:
+            raise ValueError("carbon_intensity_api_key is required when carbon_aware_enabled is True and fallback is disabled")
         return self
 
     @model_validator(mode='after')
@@ -264,6 +325,31 @@ class SustainabilityConfig(BaseModel):
         """Return whether MOPD is enabled."""
         return self.mopd.enabled
 
+    # ---------- New utility methods for enhanced features ----------
+    def is_xai_enabled(self) -> bool:
+        """Return whether XAI explanations are enabled."""
+        return self.mopd.enable_xai
+
+    def is_temporal_safety_enabled(self) -> bool:
+        """Return whether temporal safety checks are enabled."""
+        return self.mopd.enable_temporal_safety
+
+    def is_human_approval_required(self) -> bool:
+        """Return whether human approval is required for aggressive compression."""
+        return self.mopd.require_human_approval
+
+    def is_chaos_testing_enabled(self) -> bool:
+        """Return whether chaos testing is enabled."""
+        return self.mopd.enable_chaos_testing
+
+    def get_federated_config(self) -> FederatedConfig:
+        """Return the federated learning configuration."""
+        return self.federated
+
+    def get_compression_method_priority(self) -> List[CompressionMethod]:
+        """Return the priority list of compression methods."""
+        return self.compression_strategy_priority
+
     # ---------- Serialization Helpers ----------
     def to_dict(self) -> Dict:
         """Export configuration as a dictionary (excluding None values)."""
@@ -288,4 +374,5 @@ __all__ = [
     "CompressionMethod",
     "QuantizationMethod",
     "MOPDConfig",
+    "FederatedConfig",
 ]
