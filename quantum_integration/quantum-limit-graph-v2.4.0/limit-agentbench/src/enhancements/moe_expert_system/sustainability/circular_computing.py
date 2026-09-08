@@ -1,9 +1,10 @@
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/circular_computing_manager.py
-# Enhanced version v4.1.0 – Refactored for maintainability, concurrency, resilience, and MOPD support.
+# Enhanced version v4.2.0 – Refactored for maintainability, concurrency, resilience, MOPD support,
+# and now with XAI, temporal safety, human-in-the-loop, and chaos testing.
 
 """
-Enhanced Circular Computing Module v4.1.0
-Modular, event‑driven, robust, and MOPD‑aware implementation.
+Enhanced Circular Computing Module v4.2.0
+Modular, event‑driven, robust, MOPD‑aware, and with XAI, safety, approval, and chaos testing.
 """
 
 import asyncio
@@ -124,25 +125,23 @@ class HardwareComponent:
     carbon_savings_kg: float = 0.0
 
 # ============================================================================
-# MOPD Data Classes (NEW)
+# MOPD Data Classes (Enhanced with XAI)
 # ============================================================================
 @dataclass
 class MOPDPlan:
-    """Represents a recycling strategy with its objective vector."""
-    # Decision variables
-    recycling_method: str               # 'full_recycling', 'repurposing', 'material_recovery'
-    helium_recovery: bool               # whether to attempt helium recovery
-    material_recovery_target: float     # target recovery rate (0-1)
+    """Represents a recycling strategy with its objective vector and explanation."""
+    recycling_method: str
+    helium_recovery: bool
+    material_recovery_target: float
     use_ml_optimization: bool
-    # Objectives (to be minimised/maximised)
     cost: float
     carbon_saved_kg: float
     helium_recovered_l: float
     material_recovery_rate: float
     time_days: float
     sustainability_score: float
-    # Scalarised score (will be computed later)
     scalarised_score: float = 0.0
+    explanation: str = ""  # XAI
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -155,17 +154,21 @@ class MOPDPlan:
 class MOPDConfig:
     """Configuration for MOPD analysis."""
     enabled: bool = True
+    # Key names now match those used in _select_best_from_pareto
     objective_weights: Dict[str, float] = field(default_factory=lambda: {
         'cost': 0.2,
-        'carbon_saved': 0.3,
-        'helium_recovered': 0.2,
-        'material_recovery': 0.15,
-        'time': 0.15,
+        'carbon_saved_kg': 0.3,
+        'helium_recovered_l': 0.2,
+        'material_recovery_rate': 0.15,
+        'time_days': 0.15,
     })
     grid_resolution: int = 5
     enable_cost_benefit: bool = True
     enable_predictive: bool = True
     enable_quantum: bool = True
+    # NEW: Human approval and XAI flags
+    require_human_approval: bool = False
+    aggressive_threshold: float = 0.7  # if sustainability score below this, require approval
 
 # ============================================================================
 # Configuration Dataclass with Sub‑Configs (Enhanced with MOPD)
@@ -228,7 +231,6 @@ class SelfHealingConfig:
 @dataclass
 class CircularComputingConfig:
     """Centralized configuration with sub‑configs."""
-    # High‑level flags
     enable_bio_integration: bool = True
     enable_event_driven: bool = True
     enable_swarm_coordination: bool = True
@@ -236,7 +238,10 @@ class CircularComputingConfig:
     enable_cost_benefit: bool = True
     enable_time_tick_engine: bool = True
     enable_quantum_bridge: bool = True
-    enable_mopd: bool = True               # NEW: MOPD feature flag
+    enable_mopd: bool = True
+    # NEW: temporal safety and chaos testing flags
+    enable_temporal_safety: bool = True
+    enable_chaos_testing: bool = False
 
     # Sub‑configs
     carbon: CarbonConfig = field(default_factory=CarbonConfig)
@@ -247,12 +252,10 @@ class CircularComputingConfig:
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
     self_healing: SelfHealingConfig = field(default_factory=SelfHealingConfig)
-    mopd: MOPDConfig = field(default_factory=MOPDConfig)      # NEW: MOPD sub‑config
+    mopd: MOPDConfig = field(default_factory=MOPDConfig)
 
     # Budgets
     helium_budget_l: float = 100.0
-
-    # Helium-to-CO2 equivalence factor (kg CO2 per kg helium)
     helium_to_co2_factor: float = 20.0
 
     # Retry parameters
@@ -578,6 +581,7 @@ class PredictiveLifecycleAnalyzer:
 # ML Component Selector (PyTorch, with thread offload)
 # ============================================================================
 class MLComponentSelector:
+    # ... (same as before) ...
     def __init__(self, config: MLConfig):
         self.config = config
         self.input_size = config.input_size
@@ -832,6 +836,14 @@ class FederatedCircularManager:
             return None
         return await self._circuit.call(_fetch)
 
+    def get_federated_stats(self) -> Dict:
+        return {
+            'round': self.round,
+            'participants': len(self.participants),
+            'contribution_scores': self.contribution_scores,
+            'local_components': len(self.local_components)
+        }
+
     async def close(self):
         if self._session:
             await self._session.close()
@@ -924,7 +936,7 @@ class CircularComputingPersistenceManager:
         self.config = config
         self.path = config.path
         self._lock = asyncio.Lock()
-        self._version = 2  # Bumped for MOPD
+        self._version = 3  # Bumped for MOPD, XAI, etc.
         logger.info(f"CircularComputingPersistenceManager initialized (path={self.path})")
 
     async def save_state(self, state: Dict[str, Any]) -> bool:
@@ -1052,7 +1064,7 @@ class CircularStorage:
         self.waste_diversion_rate = 0.0
         self.material_recovery_rate = 0.0
         self.sustainability_score = 0.0
-        self.mopd_plans: List[MOPDPlan] = []  # NEW: store MOPD plans
+        self.mopd_plans: List[MOPDPlan] = []
         self._lock = asyncio.Lock()
 
     async def add_component(self, component: HardwareComponent):
@@ -1135,7 +1147,7 @@ class CircularStorage:
             return self.mopd_plans.copy()
 
 # ============================================================================
-# Analyzer Module (Enhanced with MOPD)
+# Analyzer Module (Enhanced with MOPD, XAI, Safety, Approval)
 # ============================================================================
 class CircularAnalyzer:
     def __init__(
@@ -1158,19 +1170,12 @@ class CircularAnalyzer:
         self._lock = asyncio.Lock()
 
     # ============================================================================
-    # MOPD Methods (NEW)
+    # MOPD Methods (with XAI and fixed weight keys)
     # ============================================================================
     async def _enumerate_recycling_strategies(
         self,
         component: HardwareComponent
     ) -> List[MOPDPlan]:
-        """Generate all feasible recycling strategies for a component."""
-        # Decision variables:
-        # - recycling_method: 'full_recycling', 'repurposing', 'material_recovery'
-        # - helium_recovery: True/False (if helium content > 0)
-        # - material_recovery_target: 0.5, 0.75, 0.95
-        # - use_ml_optimization: True/False
-
         recycling_methods = ['full_recycling', 'repurposing', 'material_recovery']
         helium_recovery_options = [False]
         if component.helium_content_l > 0:
@@ -1193,7 +1198,8 @@ class CircularAnalyzer:
                             helium_recovered_l=0.0,
                             material_recovery_rate=0.0,
                             time_days=0.0,
-                            sustainability_score=0.0
+                            sustainability_score=0.0,
+                            explanation=""
                         )
                         plans.append(plan)
         return plans
@@ -1203,16 +1209,13 @@ class CircularAnalyzer:
         plan: MOPDPlan,
         component: HardwareComponent
     ) -> MOPDPlan:
-        """Calculate cost, carbon saved, helium recovered, material recovery, time for a given plan."""
-        # Base estimates
         cost = 0.0
-        carbon_saved = component.manufacturing_carbon * 0.8  # baseline for recycling
+        carbon_saved = component.manufacturing_carbon * 0.8
         helium_recovered = 0.0
         material_recovery = 0.0
         time_days = 0.0
         sustainability = 0.5
 
-        # Adjust based on decision variables
         if plan.recycling_method == 'full_recycling':
             cost = 5.0
             carbon_saved = component.manufacturing_carbon * 0.8
@@ -1229,16 +1232,13 @@ class CircularAnalyzer:
             material_recovery = plan.material_recovery_target
             time_days = 7
 
-        # Helium recovery
         if plan.helium_recovery and self.helium_manager:
             helium_recovered = self.helium_manager.calculate_recovery(component.component_id)
             if helium_recovered > 0:
                 cost += 2.0
                 time_days += 3
-                # Carbon saving from helium recovery (avoided extraction)
-                carbon_saved += helium_recovered * 5.0  # approximate
+                carbon_saved += helium_recovered * 5.0
 
-        # ML optimization might improve efficiency
         if plan.use_ml_optimization and self.ml_selector:
             ml_result = await self.ml_selector.select_component({
                 'age_days': (datetime.now(timezone.utc) - component.deployment_date).days,
@@ -1255,7 +1255,6 @@ class CircularAnalyzer:
                 carbon_saved *= 1.1
                 cost *= 0.95
 
-        # Sustainability score (simple calculation)
         sustainability = (material_recovery * 0.4 +
                          (carbon_saved / component.manufacturing_carbon) * 0.3 +
                          (helium_recovered / component.helium_content_l if component.helium_content_l > 0 else 0) * 0.3)
@@ -1266,13 +1265,20 @@ class CircularAnalyzer:
         plan.material_recovery_rate = min(1.0, material_recovery)
         plan.time_days = time_days
         plan.sustainability_score = min(1.0, max(0.0, sustainability))
+
+        # XAI explanation
+        reasons = []
+        reasons.append(f"method={plan.recycling_method}")
+        reasons.append(f"helium_recovery={plan.helium_recovery}")
+        reasons.append(f"material_target={plan.material_recovery_target:.2f}")
+        reasons.append(f"use_ml={plan.use_ml_optimization}")
+        plan.explanation = "Plan: " + ", ".join(reasons) + f" | carbon_saved={plan.carbon_saved_kg:.2f}kg, helium_recovered={plan.helium_recovered_l:.2f}L, recovery_rate={plan.material_recovery_rate:.2f}, cost=${plan.cost:.1f}, time={plan.time_days:.0f}d"
         return plan
 
     async def _generate_pareto_front_for_recycling(
         self,
         component_id: str
     ) -> List[MOPDPlan]:
-        """Generate Pareto front of recycling strategies."""
         component = await self.storage.get_component(component_id)
         if not component:
             return []
@@ -1285,14 +1291,12 @@ class CircularAnalyzer:
 
         # Filter dominated plans
         objective_names = ['cost', 'carbon_saved_kg', 'helium_recovered_l', 'material_recovery_rate', 'time_days']
-        # We minimise cost and time; maximise carbon_saved, helium_recovered, material_recovery
         pareto = []
         for i, p_i in enumerate(computed_plans):
             dominated = False
             for j, p_j in enumerate(computed_plans):
                 if i == j:
                     continue
-                # Build vectors: for max objectives, negate
                 a_vec = [
                     p_i.cost,
                     -p_i.carbon_saved_kg,
@@ -1319,7 +1323,7 @@ class CircularAnalyzer:
             return None
         weights = self.config.mopd.objective_weights
         objective_names = ['cost', 'carbon_saved_kg', 'helium_recovered_l', 'material_recovery_rate', 'time_days']
-        # Normalise across front
+
         max_vals = {}
         min_vals = {}
         for key in objective_names:
@@ -1334,25 +1338,26 @@ class CircularAnalyzer:
             score = 0.0
             for key in objective_names:
                 val = getattr(plan, key)
-                if key in ['cost', 'time_days']:  # minimise
+                if key in ['cost', 'time_days']:
                     norm = 1.0 - (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
-                else:  # maximise
+                else:
                     norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
                 weight = weights.get(key, 1.0 / len(objective_names))
                 score += weight * norm
+            plan.scalarised_score = score
             if score > best_score:
                 best_score = score
                 best = plan
         return best
 
     # ============================================================================
-    # Core Recycling Method (Enhanced with MOPD)
+    # Core Recycling Method (Enhanced with MOPD, XAI, Safety, Approval)
     # ============================================================================
     async def recycle_component(
         self,
         component_id: str,
         use_ml_optimization: bool = False,
-        return_mopd: bool = False           # NEW: if True, return Pareto front
+        return_mopd: bool = False
     ) -> Dict[str, Any]:
         component = await self.storage.get_component(component_id)
         if not component:
@@ -1364,15 +1369,37 @@ class CircularAnalyzer:
         if self.config.enable_mopd and return_mopd:
             pareto_front = await self._generate_pareto_front_for_recycling(component_id)
             if pareto_front:
-                # Store MOPD plans
                 for plan in pareto_front:
                     await self.storage.add_mopd_plan(plan)
                 best_plan = self._select_best_from_pareto(pareto_front)
                 if best_plan:
-                    # Override decision variables based on best plan
-                    # Use the best plan's parameters for actual recycling
+                    # Use best plan to guide actual recycling
                     use_ml_optimization = best_plan.use_ml_optimization
-                    # We could also adjust other parameters, but for simplicity we just note it.
+                    # Override other parameters (simplified: we'll use best plan's method and target)
+                    # For full integration, we would adjust the recycling logic accordingly.
+                    # Here we at least store the best plan and use its ML flag.
+                    # Additional implementation would need to map method to actual operations.
+
+        # Temporal safety check
+        if self.config.enable_temporal_safety:
+            violations = self._check_invariants(component)
+            if violations:
+                logger.warning(f"Temporal safety violations for {component_id}: {violations}")
+                # Choose a safer plan if available
+                if pareto_front:
+                    safe_plans = [p for p in pareto_front if not self._check_plan_safety(p, component)]
+                    if safe_plans:
+                        best_plan = min(safe_plans, key=lambda p: p.sustainability_score, reverse=True)
+                        use_ml_optimization = best_plan.use_ml_optimization
+                    else:
+                        return {'error': 'All plans violate temporal safety'}
+
+        # Human approval if required
+        if self.config.mopd.require_human_approval and best_plan and best_plan.sustainability_score < self.config.mopd.aggressive_threshold:
+            approved = await self.request_approval(best_plan)
+            if not approved:
+                logger.info(f"Human approval not granted for {component_id} recycling with {best_plan.recycling_method}")
+                return {'error': 'Human approval not granted'}
 
         # ML optimization (if requested or from best plan)
         ml_result = None
@@ -1388,6 +1415,7 @@ class CircularAnalyzer:
                 'cost_efficiency': 0.7
             })
 
+        # Actual recycling logic (simplified; could be influenced by best_plan.recycling_method)
         recovered_materials = {}
         total_recovery_rate = 0.0
         recovery_rates = {
@@ -1401,6 +1429,9 @@ class CircularAnalyzer:
         }
         for material, amount in component.materials.items():
             rate = recovery_rates.get(material, 0.9)
+            # If best_plan specifies material_recovery_target, adjust rate
+            if best_plan and best_plan.material_recovery_target < 1.0:
+                rate = min(rate, best_plan.material_recovery_target)
             recovered = amount * rate
             recovered_materials[material.value] = {
                 'original_g': amount,
@@ -1426,9 +1457,12 @@ class CircularAnalyzer:
                     'recovered_g': helium_recovered * 1000,
                     'recovery_rate': 0.85
                 }
+                # Update helium inventory (if tracked)
+                async with self.storage._lock:
+                    self.storage.material_inventory[MaterialType.HELIUM] -= component.helium_content_l * 1000
+                    self.storage.material_inventory[MaterialType.HELIUM] += helium_recovered * 1000
 
         await self.storage.update_component_state(component_id, HardwareState.RECYCLED)
-
         sustainability = self._calc_sustainability(avg_recovery, carbon_saved, helium_recovered)
         await self.storage.update_sustainability_score(sustainability)
 
@@ -1441,12 +1475,15 @@ class CircularAnalyzer:
             'carbon_saved_kg': carbon_saved,
             'helium_recovered_g': helium_recovered * 1000,
             'ml_optimization': ml_result,
-            'sustainability_score': sustainability
+            'sustainability_score': sustainability,
+            'explanation': best_plan.explanation if best_plan else "Standard recycling",
+            'requires_approval': self.config.mopd.require_human_approval and best_plan is not None and best_plan.sustainability_score < self.config.mopd.aggressive_threshold,
+            'mopd_pareto_front': [p.to_dict() for p in pareto_front] if pareto_front else None,
+            'mopd_best_plan': best_plan.to_dict() if best_plan else None
         }
         await self.storage.add_recycling_record(record)
         await self._update_circularity_metrics()
 
-        # Update predictive history
         if self.predictive:
             self.predictive.update_history({
                 'age_days': (datetime.now(timezone.utc) - component.deployment_date).days,
@@ -1460,15 +1497,29 @@ class CircularAnalyzer:
         if self.human_ai:
             record['human_ai_insights'] = await self.human_ai.get_insights()
 
-        # Add MOPD info to record
-        if self.config.enable_mopd and return_mopd:
-            if pareto_front:
-                record['mopd_pareto_front'] = [p.to_dict() for p in pareto_front]
-            if best_plan:
-                record['mopd_best_plan'] = best_plan.to_dict()
-
         logger.info(f"Recycled {component_id}: {avg_recovery:.1%} recovery, {carbon_saved:.2f} kg CO2 saved")
         return record
+
+    def _check_invariants(self, component: HardwareComponent) -> List[str]:
+        """Check temporal safety invariants for this component."""
+        violations = []
+        if component.helium_content_l > 10 and not self.helium_manager:
+            violations.append("Large helium content but no helium manager")
+        if component.manufacturing_carbon > 100:
+            violations.append("High manufacturing carbon; consider repurposing instead of full recycling")
+        # Add more as needed
+        return violations
+
+    def _check_plan_safety(self, plan: MOPDPlan, component: HardwareComponent) -> bool:
+        """Check if a plan is safe (e.g., not too costly or time-consuming)."""
+        return plan.cost <= 10.0 and plan.time_days <= 15
+
+    async def request_approval(self, plan: MOPDPlan) -> bool:
+        """Request human approval for an aggressive plan. Default auto-denies if enabled."""
+        if not self.config.mopd.require_human_approval:
+            return True
+        logger.warning(f"Human approval required for plan: {plan.explanation}. Auto-denying.")
+        return False
 
     def _calc_sustainability(self, recovery_rate: float, carbon_saved: float, helium_recovered: float) -> float:
         recovery_factor = recovery_rate
@@ -1489,7 +1540,7 @@ class CircularAnalyzer:
             recovery = np.mean([h['average_recovery_rate'] for h in history])
         else:
             recovery = 0
-        waste_diversion = circularity  # simplification
+        waste_diversion = circularity
         await self.storage.update_metrics(circularity, waste_diversion, recovery)
 
     async def train_ml_model(self, training_data: Optional[List[Dict]] = None) -> Dict:
@@ -1584,7 +1635,7 @@ class CircularAnalyzer:
         }
 
 # ============================================================================
-# Reporter Module (Enhanced with MOPD)
+# Reporter Module (Enhanced with MOPD, async recommendations)
 # ============================================================================
 class CircularReporter:
     def __init__(
@@ -1666,7 +1717,6 @@ class CircularReporter:
         if self.human_ai:
             report['human_ai_insights'] = await self.human_ai.get_insights()
 
-        # MOPD summary
         if self.config.enable_mopd:
             mopd_plans = await self.storage.get_mopd_plans(20)
             report['mopd_plans'] = [p.to_dict() for p in mopd_plans]
@@ -1679,11 +1729,11 @@ class CircularReporter:
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'sustainability_score': metrics['sustainability_score'],
             'circularity_report': await self.get_circularity_report(),
-            'recommendations': self._generate_recommendations()
+            'recommendations': await self._generate_recommendations()
         }
 
-    def _generate_recommendations(self) -> List[str]:
-        metrics = asyncio.run(self.storage.get_metrics())
+    async def _generate_recommendations(self) -> List[str]:
+        metrics = await self.storage.get_metrics()
         recs = []
         if metrics['sustainability_score'] < 0.5:
             recs.append("Improve circularity through better material recovery")
@@ -1699,6 +1749,8 @@ class CircularReporter:
             recs.append("Improve material recovery rate through better recycling processes")
         if self.config.enable_mopd:
             recs.append("Consider using MOPD to explore trade-offs among recycling strategies")
+        if self.config.enable_chaos_testing:
+            recs.append("Run chaos tests to verify system resilience")
         return recs or ["All circularity metrics are within acceptable ranges"]
 
     async def export_telemetry(self):
@@ -1728,7 +1780,7 @@ class CircularReporter:
                     '_total_recovered': self.helium_manager._total_recovered if self.helium_manager else 0.0,
                 } if self.helium_manager else None,
                 'ml_checkpoint': self.analyzer.ml_selector.get_checkpoint() if self.analyzer.ml_selector else None,
-                'mopd_plans': [p.to_dict() for p in await self.storage.get_mopd_plans()],  # NEW
+                'mopd_plans': [p.to_dict() for p in await self.storage.get_mopd_plans()],
             }
             await self.persistence.save_state(state)
 
@@ -1772,11 +1824,11 @@ class CircularReporter:
                     await self.storage.add_mopd_plan(MOPDPlan.from_dict(p_dict))
 
 # ============================================================================
-# Main Controller (Enhanced with MOPD)
+# Main Controller (Enhanced with MOPD, XAI, Safety, Approval, Chaos)
 # ============================================================================
 class CircularComputingManager:
     """
-    Enhanced Circular Computing Manager v4.1.0
+    Enhanced Circular Computing Manager v4.2.0
     Controller that orchestrates storage, analysis, reporting, and MOPD support.
     """
 
@@ -1857,9 +1909,6 @@ class CircularComputingManager:
         if self.helium_manager:
             self.helium_manager.start()
 
-        # Initialize material inventory (defaults are zero, handled in storage)
-        # No explicit initialization needed; storage initializes with defaultdict
-
         # Subscribe to events
         if self.config.enable_event_driven and self.event_broker:
             self._subscribe_events()
@@ -1871,7 +1920,7 @@ class CircularComputingManager:
         if self.config.persistence.enabled:
             asyncio.create_task(self.reporter.load_state())
 
-        logger.info("Circular Computing Manager v4.1.0 initialized with MOPD")
+        logger.info("Circular Computing Manager v4.2.0 initialized with MOPD, XAI, safety, approval, and chaos testing")
 
     # ============================================================================
     # Event Handling (via queue)
@@ -1922,7 +1971,7 @@ class CircularComputingManager:
                 'helium_remaining': 0.5
             })
         if intensity > 500:
-            self.config.carbon_recycling_priority = 0.8  # custom attribute
+            self.config.carbon_recycling_priority = 0.8
 
     async def _on_helium_update(self, event: BioEvent):
         scarcity = event.data.get('scarcity', 0.5)
@@ -1933,7 +1982,7 @@ class CircularComputingManager:
     async def _on_alert_generated(self, event: BioEvent):
         if event.data.get('severity') == 'critical':
             logger.warning("Critical alert; triggering self‑healing")
-            self.config.circularity_strategy = 'conservative'  # custom attribute
+            self.config.circularity_strategy = 'conservative'
             if self.config.self_healing.enabled and self.self_healer:
                 await self.self_healer.apply_healing('damage_accumulation')
             if self.workflow_orchestrator and self.config.workflow_on_critical_alert:
@@ -1962,47 +2011,43 @@ class CircularComputingManager:
                 self.helium_manager.budget_l *= 0.8
 
     # ============================================================================
-    # Background Tasks (cancellable)
+    # Background Tasks
     # ============================================================================
     def _start_background_tasks(self):
-        # Event consumer
         if self.config.enable_event_driven:
             self._event_consumer_task = asyncio.create_task(self._event_consumer())
             self._background_tasks.append(self._event_consumer_task)
 
-        # Carbon update loop
         if self.carbon_manager:
             t = asyncio.create_task(self._carbon_update_loop())
             self._background_tasks.append(t)
 
-        # Predictive training loop
         if self.predictive:
             t = asyncio.create_task(self._predictive_update_loop())
             self._background_tasks.append(t)
 
-        # ML training loop
         if self.ml_selector:
             t = asyncio.create_task(self._ml_training_loop())
             self._background_tasks.append(t)
 
-        # Federated sync
         if self.federated:
             t = asyncio.create_task(self._federated_sync_loop())
             self._background_tasks.append(t)
 
-        # Telemetry export
         if self.telemetry:
             t = asyncio.create_task(self._telemetry_export_loop())
             self._background_tasks.append(t)
 
-        # Persistence save
         if self.persistence:
             t = asyncio.create_task(self._persistence_save_loop())
             self._background_tasks.append(t)
 
-        # Swarm update
         if self.config.enable_swarm_coordination and self.swarm_coordinator:
             t = asyncio.create_task(self._swarm_update_loop())
+            self._background_tasks.append(t)
+
+        if self.config.enable_chaos_testing:
+            t = asyncio.create_task(self._chaos_testing_loop())
             self._background_tasks.append(t)
 
     async def _carbon_update_loop(self):
@@ -2118,6 +2163,11 @@ class CircularComputingManager:
                 logger.error(f"Swarm update error: {e}")
                 await asyncio.sleep(120)
 
+    async def _chaos_testing_loop(self):
+        while True:
+            await asyncio.sleep(3600)  # run every hour
+            await self.run_chaos_test()
+
     # ============================================================================
     # Public API – Delegated to Analyzer and Reporter (Enhanced with MOPD)
     # ============================================================================
@@ -2144,7 +2194,7 @@ class CircularComputingManager:
         self,
         component_id: str,
         use_ml_optimization: bool = False,
-        return_mopd: bool = False           # NEW
+        return_mopd: bool = False
     ) -> Dict[str, Any]:
         result = await self.analyzer.recycle_component(component_id, use_ml_optimization, return_mopd)
 
@@ -2168,7 +2218,7 @@ class CircularComputingManager:
             self.self_evolving_gate.adapt(
                 state=state,
                 chosen_expert=0,
-                reward=await self.storage.get_metrics()['sustainability_score'],
+                reward=(await self.storage.get_metrics())['sustainability_score'],
                 environmental_feedback={'component_id': component_id},
                 quantum_mode=False
             )
@@ -2177,8 +2227,8 @@ class CircularComputingManager:
         if self.telemetry:
             self.telemetry.increment('recycles_performed')
             self.telemetry.gauge('carbon_saved', result.get('carbon_saved_kg', 0))
-            self.telemetry.gauge('sustainability_score', await self.storage.get_metrics()['sustainability_score'])
-            if return_mopd and 'mopd_pareto_front' in result:
+            self.telemetry.gauge('sustainability_score', (await self.storage.get_metrics())['sustainability_score'])
+            if return_mopd and 'mopd_pareto_front' in result and result['mopd_pareto_front']:
                 self.telemetry.increment('mopd_generations')
                 self.telemetry.histogram('mopd_pareto_front_size', len(result['mopd_pareto_front']))
 
@@ -2213,23 +2263,18 @@ class CircularComputingManager:
         return await self.analyzer.train_predictive_model()
 
     # ============================================================================
-    # MOPD Public Methods (NEW)
+    # MOPD Public Methods
     # ============================================================================
     async def get_recycling_pareto_front(
         self,
         component_id: str
     ) -> List[MOPDPlan]:
-        """
-        Generate Pareto front of recycling strategies for a given component.
-        Returns a list of MOPDPlan objects.
-        """
         if not self.config.enable_mopd:
             return []
         pareto_front = await self.analyzer._generate_pareto_front_for_recycling(component_id)
         return pareto_front
 
     async def get_mopd_summary(self) -> Dict[str, Any]:
-        """Return a summary of MOPD‑related metrics."""
         if not self.config.enable_mopd:
             return {'enabled': False}
         plans = await self.storage.get_mopd_plans(20)
@@ -2258,19 +2303,58 @@ class CircularComputingManager:
         await self.swarm_coordinator.share_predictions(payload)
 
     # ============================================================================
-    # Injection Methods
+    # Chaos Testing
     # ============================================================================
-    def set_gating_network(self, gating_network: 'GatingNetworkManager'):
-        self.gating_network = gating_network
+    async def inject_fault(self, fault_type: str, **params):
+        if not self.config.enable_chaos_testing:
+            logger.info("Chaos testing disabled")
+            return
+        if fault_type == 'helium_budget_exceeded':
+            if self.helium_manager:
+                self.helium_manager._total_usage = self.helium_manager.budget_l + 10
+                logger.warning("Injected helium_budget_exceeded fault")
+        elif fault_type == 'carbon_spike':
+            if self.carbon_manager:
+                self.carbon_manager.carbon_intensity = 900.0
+                logger.warning("Injected carbon_spike fault")
+        elif fault_type == 'component_failure':
+            # Simulate component failure by changing state to DEGRADED
+            component_id = params.get('component_id')
+            if component_id and component_id in self.storage.components:
+                await self.storage.update_component_state(component_id, HardwareState.DEGRADED)
+                logger.warning(f"Injected component_failure for {component_id}")
+        else:
+            logger.warning(f"Unknown fault type: {fault_type}")
 
-    def set_self_evolving_gate(self, gate: 'EnhancedSelfEvolvingGate'):
-        self.self_evolving_gate = gate
+    async def run_chaos_test(self) -> Dict[str, Any]:
+        if not self.config.enable_chaos_testing:
+            return {'status': 'disabled'}
+        report = {'faults': [], 'results': {}}
 
-    def set_expert_router(self, router: 'ExpertRouter'):
-        self.expert_router = router
+        # Fault 1: Helium budget exceeded
+        await self.inject_fault('helium_budget_exceeded')
+        report['faults'].append('helium_budget_exceeded')
+        if self.helium_manager:
+            pos = self.helium_manager.get_position()
+            report['results']['helium_budget_exceeded'] = {
+                'remaining_budget': pos.get('remaining_budget_l'),
+                'net': pos.get('net_position_l')
+            }
+        # Reset
+        if self.helium_manager:
+            self.helium_manager._total_usage = 0.0
+            self.helium_manager._total_recovered = 0.0
 
-    def set_helium_provider(self, provider: HeliumProvider):
-        self.helium_provider = provider
+        # Fault 2: Carbon spike
+        await self.inject_fault('carbon_spike')
+        report['faults'].append('carbon_spike')
+        if self.carbon_manager:
+            report['results']['carbon_spike'] = self.carbon_manager.carbon_intensity
+        # Reset
+        if self.carbon_manager:
+            self.carbon_manager.carbon_intensity = 400.0
+
+        return report
 
     # ============================================================================
     # Self‑Healing
@@ -2281,18 +2365,14 @@ class CircularComputingManager:
             logger.warning("Self‑healing disabled")
             return
 
-        # Reset helium budget
         if self.helium_manager:
             self.helium_manager.budget_l = self.config.helium_budget_l
         self.config.circularity_strategy = 'balanced'
 
-        # Reset sustainability score
         await self.storage.update_sustainability_score(0.0)
 
-        # Trim components and recycling history
         components = await self.storage.get_components()
         if len(components) > 10:
-            # Keep newest components
             sorted_comp = sorted(components, key=lambda c: c.deployment_date)
             for c in sorted_comp[:-10]:
                 async with self.storage._lock:
@@ -2302,11 +2382,9 @@ class CircularComputingManager:
             async with self.storage._lock:
                 self.storage.recycling_history = history[-10:]
 
-        # Reset health status
         self.health_status = "healthy"
         self.last_error = None
 
-        # Save state
         await self.reporter.save_state()
         logger.info("Self‑healing completed")
 
@@ -2329,6 +2407,9 @@ class CircularComputingManager:
             'swarm_coordination_active': self.config.enable_swarm_coordination,
             'persistence_enabled': self.config.persistence.enabled,
             'mopd_enabled': self.config.enable_mopd,
+            'human_approval_enabled': self.config.mopd.require_human_approval,
+            'temporal_safety_enabled': self.config.enable_temporal_safety,
+            'chaos_testing_enabled': self.config.enable_chaos_testing,
         }
 
     # ============================================================================
@@ -2336,20 +2417,16 @@ class CircularComputingManager:
     # ============================================================================
     async def shutdown(self):
         logger.info("Shutting down Circular Computing Manager")
-        # Cancel background tasks
         for task in self._background_tasks:
             task.cancel()
         await asyncio.gather(*self._background_tasks, return_exceptions=True)
 
-        # Stop helium accounting
         if self.helium_manager:
             await self.helium_manager.stop()
 
-        # Save final state
         if self.persistence:
             await self.reporter.save_state()
 
-        # Close external sessions
         if self.carbon_manager:
             await self.carbon_manager.close()
         if self.federated:
