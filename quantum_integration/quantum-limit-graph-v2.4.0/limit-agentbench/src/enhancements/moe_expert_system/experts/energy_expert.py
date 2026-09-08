@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/experts/energy_expert.py
-# Version 3.3.0 – Full Green Agent MODP Integration
-
-"""
-Enhanced Energy Expert v3.3.0 – MoE Expert for Energy, Carbon & Helium Profiling
-Full Green Agent MODP Integration
-
-ENHANCEMENTS OVER v3.2.0:
-1. Fixed critical bugs: safe async task creation, generic metric methods, circuit breaker fallback,
-   dataclass config serialization, aiohttp guard, carbon manager method check.
-2. Deep bio‑inspired integration: ATP spend/earn, gradient fields, scheduler‑based ATP modulation.
-3. Real MODP: multi‑objective metrics, adaptive cost compute, Pareto filtering on all relevant operations,
-   drift‑triggered adaptation.
-4. Enhanced teacher policy (`policy_probs`) as a true context‑aware MoE teacher distribution.
-5. Improved persistence and observability.
-6. All optional dependencies still gracefully degrade.
-"""
+# Version 3.4.0 – Enhanced Green Agent MODP Integration
+#
+# ENHANCEMENTS OVER v3.3.0:
+# 1. Fixed task_counts mapping bug.
+# 2. Lightweight health check (no side effects).
+# 3. Corrected energy field definitions: separated idle, CPU, memory, network, storage.
+# 4. Added XAI explanation to routing and estimation decisions.
+# 5. Added temporal safety tracking for route/strategy selections (cooldown).
+# 6. Improved state loading robustness for new dataclass fields.
+# 7. Minor cleanup and error handling.
 
 import asyncio
 import json
@@ -151,7 +145,7 @@ except ImportError:
     QUANTUM_BRIDGE_AVAILABLE = False
 
 # ============================================================================
-# Configuration – now a dataclass for easy serialization
+# Configuration – dataclass for serialization
 # ============================================================================
 @dataclass
 class EnergyExpertConfig:
@@ -207,24 +201,27 @@ class SustainabilityStrategy(Enum):
     RENEWABLE_ONLY = "renewable_only"
 
 # ============================================================================
-# Energy Profiling Results (unchanged)
+# Energy Profiling Results – updated dataclass with extra fields
 # ============================================================================
 @dataclass
 class EnergyProfile:
     task_id: str
     estimated_duration_seconds: float
-    estimated_cpu_energy_kwh: float
-    estimated_memory_energy_kwh: float
-    estimated_network_energy_kwh: float
-    estimated_total_energy_kwh: float
-    carbon_intensity_g_per_kwh: float
-    estimated_carbon_g: float
-    estimated_helium_ml: float
-    energy_efficiency_score: float
-    sustainability_score: float
-    recommended_strategy: str
-    region: str
-    timestamp: str
+    estimated_idle_energy_kwh: float = 0.0          # NEW
+    estimated_cpu_energy_kwh: float = 0.0           # CPU active only
+    estimated_memory_energy_kwh: float = 0.0
+    estimated_network_energy_kwh: float = 0.0
+    estimated_storage_energy_kwh: float = 0.0       # NEW
+    estimated_total_energy_kwh: float = 0.0
+    carbon_intensity_g_per_kwh: float = 0.0
+    estimated_carbon_g: float = 0.0
+    estimated_helium_ml: float = 0.0
+    energy_efficiency_score: float = 0.0
+    sustainability_score: float = 0.0
+    recommended_strategy: str = "balanced"
+    region: str = "us-east"
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    explanation: Dict[str, Any] = field(default_factory=dict)  # NEW for XAI
     def to_dict(self) -> Dict[str, Any]: return asdict(self)
 
 @dataclass
@@ -266,11 +263,11 @@ class EnergyExpertMetrics:
     def to_dict(self) -> Dict[str, Any]: return asdict(self)
 
 # ============================================================================
-# Energy Expert Implementation – Fully Integrated v3.3.0
+# Energy Expert Implementation – Fully Integrated v3.4.0
 # ============================================================================
 class EnergyExpert(BaseExpert):
     """
-    Energy Expert v3.3.0 – MoE Expert for Energy, Carbon & Helium Profiling
+    Energy Expert v3.4.0 – MoE Expert for Energy, Carbon & Helium Profiling
     Full Green Agent MODP integration.
     """
 
@@ -321,7 +318,13 @@ class EnergyExpert(BaseExpert):
         self.tasks_handled = 0
         self.total_latency = 0.0
         self.task_energy_cache: Dict[str, float] = {}
+
+        # Fixed task counts mapping
         self.task_counts = {'estimate': 0, 'carbon': 0, 'helium': 0, 'recommend': 0, 'route': 0, 'forecast': 0}
+
+        # Temporal safety: track recent route/strategy selections
+        self.recent_route_selections = deque(maxlen=10)
+        self.recent_strategy_selections = deque(maxlen=10)
 
         self._carbon_cache: Dict[str, Tuple[float, datetime]] = {}
         self._helium_cache: Dict[str, Tuple[float, datetime]] = {}
@@ -344,7 +347,7 @@ class EnergyExpert(BaseExpert):
         # Safe async state loading
         self._load_state_task = self._create_task(self._load_state())
 
-        logger.info(f"EnergyExpert v3.3.0 initialized.")
+        logger.info(f"EnergyExpert v3.4.0 initialized.")
 
     def _create_task(self, coro):
         try:
@@ -364,7 +367,10 @@ class EnergyExpert(BaseExpert):
                 state = json.loads(data)
                 self.tasks_handled = state.get('tasks_handled', 0)
                 self.total_latency = state.get('total_latency', 0.0)
-                self.task_counts = state.get('task_counts', {'estimate': 0, 'carbon': 0, 'helium': 0, 'recommend': 0, 'route': 0, 'forecast': 0})
+                # Use fixed keys
+                saved_counts = state.get('task_counts', {})
+                for k in self.task_counts.keys():
+                    self.task_counts[k] = saved_counts.get(k, 0)
                 for metrics_dict in state.get('metrics_history', []):
                     metrics = EnergyExpertMetrics(**metrics_dict)
                     self.metrics_history.append(metrics)
@@ -373,6 +379,10 @@ class EnergyExpert(BaseExpert):
                 for k, v in state.get('helium_analyses', {}).items():
                     self.helium_analyses[k] = HeliumAnalysis(**v)
                 for task_id, profile_dict in state.get('energy_profiles', {}).items():
+                    # Ensure new fields have defaults
+                    profile_dict.setdefault('estimated_idle_energy_kwh', 0.0)
+                    profile_dict.setdefault('estimated_storage_energy_kwh', 0.0)
+                    profile_dict.setdefault('explanation', {})
                     profile = EnergyProfile(**profile_dict)
                     self.energy_profiles[task_id] = profile
                 logger.info("EnergyExpert state loaded from central storage")
@@ -407,7 +417,6 @@ class EnergyExpert(BaseExpert):
         strategies = ['estimate', 'carbon', 'helium', 'recommend', 'route', 'forecast']
         candidates = []
         for strategy in strategies:
-            # Estimate metrics for each strategy (simplified; real metrics would come from profiling)
             if strategy == 'estimate':
                 carbon_g = 5.0
                 latency_ms = 50.0
@@ -461,14 +470,12 @@ class EnergyExpert(BaseExpert):
                 'quality_score': quality
             })
 
-        # Apply Pareto filter
         if self.pareto:
             filtered = self.pareto.filter(candidates)
             if filtered:
                 allowed = {c['strategy'] for c in filtered}
                 candidates = [c for c in candidates if c['strategy'] in allowed]
 
-        # Softmax over remaining candidates
         scores = [c['score'] for c in candidates]
         if scores:
             exp_scores = np.exp(scores - np.max(scores))
@@ -603,8 +610,19 @@ class EnergyExpert(BaseExpert):
             latency = end_ts - start_ts
             self.tasks_handled += 1
             self.total_latency += latency
-            task_key = task_type.replace('energy_', '').replace('_', '')
-            self.task_counts[task_key] = self.task_counts.get(task_key, 0) + 1
+
+            # Fixed task count mapping
+            task_map = {
+                'energy_estimate': 'estimate',
+                'carbon_profile': 'carbon',
+                'helium_analysis': 'helium',
+                'sustainability_recommend': 'recommend',
+                'energy_route': 'route',
+                'forecast': 'forecast'
+            }
+            if task_type in task_map:
+                key = task_map[task_type]
+                self.task_counts[key] = self.task_counts.get(key, 0) + 1
 
             # Generic metric recording
             self.metrics.increment("energy_task", 1)
@@ -637,15 +655,23 @@ class EnergyExpert(BaseExpert):
         storage_gb = payload.get('storage_gb', 0.0)
         duration_seconds = payload.get('duration_seconds', cpu_seconds)
 
+        # Idle energy (constant power during duration)
         idle_energy_kwh = (duration_seconds * self.config.idle_power_watt) / 3600.0 / 1000.0
-        active_energy_kwh = (
-            (cpu_seconds * self.config.cpu_power_watt) +
-            (duration_seconds * memory_gb * self.config.memory_power_per_gb) +
-            (network_mbps * duration_seconds * self.config.network_power_per_mbps) +
-            (storage_gb * self.config.storage_power_per_gb)
-        ) / 3600.0 / 1000.0 * self.config.power_utilization_factor
 
-        total_energy_kwh = idle_energy_kwh + active_energy_kwh
+        # Active CPU energy (only CPU, not including memory/network/storage)
+        cpu_energy_kwh = (cpu_seconds * self.config.cpu_power_watt) / 3600.0 / 1000.0 * self.config.power_utilization_factor
+
+        # Memory energy
+        memory_energy_kwh = (duration_seconds * memory_gb * self.config.memory_power_per_gb) / 3600.0 / 1000.0
+
+        # Network energy
+        network_energy_kwh = (network_mbps * duration_seconds * self.config.network_power_per_mbps) / 3600.0 / 1000.0
+
+        # Storage energy
+        storage_energy_kwh = (storage_gb * self.config.storage_power_per_gb) / 3600.0 / 1000.0
+
+        # Total energy
+        total_energy_kwh = idle_energy_kwh + cpu_energy_kwh + memory_energy_kwh + network_energy_kwh + storage_energy_kwh
 
         # Carbon intensity
         if self.carbon_manager:
@@ -672,12 +698,29 @@ class EnergyExpert(BaseExpert):
         else:
             recommended_strategy = "conservative"
 
+        # XAI explanation
+        explanation = {
+            'energy_breakdown_kwh': {
+                'idle': idle_energy_kwh,
+                'cpu': cpu_energy_kwh,
+                'memory': memory_energy_kwh,
+                'network': network_energy_kwh,
+                'storage': storage_energy_kwh
+            },
+            'carbon_intensity_g_per_kwh': carbon_intensity,
+            'efficiency_score': efficiency_score,
+            'sustainability_score': sustainability_score,
+            'reasoning': f"Total energy {total_energy_kwh:.6f} kWh, carbon {carbon_g:.2f} g, helium {helium_ml:.2f} ml. Efficiency based on 0.1 kWh threshold."
+        }
+
         profile = EnergyProfile(
             task_id=task_id,
             estimated_duration_seconds=duration_seconds,
-            estimated_cpu_energy_kwh=idle_energy_kwh + active_energy_kwh,
-            estimated_memory_energy_kwh=(duration_seconds * memory_gb * self.config.memory_power_per_gb) / 3600.0 / 1000.0,
-            estimated_network_energy_kwh=(network_mbps * duration_seconds * self.config.network_power_per_mbps) / 3600.0 / 1000.0,
+            estimated_idle_energy_kwh=idle_energy_kwh,
+            estimated_cpu_energy_kwh=cpu_energy_kwh,
+            estimated_memory_energy_kwh=memory_energy_kwh,
+            estimated_network_energy_kwh=network_energy_kwh,
+            estimated_storage_energy_kwh=storage_energy_kwh,
             estimated_total_energy_kwh=total_energy_kwh,
             carbon_intensity_g_per_kwh=carbon_intensity,
             estimated_carbon_g=carbon_g,
@@ -687,6 +730,7 @@ class EnergyExpert(BaseExpert):
             recommended_strategy=recommended_strategy,
             region=region,
             timestamp=datetime.now(timezone.utc).isoformat(),
+            explanation=explanation,
         )
 
         self.energy_profiles[task_id] = profile
@@ -719,7 +763,7 @@ class EnergyExpert(BaseExpert):
             carbon_g=carbon_g,
             feedback_type="energy",
             adaptive_cost_value=0.0,
-            state={'task_id': task_id, 'region': region},
+            state={'task_id': task_id, 'region': region, 'explanation': explanation},
             candidates=[{'action': 'estimate', 'carbon', 'helium', 'recommend', 'route', 'forecast'}],
             source="energy_expert",
             environment=getattr(central_config, "ENVIRONMENT", "production"),
@@ -845,7 +889,6 @@ class EnergyExpert(BaseExpert):
         strategies = ['conservative', 'balanced', 'performance', 'renewable_only']
         candidates = []
         for strategy in strategies:
-            # Estimate metrics for each strategy
             if strategy == 'conservative':
                 quality = 0.9
                 carbon_g = 5.0
@@ -889,7 +932,6 @@ class EnergyExpert(BaseExpert):
                 'quality_score': quality
             })
 
-        # Pareto filter
         if self.pareto:
             filtered = self.pareto.filter(candidates)
             if filtered:
@@ -899,10 +941,28 @@ class EnergyExpert(BaseExpert):
         if not candidates:
             strategy = 'balanced'
             reason = "No candidates passed Pareto filter; using balanced default"
+            explanation = {'reason': reason}
         else:
             best = max(candidates, key=lambda x: x['score'])
             strategy = best['strategy']
             reason = f"Selected by adaptive cost and Pareto optimization"
+            explanation = {
+                'reason': reason,
+                'score': best['score'],
+                'quality_score': best['quality_score'],
+                'carbon_g': best['carbon_g'],
+                'energy_joules': best['energy_joules'],
+                'latency_ms': best['latency_ms']
+            }
+
+        # Temporal safety: avoid frequent repetition of the same strategy
+        now = datetime.now(timezone.utc)
+        self.recent_strategy_selections.append((strategy, now))
+        if len(self.recent_strategy_selections) >= 3:
+            recent = [s for s, t in self.recent_strategy_selections if (now - t).total_seconds() < 300]
+            if len(recent) >= 3 and all(s == strategy for s in recent):
+                logger.warning(f"Strategy {strategy} selected frequently; consider adding variety.")
+                explanation['warning'] = "Strategy selected frequently"
 
         # Bio-inspired integration
         await self._bio_spend_earn(0.0, 0.0, 0.9 if strategy in ['balanced', 'conservative'] else 0.7, "recommend_strategy")
@@ -915,7 +975,7 @@ class EnergyExpert(BaseExpert):
             carbon_g=0.0,
             feedback_type="energy",
             adaptive_cost_value=0.0,
-            state={'system_load': system_load, 'strategy': strategy},
+            state={'system_load': system_load, 'strategy': strategy, 'explanation': explanation},
             candidates=[{'action': 'estimate', 'carbon', 'helium', 'recommend', 'route', 'forecast'}],
             source="energy_expert",
             environment=getattr(central_config, "ENVIRONMENT", "production"),
@@ -929,6 +989,7 @@ class EnergyExpert(BaseExpert):
             'status': 'success',
             'recommended_strategy': strategy,
             'reason': reason,
+            'explanation': explanation,
             'details': {
                 'system_load': system_load,
                 'energy_budget_remaining': energy_budget,
@@ -942,7 +1003,6 @@ class EnergyExpert(BaseExpert):
         energy_kwh = payload.get('energy_kwh', 0.1)
         carbon_g = payload.get('carbon_g', 50.0)
 
-        # Candidate routes with real metrics
         routes = ['cpu_expert', 'optimization_expert', 'io_expert']
         candidates = []
         for route in routes:
@@ -990,9 +1050,27 @@ class EnergyExpert(BaseExpert):
             routing = {r: False for r in routes}
             routing[best['expert']] = True
             recommended = [best['expert']]
+            explanation = {
+                'reason': f"Chosen {best['expert']} due to highest adaptive cost after Pareto filtering.",
+                'score': best['score'],
+                'quality_score': best['quality_score'],
+                'carbon_g': best['carbon_g'],
+                'energy_joules': best['energy_joules'],
+                'latency_ms': best['latency_ms']
+            }
         else:
             routing = {'cpu_expert': True, 'optimization_expert': False, 'io_expert': False}
             recommended = ['cpu_expert']
+            explanation = {'reason': "No candidates passed Pareto filter; using default cpu_expert"}
+
+        # Temporal safety: avoid frequent repetition of the same route
+        now = datetime.now(timezone.utc)
+        self.recent_route_selections.append((recommended[0], now))
+        if len(self.recent_route_selections) >= 3:
+            recent = [r for r, t in self.recent_route_selections if (now - t).total_seconds() < 300]
+            if len(recent) >= 3 and all(r == recommended[0] for r in recent):
+                logger.warning(f"Route {recommended[0]} selected frequently; consider load balancing.")
+                explanation['warning'] = "Route selected frequently"
 
         await self._bio_spend_earn(energy_kwh, carbon_g, 0.8, "route_by_energy")
 
@@ -1004,7 +1082,7 @@ class EnergyExpert(BaseExpert):
             carbon_g=0.0,
             feedback_type="energy",
             adaptive_cost_value=0.0,
-            state={'energy_kwh': energy_kwh, 'carbon_g': carbon_g},
+            state={'energy_kwh': energy_kwh, 'carbon_g': carbon_g, 'explanation': explanation},
             candidates=[{'action': 'estimate', 'carbon', 'helium', 'recommend', 'route', 'forecast'}],
             source="energy_expert",
             environment=getattr(central_config, "ENVIRONMENT", "production"),
@@ -1014,7 +1092,12 @@ class EnergyExpert(BaseExpert):
 
         await self._check_drift()
 
-        return {'status': 'success', 'routing': routing, 'recommended_experts': recommended}
+        return {
+            'status': 'success',
+            'routing': routing,
+            'recommended_experts': recommended,
+            'explanation': explanation
+        }
 
     async def forecast_energy(self, task: Dict[str, Any]) -> Dict[str, Any]:
         payload = task.get('payload', {})
@@ -1085,7 +1168,6 @@ class EnergyExpert(BaseExpert):
             if quality_score > 0.7:
                 await self.token_manager.earn("energy_expert", atp_cost * 2)
             if self.gradient_manager:
-                # Pump gradients based on operation outcome
                 trust_delta = 0.05 if quality_score > 0.7 else -0.05
                 self.gradient_manager.pump_field('trust', trust_delta, source=f"energy_{operation_name}")
                 if carbon_g > 50:
@@ -1102,7 +1184,6 @@ class EnergyExpert(BaseExpert):
                 drift_score = await self.drift.check_drift(self.adaptive_cost.get_current_weights())
                 if drift_score and drift_score > 0.7:
                     logger.warning(f"High drift detected ({drift_score:.3f}) in EnergyExpert.")
-                    # Adapt configuration
                     self.config.energy_efficiency_threshold = min(0.9, self.config.energy_efficiency_threshold + 0.05)
                     self.config.carbon_budget_per_task_g *= 0.9
             except Exception as e:
@@ -1135,18 +1216,39 @@ class EnergyExpert(BaseExpert):
             'total_helium_ml': total_helium,
             'failure_rate': failures / len(self.metrics_history) if self.metrics_history else 0.0,
             'profiles_cached': len(self.energy_profiles),
+            'task_counts': self.task_counts,
         }
 
     async def get_health_status(self) -> Dict[str, Any]:
+        """
+        Lightweight health check: just verify internal state, no side effects.
+        """
         try:
-            test_task = {'type': 'energy_estimate', 'payload': {'cpu_seconds': 1.0, 'memory_gb': 0.5, 'network_mbps': 1.0, 'duration_seconds': 10.0}}
-            result = await self.estimate_task_energy(test_task)
+            # Simple validation: check if necessary components exist and config is valid
+            if self.config.cpu_power_watt <= 0:
+                raise ValueError("Invalid cpu_power_watt")
+            if self.config.idle_power_watt < 0:
+                raise ValueError("Invalid idle_power_watt")
+            # If carbon manager exists, verify it has expected method (without calling)
+            if self.carbon_manager and not (hasattr(self.carbon_manager, 'get_current_intensity') or hasattr(self.carbon_manager, 'update')):
+                logger.warning("Carbon manager missing update methods")
             self.health_status = "healthy"
-            return {'status': 'healthy', 'expert': self.expert_name, 'timestamp': datetime.now(timezone.utc).isoformat(), 'last_tasks': self.tasks_handled, 'last_error': None}
+            return {
+                'status': 'healthy',
+                'expert': self.expert_name,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'tasks_handled': self.tasks_handled,
+                'last_error': None
+            }
         except Exception as e:
             self.health_status = "unhealthy"
             logger.warning(f"EnergyExpert health check failed: {e}")
-            return {'status': 'unhealthy', 'expert': self.expert_name, 'timestamp': datetime.now(timezone.utc).isoformat(), 'error': str(e)}
+            return {
+                'status': 'unhealthy',
+                'expert': self.expert_name,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'error': str(e)
+            }
 
     # ==========================================================================
     # Async Context Manager and Cleanup
