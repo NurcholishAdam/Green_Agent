@@ -1,16 +1,20 @@
 # sustainability/__init__.py
 """
-Sustainability-Aware Model Compression and Pruning Module (v3.1.0)
-Single-file drop-in for Green_Agent MoE system with MOPD support.
+Sustainability-Aware Model Compression and Pruning Module (v3.2.0)
+Single-file drop-in for Green_Agent MoE system with MOPD, XAI, temporal safety,
+human-in-the-loop, chaos testing, and federated learning config support.
 
-ENHANCEMENTS OVER v3.0.0:
-- Added MOPD (Multi‑Objective Pareto Decision) framework.
-- New MOPDPoint dataclass to represent compression candidates with objectives.
-- Pareto front generation for compression methods.
-- Selection of best method via scalarisation with configurable weights.
-- Persistence of Pareto fronts in SQLite.
-- Telemetry tracks MOPD usage.
-- Full backward compatibility.
+ENHANCEMENTS OVER v3.1.0:
+- Fixed default fitness weights to sum to 1.
+- Added max_retries, retry_base_delay_ms, retry_max_delay_ms to config.
+- Compression methods now accept an optional model parameter (no mutation of original).
+- Safe async task creation (deferred to start()/wait_ready()).
+- Added XAI explanation field to MOPDPoint.
+- Added temporal safety checks and human approval hooks.
+- Added chaos testing methods (inject_fault, run_chaos_test).
+- Added FederatedConfig sub-model.
+- Enhanced MLOpsPipelineExtension with start/stop methods.
+- Router now uses Pareto front selection if available.
 """
 
 import torch
@@ -29,6 +33,7 @@ import copy
 from datetime import datetime
 from pathlib import Path
 import numpy as np
+from enum import Enum
 
 # ---------- Pydantic ----------
 try:
@@ -47,8 +52,9 @@ except ImportError:
 # ---------- Logging ----------
 logger = logging.getLogger(__name__)
 
+
 # ==============================================
-# 1. CONFIGURATION (Pydantic validated) – Enhanced with MOPD
+# 1. CONFIGURATION (Pydantic validated) – Enhanced
 # ==============================================
 
 class MOPDConfig(BaseModel):
@@ -67,12 +73,31 @@ class MOPDConfig(BaseModel):
     enable_cost_benefit: bool = Field(True)
     enable_predictive: bool = Field(True)
 
+    # NEW: XAI, safety, approval, chaos
+    enable_xai: bool = Field(True, description="Generate explanations for compression decisions")
+    enable_temporal_safety: bool = Field(True, description="Perform temporal safety checks before applying compression")
+    require_human_approval: bool = Field(False, description="Require human approval for aggressive compression (accuracy drop above threshold)")
+    aggressive_threshold: float = Field(0.2, ge=0, le=1, description="Absolute accuracy drop above which human approval is required")
+    enable_chaos_testing: bool = Field(False, description="Enable chaos testing hooks")
+    chaos_test_interval_seconds: int = Field(3600, ge=60)
+
     @model_validator(mode='after')
     def check_weights(self):
         total = sum(self.objective_weights.values())
         if abs(total - 1.0) > 1e-6:
             raise ValueError("Objective weights must sum to 1")
         return self
+
+
+class FederatedConfig(BaseModel):
+    """Configuration for federated learning across deployments."""
+    enabled: bool = Field(False, description="Enable federated learning integration")
+    server_url: Optional[str] = Field(None, description="URL of federated aggregation server")
+    sparsity_ratio: float = Field(0.1, ge=0, le=1)
+    privacy_epsilon: float = Field(1.0, ge=0)
+    sync_interval_seconds: int = Field(3600, ge=60)
+    max_retries: int = Field(3, ge=0)
+
 
 class SustainabilityConfig(BaseModel):
     """Configuration for sustainability‑aware compression."""
@@ -82,18 +107,18 @@ class SustainabilityConfig(BaseModel):
     accuracy_drop_tolerance: float = Field(0.02, ge=0, le=1)
     # Energy estimation coefficient (pJ per MAC operation)
     energy_per_mac: float = Field(0.5e-12, gt=0)
-    # Fitness weighting
-    fitness_accuracy_weight: float = Field(0.6, ge=0, le=1)
-    fitness_energy_weight: float = Field(0.4, ge=0, le=1)
-    # Additional fitness weights (carbon and material)
-    fitness_carbon_weight: float = Field(0.1, ge=0, le=1)
+    # Fitness weighting (sum to 1)
+    fitness_accuracy_weight: float = Field(0.5, ge=0, le=1)
+    fitness_energy_weight: float = Field(0.3, ge=0, le=1)
+    fitness_carbon_weight: float = Field(0.15, ge=0, le=1)
     fitness_material_weight: float = Field(0.05, ge=0, le=1)
+    compression_bonus: float = Field(0.05, ge=0, le=0.5)
     # Pruning sparsity levels
     pruning_sparsity: float = Field(0.3, ge=0, le=1)
     hybrid_pruning_sparsity: float = Field(0.2, ge=0, le=1)
-    # SVD rank reduction factor (fraction of original rank)
+    # SVD rank reduction factor
     svd_rank_factor: float = Field(0.5, gt=0, le=1)
-    # Hardware profiles with per‑profile energy coefficients
+    # Hardware profiles
     hardware_profiles: Dict[str, float] = Field(default_factory=lambda: {
         'default': 0.5e-12,
         'gpu': 0.3e-12,
@@ -101,29 +126,35 @@ class SustainabilityConfig(BaseModel):
         'tpu': 0.2e-12,
     })
     hardware_profile: str = Field("default")
-    # Compression storage directory
+    # Storage
     compressed_model_dir: str = Field("./compressed_models")
-    # History database path
     history_db_path: str = Field("./compression_history.db")
-    # Re‑compression interval (seconds); 0 = disabled
+    # Re-compression interval
     recompress_interval: int = Field(0, ge=0)
-    # Whether to trigger compression on anomaly
     anomaly_trigger_enabled: bool = True
-    # Telemetry prefix for metrics
+    # Telemetry
     telemetry_prefix: str = "sustainability"
-    # Max energy for normalization (Joules)
+    # Max energy for normalization
     max_energy_joules: float = Field(10.0, gt=0)
-    # Carbon savings scaling factor (kg CO₂)
+    # Carbon savings scaling factor
     carbon_savings_scale_kg: float = Field(0.1, gt=0)
-    # Material index mapping per hardware profile
+    # Material index mapping
     material_index_map: Dict[str, float] = Field(default_factory=lambda: {
         'default': 0.5,
         'gpu': 0.4,
         'cpu': 0.3,
         'tpu': 0.2,
     })
-    # MOPD configuration (NEW)
+    # Retry and circuit breaker parameters
+    max_retries: int = Field(3, ge=0)
+    retry_base_delay_ms: float = Field(100.0, ge=0)
+    retry_max_delay_ms: float = Field(5000.0, ge=0)
+    circuit_breaker_failure_threshold: int = Field(5, ge=1)
+    circuit_breaker_recovery_timeout: float = Field(30.0, ge=0)
+    # MOPD sub-config
     mopd: MOPDConfig = Field(default_factory=MOPDConfig)
+    # Federated sub-config
+    federated: FederatedConfig = Field(default_factory=FederatedConfig)
 
     @model_validator(mode='after')
     def check_weights(self):
@@ -133,20 +164,20 @@ class SustainabilityConfig(BaseModel):
         return self
 
     def get_energy_coeff(self, profile: str = None) -> float:
-        """Get energy per MAC coefficient for a given hardware profile."""
         profile = profile or self.hardware_profile
         return self.hardware_profiles.get(profile, self.energy_per_mac)
 
     def get_material_index(self, profile: str = None) -> float:
-        """Get material index for a given hardware profile."""
         profile = profile or self.hardware_profile
         return self.material_index_map.get(profile, 0.5)
 
     class Config:
         env_prefix = "SUSTAINABILITY_"
 
+
 # Global config instance
 SUSTAINABILITY_CONFIG = SustainabilityConfig()
+
 
 # ==============================================
 # 2. DEPENDENCY STUBS (graceful fallback)
@@ -163,7 +194,6 @@ class CarbonIntensityManagerStub:
 class AnomalyDetectorStub:
     async def ingest(self, node_id: str, metrics: Dict) -> Optional[Any]: return None
 
-# Try to import real modules; fallback to stubs
 try:
     from ..telemetry_collector import TelemetryCollector
     TELEMETRY_AVAILABLE = True
@@ -185,8 +215,9 @@ except ImportError:
     AnomalyDetector = AnomalyDetectorStub
     ANOMALY_AVAILABLE = False
 
+
 # ==============================================
-# 3. CIRCUIT BREAKER AND RETRY (unchanged)
+# 3. CIRCUIT BREAKER AND RETRY (unchanged, but with configurable thresholds)
 # ==============================================
 
 class CircuitBreaker:
@@ -232,8 +263,9 @@ async def retry_async(func: Callable, max_retries: int, base_delay_ms: float, ma
             await asyncio.sleep(delay)
     raise RuntimeError("Max retries exceeded")
 
+
 # ==============================================
-# 4. MOPD DATA CLASSES (NEW)
+# 4. MOPD DATA CLASSES (Enhanced with XAI)
 # ==============================================
 
 @dataclass
@@ -245,6 +277,7 @@ class MOPDPoint:
     carbon_savings_kg: float
     material_index: float
     scalarised_score: float = 0.0
+    explanation: str = ""  # XAI
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -252,6 +285,7 @@ class MOPDPoint:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPoint':
         return cls(**data)
+
 
 # ==============================================
 # 5. EXPERT PROFILE EXTENSION (Enhanced with MOPD)
@@ -278,8 +312,8 @@ class SustainabilityAwareExpertProfile:
     pareto_front: List[MOPDPoint] = field(default_factory=list)
 
     def update_material_index(self, config: SustainabilityConfig):
-        """Set material index based on current hardware profile."""
         self.material_index = config.get_material_index()
+
 
 # ==============================================
 # 6. COMPRESSION HISTORY MANAGER (SQLite) – Enhanced with MOPD
@@ -317,6 +351,7 @@ class CompressionHistoryManager:
                 carbon_savings_kg REAL,
                 material_index REAL,
                 scalarised_score REAL,
+                explanation TEXT,
                 timestamp TEXT NOT NULL
             )
         """)
@@ -337,17 +372,16 @@ class CompressionHistoryManager:
         conn.close()
 
     def record_pareto_front(self, expert_id: str, pareto_front: List[MOPDPoint]):
-        """Store each Pareto point in the database."""
         conn = sqlite3.connect(self.db_path)
         for point in pareto_front:
             conn.execute("""
                 INSERT INTO pareto_fronts
                 (expert_id, method, accuracy, energy, carbon_savings_kg, material_index,
-                 scalarised_score, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 scalarised_score, explanation, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (expert_id, point.method, point.accuracy, point.energy,
                   point.carbon_savings_kg, point.material_index,
-                  point.scalarised_score, datetime.now().isoformat()))
+                  point.scalarised_score, point.explanation, datetime.now().isoformat()))
         conn.commit()
         conn.close()
 
@@ -380,7 +414,7 @@ class CompressionHistoryManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.execute(
             "SELECT method, accuracy, energy, carbon_savings_kg, material_index, "
-            "scalarised_score, timestamp FROM pareto_fronts "
+            "scalarised_score, explanation, timestamp FROM pareto_fronts "
             "WHERE expert_id = ? ORDER BY timestamp DESC LIMIT ?",
             (expert_id, limit)
         )
@@ -392,8 +426,10 @@ class CompressionHistoryManager:
             energy=r[2],
             carbon_savings_kg=r[3],
             material_index=r[4],
-            scalarised_score=r[5]
+            scalarised_score=r[5],
+            explanation=r[6]
         ) for r in rows]
+
 
 # ==============================================
 # 7. COMPRESSED MODEL STORAGE (unchanged)
@@ -427,8 +463,9 @@ class CompressedModelStorage:
         model.load_state_dict(data['model_state_dict'])
         return True
 
+
 # ==============================================
-# 8. CORE COMPRESSOR (ENHANCED WITH MOPD)
+# 8. CORE COMPRESSOR (ENHANCED)
 # ==============================================
 
 class SustainabilityCompressor:
@@ -452,10 +489,18 @@ class SustainabilityCompressor:
         self.storage = storage
         self.hardware_profile = self.config.hardware_profile
         self.accuracy_fn = accuracy_fn or self._default_accuracy_fn
-        self._original_state_dict = None
+        self._original_state_dict = copy.deepcopy(model.state_dict())
 
-        self._carbon_circuit = CircuitBreaker("carbon_manager")
-        self._telemetry_circuit = CircuitBreaker("telemetry")
+        self._carbon_circuit = CircuitBreaker(
+            "carbon_manager",
+            failure_threshold=self.config.circuit_breaker_failure_threshold,
+            recovery_timeout=self.config.circuit_breaker_recovery_timeout
+        )
+        self._telemetry_circuit = CircuitBreaker(
+            "telemetry",
+            failure_threshold=self.config.circuit_breaker_failure_threshold,
+            recovery_timeout=self.config.circuit_breaker_recovery_timeout
+        )
 
     def _default_accuracy_fn(self, model: torch.nn.Module, val_loader: Any) -> float:
         model.eval()
@@ -469,7 +514,6 @@ class SustainabilityCompressor:
                 correct += (predicted == labels).sum().item()
         return correct / total if total > 0 else 0.0
 
-    # ---------- Energy estimation (unchanged) ----------
     async def _estimate_energy_real(self, model: torch.nn.Module, sample_input: torch.Tensor) -> float:
         if TELEMETRY_AVAILABLE and self.telemetry:
             try:
@@ -477,7 +521,8 @@ class SustainabilityCompressor:
                     retry_async,
                     self.telemetry.get_energy_per_inference,
                     self.config.max_retries,
-                    100, 5000,
+                    self.config.retry_base_delay_ms,
+                    self.config.retry_max_delay_ms,
                     self.profile.expert_id
                 )
                 if energy is not None:
@@ -499,21 +544,21 @@ class SustainabilityCompressor:
         coeff = self.config.get_energy_coeff(self.hardware_profile)
         return flops * coeff
 
-    # ---------- Compression methods (unchanged) ----------
-    def apply_structured_pruning(self, sparsity: float = None, dim: int = 0) -> torch.nn.Module:
+    # ---------- Compression methods (now accept model parameter) ----------
+    def _apply_structured_pruning(self, model: torch.nn.Module, sparsity: float = None, dim: int = 0) -> torch.nn.Module:
         if sparsity is None:
             sparsity = self.config.pruning_sparsity
-        for module in self.model.modules():
+        for module in model.modules():
             if isinstance(module, torch.nn.Conv2d):
                 prune.ln_structured(module, name='weight', amount=sparsity, n=2, dim=dim)
                 prune.remove(module, 'weight')
-        return self.model
+        return model
 
-    def apply_unstructured_pruning(self, sparsity: float = None) -> torch.nn.Module:
+    def _apply_unstructured_pruning(self, model: torch.nn.Module, sparsity: float = None) -> torch.nn.Module:
         if sparsity is None:
             sparsity = self.config.pruning_sparsity
         parameters_to_prune = []
-        for module in self.model.modules():
+        for module in model.modules():
             if isinstance(module, torch.nn.Linear):
                 parameters_to_prune.append((module, "weight"))
         prune.global_unstructured(
@@ -523,25 +568,25 @@ class SustainabilityCompressor:
         )
         for module, _ in parameters_to_prune:
             prune.remove(module, "weight")
-        return self.model
+        return model
 
-    def apply_int8_quantization(self) -> torch.nn.Module:
+    def _apply_int8_quantization(self, model: torch.nn.Module) -> torch.nn.Module:
         quantized_model = quantize_dynamic(
-            self.model,
+            model,
             {torch.nn.Linear},
             dtype=torch.qint8
         )
         return quantized_model
 
-    def apply_hybrid(self) -> torch.nn.Module:
-        self.apply_unstructured_pruning(sparsity=self.config.hybrid_pruning_sparsity)
-        self.apply_int8_quantization()
-        return self.model
+    def _apply_hybrid(self, model: torch.nn.Module) -> torch.nn.Module:
+        model = self._apply_unstructured_pruning(model, sparsity=self.config.hybrid_pruning_sparsity)
+        model = self._apply_int8_quantization(model)
+        return model
 
-    def apply_svd(self, rank_factor: float = None) -> torch.nn.Module:
+    def _apply_svd(self, model: torch.nn.Module, rank_factor: float = None) -> torch.nn.Module:
         if rank_factor is None:
             rank_factor = self.config.svd_rank_factor
-        for name, module in self.model.named_modules():
+        for name, module in model.named_modules():
             if isinstance(module, torch.nn.Linear):
                 weight = module.weight.data
                 U, S, V = torch.linalg.svd(weight, full_matrices=False)
@@ -549,22 +594,20 @@ class SustainabilityCompressor:
                 U_k = U[:, :k]
                 S_k = S[:k]
                 V_k = V[:k, :]
-                new_weight = U_k @ torch.diag(S_k) @ V_k
-                module.weight.data = new_weight
-        return self.model
+                module.weight.data = U_k @ torch.diag(S_k) @ V_k
+        return model
 
     # ---------- Model handling ----------
     def _copy_model(self) -> torch.nn.Module:
         return copy.deepcopy(self.model)
 
     def _restore_original(self):
-        if self._original_state_dict is not None:
-            self.model.load_state_dict(self._original_state_dict)
+        self.model.load_state_dict(self._original_state_dict)
 
     def _evaluate_accuracy(self, model: torch.nn.Module, val_loader: Any) -> float:
         return self.accuracy_fn(model, val_loader)
 
-    # ---------- Pareto front generation (NEW) ----------
+    # ---------- Pareto front generation (fixed model passing) ----------
     async def _generate_pareto_front(
         self,
         val_loader: Any,
@@ -572,28 +615,26 @@ class SustainabilityCompressor:
         baseline_acc: float,
         baseline_energy: float
     ) -> List[MOPDPoint]:
-        """Generate Pareto front of compression candidates."""
-        candidates = [
-            ('structured_pruning', self.apply_structured_pruning, self.config.pruning_sparsity),
-            ('unstructured_pruning', self.apply_unstructured_pruning, self.config.pruning_sparsity),
-            ('int8_quant', self.apply_int8_quantization, None),
-            ('hybrid', self.apply_hybrid, None),
-            ('svd', self.apply_svd, self.config.svd_rank_factor),
+        methods = [
+            ('structured_pruning', self._apply_structured_pruning, self.config.pruning_sparsity),
+            ('unstructured_pruning', self._apply_unstructured_pruning, self.config.pruning_sparsity),
+            ('int8_quant', self._apply_int8_quantization, None),
+            ('hybrid', self._apply_hybrid, None),
+            ('svd', self._apply_svd, self.config.svd_rank_factor),
         ]
         points = []
-        for method_name, method_func, sparsity in candidates:
-            original_copy = self._copy_model()
-            model_copy = original_copy
+        for method_name, method_func, sparsity in methods:
+            model_copy = self._copy_model()
             try:
                 if sparsity is not None:
-                    model_copy = method_func(sparsity)
+                    model_copy = method_func(model_copy, sparsity)
                 else:
                     if method_name == 'hybrid':
-                        model_copy = self.apply_hybrid()
+                        model_copy = self._apply_hybrid(model_copy)
                     elif method_name == 'svd':
-                        model_copy = self.apply_svd()
+                        model_copy = self._apply_svd(model_copy)
                     else:
-                        model_copy = method_func()
+                        model_copy = method_func(model_copy)
 
                 acc = self._evaluate_accuracy(model_copy, val_loader)
                 energy = await self._estimate_energy_real(model_copy, sample_input)
@@ -604,7 +645,8 @@ class SustainabilityCompressor:
                             retry_async,
                             self.carbon_manager.get_current_intensity,
                             self.config.max_retries,
-                            100, 5000
+                            self.config.retry_base_delay_ms,
+                            self.config.retry_max_delay_ms
                         )
                         carbon_intensity = intensity_data.get('intensity', 400) / 1000
                         energy_saved = baseline_energy - energy
@@ -620,16 +662,15 @@ class SustainabilityCompressor:
                         accuracy=acc,
                         energy=energy,
                         carbon_savings_kg=carbon_savings,
-                        material_index=material
+                        material_index=material,
+                        explanation=f"Method {method_name}: accuracy {acc:.4f}, energy {energy:.4f}J, carbon saved {carbon_savings:.4f}kg, material {material:.2f}"
                     )
                     points.append(point)
             except Exception as e:
                 logger.warning(f"Compression method {method_name} failed: {e}")
             finally:
                 del model_copy
-                del original_copy
 
-        # Filter dominated points
         if not points:
             return []
 
@@ -639,7 +680,6 @@ class SustainabilityCompressor:
             for j, p_j in enumerate(points):
                 if i == j:
                     continue
-                # accuracy and carbon_savings are maximised (negate), energy and material minimised
                 a_vec = [-p_i.accuracy, p_i.energy, -p_i.carbon_savings_kg, p_i.material_index]
                 b_vec = [-p_j.accuracy, p_j.energy, -p_j.carbon_savings_kg, p_j.material_index]
                 if all(b <= a for a, b in zip(a_vec, b_vec)) and any(b < a for a, b in zip(a_vec, b_vec)):
@@ -650,7 +690,6 @@ class SustainabilityCompressor:
         return pareto
 
     def _select_best_from_pareto(self, pareto_front: List[MOPDPoint]) -> Optional[MOPDPoint]:
-        """Select best point using scalarisation with MOPD weights."""
         if not pareto_front:
             return None
         weights = self.config.mopd.objective_weights
@@ -681,14 +720,30 @@ class SustainabilityCompressor:
                 best = point
         return best
 
-    # ---------- Main compression orchestration (enhanced with MOPD) ----------
+    # ---------- Temporal safety checks ----------
+    def _check_invariants(self, baseline_acc: float, compressed_acc: float, baseline_energy: float, compressed_energy: float) -> List[str]:
+        violations = []
+        if compressed_acc < baseline_acc - self.config.accuracy_drop_tolerance:
+            violations.append(f"Accuracy drop {baseline_acc - compressed_acc:.4f} exceeds tolerance {self.config.accuracy_drop_tolerance:.4f}")
+        if compressed_energy >= baseline_energy:
+            violations.append("Compressed energy not lower than baseline")
+        return violations
+
+    # ---------- Human approval ----------
+    async def request_approval(self, point: MOPDPoint) -> bool:
+        if not self.config.mopd.require_human_approval:
+            return True
+        # In a real system, would send request to human operator.
+        logger.warning(f"Human approval required for compression method {point.method}. Auto-denying.")
+        return False
+
+    # ---------- Main compression orchestration ----------
     async def evaluate_tradeoff_and_compress(
         self,
         val_loader: Any,
         sample_input: torch.Tensor,
         use_mopd: bool = True
     ) -> bool:
-        """Enhanced orchestration with MOPD."""
         self._restore_original()
 
         baseline_acc = self._evaluate_accuracy(self.model, val_loader)
@@ -701,7 +756,6 @@ class SustainabilityCompressor:
             logger.info(f"Expert {self.profile.expert_id} energy ({baseline_energy:.2f} J) within threshold. Skipping.")
             return False
 
-        # Generate Pareto front
         pareto_front = await self._generate_pareto_front(val_loader, sample_input, baseline_acc, baseline_energy)
 
         if not pareto_front:
@@ -711,18 +765,34 @@ class SustainabilityCompressor:
 
         self.profile.pareto_front = pareto_front
 
-        # Select best candidate
         if use_mopd and self.config.mopd.enabled:
             best_point = self._select_best_from_pareto(pareto_front)
         else:
-            # Legacy: choose lowest energy
             best_point = min(pareto_front, key=lambda p: p.energy)
 
         if best_point is None:
             self._restore_original()
             return False
 
-        # Re‑apply the selected method to the actual model
+        # Temporal safety check
+        if self.config.mopd.enable_temporal_safety:
+            violations = self._check_invariants(baseline_acc, best_point.accuracy, baseline_energy, best_point.energy)
+            if violations:
+                logger.error(f"Temporal safety violations: {violations}")
+                self._restore_original()
+                return False
+
+        # Human approval if aggressive
+        if self.config.mopd.require_human_approval:
+            accuracy_drop = baseline_acc - best_point.accuracy
+            if accuracy_drop > self.config.mopd.aggressive_threshold:
+                approved = await self.request_approval(best_point)
+                if not approved:
+                    logger.info("Human approval not granted; aborting compression.")
+                    self._restore_original()
+                    return False
+
+        # Apply selected method to actual model
         method_name = best_point.method
         sparsity_map = {
             'structured_pruning': self.config.pruning_sparsity,
@@ -733,16 +803,16 @@ class SustainabilityCompressor:
         }
         sparsity = sparsity_map.get(method_name)
 
-        original_copy = self._copy_model()
+        model_copy = self._copy_model()
         if sparsity is not None:
-            model_copy = getattr(self, f"apply_{method_name}")(sparsity)
+            model_copy = getattr(self, f"_apply_{method_name}")(model_copy, sparsity)
         else:
             if method_name == 'hybrid':
-                model_copy = self.apply_hybrid()
+                model_copy = self._apply_hybrid(model_copy)
             elif method_name == 'svd':
-                model_copy = self.apply_svd()
+                model_copy = self._apply_svd(model_copy)
             else:
-                model_copy = getattr(self, f"apply_{method_name}")()
+                model_copy = getattr(self, f"_apply_{method_name}")(model_copy)
 
         self.model.load_state_dict(model_copy.state_dict())
 
@@ -781,8 +851,48 @@ class SustainabilityCompressor:
         logger.info(f"Expert {self.profile.expert_id} compressed with {method_name}. "
                     f"Energy: {baseline_energy:.4f} → {best_point.energy:.4f} J, "
                     f"Accuracy: {baseline_acc:.4f} → {best_point.accuracy:.4f}, "
-                    f"Carbon saved: {best_point.carbon_savings_kg:.4f} kg CO₂")
+                    f"Carbon saved: {best_point.carbon_savings_kg:.4f} kg CO₂, "
+                    f"Explanation: {best_point.explanation}")
         return True
+
+    # Chaos testing
+    async def inject_fault(self, fault_type: str, **params):
+        if not self.config.mopd.enable_chaos_testing:
+            logger.info("Chaos testing disabled")
+            return
+        if fault_type == 'carbon_api_failure':
+            self.carbon_manager = CarbonIntensityManagerStub()
+        elif fault_type == 'telemetry_failure':
+            self.telemetry = TelemetryCollectorStub()
+        elif fault_type == 'high_energy':
+            self.config.energy_threshold = 0.0
+        else:
+            logger.warning(f"Unknown fault type: {fault_type}")
+
+    async def run_chaos_test(self, val_loader, sample_input) -> Dict[str, Any]:
+        if not self.config.mopd.enable_chaos_testing:
+            return {'status': 'disabled'}
+        report = {'faults': [], 'results': {}}
+        # Test carbon failure
+        await self.inject_fault('carbon_api_failure')
+        report['faults'].append('carbon_api_failure')
+        try:
+            success = await self.evaluate_tradeoff_and_compress(val_loader, sample_input)
+            report['results']['carbon_api_failure'] = f"compression_success={success}"
+        except Exception as e:
+            report['results']['carbon_api_failure'] = f"error: {e}"
+        # Reset
+        self.carbon_manager = CarbonIntensityManagerStub()
+        # Test telemetry failure
+        await self.inject_fault('telemetry_failure')
+        report['faults'].append('telemetry_failure')
+        try:
+            success = await self.evaluate_tradeoff_and_compress(val_loader, sample_input)
+            report['results']['telemetry_failure'] = f"compression_success={success}"
+        except Exception as e:
+            report['results']['telemetry_failure'] = f"error: {e}"
+        return report
+
 
 # ==============================================
 # 9. FITNESS SCORER (unchanged)
@@ -810,8 +920,9 @@ class SustainabilityFitnessScorer:
         profile.sustainability_fitness_score = fitness + compression_bonus
         return profile.sustainability_fitness_score
 
+
 # ==============================================
-# 10. MLOPS PIPELINE EXTENSION (ENHANCED WITH MOPD)
+# 10. MLOPS PIPELINE EXTENSION (with safe task start)
 # ==============================================
 
 class MLOpsPipelineExtension:
@@ -836,6 +947,7 @@ class MLOpsPipelineExtension:
         self._running = False
         self._recompress_task: Optional[asyncio.Task] = None
         self._compressed_acc_cache: Dict[str, float] = {}
+        self._started = False
 
     def _ensure_pipeline(self):
         if not hasattr(self.pipeline, 'model_registry') or not hasattr(self.pipeline, 'profile_registry'):
@@ -843,59 +955,28 @@ class MLOpsPipelineExtension:
         if not hasattr(self.pipeline, 'val_loaders'):
             self.pipeline.val_loaders = {}
 
-    async def on_expert_registered(
-        self,
-        expert_id: str,
-        model: torch.nn.Module,
-        profile: SustainabilityAwareExpertProfile,
-        val_loader: Any,
-    ) -> None:
-        self._ensure_pipeline()
-        profile.update_material_index(self.config)
-
-        if self.storage:
-            latest = self.history_manager.get_latest(expert_id)
-            if latest:
-                method = latest['method']
-                if self.storage.load(expert_id, method, model):
-                    profile.compressed_flag = True
-                    profile.compression_method = method
-                    profile.accuracy_compressed = latest['accuracy_after']
-                    profile.energy_per_inference_compressed = latest['energy_after']
-                    profile.carbon_savings_kg = latest['carbon_savings_kg']
-                    profile.last_compressed_at = datetime.fromisoformat(latest['timestamp'])
-                    self.pipeline.model_registry[expert_id] = model
-                    self.pipeline.profile_registry[expert_id] = profile
-                    self._compressed_acc_cache[expert_id] = profile.accuracy_compressed
-                    logger.info(f"Loaded compressed model for expert {expert_id} (method: {method})")
-                    return
-
-        if profile.energy_per_inference_full > self.config.energy_threshold:
-            logger.info(f"Triggering compression for expert {expert_id}...")
-            compressor = SustainabilityCompressor(
-                model, profile, self.config,
-                telemetry=self.telemetry,
-                carbon_manager=self.carbon_manager,
-                history_manager=self.history_manager,
-                storage=self.storage,
-                accuracy_fn=self.accuracy_fn
-            )
-            sample_input = next(iter(val_loader))[0]
-            async def compress():
-                success = await compressor.evaluate_tradeoff_and_compress(val_loader, sample_input)
-                if success:
-                    self.pipeline.model_registry[expert_id] = compressor.model
-                    self.pipeline.profile_registry[expert_id] = profile
-                    self._compressed_acc_cache[expert_id] = profile.accuracy_compressed
-                    # Also store Pareto front in pipeline if needed
-                    if hasattr(self.pipeline, 'pareto_fronts'):
-                        self.pipeline.pareto_fronts[expert_id] = profile.pareto_front
-            asyncio.create_task(compress())
-
-    async def start_recompress_loop(self):
-        if self.config.recompress_interval <= 0:
+    async def start(self):
+        """Start background re-compression loop if enabled."""
+        if self._started or not self.config.recompress_interval > 0:
             return
+        self._started = True
         self._running = True
+        self._recompress_task = asyncio.create_task(self._recompress_loop())
+        logger.info("Started re-compression loop")
+
+    async def stop(self):
+        if self._recompress_task:
+            self._recompress_task.cancel()
+            try:
+                await self._recompress_task
+            except asyncio.CancelledError:
+                pass
+            self._recompress_task = None
+        self._running = False
+        self._started = False
+        logger.info("Stopped re-compression loop")
+
+    async def _recompress_loop(self):
         while self._running:
             await asyncio.sleep(self.config.recompress_interval)
             await self._recompress_all()
@@ -926,15 +1007,59 @@ class MLOpsPipelineExtension:
                 if hasattr(self.pipeline, 'pareto_fronts'):
                     self.pipeline.pareto_fronts[expert_id] = profile.pareto_front
 
-    async def stop_recompress_loop(self):
-        self._running = False
-        if self._recompress_task:
-            self._recompress_task.cancel()
-            try:
-                await self._recompress_task
-            except asyncio.CancelledError:
-                pass
-            self._recompress_task = None
+    async def on_expert_registered(
+        self,
+        expert_id: str,
+        model: torch.nn.Module,
+        profile: SustainabilityAwareExpertProfile,
+        val_loader: Any,
+    ) -> None:
+        self._ensure_pipeline()
+        profile.update_material_index(self.config)
+
+        if self.storage:
+            latest = self.history_manager.get_latest(expert_id)
+            if latest:
+                method = latest['method']
+                if self.storage.load(expert_id, method, model):
+                    profile.compressed_flag = True
+                    profile.compression_method = method
+                    profile.accuracy_compressed = latest['accuracy_after']
+                    profile.energy_per_inference_compressed = latest['energy_after']
+                    profile.carbon_savings_kg = latest['carbon_savings_kg']
+                    profile.last_compressed_at = datetime.fromisoformat(latest['timestamp'])
+                    self.pipeline.model_registry[expert_id] = model
+                    self.pipeline.profile_registry[expert_id] = profile
+                    self._compressed_acc_cache[expert_id] = profile.accuracy_compressed
+                    # Load Pareto front if available
+                    pareto = self.history_manager.get_pareto_front(expert_id)
+                    if pareto:
+                        profile.pareto_front = pareto
+                    logger.info(f"Loaded compressed model for expert {expert_id} (method: {method})")
+                    return
+
+        if profile.energy_per_inference_full > self.config.energy_threshold:
+            logger.info(f"Triggering compression for expert {expert_id}...")
+            compressor = SustainabilityCompressor(
+                model, profile, self.config,
+                telemetry=self.telemetry,
+                carbon_manager=self.carbon_manager,
+                history_manager=self.history_manager,
+                storage=self.storage,
+                accuracy_fn=self.accuracy_fn
+            )
+            sample_input = next(iter(val_loader))[0]
+            # Run compression asynchronously in the current loop context
+            # This method is expected to be called within an async context.
+            # If not, caller should use asyncio.run or start a loop.
+            success = await compressor.evaluate_tradeoff_and_compress(val_loader, sample_input)
+            if success:
+                self.pipeline.model_registry[expert_id] = compressor.model
+                self.pipeline.profile_registry[expert_id] = profile
+                self._compressed_acc_cache[expert_id] = profile.accuracy_compressed
+                if hasattr(self.pipeline, 'pareto_fronts'):
+                    self.pipeline.pareto_fronts[expert_id] = profile.pareto_front
+                logger.info(f"Compressed expert {expert_id}")
 
     async def on_anomaly_detected(self, node_id: str, metrics: Dict):
         if not self.config.anomaly_trigger_enabled:
@@ -966,19 +1091,22 @@ class MLOpsPipelineExtension:
                 break
 
     async def shutdown(self):
-        await self.stop_recompress_loop()
+        await self.stop()
         logger.info("MLOpsPipelineExtension shutdown complete")
 
+
 # ==============================================
-# 11. ROUTER INTEGRATION (ENHANCED WITH MOPD)
+# 11. ROUTER INTEGRATION (Pareto-aware selection)
 # ==============================================
 
 class SustainabilityAwareRouter:
-    def __init__(self, base_router: Any, scorer: Optional[SustainabilityFitnessScorer] = None):
+    def __init__(self, base_router: Any, scorer: Optional[SustainabilityFitnessScorer] = None,
+                 config: SustainabilityConfig = None):
         self.base_router = base_router
-        self.scorer = scorer or SustainabilityFitnessScorer()
+        self.scorer = scorer or SustainabilityFitnessScorer(config)
+        self.config = config or SUSTAINABILITY_CONFIG
 
-    def route(self, query: Any, required_accuracy: float = 0.90, use_mopd: bool = True) -> Any:
+    def route(self, query: Any, required_accuracy: float = 0.90, use_mopd: Optional[bool] = None) -> Any:
         candidates = self.base_router.get_all_experts(query)
 
         valid_candidates = []
@@ -990,22 +1118,39 @@ class SustainabilityAwareRouter:
         if not valid_candidates:
             return self.base_router.route(query)
 
-        # If MOPD enabled and Pareto fronts are available, use them
-        if use_mopd and SUSTAINABILITY_CONFIG.mopd.enabled:
-            # For each expert, we could use its Pareto front to select
-            # For simplicity, we use the scalarised fitness (which already uses the MOPD weights)
-            # but a more advanced router could inspect the Pareto front.
-            pass
+        use_mopd = use_mopd if use_mopd is not None else self.config.mopd.enabled
 
-        for exp_id, profile in valid_candidates:
-            self.scorer.compute(profile)
-
-        best_exp_id, best_profile = max(valid_candidates, key=lambda x: x[1].sustainability_fitness_score)
-
-        if best_profile.compressed_flag:
-            return self.base_router.load_compressed_model(best_exp_id)
+        if use_mopd:
+            # Use Pareto front scalarisation if profiles have them
+            best_id = None
+            best_score = -float('inf')
+            for exp_id, profile in valid_candidates:
+                if profile.pareto_front:
+                    # Select best point in Pareto front
+                    best_point = max(profile.pareto_front, key=lambda p: p.scalarised_score)
+                    score = best_point.scalarised_score
+                else:
+                    # Fallback to fitness score
+                    self.scorer.compute(profile)
+                    score = profile.sustainability_fitness_score
+                if score > best_score:
+                    best_score = score
+                    best_id = exp_id
+                    best_profile = profile
+            if best_id is not None:
+                return self.base_router.load_compressed_model(best_id) if best_profile.compressed_flag else self.base_router.load_full_model(best_id)
         else:
-            return self.base_router.load_full_model(best_exp_id)
+            # Traditional fitness scoring
+            for _, profile in valid_candidates:
+                self.scorer.compute(profile)
+            best_exp_id, best_profile = max(valid_candidates, key=lambda x: x[1].sustainability_fitness_score)
+            if best_profile.compressed_flag:
+                return self.base_router.load_compressed_model(best_exp_id)
+            else:
+                return self.base_router.load_full_model(best_exp_id)
+
+        return self.base_router.route(query)
+
 
 # ==============================================
 # 12. CONVENIENCE EXPORTS
@@ -1019,6 +1164,8 @@ __all__ = [
     "MLOpsPipelineExtension",
     "SustainabilityAwareRouter",
     "MOPDPoint",
+    "MOPDConfig",
+    "FederatedConfig",
 ]
 
 # ==============================================
@@ -1031,4 +1178,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Validation error: {e}")
 
-    print("Enhanced sustainability module v3.1.0 with MOPD loaded.")
+    print("Enhanced sustainability module v3.2.0 with MOPD, XAI, safety, approval, chaos, and federated support loaded.")
