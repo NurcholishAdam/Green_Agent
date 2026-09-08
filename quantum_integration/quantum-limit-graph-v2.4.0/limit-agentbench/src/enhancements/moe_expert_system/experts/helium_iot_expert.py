@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 # File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/experts/helium_iot_expert.py
-# Version 3.3.0 – Full Green Agent MODP Integration
-
-"""
-Enhanced Helium IoT Expert v3.3.0 – Full Green Agent MODP Integration
-
-ENHANCEMENTS OVER v3.2.0:
-1. Fixed critical bugs: safe async task creation, generic metric methods, async get_metrics,
-   dataclass config serialization, robust circuit breaker fallback, use provided helium manager.
-2. Deep bio‑inspired integration: ATP spend/earn, gradient fields, compartment manager.
-3. Real MODP: multi‑objective metrics, adaptive cost compute, Pareto filtering on all options,
-   drift‑triggered adaptation.
-4. Enhanced teacher policy (`policy_probs`) as a true context‑aware MoE teacher distribution.
-5. Improved persistence and observability.
-6. All optional dependencies still gracefully degrade.
-"""
+# Version 3.4.0 – Enhanced Green Agent MODP Integration
+#
+# ENHANCEMENTS OVER v3.3.0:
+# 1. Fixed get_metrics to be async, matching MoE interface.
+# 2. Initialized atp_cost variable safely.
+# 3. Implemented actual swarm coordination (shares recommendation summaries).
+# 4. Added XAI explanations for each trade-off option.
+# 5. policy_probs now uses real context metrics.
+# 6. Added human-in-the-loop flag for critical decisions (requires_approval).
+# 7. Added temporal safety cooldown for drastic actions.
+# 8. Minor bug fixes and code cleanup.
 
 import asyncio
 import json
@@ -105,7 +101,7 @@ except ImportError:
             raise NotImplementedError()
         def get_capabilities(self) -> Dict[str, Any]:
             return {'name': self.expert_name, 'supported_tasks': self.supported_task_types, 'health': self.health_status}
-        def get_metrics(self) -> Dict[str, Any]:
+        async def get_metrics(self) -> Dict[str, Any]:
             return {}
 
 # Optional: bio-inspired core
@@ -121,7 +117,7 @@ except ImportError:
             self.data = data or {}
 
 # ============================================================================
-# Configuration – now a dataclass for easy serialization
+# Configuration – dataclass for serialization
 # ============================================================================
 @dataclass
 class HeliumIoTExpertConfig:
@@ -135,6 +131,7 @@ class HeliumIoTExpertConfig:
     enable_time_tick_engine: bool = getattr(central_config, "he_iot_enable_time_tick_engine", True)
     enable_swarm_coordination: bool = getattr(central_config, "he_iot_enable_swarm_coordination", True)
     enable_self_healing: bool = getattr(central_config, "he_iot_enable_self_healing", True)
+    human_approval_required: bool = getattr(central_config, "he_iot_human_approval_required", True)
 
     thresholds: Dict[str, float] = field(default_factory=lambda: {
         'helium_scarcity_high': float(os.getenv('HELIUM_SCARCITY_HIGH', '0.6')),
@@ -154,7 +151,7 @@ class HeliumIoTExpertConfig:
     })
 
 # ============================================================================
-# Concrete HeliumProvider (simulated but realistic) – uses central helium manager if available
+# Concrete HeliumProvider (simulated) – uses central helium manager if available
 # ============================================================================
 class SimulatedHeliumProvider:
     def __init__(self):
@@ -176,12 +173,13 @@ class SimulatedHeliumProvider:
             return self._cost
 
     async def get_forecast(self, hours: int = 4) -> List[float]:
-        if len(self._trend) < 10:
-            return [self._scarcity] * hours
-        last_values = list(self._trend)[-10:]
-        slope = (last_values[-1] - last_values[0]) / 9
-        forecast = [last_values[-1] + slope * (i+1) for i in range(hours)]
-        return [max(0.0, min(1.0, v)) for v in forecast]
+        async with self._lock:
+            if len(self._trend) < 10:
+                return [self._scarcity] * hours
+            last_values = list(self._trend)[-10:]
+            slope = (last_values[-1] - last_values[0]) / 9
+            forecast = [last_values[-1] + slope * (i+1) for i in range(hours)]
+            return [max(0.0, min(1.0, v)) for v in forecast]
 
 # ============================================================================
 # Concrete PredictiveAnalyzer (simulated)
@@ -204,11 +202,20 @@ class SimulatedPredictiveAnalyzer:
         }
 
 # ============================================================================
-# Helium IoT Expert – Fully Integrated v3.3.0
+# Helium IoT Expert – Enhanced v3.4.0
 # ============================================================================
 class HeliumIoTExpert(BaseExpert):
     """
-    Helium IoT Expert v3.3.0 – Full Green Agent MODP integration.
+    Helium IoT Expert v3.4.0 – Enhanced Green Agent MODP integration.
+
+    Improvements over v3.3.0:
+      - Fixed get_metrics to be async.
+      - Safe atp_cost initialization.
+      - Implemented swarm coordination.
+      - Added XAI explanations for trade-off options.
+      - policy_probs uses real context.
+      - Human-in-the-loop flag for critical decisions.
+      - Temporal safety cooldown for drastic actions.
     """
 
     def __init__(
@@ -241,11 +248,9 @@ class HeliumIoTExpert(BaseExpert):
         self.helium_manager = helium_manager
         self.carbon_manager = carbon_manager
 
-        # Configuration – built from central_config
         self.config = HeliumIoTExpertConfig()
 
-        # Sub‑modules
-        # Use provided helium_manager if available, else SimulatedHeliumProvider
+        # Helium provider: use provided helium_manager if available else simulated
         if helium_manager is not None:
             self.helium_provider = helium_manager
         else:
@@ -270,11 +275,15 @@ class HeliumIoTExpert(BaseExpert):
         # Circuit breaker (central)
         self._helium_circuit = EnhancedCircuitBreaker("helium_provider")
 
+        # Temporal safety: track last drastic actions (cooldown)
+        self._last_drastic_action_time: Optional[datetime] = None
+        self._drastic_action_cooldown_seconds = 300  # 5 minutes
+
         # Event subscriptions (if bio‑core available)
         if self.bio_core:
             self._subscribe_events()
 
-        logger.info(f"HeliumIoTExpert v3.3.0 initialized with ID {self.config.expert_id}")
+        logger.info(f"HeliumIoTExpert v3.4.0 initialized with ID {self.config.expert_id}")
 
     def _create_task(self, coro):
         try:
@@ -370,29 +379,35 @@ class HeliumIoTExpert(BaseExpert):
         """
         Return a probability distribution over IoT strategies,
         computed using adaptive cost and Pareto constraints.
+        Uses current context to derive realistic metrics.
         """
+        # Extract context metrics
+        helium_scarcity = self._last_context.get('helium_scarcity', 0.5)
+        network_latency = self._last_context.get('network_latency_ms', 50.0)
+        battery_level = self._last_context.get('battery_level', 0.8)
+
         strategies = ['reduce_sampling', 'enable_compressed', 'use_closer_gateways', 'enable_power_saving']
         candidates = []
         for strategy in strategies:
-            # Estimate metrics for each strategy
+            # Compute metrics based on current context
             if strategy == 'reduce_sampling':
-                quality = 0.7
-                carbon_g = 2.0   # proxy for helium savings? we'll map separately
-                latency_ms = 60.0
-                energy_joules = 30.0
+                quality = 0.9 - helium_scarcity * 0.3  # lower quality when scarcity high?
+                carbon_g = helium_scarcity * 5.0        # proxy: helium savings benefit
+                latency_ms = 50.0 + helium_scarcity * 20.0
+                energy_joules = 25.0 + helium_scarcity * 10.0
             elif strategy == 'enable_compressed':
-                quality = 0.75
-                carbon_g = 1.5
-                latency_ms = 80.0
+                quality = 0.8
+                carbon_g = helium_scarcity * 4.0
+                latency_ms = 70.0 + network_latency * 0.1
                 energy_joules = 20.0
             elif strategy == 'use_closer_gateways':
                 quality = 0.85
-                carbon_g = 1.0
-                latency_ms = 30.0
+                carbon_g = helium_scarcity * 2.0
+                latency_ms = 40.0 - min(20.0, network_latency * 0.2)  # reduces latency
                 energy_joules = 15.0
             elif strategy == 'enable_power_saving':
-                quality = 0.6
-                carbon_g = 0.5
+                quality = 0.7 - battery_level * 0.2
+                carbon_g = helium_scarcity * 1.0
                 latency_ms = 100.0
                 energy_joules = 5.0
             else:
@@ -462,12 +477,8 @@ class HeliumIoTExpert(BaseExpert):
             'config': asdict(self.config),
         }
 
-    def get_metrics(self) -> Dict[str, Any]:
-        # Return sync dict, no asyncio.run
-        return {
-            'proposals_count': self._proposals_count,
-            'last_error': self.last_error,
-        }
+    async def get_metrics(self) -> Dict[str, Any]:
+        return await self._get_expert_metrics()
 
     async def get_health_status(self) -> Dict[str, Any]:
         return {
@@ -487,7 +498,7 @@ class HeliumIoTExpert(BaseExpert):
     # --------------------------------------------------------------------------
     # Threshold Management
     # --------------------------------------------------------------------------
-    def get_thresholds(self) -> Dict[str, float]:
+    def get_thresholds_sync(self) -> Dict[str, float]:
         return self.thresholds
 
     async def set_thresholds(self, thresholds: Dict[str, float]):
@@ -501,10 +512,13 @@ class HeliumIoTExpert(BaseExpert):
     async def propose_async(self, context: dict) -> dict:
         self._last_context.update(context)
 
+        # Initialize atp_cost safely
+        atp_cost = 0.0
+
         try:
             # Bio-inspired: spend ATP before computation
             if self.token_manager:
-                atp_cost = 0.05  # base cost
+                atp_cost = 0.05
                 await self.token_manager.spend("helium_iot_expert", atp_cost)
 
             # 1. Gather data using circuit breakers
@@ -528,7 +542,7 @@ class HeliumIoTExpert(BaseExpert):
                 battery_level=device_data['battery']
             )
 
-            # 4. Build alternative trade‑off options
+            # 4. Build alternative trade-off options
             options = await self._build_tradeoff_options(
                 helium_scarcity=helium_data['scarcity'],
                 helium_cost=helium_data['cost'],
@@ -536,13 +550,24 @@ class HeliumIoTExpert(BaseExpert):
                 battery_level=device_data['battery']
             )
 
-            # 5. Generate explanation
+            # 5. Generate explanation (primary)
             explanation = self._generate_explanation(
                 primary, helium_data, network_data, device_data
             )
 
-            # 6. Swarm coordination (stub)
-            # ...
+            # 6. Swarm coordination: share summary if enabled
+            if self.config.enable_swarm_coordination and hasattr(self.bio_core, 'swarm_coordinator'):
+                try:
+                    swarm_payload = {
+                        'expert': self.expert_name,
+                        'recommendation': primary,
+                        'helium_scarcity': helium_data['scarcity'],
+                        'timestamp': datetime.now(timezone.utc).isoformat()
+                    }
+                    await self.bio_core.swarm_coordinator.share_prediction(swarm_payload)
+                    logger.debug("Swarm coordination update sent")
+                except Exception as e:
+                    logger.warning(f"Swarm coordination failed: {e}")
 
             # 7. Persist history
             await self._save_history({
@@ -553,7 +578,7 @@ class HeliumIoTExpert(BaseExpert):
             })
 
             # 8. Bio-inspired: earn ATP if high-quality proposal; pump gradients
-            quality = 0.9  # placeholder; could be based on helium savings
+            quality = self._calculate_quality(primary, helium_data['scarcity'])
             if self.token_manager:
                 if quality > 0.7:
                     await self.token_manager.earn("helium_iot_expert", atp_cost * 2)
@@ -567,7 +592,19 @@ class HeliumIoTExpert(BaseExpert):
             self.last_error = None
             self._proposals_count += 1
 
-            # Publish FeedbackEvent
+            # 10. Temporal safety: check if drastic action needs cooldown
+            requires_approval = False
+            if self._is_drastic_action(primary, helium_data['scarcity']):
+                if self._last_drastic_action_time and (datetime.now(timezone.utc) - self._last_drastic_action_time).total_seconds() < self._drastic_action_cooldown_seconds:
+                    logger.warning("Drastic action within cooldown period; requiring human approval.")
+                    requires_approval = True
+                else:
+                    self._last_drastic_action_time = datetime.now(timezone.utc)
+                # If human approval required and this is a drastic action, flag it
+                if self.config.human_approval_required and not requires_approval:
+                    requires_approval = True  # Always require approval for drastic actions if config set
+
+            # 11. Publish FeedbackEvent
             event = FeedbackEvent.create_with_context(
                 task_id=f"he_iot_propose_{uuid.uuid4().hex[:8]}",
                 selected_action="propose",
@@ -576,7 +613,12 @@ class HeliumIoTExpert(BaseExpert):
                 carbon_g=0.0,
                 feedback_type="helium_iot",
                 adaptive_cost_value=0.0,
-                state=context,
+                state={
+                    **context,
+                    'requires_approval': requires_approval,
+                    'recommendation': primary,
+                    'explanation': explanation,
+                },
                 candidates=[{'action': s} for s in ['reduce_sampling', 'enable_compressed', 'use_closer_gateways', 'enable_power_saving']],
                 source="helium_iot_expert",
                 environment=getattr(central_config, "ENVIRONMENT", "production"),
@@ -593,7 +635,8 @@ class HeliumIoTExpert(BaseExpert):
             return {
                 'recommendations': primary,
                 'options': options,
-                'explanation': explanation
+                'explanation': explanation,
+                'requires_approval': requires_approval
             }
 
         except Exception as e:
@@ -610,8 +653,33 @@ class HeliumIoTExpert(BaseExpert):
             return {
                 'recommendations': fallback,
                 'options': [],
-                'explanation': f"Due to an error ({e}), a conservative fallback has been applied."
+                'explanation': f"Due to an error ({e}), a conservative fallback has been applied.",
+                'requires_approval': False
             }
+
+    # --------------------------------------------------------------------------
+    # Helper: Quality Calculation
+    # --------------------------------------------------------------------------
+    def _calculate_quality(self, recommendation: Dict[str, Any], helium_scarcity: float) -> float:
+        # Simple quality metric: better if saving helium while maintaining data quality
+        if 'sampling_rate_hz' in recommendation:
+            base_rate = self.thresholds['sampling_rate_high']
+            if helium_scarcity > self.thresholds['helium_scarcity_high']:
+                # Lower sampling is desirable; quality is high if not too low
+                return max(0.5, 1.0 - (base_rate - recommendation['sampling_rate_hz']) / base_rate * 0.5)
+            else:
+                return 1.0 - (base_rate - recommendation['sampling_rate_hz']) / base_rate * 0.1
+        return 0.8
+
+    def _is_drastic_action(self, recommendation: Dict[str, Any], helium_scarcity: float) -> bool:
+        # Drastic if sampling rate <= critical or power saving mode enabled
+        if helium_scarcity > self.thresholds['helium_scarcity_critical']:
+            return True
+        if recommendation.get('sampling_rate_hz', 10) <= self.thresholds['sampling_rate_critical']:
+            return True
+        if recommendation.get('power_saving_mode', False):
+            return True
+        return False
 
     # --------------------------------------------------------------------------
     # Data Gathering Helpers (with circuit breakers)
@@ -685,7 +753,7 @@ class HeliumIoTExpert(BaseExpert):
         else:
             rec['preferred_gateways'] = []
 
-        # Battery‑aware override
+        # Battery-aware override
         if battery_level < self.thresholds['battery_low_threshold']:
             rec['sampling_rate_hz'] = min(rec['sampling_rate_hz'], 2.0)
             rec['power_saving_mode'] = True
@@ -720,8 +788,9 @@ class HeliumIoTExpert(BaseExpert):
                 'priority': 'high',
                 'latency_ms': 60.0,
                 'energy_joules': 30.0,
-                'carbon_g': 2.0,  # proxy for helium savings? we'll use separate key
-                'quality_score': 1.0 - 0.05,
+                'carbon_g': 2.0,
+                'quality_score': 0.95,
+                'explanation': f"Reduce sampling rate to save helium (scarcity {helium_scarcity:.2f}); slightly lower data quality."
             }
             options.append(option)
 
@@ -736,6 +805,7 @@ class HeliumIoTExpert(BaseExpert):
                 'energy_joules': 20.0,
                 'carbon_g': 1.5,
                 'quality_score': 0.75,
+                'explanation': f"Use compressed aggregation to reduce bandwidth and helium usage; slight latency increase."
             }
             options.append(option)
 
@@ -750,10 +820,11 @@ class HeliumIoTExpert(BaseExpert):
                 'energy_joules': 15.0,
                 'carbon_g': 1.0,
                 'quality_score': 0.85,
+                'explanation': f"Route through closer gateways to reduce latency by ~20 ms; minor cost increase."
             }
             options.append(option)
 
-        # Option D: Enable power‑saving mode
+        # Option D: Enable power-saving mode
         if battery_level < 0.3:
             option = {
                 'action': 'enable_power_saving',
@@ -764,6 +835,7 @@ class HeliumIoTExpert(BaseExpert):
                 'energy_joules': 5.0,
                 'carbon_g': 0.5,
                 'quality_score': 0.6,
+                'explanation': f"Enable power-saving to extend battery life; accept 10% data quality loss."
             }
             options.append(option)
 
@@ -777,7 +849,6 @@ class HeliumIoTExpert(BaseExpert):
                     'carbon_g': opt.get('carbon_g', 0.0),
                     'latency_ms': opt.get('latency_ms', 0.0),
                     'energy_joules': opt.get('energy_joules', 0.0),
-                    # Keep extra info for later
                     'opt': opt,
                 })
             filtered = self.pareto.filter(candidates)
@@ -817,7 +888,7 @@ class HeliumIoTExpert(BaseExpert):
         parts = []
         helium_scarcity = helium_data.get('scarcity', 0.5)
         if helium_scarcity > self.thresholds['helium_scarcity_critical']:
-            parts.append(f"Helium scarcity is critical ({helium_scarcity:.2f}), so we reduced sampling rate to {recommendation['sampling_rate_hz']:.1f} Hz and enabled power‑saving mode.")
+            parts.append(f"Helium scarcity is critical ({helium_scarcity:.2f}), so we reduced sampling rate to {recommendation['sampling_rate_hz']:.1f} Hz and enabled power-saving mode.")
         elif helium_scarcity > self.thresholds['helium_scarcity_high']:
             parts.append(f"Helium scarcity is high ({helium_scarcity:.2f}), so we reduced sampling rate to {recommendation['sampling_rate_hz']:.1f} Hz and switched to compressed aggregation.")
         else:
@@ -887,10 +958,10 @@ class HeliumIoTExpert(BaseExpert):
                 logger.warning(f"Drift check failed: {e}")
 
     # --------------------------------------------------------------------------
-    # Self‑Healing
+    # Self-Healing
     # --------------------------------------------------------------------------
     async def self_heal(self):
-        logger.info("HeliumIoTExpert self‑healing")
+        logger.info("HeliumIoTExpert self-healing")
         if self.config.enable_self_healing:
             self.thresholds = self.config.thresholds.copy()
             await self._save_thresholds()
