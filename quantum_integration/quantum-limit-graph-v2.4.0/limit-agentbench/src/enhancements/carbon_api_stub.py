@@ -10,6 +10,15 @@ Provides:
 - A CarbonIntensityFetcher adapter that exposes async methods compatible with
   FlexGen/MODP modules (get_current_intensity, forecast_carbon_prices).
 
+NEW ENHANCEMENTS (v2.0):
+- CarbonOffsetBroker: purchase carbon offsets when intensity exceeds threshold.
+- Safety checks: is_safe() method in CarbonIntensityFetcher.
+- Feedback loop for stub: update_from_feedback() to adjust simulation.
+- ChaosCarbonAPI wrapper for resilience testing.
+- Explainability metadata in forecast responses.
+- FederatedCarbonAggregator for combining data from multiple deployments.
+- Simple temporal safety rules (e.g., intensity must not exceed limit for too long).
+
 Usage:
     Set environment variable CARBON_API_MODE=stub|real.
     Optionally set CARBON_API_KEY, CARBON_API_REGION, CARBON_API_CACHE_TTL.
@@ -91,6 +100,7 @@ class CarbonAPIStub(CarbonAPI):
         self.noise_std = noise_std
         self._start_time = start_time or time.time()
         self._rng = random.Random(42)  # deterministic for testing if needed
+        self._recent_feedback = []  # store feedback for adaptation
 
     def _simulate(self, timestamp: float) -> float:
         """Compute intensity at a given timestamp."""
@@ -118,6 +128,19 @@ class CarbonAPIStub(CarbonAPI):
             ts = now + i * 60
             forecast.append((ts, self._simulate(ts)))
         return forecast
+
+    def update_from_feedback(self, actual_intensity: float):
+        """
+        Adjust the stub's baseline parameters based on feedback from real data.
+        This is a simple online learning mechanism.
+        """
+        self._recent_feedback.append(actual_intensity)
+        if len(self._recent_feedback) > 10:
+            self._recent_feedback.pop(0)
+        if self._recent_feedback:
+            self.base = sum(self._recent_feedback) / len(self._recent_feedback)
+            # Reduce noise to make simulation more stable after feedback
+            self.noise_std = max(1.0, self.noise_std * 0.95)
 
 
 # ----------------------------------------------------------------------
@@ -216,6 +239,53 @@ class RealCarbonAPI(CarbonAPI):
 
 
 # ----------------------------------------------------------------------
+# Chaos Wrapper for Resilience Testing
+# ----------------------------------------------------------------------
+
+class ChaosCarbonAPI(CarbonAPI):
+    """
+    Wraps any CarbonAPI instance and injects random failures to test
+    downstream resilience. Useful for chaos engineering experiments.
+
+    Args:
+        base_api: Underlying CarbonAPI instance.
+        failure_probability: Probability of failure on any call (0-1).
+        delay_mean: Mean delay (seconds) to add before returning.
+        delay_std: Standard deviation of delay.
+        seed: Random seed for reproducibility.
+    """
+    def __init__(
+        self,
+        base_api: CarbonAPI,
+        failure_probability: float = 0.1,
+        delay_mean: float = 0.5,
+        delay_std: float = 0.2,
+        seed: Optional[int] = None,
+    ):
+        self.api = base_api
+        self.failure_prob = failure_probability
+        self.delay_mean = delay_mean
+        self.delay_std = delay_std
+        self._rng = random.Random(seed)
+
+    def _maybe_fail_or_delay(self):
+        # Simulate delay
+        if self.delay_mean > 0:
+            time.sleep(max(0, self._rng.gauss(self.delay_mean, self.delay_std)))
+        # Simulate failure
+        if self._rng.random() < self.failure_prob:
+            raise Exception("Simulated carbon API failure")
+
+    def get_current(self) -> float:
+        self._maybe_fail_or_delay()
+        return self.api.get_current()
+
+    def get_forecast(self, minutes: int = 60) -> List[Tuple[float, float]]:
+        self._maybe_fail_or_delay()
+        return self.api.get_forecast(minutes)
+
+
+# ----------------------------------------------------------------------
 # Factory to get the appropriate implementation
 # ----------------------------------------------------------------------
 
@@ -234,6 +304,98 @@ def get_carbon_api(mode: Optional[str] = None, **kwargs) -> CarbonAPI:
 
 
 # ----------------------------------------------------------------------
+# Carbon Offset Broker (for purchasing carbon credits)
+# ----------------------------------------------------------------------
+
+class CarbonOffsetBroker:
+    """
+    Handles purchasing of carbon offsets when carbon intensity exceeds a threshold.
+    This is a stub implementation that simulates the purchase and returns a receipt.
+    In production, you would integrate with a real marketplace (e.g., Patch, Cloverly).
+    """
+    def __init__(
+        self,
+        threshold_intensity: float = 400.0,
+        cost_per_kg_co2: float = 0.10,
+        api_key: Optional[str] = None,
+    ):
+        self.threshold = threshold_intensity
+        self.cost_per_kg = cost_per_kg_co2
+        self.api_key = api_key or os.environ.get("CARBON_OFFSET_API_KEY")
+        self.total_offset_kg = 0.0
+        self.total_cost = 0.0
+
+    def should_offset(self, current_intensity: float) -> bool:
+        """Return True if current intensity exceeds threshold and offsetting is recommended."""
+        return current_intensity > self.threshold
+
+    def purchase_offsets(self, co2_kg: float, metadata: Optional[Dict] = None) -> Dict:
+        """
+        Simulate purchasing offsets for the given amount of CO2.
+        Returns a receipt with transaction details.
+        """
+        if co2_kg <= 0:
+            return {"status": "no_action", "message": "No offset needed"}
+        cost = co2_kg * self.cost_per_kg
+        self.total_offset_kg += co2_kg
+        self.total_cost += cost
+        receipt = {
+            "status": "success",
+            "offset_kg": co2_kg,
+            "cost_usd": cost,
+            "timestamp": time.time(),
+            "provider": "mock_offset_provider",
+            "metadata": metadata or {},
+        }
+        return receipt
+
+
+# ----------------------------------------------------------------------
+# Federated Aggregator (combines data from multiple deployments)
+# ----------------------------------------------------------------------
+
+class FederatedCarbonAggregator:
+    """
+    Aggregates carbon intensity data from multiple sources/deployments
+    using a simple average (FedAvg-like) approach. This can be extended
+    with more sophisticated federated learning algorithms.
+    """
+    def __init__(self):
+        self.participant_data: Dict[str, List[float]] = {}
+        self.last_aggregation_time = None
+
+    def add_participant_data(self, participant_id: str, intensities: List[float]):
+        """Add a list of recent intensity readings from a participant."""
+        self.participant_data[participant_id] = intensities
+
+    def aggregate(self) -> Dict:
+        """
+        Compute the federated average of the latest readings from all participants.
+        Returns a dict with summary statistics.
+        """
+        if not self.participant_data:
+            return {"status": "no_data", "average": None}
+
+        all_values = []
+        for pid, values in self.participant_data.items():
+            if values:
+                # Use the most recent value from each participant
+                all_values.append(values[-1])
+
+        if not all_values:
+            return {"status": "no_data", "average": None}
+
+        avg = sum(all_values) / len(all_values)
+        self.last_aggregation_time = time.time()
+        return {
+            "status": "success",
+            "average": avg,
+            "count": len(all_values),
+            "timestamp": self.last_aggregation_time,
+        }
+
+
+# ----------------------------------------------------------------------
 # CarbonIntensityFetcher adapter for FlexGen / MODP
 # ----------------------------------------------------------------------
 
@@ -244,9 +406,14 @@ class CarbonIntensityFetcher:
 
     - `async get_current_intensity()` -> float
     - `async forecast_carbon_prices(hours)` -> dict with 'status' and 'predictions'
+    - `async is_safe(threshold)` -> bool for safety monitoring
+    - `async purchase_offsets(co2_kg)` -> dict (optional)
+    - `update_feedback(actual_intensity)` -> None (for learning)
     """
     def __init__(self, api: Optional[CarbonAPI] = None, mode: Optional[str] = None, **kwargs):
         self.api = api or get_carbon_api(mode, **kwargs)
+        self.offset_broker = CarbonOffsetBroker()  # default threshold
+        self.federated = FederatedCarbonAggregator()  # for future use
 
     async def get_current_intensity(self) -> float:
         """Return current carbon intensity asynchronously."""
@@ -261,6 +428,8 @@ class CarbonIntensityFetcher:
             'predictions': [float, ...],   # hourly average intensity for next `hours`
             'timestamps': [float, ...],    # optional Unix timestamps
             'region': str,                 # optional
+            'source': str,                 # 'stub' or 'real' (added for XAI)
+            'cache_age_sec': float,        # optional, if from cache
         }
         """
         minutes = hours * 60
@@ -279,12 +448,65 @@ class CarbonIntensityFetcher:
         timestamps = sorted(hourly.keys())
         predictions = [sum(hourly[ts]) / len(hourly[ts]) for ts in timestamps]
 
+        # Add metadata for explainability
+        source = "stub" if isinstance(self.api, CarbonAPIStub) else "real"
+        metadata = {
+            "source": source,
+            "region": getattr(self.api, 'region', 'unknown'),
+            "forecast_points": len(predictions),
+            "cache_age_sec": 0.0,  # could be computed if caching is used
+        }
+
         return {
             "status": "success",
             "predictions": predictions,
             "timestamps": timestamps,
-            "region": getattr(self.api, 'region', 'unknown'),
+            "region": metadata["region"],
+            "source": metadata["source"],
+            "metadata": metadata,
         }
+
+    async def is_safe(self, threshold: float = 500.0) -> bool:
+        """
+        Check if current carbon intensity is below a safety threshold.
+        Returns True if safe, False otherwise.
+        """
+        intensity = await self.get_current_intensity()
+        return intensity <= threshold
+
+    async def purchase_offsets(self, co2_kg: float) -> Dict:
+        """Purchase carbon offsets for a given amount of CO2."""
+        return await asyncio.to_thread(self.offset_broker.purchase_offsets, co2_kg)
+
+    def update_feedback(self, actual_intensity: float):
+        """
+        Provide feedback to the underlying API (if it's a stub) to improve its simulation.
+        This is a form of active learning.
+        """
+        if isinstance(self.api, CarbonAPIStub):
+            self.api.update_from_feedback(actual_intensity)
+
+    async def run_safety_check(self, max_consecutive_minutes: int = 30, threshold: float = 500.0) -> Dict:
+        """
+        Simple temporal logic check: returns False if carbon intensity has exceeded
+        the threshold for more than max_consecutive_minutes (based on forecast).
+        """
+        # Use forecast to estimate future intensity
+        forecast = await asyncio.to_thread(self.api.get_forecast, max_consecutive_minutes)
+        if not forecast:
+            return {"safe": False, "reason": "No forecast data"}
+
+        # Check if all forecast points are above threshold
+        consecutive_high = 0
+        for ts, intensity in forecast:
+            if intensity > threshold:
+                consecutive_high += 10  # forecast interval is 10 minutes in stub
+            else:
+                consecutive_high = 0
+            if consecutive_high >= max_consecutive_minutes:
+                return {"safe": False, "reason": f"Intensity above {threshold} for too long"}
+
+        return {"safe": True}
 
 
 # ----------------------------------------------------------------------
@@ -306,12 +528,47 @@ if __name__ == "__main__":
     fetcher = CarbonIntensityFetcher(api)
 
     async def async_demo():
+        # Current intensity
         current = await fetcher.get_current_intensity()
-        forecast = await fetcher.forecast_carbon_prices(hours=6)
         print(f"\nAsync current intensity: {current:.1f}")
-        print(f"Async forecast status: {forecast['status']}, points: {len(forecast.get('predictions', []))}")
+
+        # Forecast
+        forecast = await fetcher.forecast_carbon_prices(hours=6)
+        print(f"Async forecast status: {forecast['status']}, source: {forecast['metadata']['source']}")
         if forecast['predictions']:
             print(f"First 3 hourly predictions: {[round(p,1) for p in forecast['predictions'][:3]]}")
+
+        # Safety check
+        safe = await fetcher.is_safe(threshold=450)
+        print(f"Safety check (threshold 450): {'safe' if safe else 'unsafe'}")
+
+        # Temporal safety check
+        temporal = await fetcher.run_safety_check(max_consecutive_minutes=20, threshold=450)
+        print(f"Temporal safety check: {temporal}")
+
+        # Offset purchase
+        receipt = await fetcher.purchase_offsets(co2_kg=2.5)
+        print(f"Offset purchase: {receipt['status']}, cost: ${receipt['cost_usd']:.2f}")
+
+        # Feedback update (simulate real observation)
+        fetcher.update_feedback(210.0)
+        print("Feedback update applied to stub.")
+
+        # Demonstrate chaos wrapper
+        chaos_api = ChaosCarbonAPI(api, failure_probability=0.3, delay_mean=0.1)
+        chaos_fetcher = CarbonIntensityFetcher(chaos_api)
+        try:
+            chaos_current = await chaos_fetcher.get_current_intensity()
+            print(f"Chaos API current intensity: {chaos_current:.1f}")
+        except Exception as e:
+            print(f"Chaos API failed as expected: {e}")
+
+        # Federated aggregation demo
+        fed = FederatedCarbonAggregator()
+        fed.add_participant_data("deployment1", [300, 310, 320])
+        fed.add_participant_data("deployment2", [280, 290, 295])
+        agg = fed.aggregate()
+        print(f"Federated aggregation: {agg}")
 
     asyncio.run(async_demo())
 
