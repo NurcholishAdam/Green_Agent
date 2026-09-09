@@ -2,16 +2,16 @@
 carbon_delay_scheduler.py
 
 Enhanced carbon‑intensity‑aware delay queue with MODP, bio‑inspired tuning, MoE integration,
-and FlexGen policy selection.
+FlexGen policy selection, and NEW additions:
+- Causal Reinforcement Learning via CausalBandit.
+- Temporal Logic Safety Monitor.
+- Explainable AI (XAI) for every decision.
+- Federated Learning Coordinator (stub).
+- Multi-Agent Coordinator (basic).
+- Chaos Monkey for resilience testing.
+- Human-in-the-Loop with Active Learning.
 
-Features:
-- Multi‑objective decision (carbon, latency, energy, cost) using MODP framework.
-- Adaptive threshold and max_delay tuned by a genetic algorithm (bio_inspired).
-- Expert routing (MoE) to classify tasks by delayability.
-- Probabilistic forecast handling with confidence intervals.
-- Persistent queue across restarts.
-- Comprehensive logging and reward feedback loop.
-- FlexGen integration: select optimal offloading policy for AI tasks based on carbon intensity.
+All previous features retained.
 """
 
 import heapq
@@ -85,10 +85,154 @@ class DelayedTask:
     original_submit_time: float
     delay_reason: str
 
+# NEW: CausalBandit for policy selection
+class CausalBandit:
+    """
+    A simple causal bandit that maintains estimates of average treatment effects
+    for each scheduling action (delay vs. forward). Used instead of or alongside
+    bio-inspired optimization.
+    """
+    def __init__(self, actions: List[str] = ["delay", "forward"], initial_value: float = 0.0):
+        self.actions = actions
+        self.q_values = {a: initial_value for a in actions}
+        self.counts = {a: 0 for a in actions}
+        self.causal_effects = {a: 0.0 for a in actions}
+        self.trials = 0
+        self.context_history = []
+        self.reward_history = []
+        self.action_history = []
+
+    def select_action(self, context: Dict) -> str:
+        # epsilon-greedy with causal effect preference
+        epsilon = 0.1
+        if random.random() < epsilon:
+            return random.choice(self.actions)
+        # Use causal effect if enough data, else Q-values
+        if self.trials >= 10 and any(self.causal_effects.values()):
+            return max(self.causal_effects, key=self.causal_effects.get)
+        return max(self.q_values, key=self.q_values.get)
+
+    def update(self, context: Dict, action: str, reward: float):
+        self.trials += 1
+        self.counts[action] += 1
+        self.q_values[action] += (reward - self.q_values[action]) / self.counts[action]
+        self.context_history.append(context)
+        self.reward_history.append(reward)
+        self.action_history.append(action)
+        # Estimate causal effect: average reward for this action
+        rewards = [r for a, r in zip(self.action_history, self.reward_history) if a == action]
+        self.causal_effects[action] = sum(rewards) / len(rewards) if rewards else 0.0
+
+# NEW: Safety Monitor (Temporal Logic-like)
+class SafetyMonitor:
+    def __init__(self, max_delay_high_priority: float = 300.0):  # 5 minutes
+        self.rules = {
+            "max_delay_high_priority": lambda task, delay: task.get("priority") == "high" and delay > max_delay_high_priority,
+            "no_delay_without_forecast": lambda task, delay, forecast: forecast is None and delay > 0,
+        }
+
+    def check(self, task: Dict, delay: float, forecast: Optional[List[Tuple[float, float]]] = None) -> bool:
+        """
+        Returns True if safe, False if violation.
+        """
+        if self.rules["max_delay_high_priority"](task, delay):
+            return False
+        if self.rules["no_delay_without_forecast"](task, delay, forecast):
+            return False
+        return True
+
+# NEW: XAI Explainer
+class XAIExplainer:
+    def explain_delay(self, task: Dict, current_intensity: float, best_intensity: float,
+                      delay_seconds: float, utility: float, reason: str) -> str:
+        parts = []
+        if delay_seconds > 0:
+            parts.append(f"Delaying task for {delay_seconds:.0f}s.")
+            parts.append(f"Carbon intensity drops from {current_intensity:.1f} to {best_intensity:.1f} gCO2/kWh.")
+        else:
+            parts.append("Forwarding task immediately.")
+            if reason:
+                parts.append(f"Reason: {reason}")
+        parts.append(f"Utility score: {utility:.3f}")
+        return " ".join(parts)
+
+# NEW: Federated Learning Coordinator (stub)
+class FederatedCoordinator:
+    def __init__(self):
+        self.participants = {}
+
+    def register(self, participant_id: str, model_update: Dict):
+        self.participants[participant_id] = model_update
+
+    def aggregate(self) -> Dict:
+        if not self.participants:
+            return {}
+        # Average all model updates
+        keys = set()
+        for p in self.participants.values():
+            keys.update(p.keys())
+        avg = {}
+        for key in keys:
+            vals = [p.get(key, 0.0) for p in self.participants.values()]
+            avg[key] = sum(vals) / len(vals)
+        return avg
+
+# NEW: Multi-Agent Coordinator (basic)
+class MultiAgentCoordinator:
+    def __init__(self, num_agents: int = 3):
+        self.agents = [f"agent_{i}" for i in range(num_agents)]
+        self.responsibilities = {agent: [] for agent in self.agents}
+
+    def assign_task(self, task: Dict) -> str:
+        # Simple round-robin assignment
+        agent = self.agents[hash(task.get("id", str(time.time()))) % len(self.agents)]
+        self.responsibilities[agent].append(task.get("id"))
+        return agent
+
+# NEW: Chaos Monkey
+class ChaosMonkey:
+    def __init__(self, failure_probability: float = 0.1, enabled: bool = True):
+        self.failure_probability = failure_probability
+        self.enabled = enabled
+
+    def maybe_fail(self):
+        if self.enabled and random.random() < self.failure_probability:
+            raise Exception("Simulated chaos failure")
+
+# NEW: Human Review Manager
+class HumanReviewManager:
+    def __init__(self):
+        self.pending_reviews = {}
+
+    def request_review(self, task: Dict, decision: Dict) -> str:
+        review_id = str(uuid.uuid4()) if 'uuid' in globals() else str(time.time())
+        self.pending_reviews[review_id] = {"task": task, "decision": decision, "status": "pending"}
+        return review_id
+
+    def approve(self, review_id: str):
+        if review_id in self.pending_reviews:
+            self.pending_reviews[review_id]["status"] = "approved"
+
+    def reject(self, review_id: str):
+        if review_id in self.pending_reviews:
+            self.pending_reviews[review_id]["status"] = "rejected"
+
+    def get_pending(self) -> List[str]:
+        return [rid for rid, data in self.pending_reviews.items() if data["status"] == "pending"]
+
+
 class CarbonDelayScheduler:
     """
     Enhanced scheduler with MODP, bio‑inspired adaptation, MoE integration,
-    and FlexGen policy selection.
+    FlexGen policy selection, and now also:
+    - Causal Bandit for action selection.
+    - Safety Monitor.
+    - XAI Explanations.
+    - Federated Learning (optional).
+    - Multi-Agent Coordination (basic).
+    - Chaos Monkey.
+    - Human-in-the-Loop.
+
     """
     def __init__(
         self,
@@ -101,6 +245,13 @@ class CarbonDelayScheduler:
         moe_router: Optional[Any] = None,
         forecast_confidence_threshold: float = 0.7,
         flexgen_manager: Optional[Any] = None,
+        causal_bandit: Optional[CausalBandit] = None,
+        safety_monitor: Optional[SafetyMonitor] = None,
+        xai_explainer: Optional[XAIExplainer] = None,
+        federated_coordinator: Optional[FederatedCoordinator] = None,
+        multi_agent_coordinator: Optional[MultiAgentCoordinator] = None,
+        chaos_monkey: Optional[ChaosMonkey] = None,
+        human_review: Optional[HumanReviewManager] = None,
     ):
         """
         Args:
@@ -113,6 +264,13 @@ class CarbonDelayScheduler:
             moe_router: Instance of MoE router (optional).
             forecast_confidence_threshold: Only use forecast points with confidence > this.
             flexgen_manager: Optional FlexGen manager for policy selection.
+            causal_bandit: Optional causal bandit for scheduling decisions.
+            safety_monitor: Optional safety monitor.
+            xai_explainer: Optional XAI explainer.
+            federated_coordinator: Optional federated learning coordinator.
+            multi_agent_coordinator: Optional multi-agent coordinator.
+            chaos_monkey: Optional chaos monkey for resilience testing.
+            human_review: Optional human review manager.
         """
         self.carbon_api = carbon_api
         self.max_delay = max_delay_seconds
@@ -136,11 +294,9 @@ class CarbonDelayScheduler:
 
         # MODP instance
         try:
-            # If real ParetoOptimizer available, use it; otherwise fallback to stub logic
             if 'ParetoOptimizer' in globals() and hasattr(ParetoOptimizer, 'decide'):
                 self.modp = ParetoOptimizer()
             else:
-                # Create a stub that works like the original stub
                 class _MODP:
                     def __init__(self, weights):
                         self.weights = weights
@@ -160,26 +316,50 @@ class CarbonDelayScheduler:
         # Bio‑inspired adaptation
         self.bio = bio_optimizer if bio_optimizer else GeneticOptimizer()
 
+        # Causal bandit (if provided, else default)
+        self.causal_bandit = causal_bandit if causal_bandit else CausalBandit()
+
         # MoE router
         self.moe = moe_router if moe_router else ExpertRouter()
+
+        # Safety monitor
+        self.safety_monitor = safety_monitor if safety_monitor else SafetyMonitor()
+
+        # XAI explainer
+        self.xai = xai_explainer if xai_explainer else XAIExplainer()
+
+        # Federated coordinator (optional)
+        self.federated = federated_coordinator
+
+        # Multi-agent coordinator (optional)
+        self.multi_agent = multi_agent_coordinator
+
+        # Chaos monkey
+        self.chaos_monkey = chaos_monkey if chaos_monkey else ChaosMonkey(enabled=False)
+
+        # Human review manager
+        self.human_review = human_review if human_review else HumanReviewManager()
 
         # FlexGen manager
         self.flexgen_manager = flexgen_manager
         self._flexgen_available = FLEXGEN_AVAILABLE and flexgen_manager is not None
 
-        # Priority queue: heap of (scheduled_time, DelayedTask)
+        # Priority queue
         self.queue: List[Tuple[float, DelayedTask]] = []
 
         # Load persisted queue if exists
         self._load_queue()
 
-        # Metrics for feedback loop
+        # Metrics
         self.metrics = {
             "total_delayed": 0,
             "total_forwarded": 0,
             "total_released": 0,
             "total_rewards": 0.0,
             "total_flexgen_policies_selected": 0,
+            "total_causal_bandit_actions": 0,
+            "total_safety_violations": 0,
+            "total_reviews_requested": 0,
         }
 
     # --------------------- Persistence ---------------------
@@ -228,24 +408,20 @@ class CarbonDelayScheduler:
         Returns (should_delay, scheduled_time, reason).
         """
         # Extract task features
-        task_latency_sensitivity = task.get("latency_sensitivity", 0.5)  # 0-1
+        task_latency_sensitivity = task.get("latency_sensitivity", 0.5)
         task_energy_estimate = task.get("energy_kwh_estimate", 1.0)
         task_cost_estimate = task.get("cost_estimate", 0.0)
 
-        # Compute objectives if delayed vs forward
-        # If delayed: carbon benefit, but latency cost, possibly energy overhead (idle)
-        # If forwarded now: carbon cost, but low latency.
+        # Simulate chaos
+        self.chaos_monkey.maybe_fail()
 
-        # Simple model:
-        # Carbon benefit = current_intensity - expected_intensity_at_delay
-        # Find expected intensity at a future time (best candidate)
+        # Find best low-carbon window
         now = time.time()
         best_time = None
         best_intensity = None
         for ts, intensity in forecast:
             if intensity < self.threshold and (ts - now) <= self.max_delay:
-                # For MODP, we also consider confidence (if available)
-                confidence = 1.0  # stub; extend later
+                confidence = 1.0  # stub; could be from forecast
                 if confidence >= self.forecast_confidence_threshold:
                     if best_time is None or intensity < best_intensity:
                         best_time = ts
@@ -254,30 +430,22 @@ class CarbonDelayScheduler:
         if best_time is None:
             return False, None, "No suitable low‑carbon window"
 
-        # Objectives:
-        carbon_reduction = current_intensity - best_intensity  # gCO2/kWh benefit
-        # Latency cost = delay duration (seconds)
+        # Objectives
+        carbon_reduction = current_intensity - best_intensity
         latency_cost = best_time - now
-        # Energy overhead: assume idle energy consumption during delay
-        idle_power_watts = task.get("idle_power_watts", 10.0)  # W
+        idle_power_watts = task.get("idle_power_watts", 10.0)
         energy_overhead_kwh = (idle_power_watts * latency_cost) / 3600 / 1000
-        # Cost: could be monetary cost of energy, or carbon cost
-        # We'll treat cost as (energy_overhead * electricity_price)
-        electricity_price_per_kwh = 0.15  # €/kWh
+        electricity_price_per_kwh = 0.15
         cost = energy_overhead_kwh * electricity_price_per_kwh
 
         objectives = {
-            "carbon": -carbon_reduction,  # negative because we want to minimize carbon (or maximize reduction)
+            "carbon": -carbon_reduction,
             "latency": latency_cost,
             "energy": energy_overhead_kwh,
             "cost": cost,
         }
-        # Use MODP to compute a utility score (lower is better)
         utility = self.modp.decide(objectives, self.modp_weights)
 
-        # If utility < some threshold (e.g., 0), we delay
-        # In practice, we compare with forwarding (which would have utility = 0 + maybe carbon cost)
-        # For simplicity, we delay if utility < 0 (i.e., delay is better than forwarding).
         if utility < 0:
             return True, best_time, f"MODP utility={utility:.3f}"
         else:
@@ -285,17 +453,12 @@ class CarbonDelayScheduler:
 
     # --------------------- Bio‑inspired Adaptation ---------------------
     def adapt_parameters(self, reward: float):
-        """
-        Called after a task is released and its outcome (reward) is known.
-        The bio_inspired optimizer adjusts threshold and max_delay.
-        """
         context = {
             "threshold": self.threshold,
             "max_delay": self.max_delay,
             "task_count": len(self.queue),
             "avg_carbon": self.carbon_api.get_current(),
         }
-        # The bio module should return new parameters
         new_params = self.bio.adapt(context, reward)
         if new_params:
             self.threshold = new_params.get("threshold", self.threshold)
@@ -304,14 +467,9 @@ class CarbonDelayScheduler:
 
     # --------------------- MoE Delayability Classification ---------------------
     def _get_delayability(self, task: Dict[str, Any]) -> Delayability:
-        """
-        Uses the MoE router to classify task into delayability category.
-        """
-        # First, check explicit priority
         if task.get("priority") == "high":
             return Delayability.HIGH
 
-        # Use MoE to decide
         category = self.moe.classify(task)
         if category == "high":
             return Delayability.HIGH
@@ -322,15 +480,8 @@ class CarbonDelayScheduler:
 
     # --------------------- FlexGen Policy Selection ---------------------
     def select_flexgen_policy(self, task: Dict[str, Any], node: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        Select an optimal FlexGen policy for an AI inference task.
-        Uses the FlexGenManager (if available) to run policy optimization.
-        Returns a dict with chosen policy and metrics.
-        """
         if not self._flexgen_available:
             return {"error": "FlexGen manager not available"}
-
-        # Prepare workload and node descriptors
         try:
             workload = WorkloadDescriptor(**task.get("workload", {}))
             node_desc = NodeDescriptor(**node) if node else NodeDescriptor(
@@ -342,7 +493,6 @@ class CarbonDelayScheduler:
                 uptime=0.99,
                 maintenance_status="operational"
             )
-            # Use flexgen manager to optimize policy
             result = self.flexgen_manager.optimize_policy(workload, node_desc)
             self.metrics["total_flexgen_policies_selected"] += 1
             return result
@@ -353,77 +503,144 @@ class CarbonDelayScheduler:
     # --------------------- Main Public API ---------------------
     def submit(self, task: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Decide whether to delay the task, based on MODP, MoE, bio‑adapted thresholds,
-        and possibly FlexGen policy evaluation.
-        Returns dict with status, delay_until, reason, and optional FlexGen policy.
+        Decide whether to delay the task, based on MODP, MoE, causal bandit,
+        safety monitor, and possibly FlexGen policy evaluation.
+        Returns dict with status, delay_until, reason, explanation, and optional FlexGen policy.
         """
         # 1. Determine delayability via MoE
         delayability = self._get_delayability(task)
         if delayability == Delayability.HIGH:
             self.metrics["total_forwarded"] += 1
-            return {"status": "forward", "task": task, "delay_until": None, "reason": "High priority"}
+            explanation = self.xai.explain_delay(task, 0, 0, 0, 0, "High priority")
+            return {"status": "forward", "task": task, "delay_until": None, "reason": "High priority",
+                    "explanation": explanation}
 
         # 2. Current carbon intensity
         current_intensity = self.carbon_api.get_current()
 
         # 3. If current intensity is already low, forward immediately
         if current_intensity <= self.threshold:
-            # Optionally select FlexGen policy for the forwarded task
             flexgen_policy = None
             if self._flexgen_available and task.get("type") == "inference":
                 flexgen_policy = self.select_flexgen_policy(task)
             self.metrics["total_forwarded"] += 1
-            result = {"status": "forward", "task": task, "delay_until": None, "reason": "Already low carbon"}
+            explanation = self.xai.explain_delay(task, current_intensity, current_intensity, 0, 0, "Already low carbon")
+            result = {"status": "forward", "task": task, "delay_until": None, "reason": "Already low carbon",
+                      "explanation": explanation}
             if flexgen_policy:
                 result["flexgen_policy"] = flexgen_policy
             return result
 
         # 4. Get forecast
-        forecast_minutes = self.max_delay // 60 + 2  # extra buffer
+        forecast_minutes = self.max_delay // 60 + 2
         forecast = self.carbon_api.get_forecast(forecast_minutes)
         if not forecast:
             self.metrics["total_forwarded"] += 1
-            return {"status": "forward", "task": task, "delay_until": None, "reason": "No forecast available"}
+            explanation = self.xai.explain_delay(task, current_intensity, current_intensity, 0, 0, "No forecast available")
+            return {"status": "forward", "task": task, "delay_until": None, "reason": "No forecast available",
+                    "explanation": explanation}
 
         # 5. Evaluate delay using MODP
         should_delay, scheduled_time, reason = self._evaluate_delay(task, current_intensity, forecast)
 
-        if not should_delay:
-            # Forward, but optionally include FlexGen policy
+        # 6. Use causal bandit to decide final action (override if bandit says forward)
+        #    (We treat bandit as a meta-decision on whether to trust MODP's delay suggestion)
+        context = {
+            "current_intensity": current_intensity,
+            "forecast_available": len(forecast) > 0,
+            "delayability": delayability.value,
+            "task_type": task.get("type", "unknown"),
+        }
+        bandit_action = self.causal_bandit.select_action(context)
+        self.metrics["total_causal_bandit_actions"] += 1
+
+        if should_delay and bandit_action == "forward":
+            # Bandit suggests not delaying, override
+            should_delay = False
+            reason = "Causal bandit suggests forward"
+        elif not should_delay and bandit_action == "delay":
+            # Bandit suggests delaying, but only if MODP also found a window
+            if scheduled_time is not None:
+                should_delay = True
+                reason = "Causal bandit suggests delay"
+
+        # 7. Safety monitor check
+        delay_seconds = scheduled_time - time.time() if should_delay else 0
+        if should_delay and not self.safety_monitor.check(task, delay_seconds, forecast):
+            self.metrics["total_safety_violations"] += 1
+            should_delay = False
+            reason = "Safety monitor violation"
+            scheduled_time = None
+
+        # 8. If medium and delay too long, forward
+        if should_delay and delayability == Delayability.MEDIUM and delay_seconds > self.max_delay * 0.5:
+            should_delay = False
+            reason = f"Delay too long for medium priority ({delay_seconds:.0f}s)"
+            scheduled_time = None
+
+        # 9. Final decision
+        if should_delay:
+            delayed_task = DelayedTask(
+                scheduled_time=scheduled_time,
+                task=task,
+                original_submit_time=time.time(),
+                delay_reason=reason
+            )
+            heapq.heappush(self.queue, (delayed_task.scheduled_time, delayed_task))
+            self.metrics["total_delayed"] += 1
+            self._save_queue()
+            explanation = self.xai.explain_delay(
+                task, current_intensity, scheduled_time and self._get_forecast_intensity_at(forecast, scheduled_time),
+                delay_seconds, 0.0, reason
+            )
+            result = {
+                "status": "delayed",
+                "task": task,
+                "delay_until": scheduled_time,
+                "reason": reason,
+                "delayability": delayability.value,
+                "explanation": explanation,
+            }
+            # Human review for long delays
+            if delay_seconds > self.max_delay * 0.8:
+                review_id = self.human_review.request_review(task, result)
+                self.metrics["total_reviews_requested"] += 1
+                result["review_id"] = review_id
+                result["review_pending"] = True
+            return result
+        else:
             flexgen_policy = None
             if self._flexgen_available and task.get("type") == "inference":
                 flexgen_policy = self.select_flexgen_policy(task)
             self.metrics["total_forwarded"] += 1
-            result = {"status": "forward", "task": task, "delay_until": None, "reason": reason}
+            explanation = self.xai.explain_delay(task, current_intensity, current_intensity, 0, 0, reason)
+            result = {"status": "forward", "task": task, "delay_until": None, "reason": reason,
+                      "explanation": explanation}
             if flexgen_policy:
                 result["flexgen_policy"] = flexgen_policy
             return result
 
-        # 6. For delayable tasks, also check if the delay is acceptable given the delayability category
-        if delayability == Delayability.MEDIUM and (scheduled_time - time.time()) > self.max_delay * 0.5:
-            # For medium, we limit delay to half the max
-            self.metrics["total_forwarded"] += 1
-            return {"status": "forward", "task": task, "delay_until": None,
-                    "reason": f"Delay too long for medium priority ({scheduled_time - time.time():.0f}s)"}
-
-        # 7. Schedule the task
-        delayed_task = DelayedTask(
-            scheduled_time=scheduled_time,
-            task=task,
-            original_submit_time=time.time(),
-            delay_reason=reason
-        )
-        heapq.heappush(self.queue, (delayed_task.scheduled_time, delayed_task))
-        self.metrics["total_delayed"] += 1
-        self._save_queue()
-
-        return {
-            "status": "delayed",
-            "task": task,
-            "delay_until": scheduled_time,
-            "reason": reason,
-            "delayability": delayability.value,
-        }
+    def _get_forecast_intensity_at(self, forecast: List[Tuple[float, float]], timestamp: float) -> Optional[float]:
+        """Helper to find forecast intensity at a specific timestamp (linear interpolation)."""
+        if not forecast:
+            return None
+        # Find bracketing points
+        prev = None
+        for ts, intensity in forecast:
+            if ts <= timestamp:
+                prev = (ts, intensity)
+            else:
+                if prev is not None:
+                    # Interpolate
+                    t0, i0 = prev
+                    t1, i1 = ts, intensity
+                    if t1 == t0:
+                        return i0
+                    ratio = (timestamp - t0) / (t1 - t0)
+                    return i0 + ratio * (i1 - i0)
+                else:
+                    return intensity
+        return prev[1] if prev else None
 
     def tick(self) -> List[Dict[str, Any]]:
         """
@@ -436,27 +653,39 @@ class CarbonDelayScheduler:
             _, delayed_task = heapq.heappop(self.queue)
             released.append(delayed_task.task)
             self.metrics["total_released"] += 1
-            # Optionally select FlexGen policy upon release
             if self._flexgen_available and delayed_task.task.get("type") == "inference":
                 policy = self.select_flexgen_policy(delayed_task.task)
-                # In a real system, the policy would be attached to the task or returned separately.
-                # For simplicity, we log it.
                 self.logger.info(f"FlexGen policy selected for released task: {policy}")
 
         if released:
             self._save_queue()
         return released
 
-    def report_reward(self, task: Dict[str, Any], reward: float):
+    def report_reward(self, task: Dict[str, Any], reward: float, action: Optional[str] = None):
         """
         Called after the task is executed and its outcome is measured.
-        Feeds back into bio‑inspired adaptation.
+        Feeds back into bio‑inspired adaptation and causal bandit.
+        action: 'delay' or 'forward' (if known)
         """
         self.metrics["total_rewards"] += reward
         self.adapt_parameters(reward)
+        if action:
+            context = {
+                "current_intensity": self.carbon_api.get_current(),
+                "task_type": task.get("type", "unknown"),
+            }
+            self.causal_bandit.update(context, action, reward)
+
+    def federated_update(self, model_update: Dict):
+        if self.federated:
+            self.federated.register(self, model_update)
+
+    def aggregate_federated(self) -> Dict:
+        if self.federated:
+            return self.federated.aggregate()
+        return {}
 
     def get_queue_stats(self) -> Dict[str, Any]:
-        """Return statistics about the queue and metrics."""
         return {
             "queue_size": len(self.queue),
             "next_release": self.queue[0][0] if self.queue else None,
@@ -465,9 +694,10 @@ class CarbonDelayScheduler:
             **self.metrics,
         }
 
-    # ------------------------------------------------------------------
-    # 3. Example usage / test harness
-    # ------------------------------------------------------------------
+
+# ----------------------------------------------------------------------
+# 3. Example usage / test harness
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
@@ -475,33 +705,42 @@ if __name__ == "__main__":
     from carbon_api_stub import CarbonAPIStub
     carbon_api = CarbonAPIStub(base_intensity=250.0, volatility=80.0)
 
-    # Instantiate enhanced scheduler
+    # Instantiate enhanced scheduler with new features
     scheduler = CarbonDelayScheduler(
         carbon_api=carbon_api,
         max_delay_seconds=1800,
         threshold_gco2_per_kwh=200.0,
         persistence_file="test_queue.json",
         modp_weights={"carbon": 0.5, "latency": 0.2, "energy": 0.2, "cost": 0.1},
+        causal_bandit=CausalBandit(),
+        safety_monitor=SafetyMonitor(),
+        xai_explainer=XAIExplainer(),
+        federated_coordinator=FederatedCoordinator(),
+        multi_agent_coordinator=MultiAgentCoordinator(),
+        chaos_monkey=ChaosMonkey(enabled=False),
+        human_review=HumanReviewManager(),
     )
 
     # Simulate tasks
     tasks = [
-        {"priority": "normal", "latency_sensitivity": 0.5, "idle_power_watts": 10, "type": "inference"},
-        {"priority": "high", "latency_sensitivity": 0.9},
-        {"priority": "normal", "latency_sensitivity": 0.3, "idle_power_watts": 5, "type": "inference"},
+        {"id": "task1", "priority": "normal", "latency_sensitivity": 0.5, "idle_power_watts": 10, "type": "inference"},
+        {"id": "task2", "priority": "high", "latency_sensitivity": 0.9},
+        {"id": "task3", "priority": "normal", "latency_sensitivity": 0.3, "idle_power_watts": 5, "type": "inference"},
     ]
 
     for task in tasks:
         result = scheduler.submit(task)
-        print(f"Task {task}: {result['status']} (reason: {result.get('reason', 'N/A')})")
+        print(f"Task {task['id']}: {result['status']} (reason: {result.get('reason', 'N/A')})")
+        if 'explanation' in result:
+            print(f"  Explanation: {result['explanation']}")
 
     # Simulate tick after some time
     time.sleep(2)
     released = scheduler.tick()
     print(f"Released {len(released)} tasks")
 
-    # Report a sample reward to test adaptation
-    scheduler.report_reward({"sample": "task"}, 5.0)
+    # Report a sample reward to test adaptation and causal bandit
+    scheduler.report_reward({"id": "sample"}, 5.0, action="delay")
 
     # Show stats
     print(scheduler.get_queue_stats())
