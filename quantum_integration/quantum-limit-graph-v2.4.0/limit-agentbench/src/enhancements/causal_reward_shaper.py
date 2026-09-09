@@ -1,9 +1,19 @@
 # src/enhancements/causal_reward_shaper.py
 """
-Causal Reward Shaper with Correct State Handling and Read‑Only Graph Access.
+Causal Reward Shaper with Correct State Handling and Read‑Only Graph Access,
+PLUS enhancements for Temporal Logic Safety, Explainable AI, Federated Learning,
+Multi‑Agent Coordination, Chaos Resilience, and Human‑in‑the‑Loop.
 
 Modifies the scalar reward from the environment using the CausalGraph.
 The shaped reward encourages actions that improve downstream causal variables.
+
+New components (all in this file):
+- SafetyMonitor: temporal logic‑like safety checks on reward shaping.
+- XAIExplainer: explains the causal bonus.
+- FederatedRewardShaper: aggregates causal models from multiple shapers.
+- MultiAgentRewardShaper: coordinates multiple shapers for different agents.
+- ChaosResilientRewardShaper: wraps the base shaper with fault injection.
+- HumanReviewManager: for human‑in‑the‑loop review of shaped rewards.
 
 Usage:
     shaper = CausalRewardShaper(causal_graph, influence_weight=0.3)
@@ -12,7 +22,10 @@ Usage:
 
 import copy
 import logging
-from typing import Any, Dict, Optional, Set
+import asyncio
+import random
+from typing import Any, Dict, Optional, Set, List, Tuple, Callable
+from datetime import datetime
 
 import numpy as np
 
@@ -156,3 +169,323 @@ class CausalRewardShaper:
             f"shaped reward: {shaped_reward:.3f}"
         )
         return shaped_reward
+
+
+# =============================================================================
+# NEW: Temporal Logic Safety Monitor
+# =============================================================================
+class SafetyMonitor:
+    """
+    Monitors reward shaping decisions against simple temporal safety properties.
+    For example: "Shaped reward should not be lower than original reward more than
+    N times in a row", or "Causal bonus should be positive on average over last M steps".
+    """
+
+    def __init__(
+        self,
+        max_negative_bonus_streak: int = 3,
+        min_avg_bonus: float = -0.2,
+        window_size: int = 10,
+    ):
+        self.max_negative_bonus_streak = max_negative_bonus_streak
+        self.min_avg_bonus = min_avg_bonus
+        self.window_size = window_size
+
+        self.bonus_history: List[float] = []
+        self.violations: List[Dict[str, Any]] = []
+
+    def check(self, original_reward: float, shaped_reward: float, causal_bonus: float) -> bool:
+        """
+        Returns True if the shaping is considered safe, False if a violation is detected.
+        """
+        self.bonus_history.append(causal_bonus)
+        if len(self.bonus_history) > self.window_size * 2:
+            self.bonus_history = self.bonus_history[-self.window_size * 2 :]
+
+        # Check negative streak
+        streak = 0
+        for b in reversed(self.bonus_history):
+            if b < 0:
+                streak += 1
+            else:
+                break
+        if streak >= self.max_negative_bonus_streak:
+            self._record_violation("negative_streak", f"{streak} negative bonuses in a row")
+            return False
+
+        # Check average bonus over last window
+        if len(self.bonus_history) >= self.window_size:
+            avg = np.mean(self.bonus_history[-self.window_size :])
+            if avg < self.min_avg_bonus:
+                self._record_violation("low_avg_bonus", f"Average bonus {avg:.3f} below threshold")
+                return False
+
+        return True
+
+    def _record_violation(self, rule: str, message: str):
+        violation = {
+            "rule": rule,
+            "message": message,
+            "timestamp": datetime.now().isoformat(),
+        }
+        self.violations.append(violation)
+        logger.warning(f"Safety violation: {rule} - {message}")
+
+    def get_violations(self) -> List[Dict[str, Any]]:
+        return self.violations
+
+
+# =============================================================================
+# NEW: Explainable AI for Reward Shaping
+# =============================================================================
+class XAIExplainer:
+    """
+    Generates human‑readable explanations for why the causal bonus was given.
+    """
+
+    def explain(
+        self,
+        state_before: Dict[str, float],
+        state_after: Dict[str, float],
+        causal_bonus: float,
+        anomalies_before: Set[str],
+        anomalies_after: Set[str],
+    ) -> str:
+        """
+        Produce a natural language explanation of the causal contribution.
+        """
+        if causal_bonus > 0:
+            outcome = "improved"
+            fixed = anomalies_before - anomalies_after
+            if fixed:
+                vars_str = ", ".join(sorted(fixed))
+                explanation = f"Causal bonus positive ({causal_bonus:.2f}) because the following variables improved: {vars_str}."
+            else:
+                explanation = f"Causal bonus positive ({causal_bonus:.2f}) due to overall improvement in influence scores."
+        elif causal_bonus < 0:
+            outcome = "worsened"
+            broken = anomalies_after - anomalies_before
+            if broken:
+                vars_str = ", ".join(sorted(broken))
+                explanation = f"Causal bonus negative ({causal_bonus:.2f}) because the following variables worsened: {vars_str}."
+            else:
+                explanation = f"Causal bonus negative ({causal_bonus:.2f}) due to overall decline in influence scores."
+        else:
+            explanation = f"Causal bonus neutral ({causal_bonus:.2f}); no significant change in causal variables."
+
+        return explanation
+
+
+# =============================================================================
+# NEW: Federated Reward Shaper (aggregates models)
+# =============================================================================
+class FederatedRewardShaper:
+    """
+    Coordinates multiple CausalRewardShaper instances across deployments.
+    Aggregates their causal graphs using simple averaging of influence weights.
+    """
+
+    def __init__(self, shapers: Optional[List[CausalRewardShaper]] = None):
+        self.shapers = shapers or []
+        self.aggregated_weights: Dict[str, float] = {}
+        self._lock = asyncio.Lock()
+
+    def add_shaper(self, shaper: CausalRewardShaper):
+        self.shapers.append(shaper)
+
+    def aggregate(self) -> Dict[str, float]:
+        """
+        Average influence weights from all shapers (assumes graphs expose weights as dict).
+        """
+        if not self.shapers:
+            return {}
+        # Assume each shaper has a method `get_weights()` that returns dict
+        # If not, we fallback to no aggregation
+        all_weights = []
+        for shaper in self.shapers:
+            if hasattr(shaper, "get_weights"):
+                w = shaper.get_weights()
+                all_weights.append(w)
+        if not all_weights:
+            return {}
+        keys = set()
+        for w in all_weights:
+            keys.update(w.keys())
+        avg = {}
+        for key in keys:
+            vals = [w.get(key, 0.0) for w in all_weights]
+            avg[key] = sum(vals) / len(vals)
+        self.aggregated_weights = avg
+        return avg
+
+    def shape_reward_federated(
+        self,
+        action: int,
+        reward: float,
+        state_before: Dict[str, float],
+        state_after: Dict[str, float],
+    ) -> float:
+        """
+        Average shaped rewards from all local shapers.
+        """
+        if not self.shapers:
+            return reward
+        shaped_rewards = [
+            shaper.shape_reward(action, reward, state_before, state_after)
+            for shaper in self.shapers
+        ]
+        return float(np.mean(shaped_rewards))
+
+
+# =============================================================================
+# NEW: Multi‑Agent Reward Shaper (per‑agent shapers)
+# =============================================================================
+class MultiAgentRewardShaper:
+    """
+    Manages separate reward shapers for different agents, with optional coordination
+    via shared graph updates or shared safety constraints.
+    """
+
+    def __init__(self, num_agents: int, causal_graph=None, **shaper_kwargs):
+        self.agents = {
+            f"agent_{i}": CausalRewardShaper(causal_graph, **shaper_kwargs)
+            for i in range(num_agents)
+        }
+        self.agent_histories = {agent: [] for agent in self.agents}
+        self.coordination_bonus = 0.0  # optional global bonus for coordination
+
+    def shape_reward_for_agent(
+        self,
+        agent_id: str,
+        action: int,
+        reward: float,
+        state_before: Dict[str, float],
+        state_after: Dict[str, float],
+        coordination_signal: Optional[float] = None,
+    ) -> float:
+        """
+        Shape reward for a specific agent, optionally adding a coordination bonus.
+        """
+        if agent_id not in self.agents:
+            raise ValueError(f"Unknown agent {agent_id}")
+        shaper = self.agents[agent_id]
+        shaped = shaper.shape_reward(action, reward, state_before, state_after)
+        if coordination_signal is not None:
+            shaped += coordination_signal
+        self.agent_histories[agent_id].append(shaped)
+        return shaped
+
+    def get_agent_stats(self) -> Dict[str, float]:
+        """Return average shaped reward per agent."""
+        stats = {}
+        for agent, history in self.agent_histories.items():
+            stats[agent] = float(np.mean(history)) if history else 0.0
+        return stats
+
+
+# =============================================================================
+# NEW: Chaos‑Resilient Reward Shaper
+# =============================================================================
+class ChaosResilientRewardShaper:
+    """
+    Wraps a CausalRewardShaper and injects random failures to test robustness.
+    If the underlying shaper fails, falls back to original reward.
+    """
+
+    def __init__(
+        self,
+        base_shaper: CausalRewardShaper,
+        failure_probability: float = 0.1,
+        seed: Optional[int] = None,
+    ):
+        self.base = base_shaper
+        self.failure_probability = failure_probability
+        self._rng = random.Random(seed)
+
+    def shape_reward(
+        self,
+        action: int,
+        reward: float,
+        state_before: Dict[str, float],
+        state_after: Dict[str, float],
+    ) -> float:
+        # Simulate failure
+        if self._rng.random() < self.failure_probability:
+            logger.warning("Chaos: Causal graph failure simulated, returning original reward.")
+            return reward
+        try:
+            return self.base.shape_reward(action, reward, state_before, state_after)
+        except Exception as e:
+            logger.error(f"Chaos: Shaping failed: {e}, returning original reward.")
+            return reward
+
+
+# =============================================================================
+# NEW: Human‑in‑the‑Loop Review Manager
+# =============================================================================
+class HumanReviewManager:
+    """
+    Allows human review of shaped rewards for critical decisions.
+    """
+
+    def __init__(self):
+        self.pending_reviews: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def request_review(
+        self,
+        task_id: str,
+        action: int,
+        reward: float,
+        shaped_reward: float,
+        state_before: Dict[str, float],
+        state_after: Dict[str, float],
+    ) -> str:
+        """
+        Request human review for a reward shaping decision.
+        Returns a review ID.
+        """
+        review_id = f"review_{uuid.uuid4().hex[:8]}" if 'uuid' in globals() else f"review_{datetime.now().timestamp()}"
+        async with self._lock:
+            self.pending_reviews[review_id] = {
+                "task_id": task_id,
+                "action": action,
+                "original_reward": reward,
+                "shaped_reward": shaped_reward,
+                "state_before": state_before,
+                "state_after": state_after,
+                "status": "pending",
+            }
+        return review_id
+
+    async def approve(self, review_id: str):
+        async with self._lock:
+            if review_id in self.pending_reviews:
+                self.pending_reviews[review_id]["status"] = "approved"
+
+    async def reject(self, review_id: str):
+        async with self._lock:
+            if review_id in self.pending_reviews:
+                self.pending_reviews[review_id]["status"] = "rejected"
+
+    async def get_pending(self) -> List[Dict[str, Any]]:
+        async with self._lock:
+            return [r for r in self.pending_reviews.values() if r["status"] == "pending"]
+
+
+# =============================================================================
+# Optional: Add `get_weights` to CausalRewardShaper for federation
+# =============================================================================
+def _get_weights(self) -> Dict[str, float]:
+    """
+    Return the current influence weight and bonus scale as a dict for federation.
+    This method is monkey‑patched onto CausalRewardShaper if not already present.
+    """
+    return {
+        "influence_weight": self.influence_weight,
+        "bonus_scale": self.bonus_scale,
+    }
+
+# Monkey‑patch get_weights if not defined
+if not hasattr(CausalRewardShaper, "get_weights"):
+    CausalRewardShaper.get_weights = _get_weights
