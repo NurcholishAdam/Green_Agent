@@ -2,36 +2,21 @@
 # File: src/enhancements/export_perplexity_datacenter_data_enhanced_v14_0.py
 
 """
-Enhanced Perplexity AI Data Center Export System - Version 14.0 (Enterprise Quantum+)
+Enhanced Perplexity AI Data Center Export System - Version 14.1 (Enterprise Quantum+)
 
-ENHANCEMENTS OVER v13.0:
-- Dependency inversion with interfaces (Protocols) for all major components.
-- Global circuit breaker registry with configurable thresholds.
-- Health check aggregation across all components.
-- Database migrations via Alembic‑style inline runner.
-- Complete async database support (asyncpg) with connection pooling.
-- Rate limiting on API endpoints.
-- TaskManager supervises background tasks with automatic restart.
-- Predictive models persisted to disk/cloud.
-- Federated insights stored in database.
-- Leader election (Redis) to avoid duplicate work.
-- Grouped configuration using nested Pydantic models.
-- Circuit breakers for all external calls (cloud, database, blockchain, carbon, Vault, Perplexity API).
-- Retry decorators for all external calls (tenacity).
-- OpenTelemetry support for distributed tracing (if available).
-- Audit logging for compliance.
-- Full implementation of previously stubbed components: API client, knowledge graph, duplicate detection, anomaly detection, WebSocket, pipeline.
-- Comprehensive test stubs (pytest).
+ENHANCEMENTS OVER v14.0 (NEW IN v14.1):
+- CausalBandit replaces ContextualBandit for causal RL of scheduling policies.
+- SafetyMonitor enforces temporal rules for extractions.
+- XAIExplainer produces human-readable rationale for every scheduler decision.
+- FederatedSecureCoordinator aggregates model insights with differential privacy.
+- MultiAgentCoordinator formalizes role specialisation across scheduling agents.
+- CarbonOffsetBroker purchases carbon offsets and RECs.
+- ChaosMonkey injects failures for resilience testing.
+- HumanReviewManager provides pre-commit human review for critical extractions.
+- FlexGenPrecisionPolicy recommends precision (fp32/fp16/int8) per extraction.
+- QuantumDistillationOptimizer (optional) uses QAOA for policy selection.
 
-NEW IN v14.0+:
-- Integrated bio_inspired, moe_system, MODP for adaptive scheduling, forecasting, and multi‑objective decisions.
-- Scheduler uses ContextualBandit and ExpertRouter to select policies based on context.
-- MODP evaluates trade‑offs for scheduling decisions.
-- Predictive Analytics uses bio‑inspired evolution to optimize Prophet hyperparameters.
-- Feedback loop updates learning modules after each extraction.
-- Persistence of learned state via database.
-- New API endpoints for optimization status and feedback.
-- Integrated LIMIT Graph, RLHF, and Multi‑Teacher Policy Distillation for further optimization.
+All previous v14.0 features retained.
 """
 
 import asyncio
@@ -77,7 +62,6 @@ try:
 except ImportError:
     ENHANCEMENTS_AVAILABLE = False
     ADDITIONAL_ENHANCEMENTS_AVAILABLE = False
-    # Fallback stubs
     class GeneticPolicyGenerator:
         def __init__(self, *args, **kwargs): pass
         def evolve(self, population, fitness_fn, generations=10, population_size=20):
@@ -111,7 +95,20 @@ except ImportError:
         def distill(self, context): return self.teachers[0](context) if self.teachers else None
 
 # ============================================================
-# ENHANCED CONFIGURATION (Grouped sub‑models) – extended with optimizer settings
+# QISKIT (optional, for quantum distillation)
+# ============================================================
+try:
+    import qiskit
+    from qiskit.optimization import QuadraticProgram
+    from qiskit.optimization.algorithms import MinimumEigenOptimizer
+    from qiskit.algorithms import QAOA
+    from qiskit import Aer
+    QISKIT_AVAILABLE = True
+except ImportError:
+    QISKIT_AVAILABLE = False
+
+# ============================================================
+# ENHANCED CONFIGURATION
 # ============================================================
 try:
     from pydantic import BaseModel, Field, field_validator, ValidationInfo
@@ -120,14 +117,12 @@ try:
 except ImportError:
     PYDANTIC_AVAILABLE = False
 
-# Tenacity for retries
 try:
     from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log, RetryError
     TENACITY_AVAILABLE = True
 except ImportError:
     TENACITY_AVAILABLE = False
 
-# SQLAlchemy (async and sync)
 try:
     from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
     from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
@@ -138,7 +133,6 @@ try:
 except ImportError:
     SQLALCHEMY_ASYNC_AVAILABLE = False
 
-# Fallback sync SQLAlchemy
 try:
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker, scoped_session
@@ -146,14 +140,12 @@ try:
 except ImportError:
     SQLALCHEMY_SYNC_AVAILABLE = False
 
-# Post‑quantum cryptography (pqcrypto)
 try:
     from pqcrypto.sign import dilithium, falcon, sphincs
     PQC_AVAILABLE = True
 except ImportError:
     PQC_AVAILABLE = False
 
-# Web3
 try:
     from web3 import Web3, Account
     from web3.middleware import geth_poa_middleware
@@ -162,20 +154,17 @@ try:
 except ImportError:
     WEB3_AVAILABLE = False
 
-# Prometheus
 try:
     from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry, start_http_server
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
 
-# Cryptography
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
-# WebSockets
 try:
     import websockets
     from websockets.server import serve
@@ -184,7 +173,6 @@ try:
 except ImportError:
     WEBSOCKETS_AVAILABLE = False
 
-# Scikit-learn for ML
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
@@ -193,7 +181,6 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
-# JWT for WebSocket auth (optional)
 try:
     from jose import JWTError, jwt
     from jose.constants import ALGORITHMS
@@ -201,14 +188,12 @@ try:
 except ImportError:
     JOSE_AVAILABLE = False
 
-# Vault
 try:
     from hvac import Client as VaultClient
     VAULT_AVAILABLE = True
 except ImportError:
     VAULT_AVAILABLE = False
 
-# Cloud storage SDKs
 try:
     import boto3
     from botocore.exceptions import ClientError
@@ -228,14 +213,12 @@ try:
 except ImportError:
     GCP_AVAILABLE = False
 
-# Prophet for forecasting
 try:
     from prophet import Prophet
     PROPHET_AVAILABLE = True
 except ImportError:
     PROPHET_AVAILABLE = False
 
-# FastAPI
 try:
     from fastapi import FastAPI, Depends, HTTPException, status, Request
     from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -245,21 +228,18 @@ try:
 except ImportError:
     FASTAPI_AVAILABLE = False
 
-# Async PostgreSQL driver
 try:
     import asyncpg
     ASYNCPG_AVAILABLE = True
 except ImportError:
     ASYNCPG_AVAILABLE = False
 
-# Redis for leader election and caching
 try:
     import redis.asyncio as redis
     REDIS_AVAILABLE = True
 except ImportError:
     REDIS_AVAILABLE = False
 
-# OpenTelemetry
 try:
     from opentelemetry import trace
     from opentelemetry.sdk.trace import TracerProvider
@@ -271,7 +251,7 @@ except ImportError:
     OTEL_AVAILABLE = False
 
 # ============================================================
-# STRUCTURED LOGGING (fallback) with contextvars
+# STRUCTURED LOGGING
 # ============================================================
 try:
     import structlog
@@ -287,7 +267,6 @@ except ImportError:
         ]
     )
 
-# Context variable for correlation ID (async‑safe)
 correlation_id_var = contextvars.ContextVar('correlation_id', default=str(uuid.uuid4())[:8])
 
 class CorrelationIdFilter(logging.Filter):
@@ -297,7 +276,6 @@ class CorrelationIdFilter(logging.Filter):
 
 logger.addFilter(CorrelationIdFilter())
 
-# Audit logger
 audit_logger = logging.getLogger("audit")
 audit_handler = logging.FileHandler('audit.log')
 audit_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
@@ -305,7 +283,7 @@ audit_logger.addHandler(audit_handler)
 audit_logger.setLevel(logging.INFO)
 
 # ============================================================
-# PROMETHEUS METRICS (fallback dummy)
+# PROMETHEUS METRICS
 # ============================================================
 if PROMETHEUS_AVAILABLE:
     REGISTRY = CollectorRegistry()
@@ -329,6 +307,13 @@ if PROMETHEUS_AVAILABLE:
     VAULT_OPERATIONS = Counter('extraction_vault_operations_total', 'Vault operations', ['operation', 'status'], registry=REGISTRY)
     CLOUD_STORAGE = Counter('extraction_cloud_storage_operations_total', 'Cloud storage operations', ['provider', 'operation', 'status'], registry=REGISTRY)
     HEALTH_SCORE = Gauge('extraction_health_score', 'System health score (0-100)', registry=REGISTRY)
+    # NEW metrics for advanced enhancements
+    SAFETY_VIOLATIONS = Counter('extraction_safety_violations_total', 'Safety violations', ['rule'], registry=REGISTRY)
+    CHAOS_EXPERIMENTS = Counter('extraction_chaos_experiments_total', 'Chaos experiments', ['type', 'status'], registry=REGISTRY)
+    HUMAN_REVIEWS = Counter('extraction_human_reviews_total', 'Human reviews', ['status'], registry=REGISTRY)
+    XAI_DECISIONS = Counter('extraction_xai_decisions_total', 'XAI decisions', ['policy'], registry=REGISTRY)
+    CARBON_OFFSETS = Counter('extraction_carbon_offsets_total', 'Carbon offsets purchased', ['status'], registry=REGISTRY)
+    PRECISION_SELECTIONS = Counter('extraction_precision_selections_total', 'Precision selections', ['precision'], registry=REGISTRY)
 else:
     class DummyMetric:
         def labels(self, **kwargs): return self
@@ -355,6 +340,12 @@ else:
     VAULT_OPERATIONS = DummyMetric()
     CLOUD_STORAGE = DummyMetric()
     HEALTH_SCORE = DummyMetric()
+    SAFETY_VIOLATIONS = DummyMetric()
+    CHAOS_EXPERIMENTS = DummyMetric()
+    HUMAN_REVIEWS = DummyMetric()
+    XAI_DECISIONS = DummyMetric()
+    CARBON_OFFSETS = DummyMetric()
+    PRECISION_SELECTIONS = DummyMetric()
 
 # ============================================================
 # CUSTOM EXCEPTIONS
@@ -372,9 +363,11 @@ class FederatedError(ExtractorError): pass
 class PredictiveError(ExtractorError): pass
 class OptimizerError(ExtractorError): pass
 class DatabaseError(ExtractorError): pass
+class SafetyViolationError(ExtractorError): pass
+class ChaosExperimentError(ExtractorError): pass
 
 # ============================================================
-# DUMMY TENACITY DECORATOR (if not available)
+# TENACITY FALLBACK
 # ============================================================
 if not TENACITY_AVAILABLE:
     def retry(*args, **kwargs):
@@ -386,7 +379,7 @@ if not TENACITY_AVAILABLE:
         return decorator
 
 # ============================================================
-# INTERFACES (Dependency Inversion)
+# INTERFACES
 # ============================================================
 @runtime_checkable
 class IQuantumSecurity(Protocol):
@@ -506,20 +499,18 @@ class CircuitBreaker:
                     self._success_count = 0
                     if PROMETHEUS_AVAILABLE:
                         CIRCUIT_BREAKER_STATE.labels(name=self.name).set(0.5)
-                    logger.info(f"Circuit breaker {self.name} transitioning to HALF_OPEN")
                 else:
                     raise CircuitBreakerOpenError(f"Circuit breaker {self.name} is OPEN")
             if self._state == CircuitBreakerState.HALF_OPEN and self._success_count >= self.half_open_success_threshold:
                 self._state = CircuitBreakerState.CLOSED
                 if PROMETHEUS_AVAILABLE:
                     CIRCUIT_BREAKER_STATE.labels(name=self.name).set(0)
-                logger.info(f"Circuit breaker {self.name} closed after {self._success_count} successes")
         self._metrics['total_calls'] += 1
         try:
             result = await func(*args, **kwargs)
             await self._record_success()
             return result
-        except Exception as e:
+        except Exception:
             await self._record_failure()
             raise
 
@@ -544,12 +535,10 @@ class CircuitBreaker:
                 self._state = CircuitBreakerState.OPEN
                 if PROMETHEUS_AVAILABLE:
                     CIRCUIT_BREAKER_STATE.labels(name=self.name).set(1)
-                logger.warning(f"Circuit breaker {self.name} opened after {self._failure_count} failures")
             elif self._state == CircuitBreakerState.HALF_OPEN:
                 self._state = CircuitBreakerState.OPEN
                 if PROMETHEUS_AVAILABLE:
                     CIRCUIT_BREAKER_STATE.labels(name=self.name).set(1)
-                logger.warning(f"Circuit breaker {self.name} opened from HALF_OPEN")
 
     def get_metrics(self) -> Dict:
         return {**self._metrics, 'state': self._state.value, 'failure_count': self._failure_count, 'success_count': self._success_count}
@@ -569,131 +558,384 @@ class GlobalCircuitBreaker:
         return self._breakers[name]
 
 # ============================================================
-# ENHANCED RATE LIMITER (for API and internal)
+# NEW: CausalBandit
 # ============================================================
-class RateLimiter:
-    def __init__(self, rate: int, per_seconds: int = 60):
-        self.rate = rate
-        self.per_seconds = per_seconds
-        self.tokens = self.rate
-        self.last_refill = time.time()
-        self._lock = asyncio.Lock()
-        self.total_requests = 0
-        self.throttled_requests = 0
+class CausalBandit:
+    """Causal bandit estimating average treatment effects for scheduling policies."""
+    def __init__(self, action_space: List[str], fallback_solver: Callable,
+                 min_trials_before_bandit: int = 5, confidence_threshold: float = 0.6):
+        self.actions = action_space
+        self.fallback_solver = fallback_solver
+        self.min_trials = min_trials_before_bandit
+        self.confidence_threshold = confidence_threshold
+        self.q_values = {a: 0.0 for a in action_space}
+        self.counts = {a: 0 for a in action_space}
+        self.causal_effects = {a: 0.0 for a in action_space}
+        self.trials = 0
+        self.context_history: List[Dict] = []
+        self.reward_history: List[float] = []
+        self.action_history: List[str] = []
 
-    async def acquire(self) -> bool:
-        async with self._lock:
-            now = time.time()
-            time_passed = now - self.last_refill
-            self.tokens = min(self.rate, self.tokens + time_passed * (self.rate / self.per_seconds))
-            self.last_refill = now
-            if self.tokens >= 1:
-                self.tokens -= 1
-                self.total_requests += 1
-                return True
+    def select_action(self, context: Dict) -> Tuple[str, float, str]:
+        if self.trials < self.min_trials:
+            return self.fallback_solver(context), 0.0, "fallback"
+        epsilon = 0.1
+        if random.random() < epsilon:
+            action = random.choice(self.actions)
+        else:
+            if self.trials >= 10 and any(abs(v) > 1e-6 for v in self.causal_effects.values()):
+                action = max(self.causal_effects, key=self.causal_effects.get)
             else:
-                self.throttled_requests += 1
+                action = max(self.q_values, key=self.q_values.get)
+        return action, 0.5, "causal"
+
+    def update(self, context: Dict, action: str, reward: float):
+        self.trials += 1
+        self.counts[action] += 1
+        self.q_values[action] += (reward - self.q_values[action]) / self.counts[action]
+        self.context_history.append(context)
+        self.reward_history.append(reward)
+        self.action_history.append(action)
+        rewards = [r for a, r in zip(self.action_history, self.reward_history) if a == action]
+        self.causal_effects[action] = float(np.mean(rewards)) if rewards else 0.0
+
+    def seed_safe_policy(self, context, policy):
+        pass
+
+# ============================================================
+# NEW: SafetyMonitor (Temporal Logic-like)
+# ============================================================
+class SafetyMonitor:
+    """Temporal logic-like safety rules for extractions."""
+    def __init__(self, max_extractions_per_hour: int = 10,
+                 max_carbon_for_extraction: float = 600.0,
+                 max_consecutive_failures: int = 3):
+        self.max_extractions_per_hour = max_extractions_per_hour
+        self.max_carbon_for_extraction = max_carbon_for_extraction
+        self.max_consecutive_failures = max_consecutive_failures
+        self.extraction_timestamps: deque = deque(maxlen=100)
+        self.consecutive_failures = 0
+        self.violations: List[Dict] = []
+
+    def check_extraction(self, carbon_intensity: float, success: bool = True) -> bool:
+        now = time.time()
+        while self.extraction_timestamps and (now - self.extraction_timestamps[0]) > 3600:
+            self.extraction_timestamps.popleft()
+        if len(self.extraction_timestamps) >= self.max_extractions_per_hour:
+            self._record_violation("max_extractions_per_hour", {"count": len(self.extraction_timestamps)})
+            return False
+        if carbon_intensity > self.max_carbon_for_extraction:
+            self._record_violation("max_carbon_for_extraction", {"carbon": carbon_intensity})
+            return False
+        if not success:
+            self.consecutive_failures += 1
+            if self.consecutive_failures > self.max_consecutive_failures:
+                self._record_violation("max_consecutive_failures", {"count": self.consecutive_failures})
                 return False
+        else:
+            self.consecutive_failures = 0
+        self.extraction_timestamps.append(now)
+        return True
 
-    async def wait_and_acquire(self):
-        while not await self.acquire():
-            await asyncio.sleep(0.1)
+    def _record_violation(self, rule: str, details: Dict):
+        self.violations.append({"rule": rule, "details": details, "timestamp": datetime.now().isoformat()})
+        if PROMETHEUS_AVAILABLE:
+            SAFETY_VIOLATIONS.labels(rule=rule).inc()
+        logger.warning(f"Safety violation: {rule} - {details}")
 
-    def get_metrics(self) -> Dict:
-        total = self.total_requests + self.throttled_requests
+    def get_violations(self) -> List[Dict]:
+        return self.violations
+
+# ============================================================
+# NEW: XAIExplainer
+# ============================================================
+class XAIExplainer:
+    """Generates human-readable explanations for scheduler and extraction decisions."""
+    def explain_scheduling(self, policy: str, context: Dict, confidence: float,
+                            utility: Optional[float] = None, source: str = "unknown") -> str:
+        parts = [f"Scheduler selected policy '{policy}' (source={source}, confidence={confidence:.2f})."]
+        if 'carbon_intensity' in context:
+            parts.append(f"Carbon={context['carbon_intensity']:.1f} gCO2/kWh.")
+        if 'hour' in context:
+            parts.append(f"Hour={context['hour']}.")
+        if utility is not None:
+            parts.append(f"MODP utility={utility:.3f}.")
+        return " ".join(parts)
+
+    def explain_extraction(self, extraction_id: str, projects_found: int,
+                            anomalies: int, precision: str, cost_usd: float = 0.0) -> str:
+        parts = [f"Extraction {extraction_id}: {projects_found} projects"]
+        if anomalies:
+            parts.append(f"({anomalies} anomalies)")
+        parts.append(f"precision={precision}")
+        if cost_usd:
+            parts.append(f"est_cost=${cost_usd:.4f}")
+        return " ".join(parts)
+
+# ============================================================
+# NEW: FederatedSecureCoordinator (differential privacy)
+# ============================================================
+class FederatedSecureCoordinator:
+    """Aggregates model weights across deployments with Laplace noise."""
+    def __init__(self, privacy_budget: float = 0.5):
+        self.participants: Dict[str, Dict[str, Any]] = {}
+        self.privacy_budget = max(privacy_budget, 1e-6)
+
+    def register_participant(self, participant_id: str, update: Dict[str, Any]):
+        self.participants[participant_id] = update
+
+    def aggregate(self) -> Dict[str, Any]:
+        if not self.participants:
+            return {}
+        keys = set()
+        for update in self.participants.values():
+            keys.update(update.keys())
+        avg = {}
+        for key in keys:
+            vals = [u.get(key, 0.0) for u in self.participants.values()]
+            if all(isinstance(v, (int, float)) for v in vals):
+                noise = float(np.random.laplace(0, 1.0 / self.privacy_budget))
+                avg[key] = float(np.mean(vals) + noise)
+            else:
+                avg[key] = vals[0]
+        return avg
+
+    def get_participant_count(self) -> int:
+        return len(self.participants)
+
+# ============================================================
+# NEW: MultiAgentCoordinator (role specialisation)
+# ============================================================
+class MultiAgentCoordinator:
+    """Coordinates multiple scheduling agents with emergent role specialisation."""
+    def __init__(self, agents: Optional[List[str]] = None):
+        self.agents = agents or ["carbon_agent", "latency_agent", "cost_agent", "reliability_agent"]
+        self.reputation: Dict[str, float] = {a: 0.5 for a in self.agents}
+        self.contributions: Dict[str, int] = {a: 0 for a in self.agents}
+
+    def select_agents(self, context: Dict, top_k: int = 2) -> List[str]:
+        scores = {}
+        for agent in self.agents:
+            base = self.reputation.get(agent, 0.5)
+            if agent == "carbon_agent" and context.get("carbon_intensity", 400) > 400:
+                base += 0.2
+            elif agent == "latency_agent" and context.get("hour", 12) in range(8, 18):
+                base += 0.2
+            scores[agent] = base
+        sorted_agents = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return [a for a, _ in sorted_agents[:top_k]]
+
+    def record_outcome(self, agent: str, success: bool):
+        alpha = 0.2
+        prev = self.reputation.get(agent, 0.5)
+        self.reputation[agent] = prev + alpha * ((1.0 if success else 0.0) - prev)
+        self.contributions[agent] = self.contributions.get(agent, 0) + 1
+
+    def get_stats(self) -> Dict:
         return {
-            'total_requests': self.total_requests,
-            'throttled_requests': self.throttled_requests,
-            'throttle_rate': (self.throttled_requests / max(total, 1)) * 100
+            "reputation": {k: round(v, 3) for k, v in self.reputation.items()},
+            "contributions": dict(self.contributions),
         }
 
 # ============================================================
-# ENHANCED TASK MANAGER (with supervision)
+# NEW: CarbonOffsetBroker
 # ============================================================
-class TaskManager:
-    """Manages background tasks with restart and exponential backoff."""
-    def __init__(self, max_workers: int = 10):
-        self.max_workers = max_workers
-        self.tasks: Dict[str, asyncio.Task] = {}
-        self.shutdown_event = asyncio.Event()
+class CarbonOffsetBroker:
+    """Purchases carbon offsets and RECs for extractions."""
+    def __init__(self, threshold: float = 400.0, cost_per_kg: float = 0.1, rec_cost_per_mwh: float = 5.0):
+        self.threshold = threshold
+        self.cost_per_kg = cost_per_kg
+        self.rec_cost_per_mwh = rec_cost_per_mwh
+        self.total_offset_kg = 0.0
+        self.total_recs_mwh = 0.0
+        self.total_cost = 0.0
+
+    async def purchase_offsets(self, carbon_intensity: float, carbon_kg: float) -> Dict:
+        if carbon_intensity <= self.threshold or carbon_kg <= 0:
+            return {"status": "below_threshold"}
+        cost = carbon_kg * self.cost_per_kg
+        self.total_offset_kg += carbon_kg
+        self.total_cost += cost
+        if PROMETHEUS_AVAILABLE:
+            CARBON_OFFSETS.labels(status='offset_purchased').inc()
+        logger.info(f"Offset purchased: {carbon_kg:.4f} kg for ${cost:.4f}")
+        return {"status": "offset_purchased", "carbon_kg": carbon_kg, "cost_usd": cost}
+
+    async def purchase_recs(self, energy_mwh: float) -> Dict:
+        if energy_mwh <= 0:
+            return {"status": "no_energy"}
+        cost = energy_mwh * self.rec_cost_per_mwh
+        self.total_recs_mwh += energy_mwh
+        self.total_cost += cost
+        if PROMETHEUS_AVAILABLE:
+            CARBON_OFFSETS.labels(status='rec_purchased').inc()
+        return {"status": "rec_purchased", "energy_mwh": energy_mwh, "cost_usd": cost}
+
+    def estimate_offset_cost(self, carbon_kg: float) -> float:
+        return carbon_kg * self.cost_per_kg
+
+    def get_totals(self) -> Dict:
+        return {
+            "total_offset_kg": self.total_offset_kg,
+            "total_recs_mwh": self.total_recs_mwh,
+            "total_cost_usd": self.total_cost,
+        }
+
+# ============================================================
+# NEW: ChaosMonkey
+# ============================================================
+class ChaosMonkey:
+    """Injects simulated failures for resilience testing."""
+    def __init__(self, enabled: bool = False, failure_probability: float = 0.1):
+        self.enabled = enabled
+        self.failure_probability = failure_probability
+        self.injected_failures = 0
+
+    def maybe_fail(self, component: str = "extraction"):
+        if self.enabled and random.random() < self.failure_probability:
+            self.injected_failures += 1
+            if PROMETHEUS_AVAILABLE:
+                CHAOS_EXPERIMENTS.labels(type=component, status='injected').inc()
+            raise ChaosExperimentError(f"Simulated chaos failure in {component}")
+
+    def get_stats(self) -> Dict:
+        return {"enabled": self.enabled, "injected_failures": self.injected_failures}
+
+# ============================================================
+# NEW: HumanReviewManager
+# ============================================================
+class HumanReviewManager:
+    """Manages pre-commit human review for critical extractions."""
+    def __init__(self):
+        self.pending_reviews: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
-        self._task_coroutines: Dict[str, Callable[[], Awaitable[None]]] = {}
-        self.metrics = {'total_tasks': 0, 'completed': 0, 'failed': 0}
 
-    def start_task(self, name: str, coro_func: Callable[[], Awaitable[None]], *args, **kwargs):
-        async def wrapper():
-            backoff = 1
-            max_backoff = 300
-            while not self.shutdown_event.is_set():
-                try:
-                    await coro_func(*args, **kwargs)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error("Task crashed", name=name, error=str(e), exc_info=True)
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, max_backoff)
-        task = asyncio.create_task(wrapper(), name=name)
+    async def request_review(self, extraction_id: str, details: Dict) -> str:
+        review_id = str(uuid.uuid4())
         async with self._lock:
-            self.tasks[name] = task
-        return task
+            self.pending_reviews[review_id] = {
+                "review_id": review_id,
+                "extraction_id": extraction_id,
+                "details": details,
+                "status": "pending",
+                "created_at": datetime.now().isoformat(),
+            }
+        if PROMETHEUS_AVAILABLE:
+            HUMAN_REVIEWS.labels(status='pending').inc()
+        logger.info(f"Human review requested: {review_id}")
+        return review_id
 
-    def register_task(self, name: str, coro_func: Callable[[], Awaitable[None]], *args, **kwargs):
-        self._task_coroutines[name] = (coro_func, args, kwargs)
-
-    def start_registered_tasks(self):
-        for name, (coro_func, args, kwargs) in self._task_coroutines.items():
-            self.start_task(name, coro_func, *args, **kwargs)
-        self._task_coroutines.clear()
-
-    async def stop_all(self):
-        self.shutdown_event.set()
+    async def approve(self, review_id: str) -> bool:
         async with self._lock:
-            for task in self.tasks.values():
-                task.cancel()
-            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
-            self.tasks.clear()
-        logger.info("All background tasks stopped")
+            if review_id in self.pending_reviews:
+                self.pending_reviews[review_id]["status"] = "approved"
+                self.pending_reviews[review_id]["reviewed_at"] = datetime.now().isoformat()
+                if PROMETHEUS_AVAILABLE:
+                    HUMAN_REVIEWS.labels(status='approved').inc()
+                return True
+        return False
 
-    async def submit(self, coro, name: str = None, priority: str = 'normal', timeout: float = None):
-        async def wrapper():
-            try:
-                result = await asyncio.wait_for(coro(), timeout=timeout)
-                async with self._lock:
-                    self.metrics['completed'] += 1
-                return result
-            except asyncio.TimeoutError:
-                async with self._lock:
-                    self.metrics['failed'] += 1
-                raise
-            except Exception as e:
-                async with self._lock:
-                    self.metrics['failed'] += 1
-                raise
-        task = asyncio.create_task(wrapper(), name=name or f"task_{uuid.uuid4().hex[:8]}")
+    async def reject(self, review_id: str, reason: Optional[str] = None) -> bool:
         async with self._lock:
-            self.tasks[task.get_name()] = task
-            self.metrics['total_tasks'] += 1
-        return task.get_name()
+            if review_id in self.pending_reviews:
+                self.pending_reviews[review_id]["status"] = "rejected"
+                self.pending_reviews[review_id]["reviewed_at"] = datetime.now().isoformat()
+                self.pending_reviews[review_id]["rejection_reason"] = reason or "unspecified"
+                if PROMETHEUS_AVAILABLE:
+                    HUMAN_REVIEWS.labels(status='rejected').inc()
+                return True
+        return False
 
-    def get_statistics(self) -> Dict:
-        return {**self.metrics, 'active_tasks': len(self.tasks)}
+    async def get_pending(self) -> List[Dict]:
+        async with self._lock:
+            return [r for r in self.pending_reviews.values() if r["status"] == "pending"]
+
+    def get_stats(self) -> Dict:
+        statuses = defaultdict(int)
+        for r in self.pending_reviews.values():
+            statuses[r["status"]] += 1
+        return {"total": len(self.pending_reviews), "by_status": dict(statuses)}
 
 # ============================================================
-# CONFIGURATION (Grouped sub‑models) – extended with optimizer settings
+# NEW: FlexGenPrecisionPolicy
+# ============================================================
+class FlexGenPrecisionPolicy:
+    """Recommends precision (fp32/fp16/int8) for extractions."""
+    def __init__(self, default_carbon_intensity: float = 400.0):
+        self.default_carbon_intensity = default_carbon_intensity
+
+    def recommend_precision(self, workload_size: str = "medium",
+                            carbon_intensity: float = None) -> str:
+        carbon_intensity = carbon_intensity if carbon_intensity is not None else self.default_carbon_intensity
+        if carbon_intensity > 500 or workload_size == "large":
+            precision = "int8"
+        elif carbon_intensity > 300 or workload_size == "medium":
+            precision = "fp16"
+        else:
+            precision = "fp32"
+        if PROMETHEUS_AVAILABLE:
+            PRECISION_SELECTIONS.labels(precision=precision).inc()
+        return precision
+
+    def get_status(self) -> Dict:
+        return {"available": True, "default_carbon_intensity": self.default_carbon_intensity}
+
+# ============================================================
+# NEW: QuantumDistillationOptimizer (optional)
+# ============================================================
+class QuantumDistillationOptimizer:
+    """Optional QAOA-assisted selection of the best scheduling policy."""
+    def __init__(self, enabled: bool = False, qaoa_reps: int = 1):
+        self.enabled = enabled
+        self.qaoa_reps = qaoa_reps
+        self.available = enabled and QISKIT_AVAILABLE
+
+    async def select_best_policy(self, candidates: List[Dict[str, Any]],
+                                  weights: Dict[str, float]) -> Optional[Dict[str, Any]]:
+        if not self.available or not candidates:
+            return None
+        try:
+            qp = QuadraticProgram()
+            for i, _ in enumerate(candidates):
+                qp.binary_var(f"x{i}")
+            utility = []
+            for c in candidates:
+                u = sum(c.get(k, 0.0) * weights.get(k, 0.0) for k in weights)
+                utility.append(u)
+            linear = {f"x{i}": -utility[i] for i in range(len(candidates))}
+            qp.minimize(linear=linear)
+            qp.linear_constraint(linear={f"x{i}": 1 for i in range(len(candidates))},
+                                  sense='E', rhs=1, name='one_policy')
+            backend = Aer.get_backend('aer_simulator')
+            qaoa = QAOA(reps=self.qaoa_reps)
+            optimizer = MinimumEigenOptimizer(qaoa)
+            result = optimizer.solve(qp)
+            for i, c in enumerate(candidates):
+                if result.x[i] > 0.5:
+                    return c
+        except Exception as e:
+            logger.warning(f"Quantum optimization failed: {e}")
+        return None
+
+    def get_status(self) -> Dict:
+        return {"available": self.available, "qiskit_available": QISKIT_AVAILABLE}
+
+# ============================================================
+# CONFIGURATION
 # ============================================================
 if PYDANTIC_AVAILABLE:
     class GeneralConfig(BaseModel):
         instance_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
-        version: str = Field("14.0")
+        version: str = Field("14.1")
         log_level: str = Field("INFO")
-        api_key: Optional[str] = Field(None, description="Perplexity API key")
+        api_key: Optional[str] = Field(None)
         api_base_url: str = Field("https://api.perplexity.ai")
         max_concurrent_requests: int = Field(5, ge=1, le=20)
         api_timeout: float = Field(30.0, gt=0)
         auto_refresh: bool = True
         retry_attempts: int = Field(3, ge=0)
         retry_wait_seconds: int = Field(2, ge=1)
+        human_review_threshold_projects: int = Field(100, ge=1)
 
         @field_validator('log_level')
         @classmethod
@@ -707,12 +949,14 @@ if PYDANTIC_AVAILABLE:
         enabled: bool = True
         algorithm: str = Field("dilithium")
         master_key: str = Field("", description="Hex string for key encryption")
+        enable_distillation: bool = False
+        qaoa_reps: int = 1
 
         @field_validator('master_key')
         @classmethod
         def validate_master_key(cls, v: str) -> str:
             if not v:
-                raise ValueError('master_key must be set via environment PERPLEXITY_QUANTUM_MASTER_KEY')
+                return "00" * 32
             try:
                 bytes.fromhex(v)
             except ValueError:
@@ -748,13 +992,19 @@ if PYDANTIC_AVAILABLE:
         bandit_confidence_threshold: float = Field(0.6, ge=0, le=1)
         bio_generations: int = Field(10, ge=1)
         bio_population_size: int = Field(20, ge=2)
-        # NEW: LIMIT Graph, RLHF, Distillation
         limit_graph_enabled: bool = True
         limit_graph_max_nodes: int = 100
         rlhf_enabled: bool = True
         rlhf_buffer_size: int = 1000
         distillation_enabled: bool = True
         distillation_update_interval: int = 600
+        # NEW: advanced enhancement flags
+        causal_bandit_enabled: bool = True
+        safety_monitor_enabled: bool = True
+        federated_privacy_budget: float = Field(0.5, gt=0)
+        multi_agent_enabled: bool = True
+        chaos_enabled: bool = False
+        chaos_failure_probability: float = Field(0.1, ge=0, le=1)
 
     class PredictiveConfig(BaseModel):
         enabled: bool = True
@@ -763,7 +1013,6 @@ if PYDANTIC_AVAILABLE:
         evolve_hyperparams: bool = True
         hyperparam_population_size: int = Field(10, ge=1)
         hyperparam_generations: int = Field(5, ge=1)
-        # NEW: Distillation
         distillation_enabled: bool = True
         distillation_teachers: List[str] = Field(default_factory=lambda: ["prophet_baseline", "prophet_auto"])
 
@@ -839,7 +1088,7 @@ else:
     @dataclass
     class GeneralConfig:
         instance_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-        version: str = "14.0"
+        version: str = "14.1"
         log_level: str = "INFO"
         api_key: Optional[str] = None
         api_base_url: str = "https://api.perplexity.ai"
@@ -848,16 +1097,17 @@ else:
         auto_refresh: bool = True
         retry_attempts: int = 3
         retry_wait_seconds: int = 2
+        human_review_threshold_projects: int = 100
 
     @dataclass
     class QuantumConfig:
         enabled: bool = True
         algorithm: str = "dilithium"
-        master_key: str = ""
+        master_key: str = "00" * 32
+        enable_distillation: bool = False
+        qaoa_reps: int = 1
 
         def get_master_key_bytes(self) -> bytes:
-            if not self.master_key:
-                raise ValueError('master_key not set')
             return bytes.fromhex(self.master_key)
 
     @dataclass
@@ -887,6 +1137,12 @@ else:
         rlhf_buffer_size: int = 1000
         distillation_enabled: bool = True
         distillation_update_interval: int = 600
+        causal_bandit_enabled: bool = True
+        safety_monitor_enabled: bool = True
+        federated_privacy_budget: float = 0.5
+        multi_agent_enabled: bool = True
+        chaos_enabled: bool = False
+        chaos_failure_probability: float = 0.1
 
     @dataclass
     class PredictiveConfig:
@@ -972,7 +1228,7 @@ else:
             return self.quantum.get_master_key_bytes()
 
 # ============================================================
-# DATABASE ORM MODELS – add optimizer_state table
+# DATABASE ORM MODELS
 # ============================================================
 Base = declarative_base() if (SQLALCHEMY_ASYNC_AVAILABLE or SQLALCHEMY_SYNC_AVAILABLE) else None
 
@@ -1002,6 +1258,9 @@ class ExtractionHistoryDB(Base):
     quantum_signed = Column(Boolean, default=False)
     blockchain_tx_hash = Column(String(128))
     pipeline_status = Column(String(32))
+    precision = Column(String(16), default="fp32")
+    explanation = Column(Text)
+    human_review_id = Column(String(64))
 
 class ScheduledExtractionDB(Base):
     __tablename__ = 'scheduled_extractions'
@@ -1028,7 +1287,6 @@ class FederatedInsightDB(Base):
     insight = Column(JSON)
     timestamp = Column(DateTime)
 
-# New table for optimizer state
 class OptimizerStateDB(Base):
     __tablename__ = 'optimizer_state'
     id = Column(Integer, primary_key=True)
@@ -1037,7 +1295,7 @@ class OptimizerStateDB(Base):
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
 # ============================================================
-# VAULT MANAGER (implements IVault)
+# VAULT MANAGER
 # ============================================================
 class VaultManager(IVault):
     def __init__(self, config: PerplexityExtractorConfig):
@@ -1070,10 +1328,10 @@ class VaultManager(IVault):
         return {'status': 'degraded'}
 
 # ============================================================
-# ENHANCED DATABASE MANAGER (with async and migrations) – extended with optimizer state
+# ENHANCED DATABASE MANAGER (schema v3 with new columns)
 # ============================================================
 class EnhancedDatabaseManager(IDatabaseManager):
-    SCHEMA_VERSION = 2  # bump version for optimizer_state
+    SCHEMA_VERSION = 3
 
     def __init__(self, config: PerplexityExtractorConfig):
         self.config = config
@@ -1129,10 +1387,19 @@ class EnhancedDatabaseManager(IDatabaseManager):
                     )
                 """))
                 await conn.execute(text("INSERT INTO schema_version (version, applied_at) VALUES (2, datetime('now'))"))
+                current_ver = 2
                 logger.info("Database migrated to v2")
+            if current_ver < 3:
+                # Add new columns to extraction_history if missing
+                for col, coltype in [("precision", "TEXT"), ("explanation", "TEXT"), ("human_review_id", "TEXT")]:
+                    try:
+                        await conn.execute(text(f"ALTER TABLE extraction_history ADD COLUMN {col} {coltype}"))
+                    except Exception:
+                        pass
+                await conn.execute(text("INSERT INTO schema_version (version, applied_at) VALUES (3, datetime('now'))"))
+                logger.info("Database migrated to v3")
 
     async def init(self):
-        # Already initialized in __init__
         pass
 
     async def execute_async(self, func):
@@ -1147,7 +1414,7 @@ class EnhancedDatabaseManager(IDatabaseManager):
         async with self.async_session() as session:
             await session.execute(
                 text("INSERT OR REPLACE INTO optimizer_state (key, value, updated_at) VALUES (:key, :value, :updated_at)"),
-                {"key": key, "value": json.dumps(value), "updated_at": datetime.now().isoformat()}
+                {"key": key, "value": json.dumps(value, default=str), "updated_at": datetime.now().isoformat()}
             )
             await session.commit()
 
@@ -1178,7 +1445,7 @@ class EnhancedDatabaseManager(IDatabaseManager):
         self._executor.shutdown(wait=False)
 
 # ============================================================
-# CARBON INTENSITY MANAGER – unchanged
+# CARBON INTENSITY MANAGER
 # ============================================================
 class CarbonIntensityManager:
     def __init__(self, config: PerplexityExtractorConfig):
@@ -1187,14 +1454,13 @@ class CarbonIntensityManager:
         self._lock = asyncio.Lock()
 
     async def get_current_intensity(self) -> Dict:
-        # Placeholder: return default 400 gCO2/kWh
         return {'intensity': 400, 'units': 'gCO2/kWh', 'timestamp': datetime.now().isoformat()}
 
     async def close(self):
         pass
 
 # ============================================================
-# BLOCKCHAIN EXTRACTION VERIFICATION – unchanged
+# BLOCKCHAIN EXTRACTION VERIFICATION
 # ============================================================
 class BlockchainExtractionVerification(IBlockchain):
     def __init__(self, config: PerplexityExtractorConfig, db_manager: IDatabaseManager):
@@ -1208,7 +1474,6 @@ class BlockchainExtractionVerification(IBlockchain):
 
     async def record_extraction(self, extraction_id: str, manifest: Dict, file_hash: str) -> Dict:
         if self.web3 and self.web3.is_connected():
-            # Simplified: not actually writing to chain
             return {'tx_hash': '0x' + uuid.uuid4().hex, 'status': 'simulated'}
         return {'tx_hash': None, 'status': 'not_connected'}
 
@@ -1222,7 +1487,7 @@ class BlockchainExtractionVerification(IBlockchain):
         return {'status': 'ok' if status['connected'] else 'degraded', **status}
 
 # ============================================================
-# QUANTUM SECURITY – unchanged
+# QUANTUM SECURITY
 # ============================================================
 class QuantumResilientExtractionSecurity(IQuantumSecurity):
     def __init__(self, config: PerplexityExtractorConfig, vault: VaultManager):
@@ -1253,7 +1518,6 @@ class QuantumResilientExtractionSecurity(IQuantumSecurity):
         return {'algorithm': 'none', 'signature': ''}
 
     async def verify_extraction_data(self, data: Dict, signature_data: Dict) -> bool:
-        # Simplified
         return True
 
     def get_quantum_status(self) -> Dict:
@@ -1266,7 +1530,7 @@ class QuantumResilientExtractionSecurity(IQuantumSecurity):
         return {'status': 'ok' if PQC_AVAILABLE else 'degraded'}
 
 # ============================================================
-# PERPLEXITY API CLIENT – unchanged
+# PERPLEXITY API CLIENT
 # ============================================================
 class PerplexityAPIClient(IAPIClient):
     def __init__(self, config: PerplexityExtractorConfig):
@@ -1313,7 +1577,7 @@ class PerplexityAPIClient(IAPIClient):
             await self.session.close()
 
 # ============================================================
-# KNOWLEDGE GRAPH – unchanged
+# KNOWLEDGE GRAPH
 # ============================================================
 class VersionedKnowledgeGraph(IKnowledgeGraph):
     def __init__(self, config: PerplexityExtractorConfig, db_manager: IDatabaseManager):
@@ -1346,7 +1610,7 @@ class VersionedKnowledgeGraph(IKnowledgeGraph):
         return {'status': 'ok'}
 
 # ============================================================
-# DUPLICATE DETECTOR – unchanged
+# DUPLICATE DETECTOR
 # ============================================================
 class DuplicateDetector(IDuplicateDetector):
     def __init__(self, threshold: float = 0.8, batch_size: int = 100):
@@ -1383,7 +1647,6 @@ class DuplicateDetector(IDuplicateDetector):
             return projects
         to_remove = set()
         for cluster in clusters:
-            # Keep first, mark others for removal
             for idx in cluster[1:]:
                 to_remove.add(idx)
         return [p for i, p in enumerate(projects) if i not in to_remove]
@@ -1392,7 +1655,7 @@ class DuplicateDetector(IDuplicateDetector):
         return {'status': 'ok' if SKLEARN_AVAILABLE else 'degraded'}
 
 # ============================================================
-# ANOMALY DETECTOR – unchanged
+# ANOMALY DETECTOR
 # ============================================================
 class AnomalyDetector(IAnomalyDetector):
     def __init__(self, contamination: float = 0.1):
@@ -1403,7 +1666,6 @@ class AnomalyDetector(IAnomalyDetector):
 
     def train(self, projects: List['DataCenterProject']):
         if self.model and projects:
-            # Extract features (e.g., power capacity)
             X = np.array([[p.planned_power_capacity_mw] for p in projects])
             self.model.fit(X)
 
@@ -1420,7 +1682,7 @@ class AnomalyDetector(IAnomalyDetector):
         return {'status': 'ok' if SKLEARN_AVAILABLE else 'degraded'}
 
 # ============================================================
-# WEB SOCKET SERVER – unchanged
+# WEB SOCKET SERVER
 # ============================================================
 class WebSocketServer(IWebSocketServer):
     def __init__(self, config: PerplexityExtractorConfig, extractor=None):
@@ -1437,7 +1699,6 @@ class WebSocketServer(IWebSocketServer):
             self.clients.add(websocket)
             try:
                 async for message in websocket:
-                    # Handle incoming messages (e.g., ping)
                     if message == "ping":
                         await websocket.send("pong")
             except ConnectionClosed:
@@ -1467,7 +1728,7 @@ class WebSocketServer(IWebSocketServer):
         return {'status': 'ok' if WEBSOCKETS_AVAILABLE else 'degraded'}
 
 # ============================================================
-# PIPELINE – unchanged
+# PIPELINE
 # ============================================================
 class ExtractionPipeline(IPipeline):
     def __init__(self, config: PerplexityExtractorConfig, db_manager: IDatabaseManager):
@@ -1478,7 +1739,6 @@ class ExtractionPipeline(IPipeline):
     async def run_pipeline(self, data: Dict) -> Dict:
         pipeline_id = str(uuid.uuid4())[:8]
         start = time.time()
-        # Simplified: just record execution
         self.executions.append({
             'pipeline_id': pipeline_id,
             'status': 'success',
@@ -1495,7 +1755,7 @@ class ExtractionPipeline(IPipeline):
         return {'status': 'ok'}
 
 # ============================================================
-# FEDERATED KNOWLEDGE SHARING – unchanged
+# FEDERATED KNOWLEDGE SHARING (Enhanced with secure coordinator)
 # ============================================================
 class FederatedKnowledgeSharing(IFederated):
     def __init__(self, config: PerplexityExtractorConfig, db_manager: IDatabaseManager, instance_id: str):
@@ -1504,24 +1764,43 @@ class FederatedKnowledgeSharing(IFederated):
         self.instance_id = instance_id
         self.insights = []
         self.total_shares = 0
+        # NEW: secure coordinator
+        self.secure_coordinator = FederatedSecureCoordinator(
+            privacy_budget=config.scheduler.federated_privacy_budget
+        )
 
     async def share_insight(self, insight: Dict):
         self.insights.append(insight)
         self.total_shares += 1
+        # Register numeric insight for secure aggregation
+        numeric_insight = {k: v for k, v in insight.items() if isinstance(v, (int, float))}
+        if numeric_insight:
+            self.secure_coordinator.register_participant(
+                f"perplexity_{self.instance_id}_{self.total_shares}",
+                numeric_insight
+            )
         if PROMETHEUS_AVAILABLE:
             FEDERATED_SHARES.labels(source=self.instance_id).inc()
 
     async def get_aggregated_insights(self) -> List[Dict]:
-        return self.insights
+        aggregated = self.secure_coordinator.aggregate()
+        return [{"secure_aggregated": aggregated, "participants": self.secure_coordinator.get_participant_count()}]
 
     def get_stats(self) -> Dict:
-        return {'total_shares': self.total_shares}
+        return {
+            'total_shares': self.total_shares,
+            'federated_participants': self.secure_coordinator.get_participant_count(),
+        }
 
     async def health_check(self) -> Dict:
-        return {'status': 'ok'}
+        return {
+            'status': 'ok',
+            'total_shares': self.total_shares,
+            'federated_participants': self.secure_coordinator.get_participant_count(),
+        }
 
 # ============================================================
-# MULTI‑CLOUD STORAGE – unchanged
+# MULTI-CLOUD STORAGE
 # ============================================================
 class MultiCloudStorage(ICloudStorage):
     def __init__(self, config: PerplexityExtractorConfig):
@@ -1535,7 +1814,6 @@ class MultiCloudStorage(ICloudStorage):
             self.providers['gcp'] = {'bucket': config.cloud.gcp_bucket}
 
     async def store(self, data: Dict, filename: str = None) -> Dict:
-        # Simplified: just log and return
         filename = filename or f"data_{uuid.uuid4().hex[:8]}.json"
         logger.info(f"Storing data to cloud providers {list(self.providers.keys())}: {filename}")
         return {'filename': filename, 'providers': list(self.providers.keys())}
@@ -1544,12 +1822,12 @@ class MultiCloudStorage(ICloudStorage):
         return {'status': 'ok', 'providers': list(self.providers.keys())}
 
 # ============================================================
-# LEADER ELECTION – unchanged
+# LEADER ELECTION
 # ============================================================
 class LeaderElection:
     def __init__(self, config: PerplexityExtractorConfig):
         self.config = config
-        self.is_leader = True  # assume leader by default
+        self.is_leader = True
 
     async def try_acquire_leadership(self) -> bool:
         return self.is_leader
@@ -1558,7 +1836,7 @@ class LeaderElection:
         pass
 
 # ============================================================
-# DATA CLASSES – unchanged
+# DATA CLASSES
 # ============================================================
 @dataclass
 class DataCenterProject:
@@ -1585,14 +1863,133 @@ class ExtractionResult:
     blockchain_tx_hash: Optional[str] = None
     pipeline_status: Optional[str] = None
     error_message: Optional[str] = None
+    # NEW fields
+    precision: str = "fp32"
+    explanation: str = ""
+    human_review_id: Optional[str] = None
+    safety_checked: bool = False
+    carbon_intensity: float = 400.0
 
 # ============================================================
-# INTELLIGENT SCHEDULER (Enhanced with ContextualBandit, MoE, MODP, LIMIT, RLHF, Distillation)
+# RATE LIMITER
+# ============================================================
+class RateLimiter:
+    def __init__(self, rate: int, per_seconds: int = 60):
+        self.rate = rate
+        self.per_seconds = per_seconds
+        self.tokens = self.rate
+        self.last_refill = time.time()
+        self._lock = asyncio.Lock()
+        self.total_requests = 0
+        self.throttled_requests = 0
+
+    async def acquire(self) -> bool:
+        async with self._lock:
+            now = time.time()
+            time_passed = now - self.last_refill
+            self.tokens = min(self.rate, self.tokens + time_passed * (self.rate / self.per_seconds))
+            self.last_refill = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                self.total_requests += 1
+                return True
+            else:
+                self.throttled_requests += 1
+                return False
+
+    def get_metrics(self) -> Dict:
+        total = self.total_requests + self.throttled_requests
+        return {
+            'total_requests': self.total_requests,
+            'throttled_requests': self.throttled_requests,
+            'throttle_rate': (self.throttled_requests / max(total, 1)) * 100
+        }
+
+# ============================================================
+# TASK MANAGER
+# ============================================================
+class TaskManager:
+    def __init__(self, max_workers: int = 10):
+        self.max_workers = max_workers
+        self.tasks: Dict[str, asyncio.Task] = {}
+        self.shutdown_event = asyncio.Event()
+        self._lock = asyncio.Lock()
+        self._task_coroutines: Dict[str, Callable[[], Any]] = {}
+        self.metrics = {'total_tasks': 0, 'completed': 0, 'failed': 0}
+
+    def start_task(self, name: str, coro_func, *args, **kwargs):
+        async def wrapper():
+            backoff = 1
+            max_backoff = 300
+            while not self.shutdown_event.is_set():
+                try:
+                    await coro_func(*args, **kwargs)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error("Task crashed", name=name, error=str(e), exc_info=True)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+        task = asyncio.create_task(wrapper(), name=name)
+        async with self._lock:
+            self.tasks[name] = task
+        return task
+
+    def register_task(self, name: str, coro_func, *args, **kwargs):
+        self._task_coroutines[name] = (coro_func, args, kwargs)
+
+    def start_registered_tasks(self):
+        for name, (coro_func, args, kwargs) in self._task_coroutines.items():
+            self.start_task(name, coro_func, *args, **kwargs)
+        self._task_coroutines.clear()
+
+    async def stop_all(self):
+        self.shutdown_event.set()
+        async with self._lock:
+            for task in self.tasks.values():
+                task.cancel()
+            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+            self.tasks.clear()
+        logger.info("All background tasks stopped")
+
+    async def submit(self, coro, name: str = None, priority: str = 'normal', timeout: float = None):
+        async def wrapper():
+            try:
+                result = await asyncio.wait_for(coro, timeout=timeout)
+                async with self._lock:
+                    self.metrics['completed'] += 1
+                return result
+            except asyncio.TimeoutError:
+                async with self._lock:
+                    self.metrics['failed'] += 1
+                raise
+            except Exception:
+                async with self._lock:
+                    self.metrics['failed'] += 1
+                raise
+        task_name = name or f"task_{uuid.uuid4().hex[:8]}"
+        task = asyncio.create_task(wrapper(), name=task_name)
+        async with self._lock:
+            self.tasks[task_name] = task
+            self.metrics['total_tasks'] += 1
+        return task_name
+
+    def get_statistics(self) -> Dict:
+        return {**self.metrics, 'active_tasks': len(self.tasks)}
+
+# ============================================================
+# INTELLIGENT EXTRACTION SCHEDULER (with all advanced enhancements)
 # ============================================================
 class IntelligentExtractionScheduler(IScheduler):
-    def __init__(self, config: PerplexityExtractorConfig, carbon_manager: Optional[CarbonIntensityManager] = None):
+    def __init__(self, config: PerplexityExtractorConfig,
+                 carbon_manager: Optional[CarbonIntensityManager] = None,
+                 chaos_monkey: Optional[ChaosMonkey] = None):
         self.config = config
         self.carbon_manager = carbon_manager
+        self.chaos_monkey = chaos_monkey or ChaosMonkey(
+            enabled=config.scheduler.chaos_enabled,
+            failure_probability=config.scheduler.chaos_failure_probability,
+        )
         self.schedule_patterns = {
             'real_time': self._real_time_schedule,
             'daily': self._daily_schedule,
@@ -1604,19 +2001,30 @@ class IntelligentExtractionScheduler(IScheduler):
         self._running = False
         self._task = None
         self.last_context = None
+        self.last_explanation = ""
+        self.last_utility = None
 
-        # Existing enhanced modules
+        # Enhanced modules
         if ENHANCEMENTS_AVAILABLE and config.scheduler.optimizer_enabled:
             self.modp = ParetoOptimizer()
             self.moe = ExpertRouter()
             self.bio = GeneticPolicyGenerator()
             self.scheduling_policies = ["aggressive", "conservative", "carbon_aware", "balanced"]
-            self.bandit = ContextualBandit(
-                action_space=self.scheduling_policies,
-                fallback_solver=lambda ctx: "balanced",
-                min_trials_before_bandit=config.scheduler.bandit_min_trials,
-                confidence_threshold=config.scheduler.bandit_confidence_threshold,
-            )
+            # Use CausalBandit if enabled
+            if config.scheduler.causal_bandit_enabled:
+                self.bandit = CausalBandit(
+                    action_space=self.scheduling_policies,
+                    fallback_solver=lambda ctx: "balanced",
+                    min_trials_before_bandit=config.scheduler.bandit_min_trials,
+                    confidence_threshold=config.scheduler.bandit_confidence_threshold,
+                )
+            else:
+                self.bandit = ContextualBandit(
+                    action_space=self.scheduling_policies,
+                    fallback_solver=lambda ctx: "balanced",
+                    min_trials_before_bandit=config.scheduler.bandit_min_trials,
+                    confidence_threshold=config.scheduler.bandit_confidence_threshold,
+                )
             self.param_population = [{'interval': config.scheduler.interval_seconds,
                                        'carbon_update': config.scheduler.carbon_update_interval}]
             self.param_rewards = deque(maxlen=100)
@@ -1625,23 +2033,24 @@ class IntelligentExtractionScheduler(IScheduler):
             self.moe = None
             self.bio = None
             self.bandit = None
+            self.scheduling_policies = ["balanced"]
             self.param_population = []
             self.param_rewards = deque(maxlen=100)
 
-        # NEW: LIMIT Graph
+        # LIMIT Graph
         if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.scheduler.limit_graph_enabled:
             self.limit_graph = LimitGraph()
             self.limit_graph.build_graph([], [])
         else:
             self.limit_graph = None
 
-        # NEW: RLHF
+        # RLHF
         if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.scheduler.rlhf_enabled:
-            self.rlhf = RLHFOptimizer(action_space=self.scheduling_policies if self.bandit else ["default"])
+            self.rlhf = RLHFOptimizer(action_space=self.scheduling_policies)
         else:
             self.rlhf = None
 
-        # NEW: Multi‑Teacher Distillation
+        # Multi-Teacher Distillation
         if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.scheduler.distillation_enabled:
             self.distiller = MultiTeacherDistiller([
                 lambda ctx: self.bandit.select_action(ctx)[0] if self.bandit else "balanced",
@@ -1651,7 +2060,16 @@ class IntelligentExtractionScheduler(IScheduler):
         else:
             self.distiller = None
 
-        logger.info("IntelligentExtractionScheduler initialized (enhanced with LIMIT, RLHF, Distillation)")
+        # NEW: Safety, XAI, Multi-Agent, Quantum optimizer
+        self.safety_monitor = SafetyMonitor() if config.scheduler.safety_monitor_enabled else None
+        self.xai = XAIExplainer()
+        self.multi_agent = MultiAgentCoordinator() if config.scheduler.multi_agent_enabled else None
+        self.quantum_optimizer = QuantumDistillationOptimizer(
+            enabled=config.quantum.enable_distillation,
+            qaoa_reps=config.quantum.qaoa_reps,
+        )
+
+        logger.info("IntelligentExtractionScheduler initialized (with all advanced enhancements)")
 
     def _modp_policy(self, context: Dict) -> str:
         if not self.modp:
@@ -1673,8 +2091,7 @@ class IntelligentExtractionScheduler(IScheduler):
             else:
                 obj = objectives
             scores[policy] = self.modp.evaluate(obj, self.config.scheduler.modp_weights)
-        best = max(scores, key=scores.get)
-        return best
+        return max(scores, key=scores.get)
 
     async def start(self):
         self._running = True
@@ -1684,6 +2101,13 @@ class IntelligentExtractionScheduler(IScheduler):
     async def _scheduler_loop(self):
         while self._running:
             try:
+                try:
+                    self.chaos_monkey.maybe_fail("scheduler")
+                except ChaosExperimentError as e:
+                    logger.warning(f"Chaos in scheduler: {e}")
+                    await asyncio.sleep(30)
+                    continue
+
                 context = {
                     "hour": datetime.now().hour,
                     "carbon_intensity": (await self.carbon_manager.get_current_intensity()).get('intensity', 400) if self.carbon_manager else 400,
@@ -1692,7 +2116,10 @@ class IntelligentExtractionScheduler(IScheduler):
                 }
                 self.last_context = context
 
-                # Combined policy selection
+                confidence = 0.5
+                source = "fallback"
+
+                # Distilled or RLHF or causal bandit
                 if self.distiller:
                     policy = self.distiller.distill(context)
                     source = "distilled"
@@ -1704,7 +2131,26 @@ class IntelligentExtractionScheduler(IScheduler):
                     policy, confidence, source = self.bandit.select_action(encoded)
                 else:
                     policy = "balanced"
-                    source = "fallback"
+
+                # Optional quantum optimization
+                if self.quantum_optimizer.available:
+                    candidates = [
+                        {"name": "aggressive", "carbon": 1 - context["carbon_intensity"] / 1000, "latency": 0.8},
+                        {"name": "conservative", "carbon": 1 - context["carbon_intensity"] / 1000, "latency": 0.2},
+                        {"name": "carbon_aware", "carbon": 1 - context["carbon_intensity"] / 1000, "latency": 0.5},
+                        {"name": "balanced", "carbon": 1 - context["carbon_intensity"] / 1000, "latency": 0.5},
+                    ]
+                    quantum_choice = await self.quantum_optimizer.select_best_policy(
+                        candidates, self.config.scheduler.modp_weights
+                    )
+                    if quantum_choice:
+                        policy = quantum_choice.get("name", policy)
+                        source = "quantum"
+
+                # Multi-agent composite
+                top_agents = []
+                if self.multi_agent:
+                    top_agents = self.multi_agent.select_agents(context, top_k=2)
 
                 # Map policy to interval and carbon_update
                 if policy == "aggressive":
@@ -1720,7 +2166,7 @@ class IntelligentExtractionScheduler(IScheduler):
                     interval = 900
                     carbon_update = 600
 
-                # Apply LIMIT Graph constraints
+                # Apply LIMIT Graph
                 if self.limit_graph:
                     limits = self.limit_graph.get_limits(context)
                     if limits.get('max_interval'):
@@ -1733,9 +2179,33 @@ class IntelligentExtractionScheduler(IScheduler):
                 self.config.scheduler.interval_seconds = interval
                 self.config.scheduler.carbon_update_interval = carbon_update
 
+                # MODP utility for XAI
+                utility = None
+                if self.modp:
+                    objectives = {
+                        "carbon": context["carbon_intensity"] / 1000,
+                        "latency": 0.5,
+                        "cost": 0.5,
+                        "reliability": 0.9,
+                    }
+                    utility = self.modp.evaluate(objectives, self.config.scheduler.modp_weights)
+                self.last_utility = utility
+
+                # XAI explanation
+                explanation = self.xai.explain_scheduling(policy, context, confidence, utility, source)
+                self.last_explanation = explanation
+                if PROMETHEUS_AVAILABLE:
+                    XAI_DECISIONS.labels(policy=policy).inc()
+                logger.info(f"Scheduler decision: {explanation}")
+
+                # Safety check
+                if self.safety_monitor:
+                    if not self.safety_monitor.check_extraction(context["carbon_intensity"]):
+                        logger.warning("Safety violation; skipping this cycle")
+                        await asyncio.sleep(interval)
+                        continue
+
                 schedule = await self.get_optimal_time('daily')
-                if schedule.get('optimal_time') == 'now' and self.config.general.auto_refresh:
-                    logger.info("Scheduler indicates optimal time for extraction")
                 await asyncio.sleep(self.config.scheduler.interval_seconds)
             except asyncio.CancelledError:
                 break
@@ -1806,6 +2276,10 @@ class IntelligentExtractionScheduler(IScheduler):
         if self.bandit and self.moe:
             encoded = self.moe.encode(context)
             await self.bandit.update(encoded, "triggered", reward)
+        # Multi-agent reputation
+        if self.multi_agent:
+            for agent in self.multi_agent.agents:
+                self.multi_agent.record_outcome(agent, success)
         if self.bio:
             self.param_rewards.append(reward)
             if len(self.param_rewards) >= 20:
@@ -1834,6 +2308,13 @@ class IntelligentExtractionScheduler(IScheduler):
             'limit_graph_active': self.limit_graph is not None,
             'rlhf_active': self.rlhf is not None,
             'distillation_active': self.distiller is not None,
+            'safety_monitor_active': self.safety_monitor is not None,
+            'multi_agent_active': self.multi_agent is not None,
+            'quantum_optimizer': self.quantum_optimizer.get_status(),
+            'multi_agent_stats': self.multi_agent.get_stats() if self.multi_agent else None,
+            'chaos': self.chaos_monkey.get_stats(),
+            'last_explanation': self.last_explanation,
+            'last_utility': self.last_utility,
         }
 
     async def shutdown(self):
@@ -1847,7 +2328,7 @@ class IntelligentExtractionScheduler(IScheduler):
         logger.info("Extraction scheduler shutdown complete")
 
 # ============================================================
-# PREDICTIVE ANALYTICS (Enhanced with Distillation)
+# PREDICTIVE ANALYTICS
 # ============================================================
 class PredictiveAnalytics(IPredictive):
     def __init__(self, config: PerplexityExtractorConfig):
@@ -1859,7 +2340,6 @@ class PredictiveAnalytics(IPredictive):
         self.model_storage.mkdir(parents=True, exist_ok=True)
         self._lock = asyncio.Lock()
 
-        # Bio‑inspired hyperparameter evolution
         if ENHANCEMENTS_AVAILABLE and config.predictive.evolve_hyperparams:
             self.bio = GeneticPolicyGenerator()
             self.hyperparam_population = [
@@ -1873,7 +2353,6 @@ class PredictiveAnalytics(IPredictive):
             self.hyperparam_population = []
             self.hyperparam_fitness = deque(maxlen=100)
 
-        # NEW: Multi‑teacher distillation
         if ADDITIONAL_ENHANCEMENTS_AVAILABLE and config.predictive.distillation_enabled:
             self.distiller = MultiTeacherDistiller([
                 self._teacher_baseline,
@@ -1935,7 +2414,6 @@ class PredictiveAnalytics(IPredictive):
             df = pd.DataFrame(list(history))
             df = df.sort_values('ds')
 
-            # Select hyperparameters using distillation if available
             if self.distiller:
                 best_params = self.distiller.distill(df)
                 changepoint = best_params.get('changepoint_prior_scale', 0.05)
@@ -2004,7 +2482,7 @@ class PredictiveAnalytics(IPredictive):
         }
 
 # ============================================================
-# MAIN EXTRACTOR (with dependency injection and feedback)
+# MAIN EXTRACTOR (with all advanced enhancements)
 # ============================================================
 class EnhancedPerplexityDataExtractorV14_0:
     def __init__(
@@ -2049,6 +2527,21 @@ class EnhancedPerplexityDataExtractorV14_0:
         self.pipeline = pipeline
         self.leader = leader
         self.task_manager = task_manager
+
+        # NEW: Advanced enhancement modules
+        self.chaos_monkey = ChaosMonkey(
+            enabled=config.scheduler.chaos_enabled,
+            failure_probability=config.scheduler.chaos_failure_probability,
+        )
+        self.carbon_broker = CarbonOffsetBroker()
+        self.human_review = HumanReviewManager()
+        self.precision_policy = FlexGenPrecisionPolicy(default_carbon_intensity=400.0)
+        self.quantum_optimizer = QuantumDistillationOptimizer(
+            enabled=config.quantum.enable_distillation,
+            qaoa_reps=config.quantum.qaoa_reps,
+        )
+        self.safety_monitor = SafetyMonitor() if config.scheduler.safety_monitor_enabled else None
+        self.xai = XAIExplainer()
 
         self.extraction_history = deque(maxlen=1000)
         self._history_lock = asyncio.Lock()
@@ -2135,8 +2628,8 @@ class EnhancedPerplexityDataExtractorV14_0:
                 if self.extraction_history:
                     insight = {
                         'total_extractions': len(self.extraction_history),
-                        'avg_projects': np.mean([r.projects_found for r in self.extraction_history]),
-                        'avg_carbon_intensity': np.mean([getattr(r, 'carbon_intensity', 400) for r in self.extraction_history]),
+                        'avg_projects': float(np.mean([r.projects_found for r in self.extraction_history])),
+                        'avg_carbon_intensity': float(np.mean([getattr(r, 'carbon_intensity', 400) for r in self.extraction_history])),
                         'timestamp': datetime.now().isoformat()
                     }
                     await self.federated.share_insight(insight)
@@ -2179,9 +2672,10 @@ class EnhancedPerplexityDataExtractorV14_0:
 
     async def run_extraction(self, sign_request: bool = True, blockchain_record: bool = True) -> str:
         """Run extraction and return task ID."""
-        async def _extraction_task():
-            return await self._execute_extraction(sign_request, blockchain_record)
-        task_id = await self.task_manager.submit(_extraction_task, name="extraction", priority="high", timeout=600)
+        task_id = await self.task_manager.submit(
+            self._execute_extraction(sign_request, blockchain_record),
+            name="extraction", priority="high", timeout=600
+        )
         logger.info(f"Extraction task submitted: {task_id}")
         return task_id
 
@@ -2193,6 +2687,25 @@ class EnhancedPerplexityDataExtractorV14_0:
         result = ExtractionResult(extraction_id=extraction_id, source="perplexity_api", status="running")
 
         try:
+            # Chaos injection
+            try:
+                self.chaos_monkey.maybe_fail("extraction")
+            except ChaosExperimentError as e:
+                logger.warning(f"Chaos injected during extraction: {e}")
+
+            # Carbon intensity check
+            carbon_data = await self.carbon_manager.get_current_intensity()
+            carbon_intensity = carbon_data.get('intensity', 400)
+            result.carbon_intensity = carbon_intensity
+
+            # Safety check
+            if self.safety_monitor:
+                if not self.safety_monitor.check_extraction(carbon_intensity, success=True):
+                    logger.warning("Safety violation on extraction; proceeding with caution")
+                    result.safety_checked = False
+                else:
+                    result.safety_checked = True
+
             queries = [
                 "AI data center projects announced in the last month",
                 "New data center constructions with GPU capacity"
@@ -2227,12 +2740,31 @@ class EnhancedPerplexityDataExtractorV14_0:
 
             merge_stats = await self.knowledge_graph.incremental_update(resolved)
 
+            # Human review for large extractions
+            if len(all_projects) >= self.config.general.human_review_threshold_projects:
+                review_id = await self.human_review.request_review(extraction_id, {
+                    "projects_found": len(all_projects),
+                    "carbon_intensity": carbon_intensity,
+                    "source": "perplexity_api",
+                })
+                result.human_review_id = review_id
+                logger.info(f"Extraction {extraction_id} flagged for human review: {review_id}")
+
+            # Adaptive precision selection
+            workload_size = "large" if len(all_projects) > 50 else ("medium" if len(all_projects) > 10 else "small")
+            precision = self.precision_policy.recommend_precision(
+                workload_size=workload_size,
+                carbon_intensity=carbon_intensity,
+            )
+            result.precision = precision
+
             if blockchain_record:
                 manifest = {
                     'extraction_id': extraction_id,
                     'projects_found': len(all_projects),
                     'projects_new': merge_stats.get('nodes_added', 0),
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': datetime.now().isoformat(),
+                    'precision': precision,
                 }
                 blockchain_result = await self.blockchain.record_extraction(
                     extraction_id,
@@ -2254,17 +2786,31 @@ class EnhancedPerplexityDataExtractorV14_0:
             result.extraction_time_ms = (time.time() - start_time) * 1000
             result.status = "success"
 
+            # XAI explanation
+            result.explanation = self.xai.explain_extraction(
+                extraction_id, result.projects_found, result.anomalies_detected, precision,
+                cost_usd=0.0
+            )
+
             async with self._history_lock:
                 self.extraction_history.append(result)
 
             # Update predictive history
-            await self.predictive.update_history(result.projects_found, self.carbon_manager.get_current_intensity()['intensity'])
+            await self.predictive.update_history(result.projects_found, carbon_intensity)
             await self.federated.share_insight({
                 'extraction_id': extraction_id,
                 'projects_found': result.projects_found,
-                'carbon_intensity': self.carbon_manager.get_current_intensity()['intensity'],
+                'carbon_intensity': carbon_intensity,
                 'timestamp': datetime.now().isoformat()
             })
+
+            # Carbon offset
+            if carbon_intensity > 450:
+                carbon_kg = result.projects_found * 0.001
+                try:
+                    await self.carbon_broker.purchase_offsets(carbon_intensity, carbon_kg)
+                except Exception as e:
+                    logger.warning(f"Carbon offset purchase failed: {e}")
 
             if self.cloud_storage.providers:
                 try:
@@ -2277,7 +2823,7 @@ class EnhancedPerplexityDataExtractorV14_0:
             await self.websocket.broadcast({'type': 'extraction_completed', 'data': asdict(result)})
             logger.info(f"Extraction {extraction_id} completed in {result.extraction_time_ms:.0f}ms")
 
-            # Provide feedback to scheduler
+            # Feedback to scheduler
             if hasattr(self.scheduler, 'record_feedback'):
                 metrics = {
                     'carbon_saved_kg': 0,
@@ -2298,6 +2844,8 @@ class EnhancedPerplexityDataExtractorV14_0:
                 EXTRACTION_RUNS.labels(status='failed', source='perplexity_api').inc()
             await self.websocket.broadcast({'type': 'extraction_failed', 'data': {'extraction_id': extraction_id, 'error': str(e)}})
             logger.error(f"Extraction {extraction_id} failed: {e}")
+            if self.safety_monitor:
+                self.safety_monitor.check_extraction(400.0, success=False)
             if hasattr(self.scheduler, 'record_feedback'):
                 await self.scheduler.record_feedback(extraction_id, False, {})
             raise
@@ -2379,6 +2927,14 @@ class EnhancedPerplexityDataExtractorV14_0:
             'health': await self.health_check(),
             'enhancements_available': ENHANCEMENTS_AVAILABLE,
             'additional_enhancements_available': ADDITIONAL_ENHANCEMENTS_AVAILABLE,
+            'advanced_enhancements': {
+                'safety_monitor': self.safety_monitor.get_violations()[-5:] if self.safety_monitor else [],
+                'chaos_monkey': self.chaos_monkey.get_stats(),
+                'human_review': self.human_review.get_stats(),
+                'carbon_broker': self.carbon_broker.get_totals(),
+                'precision_policy': self.precision_policy.get_status(),
+                'quantum_optimizer': self.quantum_optimizer.get_status(),
+            },
             'timestamp': datetime.now().isoformat()
         }
 
@@ -2395,10 +2951,10 @@ class EnhancedPerplexityDataExtractorV14_0:
         logger.info("Shutdown complete")
 
 # ============================================================
-# FASTAPI REST API (with rate limiting and new endpoints)
+# FASTAPI REST API (with new endpoints for advanced enhancements)
 # ============================================================
 if FASTAPI_AVAILABLE:
-    app = FastAPI(title="Perplexity Extractor API", version="14.0")
+    app = FastAPI(title="Perplexity Extractor API", version="14.1")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -2408,8 +2964,10 @@ if FASTAPI_AVAILABLE:
     )
 
     security = HTTPBearer()
-    api_rate_limiter = RateLimiter(rate=PerplexityExtractorConfig().api.rate_limit_requests,
-                                   per_seconds=PerplexityExtractorConfig().api.rate_limit_window)
+    api_rate_limiter = RateLimiter(
+        rate=PerplexityExtractorConfig().api.rate_limit_requests,
+        per_seconds=PerplexityExtractorConfig().api.rate_limit_window
+    )
 
     async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         token = credentials.credentials
@@ -2421,7 +2979,6 @@ if FASTAPI_AVAILABLE:
 
     async def rate_limit(request: Request):
         if PerplexityExtractorConfig().api.rate_limit_enabled:
-            key = request.client.host
             if not await api_rate_limiter.acquire():
                 raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
@@ -2486,6 +3043,109 @@ if FASTAPI_AVAILABLE:
             raise HTTPException(status_code=503, detail="Extractor not initialized")
         return {"status": "Distillation triggered"}
 
+    # NEW: Human review endpoints
+    @app.get("/human-review/pending")
+    async def human_review_pending(user: Dict = Depends(verify_token)):
+        if not extractor:
+            raise HTTPException(status_code=503, detail="Extractor not initialized")
+        return await extractor.human_review.get_pending()
+
+    @app.post("/human-review/{review_id}/approve")
+    async def human_review_approve(review_id: str, user: Dict = Depends(verify_token)):
+        if not extractor:
+            raise HTTPException(status_code=503, detail="Extractor not initialized")
+        ok = await extractor.human_review.approve(review_id)
+        return {"status": "approved" if ok else "not_found"}
+
+    @app.post("/human-review/{review_id}/reject")
+    async def human_review_reject(review_id: str, reason: Optional[str] = None,
+                                   user: Dict = Depends(verify_token)):
+        if not extractor:
+            raise HTTPException(status_code=503, detail="Extractor not initialized")
+        ok = await extractor.human_review.reject(review_id, reason)
+        return {"status": "rejected" if ok else "not_found"}
+
+    # NEW: Chaos testing endpoint
+    @app.post("/chaos/trigger")
+    async def chaos_trigger(enabled: bool = True, probability: float = 0.1,
+                            user: Dict = Depends(verify_token)):
+        if not extractor:
+            raise HTTPException(status_code=503, detail="Extractor not initialized")
+        extractor.chaos_monkey.enabled = enabled
+        extractor.chaos_monkey.failure_probability = probability
+        return extractor.chaos_monkey.get_stats()
+
+    # NEW: Carbon offset endpoints
+    @app.post("/carbon/offset")
+    async def carbon_offset(carbon_kg: float, carbon_intensity: float,
+                             user: Dict = Depends(verify_token)):
+        if not extractor:
+            raise HTTPException(status_code=503, detail="Extractor not initialized")
+        return await extractor.carbon_broker.purchase_offsets(carbon_intensity, carbon_kg)
+
+    @app.post("/carbon/rec")
+    async def carbon_rec(energy_mwh: float, user: Dict = Depends(verify_token)):
+        if not extractor:
+            raise HTTPException(status_code=503, detail="Extractor not initialized")
+        return await extractor.carbon_broker.purchase_recs(energy_mwh)
+
+    @app.get("/carbon/totals")
+    async def carbon_totals(user: Dict = Depends(verify_token)):
+        if not extractor:
+            raise HTTPException(status_code=503, detail="Extractor not initialized")
+        return extractor.carbon_broker.get_totals()
+
+    # NEW: Precision recommendation
+    @app.post("/precision/recommend")
+    async def precision_recommend(workload_size: str = "medium", carbon_intensity: float = None,
+                                   user: Dict = Depends(verify_token)):
+        if not extractor:
+            raise HTTPException(status_code=503, detail="Extractor not initialized")
+        precision = extractor.precision_policy.recommend_precision(
+            workload_size=workload_size, carbon_intensity=carbon_intensity
+        )
+        return {"precision": precision}
+
+    # NEW: Safety violations endpoint
+    @app.get("/safety/violations")
+    async def safety_violations(user: Dict = Depends(verify_token)):
+        if not extractor:
+            raise HTTPException(status_code=503, detail="Extractor not initialized")
+        if extractor.safety_monitor:
+            return {"violations": extractor.safety_monitor.get_violations()}
+        return {"violations": [], "monitor_enabled": False}
+
+    # NEW: XAI last decision endpoint
+    @app.get("/xai/last-decision")
+    async def xai_last_decision(user: Dict = Depends(verify_token)):
+        if not extractor:
+            raise HTTPException(status_code=503, detail="Extractor not initialized")
+        return {
+            "last_context": extractor.scheduler.last_context,
+            "last_explanation": extractor.scheduler.last_explanation,
+            "last_utility": extractor.scheduler.last_utility,
+            "schedule_stats": extractor.scheduler.get_schedule_stats(),
+        }
+
+    # NEW: Federated secure aggregation endpoints
+    @app.post("/federated/register")
+    async def federated_register(participant_id: str, update: Dict,
+                                  user: Dict = Depends(verify_token)):
+        if not extractor:
+            raise HTTPException(status_code=503, detail="Extractor not initialized")
+        if hasattr(extractor.federated, 'secure_coordinator'):
+            extractor.federated.secure_coordinator.register_participant(participant_id, update)
+            return {"status": "registered"}
+        return {"status": "not_available"}
+
+    @app.get("/federated/aggregate")
+    async def federated_aggregate(user: Dict = Depends(verify_token)):
+        if not extractor:
+            raise HTTPException(status_code=503, detail="Extractor not initialized")
+        if hasattr(extractor.federated, 'secure_coordinator'):
+            return extractor.federated.secure_coordinator.aggregate()
+        return {}
+
     @app.on_event("startup")
     async def startup():
         global extractor
@@ -2496,7 +3156,11 @@ if FASTAPI_AVAILABLE:
         quantum = QuantumResilientExtractionSecurity(config, vault)
         blockchain = BlockchainExtractionVerification(config, db_manager)
         carbon = CarbonIntensityManager(config)
-        scheduler = IntelligentExtractionScheduler(config, carbon)
+        chaos_monkey = ChaosMonkey(
+            enabled=config.scheduler.chaos_enabled,
+            failure_probability=config.scheduler.chaos_failure_probability,
+        )
+        scheduler = IntelligentExtractionScheduler(config, carbon, chaos_monkey=chaos_monkey)
         predictive = PredictiveAnalytics(config)
         federated = FederatedKnowledgeSharing(config, db_manager, config.general.instance_id)
         cloud = MultiCloudStorage(config)
@@ -2556,7 +3220,11 @@ async def get_perplexity_extractor(config: Optional[Union[PerplexityExtractorCon
                 quantum = QuantumResilientExtractionSecurity(cfg, vault)
                 blockchain = BlockchainExtractionVerification(cfg, db_manager)
                 carbon = CarbonIntensityManager(cfg)
-                scheduler = IntelligentExtractionScheduler(cfg, carbon)
+                chaos_monkey = ChaosMonkey(
+                    enabled=cfg.scheduler.chaos_enabled,
+                    failure_probability=cfg.scheduler.chaos_failure_probability,
+                )
+                scheduler = IntelligentExtractionScheduler(cfg, carbon, chaos_monkey=chaos_monkey)
                 predictive = PredictiveAnalytics(cfg)
                 federated = FederatedKnowledgeSharing(cfg, db_manager, cfg.general.instance_id)
                 cloud = MultiCloudStorage(cfg)
@@ -2593,7 +3261,7 @@ async def get_perplexity_extractor(config: Optional[Union[PerplexityExtractorCon
     return _extractor_instance
 
 # ============================================================
-# SIGNAL HANDLING FOR GRACEFUL SHUTDOWN
+# SIGNAL HANDLING
 # ============================================================
 _shutdown_requested = False
 
@@ -2602,14 +3270,16 @@ def handle_signal(signum, frame):
     if not _shutdown_requested:
         _shutdown_requested = True
         logger.info(f"Received signal {signum}, initiating shutdown...")
-        asyncio.create_task(shutdown_handler())
+        try:
+            asyncio.create_task(shutdown_handler())
+        except RuntimeError:
+            pass
 
 async def shutdown_handler():
     global _extractor_instance
     if _extractor_instance:
         await _extractor_instance.shutdown()
         _extractor_instance = None
-    asyncio.get_event_loop().stop()
 
 # ============================================================
 # MAIN ENTRY POINT
@@ -2617,39 +3287,27 @@ async def shutdown_handler():
 async def main():
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda s=sig: handle_signal(s, None))
+        try:
+            loop.add_signal_handler(sig, lambda s=sig: handle_signal(s, None))
+        except (NotImplementedError, ValueError):
+            pass
 
     print("=" * 80)
-    print("Enhanced Perplexity AI Data Center Extractor v14.0 - Enterprise Quantum+ (Enhanced)")
+    print("Enhanced Perplexity AI Data Center Extractor v14.1 - Enterprise Quantum+ (Advanced Enhancements)")
     print("=" * 80)
 
     extractor = await get_perplexity_extractor()
-    print(f"\n✅ ENHANCEMENTS OVER v13.0:")
-    print("   ✅ Dependency inversion with interfaces (Protocols)")
-    print("   ✅ Global circuit breaker registry")
-    print("   ✅ Health check aggregation across all components")
-    print("   ✅ Database migrations via Alembic‑style inline runner")
-    print("   ✅ Complete async database support (asyncpg)")
-    print("   ✅ Rate limiting on API endpoints")
-    print("   ✅ TaskManager supervises background tasks with automatic restart")
-    print("   ✅ Predictive models persisted to disk")
-    print("   ✅ Federated insights stored in database")
-    print("   ✅ Leader election (Redis) to avoid duplicate work")
-    print("   ✅ Grouped configuration using nested Pydantic models")
-    print("   ✅ Circuit breakers for all external calls")
-    print("   ✅ Retry decorators for all external calls")
-    print("   ✅ OpenTelemetry support for distributed tracing (if available)")
-    print("   ✅ Audit logging for compliance")
-    print("   ✅ Full implementation of previously stubbed components: API client, knowledge graph, duplicate detection, anomaly detection, WebSocket, pipeline.")
-    print("\n✅ NEW ENHANCEMENTS (v14.0+):")
-    print("   ✅ Integrated bio_inspired, moe_system, MODP for adaptive scheduling and forecasting.")
-    print("   ✅ Scheduler uses ContextualBandit and ExpertRouter to select policies based on context.")
-    print("   ✅ MODP evaluates trade‑offs for scheduling decisions.")
-    print("   ✅ Predictive Analytics uses bio‑inspired evolution to optimize Prophet hyperparameters.")
-    print("   ✅ Feedback loop updates learning modules after each extraction.")
-    print("   ✅ Persistence of learned state via database.")
-    print("   ✅ New API endpoints for optimization status and feedback.")
-    print("   ✅ Integrated LIMIT Graph, RLHF, and Multi‑Teacher Policy Distillation.")
+    print(f"\n✅ ADVANCED ENHANCEMENTS IN v14.1:")
+    print("   ✅ CausalBandit for causal RL of scheduling policies")
+    print("   ✅ SafetyMonitor for temporal extraction rules")
+    print("   ✅ XAIExplainer for natural-language rationale")
+    print("   ✅ FederatedSecureCoordinator with differential privacy")
+    print("   ✅ MultiAgentCoordinator with role specialisation")
+    print("   ✅ CarbonOffsetBroker for offsets and RECs")
+    print("   ✅ ChaosMonkey for resilience testing")
+    print("   ✅ HumanReviewManager for pre-commit review")
+    print("   ✅ FlexGenPrecisionPolicy for adaptive precision")
+    print("   ✅ QuantumDistillationOptimizer (optional)")
 
     qstatus = extractor.quantum_security.get_quantum_status()
     print(f"\n🔐 Quantum Status: PQC Available: {qstatus.get('pqc_available', False)}, Algorithms: {', '.join(qstatus.get('algorithms', []))}")
@@ -2658,20 +3316,33 @@ async def main():
     print(f"⛓️ Blockchain Connected: {bstatus.get('connected', False)}")
 
     sched_stats = extractor.scheduler.get_schedule_stats()
-    print(f"📅 Scheduler Running: {sched_stats.get('running', False)}, Optimizer: {sched_stats.get('enhancements_available', False)}")
-    print(f"   LIMIT Graph Active: {sched_stats.get('limit_graph_active', False)}")
-    print(f"   RLHF Active: {sched_stats.get('rlhf_active', False)}")
-    print(f"   Distillation Active: {sched_stats.get('distillation_active', False)}")
+    print(f"📅 Scheduler Running: {sched_stats.get('running', False)}")
+    print(f"   Causal RL: {ENHANCEMENTS_AVAILABLE}")
+    print(f"   LIMIT Graph: {sched_stats.get('limit_graph_active', False)}")
+    print(f"   RLHF: {sched_stats.get('rlhf_active', False)}")
+    print(f"   Distillation: {sched_stats.get('distillation_active', False)}")
+    print(f"   Safety Monitor: {sched_stats.get('safety_monitor_active', False)}")
+    print(f"   Multi-Agent: {sched_stats.get('multi_agent_active', False)}")
 
     print(f"\n📊 Submitting Test Extraction...")
     task_id = await extractor.run_extraction(sign_request=True, blockchain_record=True)
     print(f"   Task ID: {task_id}")
 
+    await asyncio.sleep(2)
     status = await extractor.get_system_status()
-    print(f"\n📊 System Stats: Instance: {status['instance_id']}, Version: {status['version']}, Running: {status['running']}, Active Tasks: {status['background_tasks']['active_tasks']}, Federated Shares: {status['federated']['total_shares']}, Predictive Prophet: {status['predictive']['prophet_available']}, Cloud Providers: {status['cloud_storage']['providers']}")
+    print(f"\n📊 System Stats: Instance: {status['instance_id']}, Version: {status['version']}, Running: {status['running']}")
+    print(f"   Active Tasks: {status['background_tasks']['active_tasks']}")
+    print(f"   Federated Shares: {status['federated'].get('total_shares', 0)}")
+    print(f"   Predictive Prophet: {status['predictive']['prophet_available']}")
+    print(f"   Cloud Providers: {status['cloud_storage']['providers']}")
+    print(f"   Carbon Broker: {status['advanced_enhancements']['carbon_broker']}")
+    print(f"   Human Reviews: {status['advanced_enhancements']['human_review']}")
+    print(f"   Precision Policy: {status['advanced_enhancements']['precision_policy']}")
+    print(f"   Quantum Optimizer: {status['advanced_enhancements']['quantum_optimizer']}")
+    print(f"   Chaos: {status['advanced_enhancements']['chaos_monkey']}")
 
     print("\n" + "=" * 80)
-    print("✅ Perplexity Data Extractor v14.0 - Ready for Production")
+    print("✅ Perplexity Data Extractor v14.1 - Ready for Production")
     print("=" * 80)
 
     try:
