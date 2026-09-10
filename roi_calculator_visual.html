@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Green Agent ROI Calculator - Visual Edition</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap');
+        
+        body {
+            font-family: 'Inter', system_ui, sans-serif;
+        }
+        
+        .heading {
+            font-family: 'Space Grotesk', 'Inter', sans-serif;
+            font-weight: 600;
+        }
+
+        .metric-card {
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        
+        .metric-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 20px 40px rgba(0,0,0,0.3);
+        }
+
+        .result-value {
+            font-size: 2rem;
+            line-height: 2.5rem;
+            font-weight: 700;
+        }
+
+        .chart-container {
+            position: relative;
+            height: 300px;
+            width: 100%;
+        }
+
+        .gradient-green {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+        }
+
+        .gradient-blue {
+            background: linear-gradient(135deg, #3b82f6 0%, #1e40af 100%);
+        }
+
+        .gradient-purple {
+            background: linear-gradient(135deg, #a855f7 0%, #6d28d9 100%);
+        }
+
+        .gradient-amber {
+            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+        }
+
+        .gradient-red {
+            background: linear-gradient(135deg, #ef4444 0%, #991b1b 100%);
+        }
+    </style>
+</head>
+<body class="bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-zinc-200 min-h-screen">
+    <div class="max-w-7xl mx-auto p-8">
+        <!-- Header -->
+        <div class="mb-12">
+            <div class="flex items-center gap-4 mb-6">
+                <div class="w-16 h-16 gradient-green rounded-2xl flex items-center justify-center shadow-lg">
+                    <span class="text-white text-4xl">🌱</span>
+                </div>
+                <div>
+                    <h1 class="heading text-4xl font-bold bg-gradient-to-r from-emerald-400 to-emerald-600 bg-clip-text text-transparent">Green Agent ROI Calculator</h1>
+                    <p class="text-zinc-400 text-lg">Interactive visualization comparing Green Agent vs. Industry Competitors</p>
+                </div>
+            </div>
+            <div class="h-1 w-32 gradient-green rounded-full"></div>
+        </div>
+
+        <!-- Input Section -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
+            
+            <!-- Main Inputs -->
+            <div class="lg:col-span-1 bg-slate-800/50 backdrop-blur-sm rounded-2xl p-6 border border-slate-700 shadow-xl">
+                <h2 class="font-semibold text-xl mb-4 flex items-center gap-2 text-emerald-400">
+                    <span>⚙️</span> 
+                    <span>Parameters</span>
+                </h2>
+                
+                <div class="space-y-5">
+                    <div>
+                        <label class="block text-sm text-zinc-300 font-medium mb-2">Annual IT Energy (kWh)</label>
+                        <input type="number" id="annualEnergy" value="8760000" 
+                               class="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20">
+                        <div class="text-xs text-zinc-400 mt-1">10 MW × 8760 hours</div>
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm text-zinc-300 font-medium mb-2">Current PUE</label>
+                        <input type="number" id="currentPUE" value="1.60" step="0.01"
+                               class="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20">
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm text-zinc-300 font-medium mb-2">Grid Carbon (g CO₂/kWh)</label>
+                        <input type="number" id="gridIntensity" value="400" 
+                               class="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20">
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm text-zinc-300 font-medium mb-2">Electricity Price ($/kWh)</label>
+                        <input type="number" id="electricityPrice" value="0.10" step="0.01"
+                               class="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20">
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm text-zinc-300 font-medium mb-2">Green Agent Savings (%)</label>
+                        <input type="number" id="energySavings" value="18" step="1"
+                               class="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20">
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm text-zinc-300 font-medium mb-2">Annual Cost ($)</label>
+                        <input type="number" id="greenAgentCost" value="150000" 
+                               class="w-full bg-slate-700/50 border border-slate-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20">
+                    </div>
+                </div>
+            </div>
+
+            <!-- Competitor Inputs -->
+            <div class="lg:col-span-2 bg-slate-800/50 backdrop-blur-sm rounded-2xl p-6 border border-slate-700 shadow-xl">
+                <h2 class="font-semibold text-xl mb-4 flex items-center gap-2 text-blue-400">
+                    <span>⚔️</span> 
+                    <span>Competitors</span>
+                </h2>
+                
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    
+                    <!-- Kubecost -->
+                    <div class="bg-gradient-to-br from-blue-500/10 to-blue-600/5 border border-blue-500/30 rounded-lg p-4">
+                        <div class="font-bold text-sm text-blue-300 mb-2">📊 Kubecost</div>
+                        <div class="space-y-2">
+                            <div>
+                                <label class="text-xs text-zinc-400">Savings %</label>
+                                <input type="number" id="kubecostSavings" value="8" step="1" 
+                                       class="w-full bg-slate-700/50 border border-blue-500/30 rounded px-2 py-1 text-xs text-white">
+                            </div>
+                            <div>
+                                <label class="text-xs text-zinc-400">Cost ($)</label>
+                                <input type="number" id="kubecostCost" value="45000" 
+                                       class="w-full bg-slate-700/50 border border-blue-500/30 rounded px-2 py-1 text-xs text-white">
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- WattTime -->
+                    <div class="bg-gradient-to-br from-amber-500/10 to-amber-600/5 border border-amber-500/30 rounded-lg p-4">
+                        <div class="font-bold text-sm text-amber-300 mb-2">⚡ WattTime</div>
+                        <div class="space-y-2">
+                            <div>
+                                <label class="text-xs text-zinc-400">Savings %</label>
+                                <input type="number" id="watttimeSavings" value="3" step="1" 
+                                       class="w-full bg-slate-700/50 border border-amber-500/30 rounded px-2 py-1 text-xs text-white">
+                            </div>
+                            <div>
+                                <label class="text-xs text-zinc-400">Cost ($)</label>
+                                <input type="number" id="watttimeCost" value="25000" 
+                                       class="w-full bg-slate-700/50 border border-amber-500/30 rounded px-2 py-1 text-xs text-white">
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Databricks -->
+                    <div class="bg-gradient-to-br from-purple-500/10 to-purple-600/5 border border-purple-500/30 rounded-lg p-4">
+                        <div class="font-bold text-sm text-purple-300 mb-2">🔷 Databricks</div>
+                        <div class="space-y-2">
+                            <div>
+                                <label class="text-xs text-zinc-400">Savings %</label>
+                                <input type="number" id="databricksSavings" value="12" step="1" 
+                                       class="w-full bg-slate-700/50 border border-purple-500/30 rounded px-2 py-1 text-xs text-white">
+                            </div>
+                            <div>
+                                <label class="text-xs text-zinc-400">Cost ($)</label>
+                                <input type="number" id="databricksCost" value="0" 
+                                       class="w-full bg-slate-700/50 border border-purple-500/30 rounded px-2 py-1 text-xs text-white">
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Watershed -->
+                    <div class="bg-gradient-to-br from-red-500/10 to-red-600/5 border border-red-500/30 rounded-lg p-4">
+                        <div class="font-bold text-sm text-red-300 mb-2">🌊 Watershed</div>
+                        <div class="space-y-2">
+                            <div>
+                                <label class="text-xs text-zinc-400">Savings %</label>
+                                <input type="number" id="watershedSavings" value="5" step="1" 
+                                       class="w-full bg-slate-700/50 border border-red-500/30 rounded px-2 py-1 text-xs text-white">
+                            </div>
+                            <div>
+                                <label class="text-xs text-zinc-400">Cost ($)</label>
+                                <input type="number" id="watershedCost" value="120000" 
+                                       class="w-full bg-slate-700/50 border border-red-500/30 rounded px-2 py-1 text-xs text-white">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Charts Section -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+            <!-- ROI Comparison Chart -->
+            <div class="bg-slate-800/50 backdrop-blur-sm rounded-2xl p-6 border border-slate-700 shadow-xl">
+                <h3 class="text-lg font-semibold text-emerald-400 mb-4">📊 Net Annual Savings</h3>
+                <div class="chart-container">
+                    <canvas id="roiChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Energy Savings Chart -->
+            <div class="bg-slate-800/50 backdrop-blur-sm rounded-2xl p-6 border border-slate-700 shadow-xl">
+                <h3 class="text-lg font-semibold text-blue-400 mb-4">⚡ Energy Savings %</h3>
+                <div class="chart-container">
+                    <canvas id="energyChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Carbon Reduction Chart -->
+            <div class="bg-slate-800/50 backdrop-blur-sm rounded-2xl p-6 border border-slate-700 shadow-xl">
+                <h3 class="text-lg font-semibold text-green-400 mb-4">🌍 Carbon Reduction %</h3>
+                <div class="chart-container">
+                    <canvas id="carbonChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Payback Period Chart -->
+            <div class="bg-slate-800/50 backdrop-blur-sm rounded-2xl p-6 border border-slate-700 shadow-xl">
+                <h3 class="text-lg font-semibold text-purple-400 mb-4">📅 Payback Period (Months)</h3>
+                <div class="chart-container">
+                    <canvas id="paybackChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Results Cards -->
+        <div class="bg-slate-800/50 backdrop-blur-sm rounded-2xl p-6 border border-slate-700 shadow-xl mb-8">
+            <h2 class="font-semibold text-xl mb-6 flex items-center gap-2 text-emerald-400">
+                <span>📈</span> 
+                <span>ROI Comparison Results</span>
+            </h2>
+            
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4" id="results">
+                <!-- Populated by JavaScript -->
+            </div>
+        </div>
+
+        <!-- Summary Section -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <!-- Best Value -->
+            <div class="gradient-green rounded-2xl p-6 shadow-2xl text-white">
+                <div class="text-sm font-medium opacity-90">🏆 Best Value</div>
+                <div id="bestValue" class="text-3xl font-bold mt-2">Green Agent</div>
+                <div class="text-sm opacity-75 mt-1">Highest Net Savings</div>
+            </div>
+
+            <!-- Net Savings -->
+            <div class="gradient-blue rounded-2xl p-6 shadow-2xl text-white">
+                <div class="text-sm font-medium opacity-90">💰 Net Annual Savings</div>
+                <div id="netSavings" class="text-3xl font-bold mt-2">$0</div>
+                <div class="text-sm opacity-75 mt-1">vs. Baseline</div>
+            </div>
+
+            <!-- Carbon Impact -->
+            <div class="gradient-purple rounded-2xl p-6 shadow-2xl text-white">
+                <div class="text-sm font-medium opacity-90">🌱 Carbon Reduction</div>
+                <div id="carbonReduction" class="text-3xl font-bold mt-2">0%</div>
+                <div class="text-sm opacity-75 mt-1">Annual CO₂ Savings</div>
+            </div>
+        </div>
+        
+        <div class="text-center text-xs text-zinc-400 mt-8 py-4 border-t border-slate-700">
+            Assumptions: 10 MW IT load • 1.6 PUE • $0.10/kWh • 400 g CO₂/kWh • 18% savings with Green Agent<br>
+            <span class="text-zinc-500">All calculations are estimates. Actual results may vary based on your infrastructure.</span>
+        </div>
+    </div>
+
+    <script>
+        let roiChart, energyChart, carbonChart, paybackChart;
+
+        function calculateROI() {
+            // Get input values
+            const annualEnergy = parseFloat(document.getElementById('annualEnergy').value) || 8760000;
+            const currentPUE = parseFloat(document.getElementById('currentPUE').value) || 1.6;
+            const gridIntensity = parseFloat(document.getElementById('gridIntensity').value) || 400;
+            const electricityPrice = parseFloat(document.getElementById('electricityPrice').value) || 0.10;
+            const energySavings = parseFloat(document.getElementById('energySavings').value) || 18;
+            const greenAgentCost = parseFloat(document.getElementById('greenAgentCost').value) || 150000;
+            
+            const kubecostSavings = parseFloat(document.getElementById('kubecostSavings').value) || 8;
+            const kubecostCost = parseFloat(document.getElementById('kubecostCost').value) || 45000;
+            
+            const watttimeSavings = parseFloat(document.getElementById('watttimeSavings').value) || 3;
+            const watttimeCost = parseFloat(document.getElementById('watttimeCost').value) || 25000;
+            
+            const databricksSavings = parseFloat(document.getElementById('databricksSavings').value) || 12;
+            const databricksCost = parseFloat(document.getElementById('databricksCost').value) || 0;
+            
+            const watershedSavings = parseFloat(document.getElementById('watershedSavings').value) || 5;
+            const watershedCost = parseFloat(document.getElementById('watershedCost').value) || 120000;
+            
+            // Baseline calculations
+            const baselineEnergy = annualEnergy * currentPUE;
+            const baselineCost = baselineEnergy * electricityPrice;
+            const baselineCarbon = baselineEnergy * gridIntensity / 1000;
+            
+            // Calculate for all solutions
+            const solutions = {
+                'Green Agent': calculateMetrics(baselineEnergy, baselineCost, baselineCarbon, energySavings, greenAgentCost, gridIntensity),
+                'Kubecost': calculateMetrics(baselineEnergy, baselineCost, baselineCarbon, kubecostSavings, kubecostCost, gridIntensity),
+                'WattTime': calculateMetrics(baselineEnergy, baselineCost, baselineCarbon, watttimeSavings, watttimeCost, gridIntensity),
+                'Databricks': calculateMetrics(baselineEnergy, baselineCost, baselineCarbon, databricksSavings, databricksCost, gridIntensity),
+                'Watershed': calculateMetrics(baselineEnergy, baselineCost, baselineCarbon, watershedSavings, watershedCost, gridIntensity)
+            };
+            
+            updateResultsCards(solutions);
+            updateCharts(solutions);
+            updateSummary(solutions);
+        }
+
+        function calculateMetrics(baselineEnergy, baselineCost, baselineCarbon, savingsPercent, cost, gridIntensity) {
+            const energy = baselineEnergy * (1 - savingsPercent / 100);
+            const operatingCost = energy * (baselineCost / baselineEnergy);
+            const costSavings = baselineCost - operatingCost;
+            const netSavings = costSavings - cost;
+            const carbon = energy * gridIntensity / 1000;
+            const carbonReduction = ((baselineCarbon - carbon) / baselineCarbon) * 100;
+            const payback = costSavings > 0 ? (cost / costSavings * 12) : 999;
+
+            return {
+                energy: energy,
+                operatingCost: operatingCost,
+                costSavings: costSavings,
+                netSavings: netSavings,
+                carbon: carbon,
+                carbonReduction: carbonReduction,
+                payback: payback,
+                savingsPercent: savingsPercent
+            };
+        }
+
+        function updateResultsCards(solutions) {
+            const colors = {
+                'Green Agent': { bg: 'from-emerald-500/20 to-emerald-600/5', border: 'border-emerald-500/50', text: 'text-emerald-400', label: '🌱' },
+                'Kubecost': { bg: 'from-blue-500/20 to-blue-600/5', border: 'border-blue-500/50', text: 'text-blue-400', label: '📊' },
+                'WattTime': { bg: 'from-amber-500/20 to-amber-600/5', border: 'border-amber-500/50', text: 'text-amber-400', label: '⚡' },
+                'Databricks': { bg: 'from-purple-500/20 to-purple-600/5', border: 'border-purple-500/50', text: 'text-purple-400', label: '🔷' },
+                'Watershed': { bg: 'from-red-500/20 to-red-600/5', border: 'border-red-500/50', text: 'text-red-400', label: '🌊' }
+            };
+
+            let html = '';
+            for (const [name, metrics] of Object.entries(solutions)) {
+                const color = colors[name];
+                html += `
+                    <div class="metric-card bg-gradient-to-br ${color.bg} border ${color.border} rounded-2xl p-5 backdrop-blur-sm">
+                        <div class="${color.text} text-xs font-bold mb-1">${color.label} ${name.toUpperCase()}</div>
+                        <div class="result-value ${color.text}">$${Math.round(metrics.netSavings / 1000)}K</div>
+                        <div class="text-xs ${color.text}/70">Net Savings</div>
+                        <div class="mt-4 space-y-2 text-xs">
+                            <div class="flex justify-between text-zinc-300">
+                                <span>Savings</span>
+                                <span class="font-mono font-bold ${color.text}">${metrics.savingsPercent}%</span>
+                            </div>
+                            <div class="flex justify-between text-zinc-300">
+                                <span>Carbon ↓</span>
+                                <span class="font-mono font-bold text-green-400">${metrics.carbonReduction.toFixed(1)}%</span>
+                            </div>
+                            <div class="flex justify-between text-zinc-300">
+                                <span>Payback</span>
+                                <span class="font-mono font-bold ${color.text}">${metrics.payback < 999 ? metrics.payback.toFixed(1) : '∞'} mo</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+            document.getElementById('results').innerHTML = html;
+        }
+
+        function updateCharts(solutions) {
+            const names = Object.keys(solutions);
+            const colors = ['#10b981', '#3b82f6', '#f59e0b', '#a855f7', '#ef4444'];
+            
+            // ROI Chart
+            if (roiChart) roiChart.destroy();
+            const roiCtx = document.getElementById('roiChart').getContext('2d');
+            roiChart = new Chart(roiCtx, {
+                type: 'bar',
+                data: {
+                    labels: names,
+                    datasets: [{
+                        label: 'Net Annual Savings ($K)',
+                        data: names.map(n => solutions[n].netSavings / 1000),
+                        backgroundColor: colors,
+                        borderRadius: 8,
+                        borderSkipped: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            backgroundColor: 'rgba(0,0,0,0.8)',
+                            padding: 12,
+                            titleColor: '#fff',
+                            bodyColor: '#fff'
+                        }
+                    },
+                    scales: {
+                        y: {
+                            grid: { color: 'rgba(255,255,255,0.1)' },
+                            ticks: { color: '#a1a1a1' }
+                        },
+                        x: {
+                            grid: { display: false },
+                            ticks: { color: '#a1a1a1' }
+                        }
+                    }
+                }
+            });
+
+            // Energy Chart
+            if (energyChart) energyChart.destroy();
+            const energyCtx = document.getElementById('energyChart').getContext('2d');
+            energyChart = new Chart(energyCtx, {
+                type: 'radar',
+                data: {
+                    labels: names,
+                    datasets: [{
+                        label: 'Energy Savings %',
+                        data: names.map(n => solutions[n].savingsPercent),
+                        borderColor: '#10b981',
+                        backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                        pointBackgroundColor: '#10b981',
+                        pointBorderColor: '#fff',
+                        pointRadius: 5
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { labels: { color: '#a1a1a1' } }
+                    },
+                    scales: {
+                        r: {
+                            grid: { color: 'rgba(255,255,255,0.1)' },
+                            ticks: { color: '#a1a1a1' },
+                            max: 20
+                        }
+                    }
+                }
+            });
+
+            // Carbon Chart
+            if (carbonChart) carbonChart.destroy();
+            const carbonCtx = document.getElementById('carbonChart').getContext('2d');
+            carbonChart = new Chart(carbonCtx, {
+                type: 'doughnut',
+                data: {
+                    labels: names,
+                    datasets: [{
+                        data: names.map(n => solutions[n].carbonReduction),
+                        backgroundColor: colors,
+                        borderColor: '#1e293b'
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { labels: { color: '#a1a1a1' } }
+                    }
+                }
+            });
+
+            // Payback Chart
+            if (paybackChart) paybackChart.destroy();
+            const paybackCtx = document.getElementById('paybackChart').getContext('2d');
+            paybackChart = new Chart(paybackCtx, {
+                type: 'bar',
+                data: {
+                    labels: names,
+                    datasets: [{
+                        label: 'Payback Period (months)',
+                        data: names.map(n => solutions[n].payback < 999 ? solutions[n].payback : null),
+                        backgroundColor: colors,
+                        borderRadius: 8,
+                        borderSkipped: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false }
+                    },
+                    scales: {
+                        y: {
+                            grid: { color: 'rgba(255,255,255,0.1)' },
+                            ticks: { color: '#a1a1a1' }
+                        },
+                        x: {
+                            grid: { display: false },
+                            ticks: { color: '#a1a1a1' }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateSummary(solutions) {
+            const values = Object.entries(solutions)
+                .map(([name, metrics]) => ({ name, value: metrics.netSavings }))
+                .sort((a, b) => b.value - a.value);
+            
+            const best = values[0];
+            const gaMetrics = solutions['Green Agent'];
+
+            document.getElementById('bestValue').textContent = best.name;
+            document.getElementById('netSavings').textContent = `$${(best.value / 1000).toFixed(0)}K`;
+            document.getElementById('carbonReduction').textContent = `${gaMetrics.carbonReduction.toFixed(1)}%`;
+        }
+
+        function initCalculator() {
+            const inputs = document.querySelectorAll('input');
+            inputs.forEach(input => {
+                input.addEventListener('input', calculateROI);
+            });
+            calculateROI();
+        }
+
+        window.onload = initCalculator;
+    </script>
+</body>
+</html>
