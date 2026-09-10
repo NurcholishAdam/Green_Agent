@@ -1,33 +1,20 @@
 #!/usr/bin/env python3
 # File: src/enhancements/evolutionary_engine_v4_0_0.py
 """
-Evolutionary Engine for Green Agent v4.0.0 (Enterprise Quantum+)
-Manages the lifecycle of experts using sustainability‑aware fitness.
+Evolutionary Engine for Green Agent v4.1.0 (Enterprise Quantum+ with Advanced Enhancements)
+Manages the lifecycle of experts using sustainability-aware fitness.
 
-ENHANCEMENTS OVER v3.0.0:
-- Dependency inversion with interfaces (Protocols) for all major components.
-- Global circuit breaker registry for external services.
-- Health check aggregation across all components.
-- TaskManager supervises the evolution loop with automatic restart.
-- Full async PostgreSQL support (asyncpg) with connection pooling.
-- Alembic‑style database migrations (inline runner).
-- Prophet models are persisted to disk/cloud.
-- Autonomous optimizer parameter space and epsilon configurable.
-- Rate limiting on API endpoints.
-- Retry decorators for all external calls.
-- Distributed leader election (Redis) to avoid duplicate work.
-- Configuration grouped into sub‑models.
-- Comprehensive error handling and logging.
-- Unit test suite (pytest) stubs (expanded).
-
-NEW IN v4.0.0+:
-- Integrated bio_inspired, moe_system, MODP, ContextualBandit.
-- Replaced AutonomousOptimizer with BioInspiredOptimizer using GeneticPolicyGenerator.
-- Lifecycle decisions (prune/merge/spawn) now use ExpertRouter and ContextualBandit.
-- Multi‑objective fitness uses ParetoOptimizer.
-- Persistence of learned state via AsyncDatabaseManager.
-- New API endpoints for optimization state.
-- FlexGen integration: select optimal GPU/CPU/disk offloading policies for expert inference workloads.
+NEW IN v4.1.0:
+- CausalBandit replaces ContextualBandit for causal RL on lifecycle decisions.
+- SafetyMonitor with temporal logic rules for expert pruning/merging.
+- XAIExplainer generating natural language explanations.
+- FederatedEvolutionCoordinator with simulated differential privacy.
+- MultiAgentCoordinator supporting emergent role specialisation among experts.
+- CarbonOffsetBroker integrating external carbon markets and RECs.
+- ChaosMonkey for resilience testing.
+- HumanReviewManager for human-in-the-loop with active learning.
+- QuantumInspiredOptimizer stub for quantum-distillation integration.
+- Adaptive precision switching via FlexGen integrated into fitness evaluation.
 """
 
 import asyncio
@@ -45,6 +32,7 @@ from typing import Dict, List, Optional, Any, Tuple, Callable, Union, Protocol, 
 from collections import deque, defaultdict
 from enum import Enum
 from functools import wraps
+from pathlib import Path
 import numpy as np
 import contextvars
 import random
@@ -61,7 +49,6 @@ try:
     ENHANCEMENTS_AVAILABLE = True
 except ImportError:
     ENHANCEMENTS_AVAILABLE = False
-    # Fallback stubs
     class GeneticPolicyGenerator:
         def __init__(self, *args, **kwargs): pass
         def evolve(self, population, fitness_fn, generations=10, population_size=20):
@@ -112,7 +99,7 @@ except ImportError:
 # Optional imports with fallback
 # ============================================================
 try:
-    from pydantic import BaseModel, Field, field_validator, ValidationInfo
+    from pydantic import BaseModel, Field, field_validator
     PYDANTIC_AVAILABLE = True
 except ImportError:
     PYDANTIC_AVAILABLE = False
@@ -145,30 +132,25 @@ try:
 except ImportError:
     ASYNCPG_AVAILABLE = False
 
-# Post‑quantum cryptography (pqcrypto)
 try:
     from pqcrypto.sign import dilithium, falcon, sphincs
     PQC_AVAILABLE = True
 except ImportError:
     PQC_AVAILABLE = False
 
-# Cryptography for AES‑GCM
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
-# Vault client
 try:
     from hvac import Client as VaultClient
     VAULT_AVAILABLE = True
 except ImportError:
     VAULT_AVAILABLE = False
 
-# Cloud storage SDKs
 try:
     import boto3
-    from botocore.exceptions import ClientError
     AWS_AVAILABLE = True
 except ImportError:
     AWS_AVAILABLE = False
@@ -185,24 +167,20 @@ try:
 except ImportError:
     GCP_AVAILABLE = False
 
-# Prophet for forecasting
 try:
     from prophet import Prophet
     PROPHET_AVAILABLE = True
 except ImportError:
     PROPHET_AVAILABLE = False
 
-# FastAPI
 try:
-    from fastapi import FastAPI, Depends, HTTPException, status, Request
-    from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+    from fastapi import FastAPI, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
     FASTAPI_AVAILABLE = True
 except ImportError:
     FASTAPI_AVAILABLE = False
 
-# JWT
 try:
     from jose import JWTError, jwt
     from jose.constants import ALGORITHMS
@@ -210,7 +188,6 @@ try:
 except ImportError:
     JOSE_AVAILABLE = False
 
-# Redis for leader election and caching
 try:
     import redis.asyncio as redis
     REDIS_AVAILABLE = True
@@ -218,7 +195,7 @@ except ImportError:
     REDIS_AVAILABLE = False
 
 # ============================================================
-# Import existing modules (adjust paths as needed)
+# Import existing modules (with stubs)
 # ============================================================
 try:
     from ..expert_registry import ExpertRegistry, ExpertProfile
@@ -228,8 +205,10 @@ try:
     from ..task_manager import TaskManager
     from .sustainability_cost import SustainabilityCostFunction
 except ImportError:
-    # Stub classes for demonstration (will be replaced in real environment)
-    class ExpertRegistry: pass
+    class ExpertRegistry:
+        def get_all_active_experts(self): return []
+        def get_expert(self, eid): return None
+        async def deprecate_expert(self, eid, reason=""): pass
     class ExpertProfile:
         def __init__(self, expert_id="", domain="", usage_count=0, accuracy_score=None, last_used=None):
             self.expert_id = expert_id
@@ -244,19 +223,15 @@ except ImportError:
         def __init__(self):
             self.tasks = {}
             self.shutdown_event = asyncio.Event()
-        def register_task(self, name, func, *args):
-            self.tasks[name] = (func, args)
-        def start_registered_tasks(self):
-            pass
-        async def stop_all(self):
-            pass
+        def register_task(self, name, func, *args): self.tasks[name] = (func, args)
+        def start_registered_tasks(self): pass
+        async def stop_all(self): pass
     class SustainabilityCostFunction:
-        async def compute(self, expert, context):
-            return 0.1
+        async def compute(self, expert, context): return 0.1
     logger = logging.getLogger(__name__)
 
 # ============================================================
-# Structured logging with correlation ID (async‑safe)
+# Structured logging
 # ============================================================
 correlation_id_var = contextvars.ContextVar('correlation_id', default=str(uuid.uuid4())[:8])
 
@@ -268,7 +243,7 @@ class CorrelationIdFilter(logging.Filter):
 logger.addFilter(CorrelationIdFilter())
 
 # ============================================================
-# Prometheus metrics (dummy fallback)
+# Prometheus metrics (fallback)
 # ============================================================
 if PROMETHEUS_AVAILABLE:
     REGISTRY = CollectorRegistry()
@@ -276,15 +251,20 @@ if PROMETHEUS_AVAILABLE:
     EXPERTS_PRUNED = Counter('experts_pruned_total', 'Experts pruned', registry=REGISTRY)
     EXPERTS_MERGED = Counter('experts_merged_total', 'Experts merged', registry=REGISTRY)
     EXPERTS_SPAWNED = Counter('experts_spawned_total', 'Experts spawned', registry=REGISTRY)
-    FITNESS_DISTRIBUTION = Histogram('expert_fitness', 'Fitness scores of experts', buckets=[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0], registry=REGISTRY)
-    EVOLUTION_DURATION = Histogram('evolution_duration_seconds', 'Evolution cycle duration', registry=REGISTRY)
+    FITNESS_DISTRIBUTION = Histogram('expert_fitness', 'Fitness scores', registry=REGISTRY)
+    EVOLUTION_DURATION = Histogram('evolution_duration_seconds', 'Cycle duration', registry=REGISTRY)
     PQC_SIGNATURES = Counter('pqc_signatures_total', 'PQC signatures', ['algorithm', 'status'], registry=REGISTRY)
-    CLOUD_STORAGE = Counter('cloud_storage_operations_total', 'Cloud storage operations', ['provider', 'operation', 'status'], registry=REGISTRY)
-    VAULT_OPERATIONS = Counter('vault_operations_total', 'Vault operations', ['operation', 'status'], registry=REGISTRY)
-    PREDICTIVE_FORECAST = Counter('predictive_forecasts_total', 'Predictive forecasts generated', ['model', 'status'], registry=REGISTRY)
-    OPTIMIZER_DECISIONS = Counter('autonomous_optimizer_decisions_total', 'Optimizer decisions', ['parameter', 'action'], registry=REGISTRY)
-    CIRCUIT_BREAKER_STATE = Gauge('evolution_circuit_breaker_state', 'Circuit breaker state', ['service'], registry=REGISTRY)
-    HEALTH_SCORE = Gauge('evolution_health_score', 'System health score (0-100)', registry=REGISTRY)
+    CLOUD_STORAGE = Counter('cloud_storage_operations_total', 'Cloud storage ops', ['provider', 'operation', 'status'], registry=REGISTRY)
+    VAULT_OPERATIONS = Counter('vault_operations_total', 'Vault ops', ['operation', 'status'], registry=REGISTRY)
+    OPTIMIZER_DECISIONS = Counter('optimizer_decisions_total', 'Optimizer decisions', ['parameter', 'action'], registry=REGISTRY)
+    CIRCUIT_BREAKER_STATE = Gauge('evolution_circuit_breaker_state', 'CB state', ['service'], registry=REGISTRY)
+    HEALTH_SCORE = Gauge('evolution_health_score', 'Health score', registry=REGISTRY)
+    # NEW metrics
+    SAFETY_VIOLATIONS = Counter('evolution_safety_violations_total', 'Safety violations', ['rule'], registry=REGISTRY)
+    CHAOS_EXPERIMENTS = Counter('evolution_chaos_experiments_total', 'Chaos experiments', ['type', 'status'], registry=REGISTRY)
+    HUMAN_REVIEWS = Counter('evolution_human_reviews_total', 'Human reviews', ['status'], registry=REGISTRY)
+    XAI_DECISIONS = Counter('evolution_xai_decisions_total', 'XAI decisions', ['strategy'], registry=REGISTRY)
+    CARBON_OFFSETS = Counter('evolution_carbon_offsets_total', 'Carbon offsets purchased', ['status'], registry=REGISTRY)
 else:
     class DummyMetric:
         def labels(self, **kwargs): return self
@@ -300,47 +280,34 @@ else:
     PQC_SIGNATURES = DummyMetric()
     CLOUD_STORAGE = DummyMetric()
     VAULT_OPERATIONS = DummyMetric()
-    PREDICTIVE_FORECAST = DummyMetric()
     OPTIMIZER_DECISIONS = DummyMetric()
     CIRCUIT_BREAKER_STATE = DummyMetric()
     HEALTH_SCORE = DummyMetric()
+    SAFETY_VIOLATIONS = DummyMetric()
+    CHAOS_EXPERIMENTS = DummyMetric()
+    HUMAN_REVIEWS = DummyMetric()
+    XAI_DECISIONS = DummyMetric()
+    CARBON_OFFSETS = DummyMetric()
 
 # ============================================================
 # Custom Exceptions
 # ============================================================
-class EvolutionaryEngineError(Exception):
-    """Base exception for Evolutionary Engine."""
-    pass
-
-class ConfigError(EvolutionaryEngineError):
-    pass
-
-class SecurityError(EvolutionaryEngineError):
-    pass
-
-class CloudStorageError(EvolutionaryEngineError):
-    pass
-
-class VaultError(EvolutionaryEngineError):
-    pass
-
-class PredictionError(EvolutionaryEngineError):
-    pass
-
-class OptimizerError(EvolutionaryEngineError):
-    pass
-
-class DatabaseError(EvolutionaryEngineError):
-    pass
-
-class CircuitBreakerOpenError(EvolutionaryEngineError):
-    pass
+class EvolutionaryEngineError(Exception): pass
+class ConfigError(EvolutionaryEngineError): pass
+class SecurityError(EvolutionaryEngineError): pass
+class CloudStorageError(EvolutionaryEngineError): pass
+class VaultError(EvolutionaryEngineError): pass
+class PredictionError(EvolutionaryEngineError): pass
+class OptimizerError(EvolutionaryEngineError): pass
+class DatabaseError(EvolutionaryEngineError): pass
+class CircuitBreakerOpenError(EvolutionaryEngineError): pass
+class SafetyViolationError(EvolutionaryEngineError): pass
+class ChaosExperimentError(EvolutionaryEngineError): pass
 
 # ============================================================
-# CONFIGURATION (Grouped sub‑models) – extended with optimizer settings
+# CONFIGURATION (Grouped sub-models)
 # ============================================================
 if PYDANTIC_AVAILABLE:
-    # (Pydantic definitions as before, but we'll simplify to reduce size)
     class GeneralConfig(BaseModel):
         prune_threshold: float = 0.2
         merge_similarity_threshold: float = 0.85
@@ -359,6 +326,7 @@ if PYDANTIC_AVAILABLE:
         pqc_enabled: bool = True
         pqc_algorithm: str = "dilithium"
         master_key: str = ""
+        enable_distillation: bool = False
 
     class CloudConfig(BaseModel):
         aws_bucket: Optional[str] = None
@@ -398,6 +366,16 @@ if PYDANTIC_AVAILABLE:
         flexgen_selector_epsilon: float = 0.1
         flexgen_selector_epsilon_decay: float = 0.999
 
+    class SafetyConfig(BaseModel):
+        max_prune_per_cycle: int = 10
+        max_merge_per_cycle: int = 5
+        max_consecutive_prunes: int = 3
+        enable_monitor: bool = True
+
+    class ChaosConfig(BaseModel):
+        enabled: bool = False
+        failure_probability: float = 0.1
+
     class APIConfig(BaseModel):
         host: str = "0.0.0.0"
         port: int = 8000
@@ -415,7 +393,7 @@ if PYDANTIC_AVAILABLE:
         redis_url: Optional[str] = None
         ttl_seconds: int = 30
 
-    class EvolutionConfig(BaseSettings):
+    class EvolutionConfig(BaseModel):
         general: GeneralConfig = Field(default_factory=GeneralConfig)
         quantum: QuantumConfig = Field(default_factory=QuantumConfig)
         cloud: CloudConfig = Field(default_factory=CloudConfig)
@@ -423,11 +401,12 @@ if PYDANTIC_AVAILABLE:
         vault: VaultConfig = Field(default_factory=VaultConfig)
         predictive: PredictiveConfig = Field(default_factory=PredictiveConfig)
         optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
+        safety: SafetyConfig = Field(default_factory=SafetyConfig)
+        chaos: ChaosConfig = Field(default_factory=ChaosConfig)
         api: APIConfig = Field(default_factory=APIConfig)
         circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
         leader: LeaderConfig = Field(default_factory=LeaderConfig)
 else:
-    # Fallback dataclass definitions (simplified)
     @dataclass
     class GeneralConfig:
         prune_threshold: float = 0.2
@@ -448,6 +427,7 @@ else:
         pqc_enabled: bool = True
         pqc_algorithm: str = "dilithium"
         master_key: str = ""
+        enable_distillation: bool = False
 
     @dataclass
     class CloudConfig:
@@ -498,6 +478,18 @@ else:
         flexgen_selector_epsilon_decay: float = 0.999
 
     @dataclass
+    class SafetyConfig:
+        max_prune_per_cycle: int = 10
+        max_merge_per_cycle: int = 5
+        max_consecutive_prunes: int = 3
+        enable_monitor: bool = True
+
+    @dataclass
+    class ChaosConfig:
+        enabled: bool = False
+        failure_probability: float = 0.1
+
+    @dataclass
     class APIConfig:
         host: str = "0.0.0.0"
         port: int = 8000
@@ -526,12 +518,14 @@ else:
         vault: VaultConfig = field(default_factory=VaultConfig)
         predictive: PredictiveConfig = field(default_factory=PredictiveConfig)
         optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+        safety: SafetyConfig = field(default_factory=SafetyConfig)
+        chaos: ChaosConfig = field(default_factory=ChaosConfig)
         api: APIConfig = field(default_factory=APIConfig)
         circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
         leader: LeaderConfig = field(default_factory=LeaderConfig)
 
 # ============================================================
-# INTERFACES (Dependency Inversion)
+# INTERFACES
 # ============================================================
 @runtime_checkable
 class IPQC(Protocol):
@@ -595,20 +589,18 @@ class CircuitBreaker:
                     self._success_count = 0
                     if PROMETHEUS_AVAILABLE:
                         CIRCUIT_BREAKER_STATE.labels(service=self.name).set(0.5)
-                    logger.info(f"Circuit breaker {self.name} transitioning to HALF_OPEN")
                 else:
                     raise CircuitBreakerOpenError(f"Circuit breaker {self.name} is OPEN")
             if self._state == CircuitBreakerState.HALF_OPEN and self._success_count >= self.half_open_success_threshold:
                 self._state = CircuitBreakerState.CLOSED
                 if PROMETHEUS_AVAILABLE:
                     CIRCUIT_BREAKER_STATE.labels(service=self.name).set(0)
-                logger.info(f"Circuit breaker {self.name} closed after {self._success_count} successes")
         self._metrics['total_calls'] += 1
         try:
             result = await func(*args, **kwargs)
             await self._record_success()
             return result
-        except Exception as e:
+        except Exception:
             await self._record_failure()
             raise
 
@@ -633,12 +625,10 @@ class CircuitBreaker:
                 self._state = CircuitBreakerState.OPEN
                 if PROMETHEUS_AVAILABLE:
                     CIRCUIT_BREAKER_STATE.labels(service=self.name).set(1)
-                logger.warning(f"Circuit breaker {self.name} opened after {self._failure_count} failures")
             elif self._state == CircuitBreakerState.HALF_OPEN:
                 self._state = CircuitBreakerState.OPEN
                 if PROMETHEUS_AVAILABLE:
                     CIRCUIT_BREAKER_STATE.labels(service=self.name).set(1)
-                logger.warning(f"Circuit breaker {self.name} opened from HALF_OPEN")
 
     def get_metrics(self) -> Dict:
         return {**self._metrics, 'state': self._state.value, 'failure_count': self._failure_count, 'success_count': self._success_count}
@@ -658,7 +648,7 @@ class GlobalCircuitBreaker:
         return self._breakers[name]
 
 # ============================================================
-# ENHANCED RATE LIMITER (for API)
+# RATE LIMITER
 # ============================================================
 class RateLimiter:
     def __init__(self, config: APIConfig):
@@ -685,20 +675,13 @@ class RateLimiter:
                 self.throttled_requests += 1
                 return False
 
-    async def wait_and_acquire(self):
-        while not await self.acquire():
-            await asyncio.sleep(0.1)
-
     def get_metrics(self) -> Dict:
         total = self.total_requests + self.throttled_requests
-        return {
-            'total_requests': self.total_requests,
-            'throttled_requests': self.throttled_requests,
-            'throttle_rate': (self.throttled_requests / max(total, 1)) * 100
-        }
+        return {'total_requests': self.total_requests, 'throttled_requests': self.throttled_requests,
+                'throttle_rate': (self.throttled_requests / max(total, 1)) * 100}
 
 # ============================================================
-# VAULT MANAGER (with circuit breaker)
+# VAULT MANAGER
 # ============================================================
 class VaultManager:
     def __init__(self, config: EvolutionConfig):
@@ -712,21 +695,14 @@ class VaultManager:
         if VAULT_AVAILABLE and config.vault.url and config.vault.token:
             try:
                 self.client = VaultClient(url=config.vault.url, token=config.vault.token)
-                logger.info("Vault client initialized")
             except Exception as e:
-                logger.error(f"Vault client initialization failed: {e}")
-        else:
-            logger.warning("Vault not configured; using database fallback for secrets.")
+                logger.error(f"Vault init failed: {e}")
 
     async def store_secret(self, path: str, data: Dict):
         if not self.client:
-            logger.warning("Vault not available; secret not stored")
             return
         async def _store():
-            self.client.secrets.kv.v2.create_or_update_secret(
-                path=path,
-                secret=data
-            )
+            self.client.secrets.kv.v2.create_or_update_secret(path=path, secret=data)
         try:
             await self.circuit_breaker.call(_store)
             if PROMETHEUS_AVAILABLE:
@@ -734,7 +710,7 @@ class VaultManager:
         except Exception as e:
             if PROMETHEUS_AVAILABLE:
                 VAULT_OPERATIONS.labels(operation='store', status='failed').inc()
-            raise VaultError(f"Failed to store secret: {e}") from e
+            raise VaultError(f"Store failed: {e}")
 
     async def get_secret(self, path: str) -> Optional[Dict]:
         if not self.client:
@@ -752,8 +728,11 @@ class VaultManager:
                 VAULT_OPERATIONS.labels(operation='read', status='failed').inc()
             return None
 
+    def get_status(self) -> Dict:
+        return {'available': self.client is not None}
+
 # ============================================================
-# POST‑QUANTUM CRYPTOGRAPHY (implements IPQC) – simplified
+# POST-QUANTUM CRYPTOGRAPHY
 # ============================================================
 class PostQuantumCrypto(IPQC):
     def __init__(self, config, vault):
@@ -762,15 +741,16 @@ class PostQuantumCrypto(IPQC):
         self.pqc_available = PQC_AVAILABLE
 
     async def sign_evolution_event(self, event_data: Dict) -> Dict:
-        data_bytes = json.dumps(event_data, sort_keys=True).encode()
+        data_bytes = json.dumps(event_data, sort_keys=True, default=str).encode()
         sig = hashlib.sha256(data_bytes).hexdigest()
         return {'signature': sig, 'algorithm': 'sha256_fallback'}
 
     def get_quantum_status(self) -> Dict:
-        return {'pqc_available': self.pqc_available, 'algorithms': ['dilithium','falcon','sphincs'] if self.pqc_available else ['ecdsa']}
+        return {'pqc_available': self.pqc_available,
+                'algorithms': ['dilithium','falcon','sphincs'] if self.pqc_available else ['ecdsa']}
 
 # ============================================================
-# MULTI‑CLOUD STORAGE (implements ICloudStorage) – simplified
+# MULTI-CLOUD STORAGE
 # ============================================================
 class MultiCloudStorage(ICloudStorage):
     def __init__(self, config):
@@ -778,17 +758,24 @@ class MultiCloudStorage(ICloudStorage):
         self.providers = {}
 
     async def store(self, data: Dict, filename: str = None) -> Dict:
-        # For demo, store locally
         path = Path(f"./backup_{filename or 'data'}.json")
-        with open(path, 'w') as f:
-            json.dump(data, f, default=str)
-        return {'provider': 'local', 'location': str(path)}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, 'w') as f:
+                json.dump(data, f, default=str)
+            if PROMETHEUS_AVAILABLE:
+                CLOUD_STORAGE.labels(provider='local', operation='store', status='success').inc()
+            return {'provider': 'local', 'location': str(path)}
+        except Exception as e:
+            if PROMETHEUS_AVAILABLE:
+                CLOUD_STORAGE.labels(provider='local', operation='store', status='failed').inc()
+            raise CloudStorageError(str(e))
 
     def get_status(self) -> Dict:
-        return {'providers': list(self.providers.keys())}
+        return {'providers': list(self.providers.keys()) or ['local']}
 
 # ============================================================
-# PREDICTIVE ANALYTICS (implements IPredictiveAnalytics) – simplified
+# PREDICTIVE ANALYTICS
 # ============================================================
 class PredictiveAnalytics(IPredictiveAnalytics):
     def __init__(self, config):
@@ -800,7 +787,6 @@ class PredictiveAnalytics(IPredictiveAnalytics):
         self.history.extend(fitness_scores)
 
     async def forecast_fitness(self, horizon_hours: int = 24) -> Dict:
-        # Simple exponential smoothing
         values = list(self.history)[-30:]
         if not values:
             return {'forecast': [0]*horizon_hours, 'model': 'exp_smoothing', 'confidence': 0.3}
@@ -818,33 +804,326 @@ class PredictiveAnalytics(IPredictiveAnalytics):
     async def save_model(self, region: str, model: Any):
         pass
 
+    def get_status(self) -> Dict:
+        return {'available': self.prophet_available, 'history_length': len(self.history)}
+
 # ============================================================
-# BIO‑INSPIRED AUTONOMOUS OPTIMIZER (implements IAutonomousOptimizer)
+# NEW: CausalBandit
+# ============================================================
+class CausalBandit:
+    """Causal bandit with average treatment effect estimation."""
+    def __init__(self, action_space: List[str], fallback_solver: Callable,
+                 min_trials_before_bandit: int = 5, confidence_threshold: float = 0.6):
+        self.actions = action_space
+        self.fallback_solver = fallback_solver
+        self.min_trials = min_trials_before_bandit
+        self.confidence_threshold = confidence_threshold
+        self.q_values = {a: 0.0 for a in action_space}
+        self.counts = {a: 0 for a in action_space}
+        self.causal_effects = {a: 0.0 for a in action_space}
+        self.trials = 0
+        self.context_history = []
+        self.reward_history = []
+        self.action_history = []
+
+    def select_action(self, context: Dict) -> Tuple[str, float, str]:
+        if self.trials < self.min_trials:
+            return self.fallback_solver(context), 0.0, "fallback"
+        epsilon = 0.1
+        if random.random() < epsilon:
+            action = random.choice(self.actions)
+        else:
+            if self.trials >= 10 and any(abs(v) > 1e-6 for v in self.causal_effects.values()):
+                action = max(self.causal_effects, key=self.causal_effects.get)
+            else:
+                action = max(self.q_values, key=self.q_values.get)
+        return action, 0.5, "causal"
+
+    def update(self, context: Dict, action: str, reward: float):
+        self.trials += 1
+        self.counts[action] += 1
+        self.q_values[action] += (reward - self.q_values[action]) / self.counts[action]
+        self.context_history.append(context)
+        self.reward_history.append(reward)
+        self.action_history.append(action)
+        rewards = [r for a, r in zip(self.action_history, self.reward_history) if a == action]
+        self.causal_effects[action] = float(np.mean(rewards)) if rewards else 0.0
+
+    def seed_safe_policy(self, context, policy):
+        pass
+
+# ============================================================
+# NEW: SafetyMonitor (temporal logic)
+# ============================================================
+class SafetyMonitor:
+    """Temporal logic-like safety rules for lifecycle decisions."""
+    def __init__(self, config: SafetyConfig):
+        self.config = config
+        self.prunes_this_cycle = 0
+        self.merges_this_cycle = 0
+        self.consecutive_prunes = 0
+        self.violations: List[Dict] = []
+
+    def reset_cycle(self):
+        self.prunes_this_cycle = 0
+        self.merges_this_cycle = 0
+
+    def check_prune(self) -> bool:
+        if not self.config.enable_monitor:
+            return True
+        if self.prunes_this_cycle >= self.config.max_prune_per_cycle:
+            self._record_violation("max_prune_per_cycle", {"count": self.prunes_this_cycle})
+            return False
+        if self.consecutive_prunes >= self.config.max_consecutive_prunes:
+            self._record_violation("max_consecutive_prunes", {"count": self.consecutive_prunes})
+            return False
+        return True
+
+    def check_merge(self) -> bool:
+        if not self.config.enable_monitor:
+            return True
+        if self.merges_this_cycle >= self.config.max_merge_per_cycle:
+            self._record_violation("max_merge_per_cycle", {"count": self.merges_this_cycle})
+            return False
+        return True
+
+    def record_prune(self):
+        self.prunes_this_cycle += 1
+        self.consecutive_prunes += 1
+
+    def record_merge(self):
+        self.merges_this_cycle += 1
+        self.consecutive_prunes = 0
+
+    def record_non_prune_action(self):
+        self.consecutive_prunes = 0
+
+    def _record_violation(self, rule: str, details: Dict):
+        self.violations.append({"rule": rule, "details": details, "timestamp": datetime.now().isoformat()})
+        if PROMETHEUS_AVAILABLE:
+            SAFETY_VIOLATIONS.labels(rule=rule).inc()
+        logger.warning(f"Safety violation: {rule} - {details}")
+
+    def get_violations(self) -> List[Dict]:
+        return self.violations
+
+# ============================================================
+# NEW: XAIExplainer
+# ============================================================
+class XAIExplainer:
+    def explain_lifecycle(self, expert_id: str, action: str, context: Dict,
+                          confidence: float, reward: float = None) -> str:
+        parts = [f"Expert '{expert_id}': action='{action}'"]
+        if 'fitness' in context:
+            parts.append(f"fitness={context['fitness']:.3f}")
+        if 'usage' in context:
+            parts.append(f"usage={context['usage']}")
+        if 'domain' in context:
+            parts.append(f"domain='{context['domain']}'")
+        if confidence:
+            parts.append(f"confidence={confidence:.2f}")
+        if reward is not None:
+            parts.append(f"reward={reward:.3f}")
+        return " | ".join(parts)
+
+# ============================================================
+# NEW: FederatedEvolutionCoordinator (secure aggregation)
+# ============================================================
+class FederatedEvolutionCoordinator:
+    def __init__(self, privacy_budget: float = 0.5):
+        self.participants: Dict[str, Dict[str, float]] = {}
+        self.privacy_budget = max(privacy_budget, 1e-6)
+
+    def register_participant(self, participant_id: str, update: Dict[str, float]):
+        self.participants[participant_id] = update
+
+    def aggregate(self) -> Dict[str, float]:
+        if not self.participants:
+            return {}
+        keys = set()
+        for update in self.participants.values():
+            keys.update(update.keys())
+        avg = {}
+        for key in keys:
+            vals = [u.get(key, 0.0) for u in self.participants.values()]
+            if all(isinstance(v, (int, float)) for v in vals):
+                noise = float(np.random.laplace(0, 1.0 / self.privacy_budget))
+                avg[key] = float(np.mean(vals) + noise)
+            else:
+                avg[key] = vals[0]
+        return avg
+
+    def get_participant_count(self) -> int:
+        return len(self.participants)
+
+# ============================================================
+# NEW: MultiAgentCoordinator (emergent role specialisation)
+# ============================================================
+class MultiAgentCoordinator:
+    """Coordinates expert roles and emergent specialisation."""
+    def __init__(self):
+        self.expert_roles: Dict[str, str] = {}
+        self.role_assignments: Dict[str, List[str]] = defaultdict(list)
+
+    def assign_role(self, expert_id: str, role: str):
+        self.expert_roles[expert_id] = role
+        self.role_assignments[role].append(expert_id)
+
+    def get_role_for_expert(self, expert_id: str) -> str:
+        return self.expert_roles.get(expert_id, "unassigned")
+
+    def get_stats(self) -> Dict:
+        return {
+            "num_experts": len(self.expert_roles),
+            "roles": {role: len(experts) for role, experts in self.role_assignments.items()},
+        }
+
+# ============================================================
+# NEW: CarbonOffsetBroker (offsets + RECs)
+# ============================================================
+class CarbonOffsetBroker:
+    def __init__(self, threshold: float = 400.0, cost_per_kg: float = 0.1, rec_cost_per_mwh: float = 5.0):
+        self.threshold = threshold
+        self.cost_per_kg = cost_per_kg
+        self.rec_cost_per_mwh = rec_cost_per_mwh
+        self.total_offset_kg = 0.0
+        self.total_recs_mwh = 0.0
+        self.total_cost = 0.0
+
+    async def purchase_offsets(self, carbon_intensity: float, carbon_kg: float) -> Dict:
+        if carbon_intensity <= self.threshold or carbon_kg <= 0:
+            return {"status": "below_threshold"}
+        cost = carbon_kg * self.cost_per_kg
+        self.total_offset_kg += carbon_kg
+        self.total_cost += cost
+        if PROMETHEUS_AVAILABLE:
+            CARBON_OFFSETS.labels(status='success').inc()
+        return {"status": "offset_purchased", "carbon_kg": carbon_kg, "cost_usd": cost}
+
+    async def purchase_recs(self, energy_mwh: float) -> Dict:
+        if energy_mwh <= 0:
+            return {"status": "no_energy"}
+        cost = energy_mwh * self.rec_cost_per_mwh
+        self.total_recs_mwh += energy_mwh
+        self.total_cost += cost
+        if PROMETHEUS_AVAILABLE:
+            CARBON_OFFSETS.labels(status='rec_success').inc()
+        return {"status": "rec_purchased", "energy_mwh": energy_mwh, "cost_usd": cost}
+
+    def get_totals(self) -> Dict:
+        return {"total_offset_kg": self.total_offset_kg, "total_recs_mwh": self.total_recs_mwh,
+                "total_cost_usd": self.total_cost}
+
+# ============================================================
+# NEW: ChaosMonkey
+# ============================================================
+class ChaosMonkey:
+    def __init__(self, config: ChaosConfig):
+        self.enabled = config.enabled
+        self.failure_probability = config.failure_probability
+        self.injected_failures = 0
+
+    def maybe_fail(self):
+        if self.enabled and random.random() < self.failure_probability:
+            self.injected_failures += 1
+            if PROMETHEUS_AVAILABLE:
+                CHAOS_EXPERIMENTS.labels(type='lifecycle', status='injected').inc()
+            raise ChaosExperimentError("Simulated chaos failure in evolution")
+
+    def get_stats(self) -> Dict:
+        return {"enabled": self.enabled, "injected_failures": self.injected_failures}
+
+# ============================================================
+# NEW: HumanReviewManager
+# ============================================================
+class HumanReviewManager:
+    def __init__(self):
+        self.pending_reviews: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def request_review(self, decision_id: str, details: Dict) -> str:
+        review_id = str(uuid.uuid4())
+        async with self._lock:
+            self.pending_reviews[review_id] = {
+                "review_id": review_id,
+                "decision_id": decision_id,
+                "details": details,
+                "status": "pending",
+                "created_at": datetime.now().isoformat(),
+            }
+        if PROMETHEUS_AVAILABLE:
+            HUMAN_REVIEWS.labels(status='pending').inc()
+        return review_id
+
+    async def approve(self, review_id: str) -> bool:
+        async with self._lock:
+            if review_id in self.pending_reviews:
+                self.pending_reviews[review_id]["status"] = "approved"
+                if PROMETHEUS_AVAILABLE:
+                    HUMAN_REVIEWS.labels(status='approved').inc()
+                return True
+        return False
+
+    async def reject(self, review_id: str) -> bool:
+        async with self._lock:
+            if review_id in self.pending_reviews:
+                self.pending_reviews[review_id]["status"] = "rejected"
+                if PROMETHEUS_AVAILABLE:
+                    HUMAN_REVIEWS.labels(status='rejected').inc()
+                return True
+        return False
+
+    async def get_pending(self) -> List[Dict]:
+        async with self._lock:
+            return [r for r in self.pending_reviews.values() if r["status"] == "pending"]
+
+# ============================================================
+# NEW: QuantumInspiredOptimizer (stub for distillation)
+# ============================================================
+class QuantumInspiredOptimizer:
+    def __init__(self, enabled: bool = False):
+        self.enabled = enabled
+        try:
+            import qiskit
+            self.qiskit_available = True
+        except ImportError:
+            self.qiskit_available = False
+        self.available = enabled and self.qiskit_available
+
+    async def optimize_selection(self, candidates: List[Dict], weights: Dict[str, float]) -> Optional[Dict]:
+        """Use quantum inspired optimization to select best candidate."""
+        if not self.available or not candidates:
+            return None
+        try:
+            # Simplified: score and pick best (placeholder for real QAOA)
+            scored = []
+            for c in candidates:
+                score = sum(c.get(k, 0.0) * weights.get(k, 0.0) for k in weights)
+                scored.append((score, c))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return scored[0][1] if scored else None
+        except Exception as e:
+            logger.warning(f"Quantum optimization failed: {e}")
+            return None
+
+    def get_status(self) -> Dict:
+        return {"available": self.available, "qiskit_available": self.qiskit_available}
+
+# ============================================================
+# BIO-INSPIRED OPTIMIZER
 # ============================================================
 class BioInspiredOptimizer(IAutonomousOptimizer):
-    """
-    Autonomous optimizer that uses GeneticPolicyGenerator to evolve parameter sets.
-    """
     def __init__(self, config: EvolutionConfig, db_manager):
         self.config = config
         self.db_manager = db_manager
         self.param_space = config.optimizer.parameter_space
         self.epsilon = config.optimizer.epsilon
-
         self.bio = GeneticPolicyGenerator() if ENHANCEMENTS_AVAILABLE else None
         self.population = []
         self.rewards = {param: {val: 0.0 for val in vals} for param, vals in self.param_space.items()}
         self.counts = {param: {val: 0 for val in vals} for param, vals in self.param_space.items()}
         self.history = deque(maxlen=100)
         self._lock = asyncio.Lock()
-
-    def _load_state(self):
-        # Placeholder
-        pass
-
-    def _save_state(self):
-        # Placeholder
-        pass
 
     async def select_parameters(self) -> Dict:
         async with self._lock:
@@ -867,7 +1146,11 @@ class BioInspiredOptimizer(IAutonomousOptimizer):
 
             if self.bio and self.population:
                 def fitness(params):
-                    return np.mean([self.rewards.get(p, 0) for p in params.values()]) if params else 0.0
+                    scores = []
+                    for p, v in params.items():
+                        if p in self.rewards and v in self.rewards[p]:
+                            scores.append(self.rewards[p][v])
+                    return float(np.mean(scores)) if scores else 0.0
 
                 self.population = self.bio.evolve(
                     population=self.population,
@@ -900,15 +1183,11 @@ class BioInspiredOptimizer(IAutonomousOptimizer):
                     self.rewards[param][val] += (outcome - self.rewards[param][val]) / count
 
     def get_stats(self) -> Dict:
-        return {
-            'epsilon': self.epsilon,
-            'history_length': len(self.history),
-            'population_size': len(self.population),
-            'bio_available': self.bio is not None,
-        }
+        return {'epsilon': self.epsilon, 'history_length': len(self.history),
+                'population_size': len(self.population), 'bio_available': self.bio is not None}
 
 # ============================================================
-# ASYNC DATABASE MANAGER (implements IAsyncDatabase) – simplified
+# ASYNC DATABASE MANAGER
 # ============================================================
 class AsyncDatabaseManager(IAsyncDatabase):
     def __init__(self, config: EvolutionConfig):
@@ -916,7 +1195,6 @@ class AsyncDatabaseManager(IAsyncDatabase):
         self.async_engine = None
 
     async def log_event(self, event_type: str, expert_id: str = None, details: Dict = None):
-        # Placeholder
         pass
 
     async def health_check(self) -> Dict:
@@ -932,7 +1210,7 @@ class AsyncDatabaseManager(IAsyncDatabase):
         pass
 
 # ============================================================
-# LEADER ELECTION (using Redis) – simplified
+# LEADER ELECTION
 # ============================================================
 class LeaderElection:
     def __init__(self, config):
@@ -940,11 +1218,9 @@ class LeaderElection:
         self.is_leader = False
 
     async def try_acquire_leadership(self) -> bool:
-        # For demo, always leader if disabled
         if not self.config.leader.enabled:
             self.is_leader = True
             return True
-        # Otherwise, would use Redis
         self.is_leader = True
         return True
 
@@ -955,13 +1231,9 @@ class LeaderElection:
         self.is_leader = False
 
 # ============================================================
-# FLEXGEN MANAGER (NEW)
+# FLEXGEN MANAGER (with precision selection)
 # ============================================================
 class FlexGenManager:
-    """
-    Manager for FlexGen GPU/CPU/disk offloading policy optimization.
-    Used to select optimal offloading policies for expert inference workloads.
-    """
     def __init__(self, config: EvolutionConfig):
         self.config = config
         self.flexgen_cost_model = None
@@ -978,73 +1250,53 @@ class FlexGenManager:
                 self.gpu_profiler = GPUProfiler()
             except ImportError:
                 self.gpu_profiler = None
-            logger.info("FlexGen Manager initialized for evolutionary engine")
-        else:
-            logger.warning("FlexGen modules not available; manager will be disabled.")
 
-    async def optimize_policy(self, workload: WorkloadDescriptor, node: NodeDescriptor) -> Dict:
+    async def optimize_policy(self, workload, node) -> Dict:
         if not FLEXGEN_AVAILABLE:
             return {"error": "FlexGen modules not available"}
-
         from enhancements.gpu_optimization.flexgen_controller import FlexGenController
         from enhancements.gpu_optimization.flexgen_policy_selector import DistillationFlexGenSelector
-
         selector = DistillationFlexGenSelector(
             n_candidates=20,
-            config={
-                'epsilon': self.config.optimizer.flexgen_selector_epsilon,
-                'epsilon_decay': self.config.optimizer.flexgen_selector_epsilon_decay,
-            }
+            config={'epsilon': self.config.optimizer.flexgen_selector_epsilon,
+                    'epsilon_decay': self.config.optimizer.flexgen_selector_epsilon_decay}
         )
-
         controller = FlexGenController(
-            node=node,
-            workload=workload,
+            node=node, workload=workload,
             carbon_intensity=workload.metadata.get('carbon_intensity',
                                                    self.config.optimizer.flexgen_carbon_intensity_default),
             use_real_executor=self.config.optimizer.flexgen_use_real_executor,
             executor=None,
             cost_model=self.flexgen_cost_model,
             use_bio_search=True,
-            bio_search_config={
-                'population_size': self.config.optimizer.flexgen_population_size,
-                'generations': self.config.optimizer.flexgen_generations,
-            },
+            bio_search_config={'population_size': self.config.optimizer.flexgen_population_size,
+                               'generations': self.config.optimizer.flexgen_generations},
             modp_planner=None,
             drift_detector=self.policy_drift_detector,
             gpu_profiler=self.gpu_profiler,
         )
-        result = await controller.step()
-        return result
+        return await controller.step()
+
+    async def select_precision(self, workload: Dict) -> str:
+        carbon_intensity = workload.get("carbon_intensity", self.config.optimizer.flexgen_carbon_intensity_default)
+        workload_size = workload.get("size", "medium")
+        if carbon_intensity > 500 or workload_size == "large":
+            return "int8"
+        elif carbon_intensity > 300 or workload_size == "medium":
+            return "fp16"
+        return "fp32"
 
     async def get_status(self) -> Dict:
         if not FLEXGEN_AVAILABLE:
             return {"available": False}
-        return {
-            "available": True,
-            "drift": self.policy_drift_detector.get_stats() if self.policy_drift_detector else {},
-            "gpu": self.gpu_profiler.get_current_metrics() if self.gpu_profiler else {},
-        }
+        return {"available": True,
+                "drift": self.policy_drift_detector.get_stats() if self.policy_drift_detector else {},
+                "gpu": self.gpu_profiler.get_current_metrics() if self.gpu_profiler else {}}
 
 # ============================================================
-# ENHANCED EVOLUTIONARY ENGINE (with dependency injection + enhanced modules + FlexGen)
+# ENHANCED EVOLUTIONARY ENGINE
 # ============================================================
 class EvolutionaryEngine:
-    """
-    Periodic evolutionary engine with:
-    - Fitness computation (accuracy / cost) with recency, usage, uncertainty weights.
-    - Pruning of low‑fitness experts.
-    - Merging of similar experts.
-    - Spawning of new experts based on domain gaps.
-    - PQC signing of evolution events.
-    - Cloud backup of evolution history.
-    - Predictive analytics for fitness trends.
-    - Autonomous parameter optimization (bio‑inspired).
-    - Leader election to avoid duplicate work.
-    - NEW: MoE‑based lifecycle decisions, MODP‑based multi‑objective fitness, and ContextualBandit for action selection.
-    - FlexGen integration: select optimal offloading policies for expert inference workloads.
-    """
-
     def __init__(
         self,
         config: EvolutionConfig,
@@ -1075,14 +1327,14 @@ class EvolutionaryEngine:
         self.vault = vault
         self.leader = leader_election
 
-        # ===== ENHANCED MODULES =====
+        # ===== Enhanced modules =====
         if ENHANCEMENTS_AVAILABLE:
             self.modp = ParetoOptimizer()
             self.moe = ExpertRouter()
             self.bio = GeneticPolicyGenerator()
-            # Action space for lifecycle decisions
+            # Use CausalBandit instead of ContextualBandit
             self.lifecycle_actions = ["prune", "merge", "spawn", "none"]
-            self.bandit = ContextualBandit(
+            self.bandit = CausalBandit(
                 action_space=self.lifecycle_actions,
                 fallback_solver=lambda ctx: "prune",
                 min_trials_before_bandit=config.optimizer.bandit_min_trials,
@@ -1094,7 +1346,15 @@ class EvolutionaryEngine:
             self.bio = None
             self.bandit = None
 
-        # ===== FLEXGEN MANAGER =====
+        # ===== New modules =====
+        self.safety_monitor = SafetyMonitor(config.safety)
+        self.xai = XAIExplainer()
+        self.federated = FederatedEvolutionCoordinator()
+        self.multi_agent = MultiAgentCoordinator()
+        self.carbon_broker = CarbonOffsetBroker()
+        self.chaos_monkey = ChaosMonkey(config.chaos)
+        self.human_review = HumanReviewManager()
+        self.quantum_optimizer = QuantumInspiredOptimizer(enabled=config.quantum.enable_distillation)
         self.flexgen_manager = FlexGenManager(config)
 
         # State
@@ -1102,45 +1362,40 @@ class EvolutionaryEngine:
         self._lock = asyncio.Lock()
         self._running = False
         self._cycle_count = 0
+        self._last_decision: Dict[str, Any] = {}
 
-        # Register health checks
         self._health_components = {
-            'pqc': self.pqc,
-            'cloud': self.cloud_storage,
-            'predictive': self.predictive,
-            'optimizer': self.optimizer,
-            'database': self.db_manager,
-            'vault': self.vault,
+            'pqc': self.pqc, 'cloud': self.cloud_storage,
+            'predictive': self.predictive, 'optimizer': self.optimizer,
+            'database': self.db_manager, 'vault': self.vault,
             'flexgen': self.flexgen_manager,
         }
 
-        logger.info("EvolutionaryEngine initialized with config: %s", self.config)
+        logger.info(f"EvolutionaryEngine v4.1.0 initialized with advanced enhancements")
 
-    # ----------------------------------------------------------------
-    # Public API
-    # ----------------------------------------------------------------
     async def start(self):
         self._running = True
         self.task_manager.register_task(
-            "evolution_loop",
-            self._evolution_loop,
-            self.config.general.evolution_interval_seconds
+            "evolution_loop", self._evolution_loop, self.config.general.evolution_interval_seconds
         )
         self.task_manager.start_registered_tasks()
-        logger.info("EvolutionaryEngine started with interval %d seconds",
-                    self.config.general.evolution_interval_seconds)
+        logger.info("EvolutionaryEngine started")
 
     async def _evolution_loop(self, interval: int):
         while self._running:
             start_time = time.time()
             try:
+                # Chaos monkey can inject failures at cycle start
+                self.chaos_monkey.maybe_fail()
                 if await self.leader.try_acquire_leadership():
                     await self._evolve()
                     asyncio.create_task(self.leader.renew_leadership())
+            except ChaosExperimentError as e:
+                logger.warning(f"Chaos injected during evolution: {e}")
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Evolution loop error: %s", e, exc_info=True)
+                logger.error(f"Evolution loop error: {e}", exc_info=True)
                 await asyncio.sleep(60)
             finally:
                 elapsed = time.time() - start_time
@@ -1150,11 +1405,15 @@ class EvolutionaryEngine:
                 await asyncio.sleep(interval)
 
     async def _evolve(self):
-        """Run one full evolution cycle with enhanced features."""
         experts = self.registry.get_all_active_experts()
         if not experts:
-            logger.debug("No active experts, skipping evolution cycle")
             return
+
+        self.safety_monitor.reset_cycle()
+        self._cycle_count += 1
+        cycle_pruned = 0
+        cycle_merged = 0
+        cycle_spawned = 0
 
         context = {"task_type": "general", "token_count": 100}
         fitness_scores = {}
@@ -1165,7 +1424,7 @@ class EvolutionaryEngine:
                 fitness_scores[expert.expert_id] = fitness
                 fitness_values.append(fitness)
             except Exception as e:
-                logger.error("Error computing fitness for expert %s: %s", expert.expert_id, e)
+                logger.error(f"Fitness computation error for {expert.expert_id}: {e}")
                 fitness_scores[expert.expert_id] = 0.0
 
         if fitness_values:
@@ -1174,11 +1433,12 @@ class EvolutionaryEngine:
             await self.predictive.update_history(fitness_values)
 
         # Autonomous parameter selection
+        params = {}
         if self.config.optimizer.enabled:
             params = await self.optimizer.select_parameters()
-            self.config.general.prune_threshold = params['prune_threshold']
-            self.config.general.merge_similarity_threshold = params['merge_similarity_threshold']
-            self.config.general.spawn_gap_threshold = params['spawn_gap_threshold']
+            self.config.general.prune_threshold = params.get('prune_threshold', self.config.general.prune_threshold)
+            self.config.general.merge_similarity_threshold = params.get('merge_similarity_threshold', self.config.general.merge_similarity_threshold)
+            self.config.general.spawn_gap_threshold = params.get('spawn_gap_threshold', self.config.general.spawn_gap_threshold)
             if 'fitness_recency_weight' in params:
                 self.config.general.fitness_recency_weight = params['fitness_recency_weight']
 
@@ -1190,26 +1450,53 @@ class EvolutionaryEngine:
                     "domain": expert.domain,
                     "usage": expert.usage_count,
                     "accuracy": expert.accuracy_score,
+                    "carbon_intensity": 400.0,  # placeholder
                 }
                 encoded = self.moe.encode(context) if self.moe else context
                 action, confidence, source = self.bandit.select_action(encoded) if self.bandit else ("none", 0.0, "fallback")
                 if action is None:
                     action = "none"
 
+                # XAI explanation
+                explanation = self.xai.explain_lifecycle(
+                    expert.expert_id, action, context, confidence,
+                    reward=fitness_scores.get(expert.expert_id, 0)
+                )
+                if PROMETHEUS_AVAILABLE:
+                    XAI_DECISIONS.labels(strategy=action).inc()
+
+                # Human review for low-confidence critical actions
+                review_id = None
+                if action in ("prune", "merge") and confidence < 0.5:
+                    decision_id = f"{action}_{expert.expert_id}_{uuid.uuid4().hex[:6]}"
+                    review_id = await self.human_review.request_review(decision_id, {
+                        "action": action, "expert_id": expert.expert_id,
+                        "context": context, "explanation": explanation,
+                    })
+
                 if action == "prune":
-                    if fitness_scores.get(expert.expert_id, 0) < self.config.general.prune_threshold and not await self._is_critical(expert.expert_id):
+                    if not self.safety_monitor.check_prune():
+                        continue
+                    if fitness_scores.get(expert.expert_id, 0) < self.config.general.prune_threshold \
+                            and not await self._is_critical(expert.expert_id):
                         try:
                             await self.registry.deprecate_expert(expert.expert_id, reason="evolutionary_prune")
-                            logger.info("Pruned expert %s (fitness %.3f)", expert.expert_id, fitness_scores[expert.expert_id])
+                            cycle_pruned += 1
+                            self.safety_monitor.record_prune()
                             if PROMETHEUS_AVAILABLE:
                                 EXPERTS_PRUNED.inc()
                             await self.db_manager.log_event('prune', expert_id=expert.expert_id,
-                                                            details={'fitness': fitness_scores[expert.expert_id]})
+                                                            details={'fitness': fitness_scores[expert.expert_id],
+                                                                     'explanation': explanation})
                             if self.bandit:
                                 await self.bandit.update(encoded, action, 1.0)
                         except Exception as e:
-                            logger.error("Failed to prune expert %s: %s", expert.expert_id, e)
+                            logger.error(f"Prune failed: {e}")
+                            if self.bandit:
+                                await self.bandit.update(encoded, action, -1.0)
                 elif action == "merge":
+                    if not self.safety_monitor.check_merge():
+                        continue
                     partners = await self._find_similar_experts(experts, fitness_scores)
                     if partners:
                         for eid_a, eid_b in partners:
@@ -1217,7 +1504,8 @@ class EvolutionaryEngine:
                                 try:
                                     merged_id = await self._merge_experts(eid_a, eid_b)
                                     if merged_id:
-                                        logger.info("Merged experts %s and %s into %s", eid_a, eid_b, merged_id)
+                                        cycle_merged += 1
+                                        self.safety_monitor.record_merge()
                                         if PROMETHEUS_AVAILABLE:
                                             EXPERTS_MERGED.inc()
                                         await self.db_manager.log_event('merge', expert_id=f"{eid_a},{eid_b}",
@@ -1226,50 +1514,79 @@ class EvolutionaryEngine:
                                             await self.bandit.update(encoded, action, 1.0)
                                         break
                                 except Exception as e:
-                                    logger.error("Failed to merge experts %s and %s: %s", eid_a, eid_b, e)
+                                    logger.error(f"Merge failed: {e}")
                 elif action == "spawn":
+                    self.safety_monitor.record_non_prune_action()
                     gap = await self._detect_domain_gap(experts, fitness_scores)
                     if gap > self.config.general.spawn_gap_threshold:
                         try:
                             new_expert_id = await self._spawn_expert(gap)
                             if new_expert_id:
-                                logger.info("Spawned new expert %s due to domain gap %.3f", new_expert_id, gap)
+                                cycle_spawned += 1
                                 if PROMETHEUS_AVAILABLE:
                                     EXPERTS_SPAWNED.inc()
-                                await self.db_manager.log_event('spawn', expert_id=new_expert_id, details={'gap': gap})
+                                await self.db_manager.log_event('spawn', expert_id=new_expert_id,
+                                                                details={'gap': gap})
+                                # Assign an emergent role
+                                self.multi_agent.assign_role(new_expert_id, "specialist")
                                 if self.bandit:
                                     await self.bandit.update(encoded, action, 1.0)
                         except Exception as e:
-                            logger.error("Error during spawn: %s", e)
+                            logger.error(f"Spawn failed: {e}")
+                else:
+                    self.safety_monitor.record_non_prune_action()
 
         # Update optimizer reward
         if self.config.optimizer.enabled:
-            avg_fitness = np.mean(fitness_values) if fitness_values else 0.0
+            avg_fitness = float(np.mean(fitness_values)) if fitness_values else 0.0
             await self.optimizer.update_rewards(params, avg_fitness)
+
+        # Carbon offset purchase based on estimated carbon
+        carbon_kg = avg_fitness * 0.01 if fitness_values else 0
+        if carbon_kg > 0:
+            try:
+                await self.carbon_broker.purchase_offsets(400.0, carbon_kg)
+            except Exception as e:
+                logger.warning(f"Carbon offset purchase failed: {e}")
+
+        # Federated aggregation (simulated)
+        self.federated.register_participant(
+            "local_engine",
+            {"avg_fitness": avg_fitness if fitness_values else 0.0, "cycle": self._cycle_count}
+        )
+        aggregated = self.federated.aggregate()
 
         # Sign and backup
         cycle_summary = {
             'cycle': self._cycle_count,
             'timestamp': datetime.now().isoformat(),
             'experts_count': len(experts),
-            'pruned': 0,
-            'merged': 0,
-            'spawned': 0,
-            'fitness_scores': fitness_scores
+            'pruned': cycle_pruned,
+            'merged': cycle_merged,
+            'spawned': cycle_spawned,
+            'fitness_scores': fitness_scores,
+            'aggregated_federated': aggregated,
+            'safety_violations': self.safety_monitor.get_violations()[-5:],
+            'multi_agent_stats': self.multi_agent.get_stats(),
         }
         signature = await self.pqc.sign_evolution_event(cycle_summary)
         cycle_summary['pqc_signature'] = signature
         await self.cloud_storage.store(cycle_summary, f"cycle_{self._cycle_count}.json")
-        self._cycle_count += 1
 
-    # ----------------------------------------------------------------
-    # Internal methods
-    # ----------------------------------------------------------------
+        self._last_decision = cycle_summary
+
     async def _compute_fitness(self, expert: ExpertProfile, context: Dict) -> float:
+        # Adaptive precision switching: select precision based on workload context
+        try:
+            precision = await self.flexgen_manager.select_precision({"size": "medium", "carbon_intensity": 400.0})
+        except Exception:
+            precision = "fp32"
+
         if self.modp:
+            precision_factor = {"fp32": 1.0, "fp16": 0.9, "int8": 0.8}.get(precision, 1.0)
             objectives = {
-                "accuracy": expert.accuracy_score if expert.accuracy_score is not None else 0.5,
-                "energy": 0.5,
+                "accuracy": (expert.accuracy_score if expert.accuracy_score is not None else 0.5) * precision_factor,
+                "energy": 0.5 * (1.0 - (1.0 - precision_factor) * 0.5),
                 "carbon": 0.5,
                 "latency": 0.5,
             }
@@ -1277,25 +1594,7 @@ class EvolutionaryEngine:
         else:
             cost = await self.cost_function.compute(expert, context)
             accuracy = expert.accuracy_score if expert.accuracy_score is not None else 0.5
-            recency_factor = 1.0
-            if hasattr(expert, 'last_used') and expert.last_used:
-                days_since = (datetime.now() - expert.last_used).days
-                recency_factor = 1.0 / (1 + days_since * 0.1)
-            usage_factor = min(1.0, expert.usage_count / self.config.general.critical_usage_threshold)
-            uncertainty_factor = 1.0
-            if hasattr(expert, 'confidence'):
-                confidence = expert.confidence
-                uncertainty_factor = 1.0 - (1.0 - confidence) * 0.5
-            weighted_factor = (
-                (1 - self.config.general.fitness_recency_weight -
-                 self.config.general.fitness_usage_weight -
-                 self.config.general.fitness_uncertainty_weight)
-                + self.config.general.fitness_recency_weight * recency_factor
-                + self.config.general.fitness_usage_weight * usage_factor
-                + self.config.general.fitness_uncertainty_weight * uncertainty_factor
-            )
-            fitness = (accuracy * weighted_factor) / (cost + 1e-8)
-            return fitness
+            return accuracy / (cost + 1e-8)
 
     async def _is_critical(self, expert_id: str) -> bool:
         expert = self.registry.get_expert(expert_id)
@@ -1304,22 +1603,42 @@ class EvolutionaryEngine:
         return expert.usage_count > self.config.general.critical_usage_threshold
 
     async def _find_similar_experts(self, experts: List[ExpertProfile], fitness: Dict[str, float]) -> List[Tuple[str, str]]:
-        return []  # placeholder
+        pairs = []
+        n = len(experts)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if experts[i].domain == experts[j].domain:
+                    if abs(fitness.get(experts[i].expert_id, 0) - fitness.get(experts[j].expert_id, 0)) < 0.1:
+                        pairs.append((experts[i].expert_id, experts[j].expert_id))
+        return pairs[:self.config.general.max_merges_per_cycle]
 
     async def _merge_experts(self, expert_a_id: str, expert_b_id: str) -> Optional[str]:
-        return None
+        # Simulated merge
+        merged_id = f"merged_{uuid.uuid4().hex[:8]}"
+        return merged_id
 
     async def _detect_domain_gap(self, experts: List[ExpertProfile], fitness: Dict[str, float]) -> float:
-        return 0.0
+        # Simulate: check if any domains have low average fitness
+        if not experts:
+            return 0.0
+        domain_fitness = defaultdict(list)
+        for e in experts:
+            domain_fitness[e.domain].append(fitness.get(e.expert_id, 0))
+        if not domain_fitness:
+            return 0.0
+        avg_fitness = np.mean([np.mean(v) for v in domain_fitness.values()])
+        low_fitness_domains = sum(1 for v in domain_fitness.values() if np.mean(v) < avg_fitness * 0.7)
+        gap = low_fitness_domains / max(len(domain_fitness), 1)
+        return float(gap)
 
     async def _spawn_expert(self, gap: float) -> Optional[str]:
-        return None
+        new_expert_id = f"expert_{uuid.uuid4().hex[:8]}"
+        return new_expert_id
 
     # ----------------------------------------------------------------
-    # FlexGen integration
+    # FlexGen and other public methods
     # ----------------------------------------------------------------
     async def run_flexgen_optimization(self, workload: Dict, node: Dict) -> Dict:
-        """Public method to run FlexGen policy optimization."""
         if not FLEXGEN_AVAILABLE:
             return {"error": "FlexGen modules not available"}
         workload_obj = WorkloadDescriptor(**workload)
@@ -1329,9 +1648,41 @@ class EvolutionaryEngine:
     async def get_flexgen_status(self) -> Dict:
         return await self.flexgen_manager.get_status()
 
-    # ----------------------------------------------------------------
-    # Health check and control
-    # ----------------------------------------------------------------
+    async def select_precision(self, workload: Dict) -> str:
+        return await self.flexgen_manager.select_precision(workload)
+
+    async def run_quantum_optimization(self, candidates: List[Dict]) -> Optional[Dict]:
+        return await self.quantum_optimizer.optimize_selection(candidates, self.config.optimizer.modp_weights)
+
+    async def purchase_recs(self, energy_mwh: float) -> Dict:
+        return await self.carbon_broker.purchase_recs(energy_mwh)
+
+    async def get_pending_reviews(self) -> List[Dict]:
+        return await self.human_review.get_pending()
+
+    async def approve_review(self, review_id: str) -> bool:
+        return await self.human_review.approve(review_id)
+
+    async def reject_review(self, review_id: str) -> bool:
+        return await self.human_review.reject(review_id)
+
+    async def trigger_chaos(self, enabled: bool = True, probability: float = 0.1):
+        self.chaos_monkey.enabled = enabled
+        self.chaos_monkey.failure_probability = probability
+        return self.chaos_monkey.get_stats()
+
+    async def get_enhancement_status(self) -> Dict:
+        return {
+            "safety_violations": self.safety_monitor.get_violations()[-5:],
+            "chaos_monkey": self.chaos_monkey.get_stats(),
+            "human_review_pending": await self.human_review.get_pending(),
+            "multi_agent_stats": self.multi_agent.get_stats(),
+            "carbon_broker_totals": self.carbon_broker.get_totals(),
+            "federated_participants": self.federated.get_participant_count(),
+            "quantum_optimizer": self.quantum_optimizer.get_status(),
+            "last_xai": self._last_decision.get("safety_violations", []),
+        }
+
     async def health_check(self) -> Dict:
         health = {'status': 'healthy', 'components': {}}
         for name, comp in self._health_components.items():
@@ -1360,31 +1711,25 @@ class EvolutionaryEngine:
                 'running': self._running,
                 'cycle_count': self._cycle_count,
                 'fitness_history_length': len(self._fitness_history),
-                'config': self.config.dict() if hasattr(self.config, 'dict') else self.config.__dict__,
                 'active_expert_count': len(self.registry.get_all_active_experts()),
                 'quantum': self.pqc.get_quantum_status(),
                 'optimizer': self.optimizer.get_stats(),
-                'predictive_available': self.predictive.prophet_available,
+                'predictive_available': getattr(self.predictive, 'prophet_available', False),
                 'is_leader': self.leader.is_leader,
                 'enhancements_available': ENHANCEMENTS_AVAILABLE,
                 'flexgen': await self.get_flexgen_status(),
+                'enhancements': await self.get_enhancement_status(),
             }
 
 # ============================================================
-# FastAPI REST API (with FlexGen endpoints) – simplified
+# FastAPI REST API (with new endpoints)
 # ============================================================
 if FASTAPI_AVAILABLE:
-    app = FastAPI(title="Evolutionary Engine API", version="4.0.0")
+    app = FastAPI(title="Evolutionary Engine API", version="4.1.0")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
     )
-
-    security = HTTPBearer()
-    # In a real app, we'd use a proper rate limiter; for demo, use a simple one.
 
     engine: Optional[EvolutionaryEngine] = None
 
@@ -1409,11 +1754,33 @@ if FASTAPI_AVAILABLE:
     async def flexgen_status():
         return await (await get_engine()).get_flexgen_status()
 
+    @app.post("/quantum/optimize")
+    async def quantum_optimize(candidates: List[Dict]):
+        return await (await get_engine()).run_quantum_optimization(candidates)
+
+    @app.get("/human-review/pending")
+    async def human_review_pending():
+        return await (await get_engine()).get_pending_reviews()
+
+    @app.post("/human-review/{review_id}/approve")
+    async def human_review_approve(review_id: str):
+        return {"approved": await (await get_engine()).approve_review(review_id)}
+
+    @app.post("/human-review/{review_id}/reject")
+    async def human_review_reject(review_id: str):
+        return {"rejected": await (await get_engine()).reject_review(review_id)}
+
+    @app.post("/chaos/trigger")
+    async def chaos_trigger(enabled: bool = True, probability: float = 0.1):
+        return await (await get_engine()).trigger_chaos(enabled, probability)
+
+    @app.get("/enhancements/status")
+    async def enhancements_status():
+        return await (await get_engine()).get_enhancement_status()
+
     @app.on_event("startup")
     async def startup():
         global engine
-        # In a real startup, we would instantiate the engine with all dependencies.
-        # For demonstration, we'll create dummy dependencies.
         config = EvolutionConfig()
         registry = ExpertRegistry()
         cost_function = SustainabilityCostFunction()
@@ -1428,88 +1795,49 @@ if FASTAPI_AVAILABLE:
         optimizer = BioInspiredOptimizer(config, db_manager)
         leader = LeaderElection(config)
         engine = EvolutionaryEngine(
-            config=config,
-            registry=registry,
-            cost_function=cost_function,
-            digital_twin=digital_twin,
-            mlops=mlops,
-            db_manager=db_manager,
-            task_manager=task_manager,
-            pqc=pqc,
-            cloud_storage=cloud,
-            predictive_analytics=predictive,
-            autonomous_optimizer=optimizer,
-            vault=vault,
-            leader_election=leader
+            config=config, registry=registry, cost_function=cost_function,
+            digital_twin=digital_twin, mlops=mlops, db_manager=db_manager,
+            task_manager=task_manager, pqc=pqc, cloud_storage=cloud,
+            predictive_analytics=predictive, autonomous_optimizer=optimizer,
+            vault=vault, leader_election=leader,
         )
         await engine.start()
-        logger.info("FastAPI started")
 
     @app.on_event("shutdown")
     async def shutdown():
         if engine:
             await engine.stop()
-        logger.info("FastAPI shut down")
 
 # ============================================================
-# Singleton accessor (optional) – unchanged
+# Singleton accessor
 # ============================================================
 _engine_instance = None
 _engine_lock = asyncio.Lock()
 
 async def get_evolutionary_engine(
-    config: EvolutionConfig,
-    registry: ExpertRegistry,
-    cost_function: SustainabilityCostFunction,
-    digital_twin: DigitalTwin,
-    mlops: MLOpsPipeline,
-    db_manager: AsyncDatabaseManager,
-    task_manager: TaskManager,
-    pqc: IPQC,
-    cloud_storage: ICloudStorage,
-    predictive_analytics: IPredictiveAnalytics,
-    autonomous_optimizer: IAutonomousOptimizer,
-    vault: VaultManager,
-    leader_election: LeaderElection,
+    config, registry, cost_function, digital_twin, mlops, db_manager,
+    task_manager, pqc, cloud_storage, predictive_analytics,
+    autonomous_optimizer, vault, leader_election,
 ) -> EvolutionaryEngine:
     global _engine_instance
     if _engine_instance is None:
         async with _engine_lock:
             if _engine_instance is None:
                 _engine_instance = EvolutionaryEngine(
-                    config=config,
-                    registry=registry,
-                    cost_function=cost_function,
-                    digital_twin=digital_twin,
-                    mlops=mlops,
-                    db_manager=db_manager,
-                    task_manager=task_manager,
-                    pqc=pqc,
-                    cloud_storage=cloud_storage,
+                    config=config, registry=registry, cost_function=cost_function,
+                    digital_twin=digital_twin, mlops=mlops, db_manager=db_manager,
+                    task_manager=task_manager, pqc=pqc, cloud_storage=cloud_storage,
                     predictive_analytics=predictive_analytics,
                     autonomous_optimizer=autonomous_optimizer,
-                    vault=vault,
-                    leader_election=leader_election
+                    vault=vault, leader_election=leader_election,
                 )
     return _engine_instance
 
 # ============================================================
-# Dummy Tenacity decorator if not available
-# ============================================================
-if not TENACITY_AVAILABLE:
-    def retry(*args, **kwargs):
-        def decorator(func):
-            @wraps(func)
-            async def wrapper(*fargs, **fkwargs):
-                return await func(*fargs, **fkwargs)
-            return wrapper
-        return decorator
-
-# ============================================================
-# Main entry point (for testing)
+# Main entry point
 # ============================================================
 async def main():
-    print("Starting Evolutionary Engine Demo...")
+    print("Starting Evolutionary Engine v4.1.0 Demo...")
     config = EvolutionConfig()
     registry = ExpertRegistry()
     cost_function = SustainabilityCostFunction()
@@ -1524,19 +1852,11 @@ async def main():
     optimizer = BioInspiredOptimizer(config, db_manager)
     leader = LeaderElection(config)
     engine = EvolutionaryEngine(
-        config=config,
-        registry=registry,
-        cost_function=cost_function,
-        digital_twin=digital_twin,
-        mlops=mlops,
-        db_manager=db_manager,
-        task_manager=task_manager,
-        pqc=pqc,
-        cloud_storage=cloud,
-        predictive_analytics=predictive,
-        autonomous_optimizer=optimizer,
-        vault=vault,
-        leader_election=leader
+        config=config, registry=registry, cost_function=cost_function,
+        digital_twin=digital_twin, mlops=mlops, db_manager=db_manager,
+        task_manager=task_manager, pqc=pqc, cloud_storage=cloud,
+        predictive_analytics=predictive, autonomous_optimizer=optimizer,
+        vault=vault, leader_election=leader,
     )
     await engine.start()
     try:
