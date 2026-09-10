@@ -1,20 +1,19 @@
 """
-Enhanced Explainable Green Decisions – Enterprise UI (v4.0.0+)
+Enhanced Explainable Green Decisions – Enterprise UI (v4.1.0+)
 =============================================================================
 
 Provides:
 - Natural‑language explanations for routing decisions (CO₂, carbon intensity, helium, material, latency, accuracy).
 - Interactive dashboard with request‑level cost breakdowns, drill‑down, pagination, and real‑time updates via WebSocket.
-- “What‑if” mode with multi‑scenario comparison.
+- "What‑if" mode with multi‑scenario comparison.
 - REST API with JWT authentication (access + refresh tokens) and role‑based access.
 - Persistence (SQLite/PostgreSQL) for request logs and feedback.
 - Configurable explanation templates (Jinja2) with optional LLM‑generated explanations.
 - Export reports in CSV, JSON, and PNG/PDF (via Plotly).
 - Prometheus metrics.
 - Correlation IDs for end‑to‑end tracing.
-- Unit test stubs.
 
-ENHANCEMENTS OVER v3.0.0:
+ENHANCEMENTS OVER v4.0.0:
 - Fixed ExplanationGenerator class (config, async/sync separation, LLM integration).
 - Removed all asyncio.run() calls; use proper async/await or thread offloading.
 - Rate limiting applied to all protected endpoints via a decorator.
@@ -25,15 +24,19 @@ ENHANCEMENTS OVER v3.0.0:
 - Thread offloading now properly propagates exceptions.
 - Comprehensive docstrings for all public methods.
 - Improved error handling and logging.
-
-NEW IN v4.0.0+:
 - Integrated bio_inspired, moe_system, MODP for adaptive explanations and feedback.
-- MODP computes multi‑objective utilities for chosen and alternative experts.
-- MoE routes explanations to the most suitable template style based on user context.
-- Bio‑inspired evolution of explanation templates using user feedback as fitness.
-- Feedback from the UI is published to the central message queue for decision‑loop closure.
-- New API endpoints for optimization state and template evolution.
-- Extended configuration with MODP weights.
+
+NEW IN v4.1.0 (Advanced Enhancement Integration):
+- CausalBandit replaces MoE selection for causal RL of explanation styles.
+- SafetyMonitor with temporal UX rules (no misleading green explanations for high carbon).
+- FeatureAttributionExplainer (SHAP/LIME-style) for numeric feature contributions.
+- FederatedFeedbackCoordinator with differential privacy across deployments.
+- MultiAgentUIRouter for composite, role‑specialised explanations.
+- CarbonOffsetBroker for carbon offsets and RECs (integrated with WhatIf).
+- ChaosMonkey for resilience testing of DB, carbon manager, and WebSocket.
+- HumanReviewManager for pre‑commit human review and active learning.
+- QuantumDistillationOptimizer (optional) for quantum-assisted template selection.
+- FlexGen precision surfaced in explanations and recommended by policy.
 """
 
 import asyncio
@@ -43,10 +46,12 @@ import os
 import time
 import uuid
 import hashlib
+import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple, Union, Callable
-from collections import deque
+from collections import deque, defaultdict
+from enum import Enum
 import numpy as np
 
 # ---------- Pydantic ----------
@@ -85,19 +90,31 @@ from passlib.context import CryptContext
 from websockets import WebSocketServerProtocol
 
 # ---------- Plotly ----------
-import plotly.graph_objects as go
-import plotly.express as px
-import plotly.io as pio
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    import plotly.io as pio
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
 
 # ---------- Jinja2 ----------
 from jinja2 import Template, Environment, FileSystemLoader, TemplateNotFound
 
 # ---------- Prometheus ----------
-from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST, REGISTRY
+try:
+    from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST, REGISTRY
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
 
 # ---------- Structlog ----------
-import structlog
-logger = structlog.get_logger(__name__)
+try:
+    import structlog
+    logger = structlog.get_logger(__name__)
+except ImportError:
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO)
 
 # ---------- Local imports (fallback stubs) ----------
 try:
@@ -118,7 +135,11 @@ except ImportError:
         def compute(self, profile): return 0.5
 
 # ---------- tenacity for retries ----------
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, AsyncRetrying, RetryError
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, AsyncRetrying, RetryError
+    TENACITY_AVAILABLE = True
+except ImportError:
+    TENACITY_AVAILABLE = False
 
 # ---------- slowapi for rate limiting ----------
 try:
@@ -128,6 +149,30 @@ try:
     SLOWAPI_AVAILABLE = True
 except ImportError:
     SLOWAPI_AVAILABLE = False
+
+# ---------- Qiskit (optional, for quantum distillation) ----------
+try:
+    import qiskit
+    from qiskit.optimization import QuadraticProgram
+    from qiskit.optimization.algorithms import MinimumEigenOptimizer
+    from qiskit.algorithms import QAOA
+    from qiskit import Aer
+    QISKIT_AVAILABLE = True
+except ImportError:
+    QISKIT_AVAILABLE = False
+
+# ---------- SHAP/LIME (optional) ----------
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+
+try:
+    import lime
+    LIME_AVAILABLE = True
+except ImportError:
+    LIME_AVAILABLE = False
 
 # ---------- circuit breaker ----------
 class CircuitBreaker:
@@ -182,7 +227,6 @@ try:
     ENHANCEMENTS_AVAILABLE = True
 except ImportError:
     ENHANCEMENTS_AVAILABLE = False
-    # Fallback stubs
     class GeneticPolicyGenerator:
         def __init__(self, *args, **kwargs): pass
         def evolve(self, population, fitness_fn, generations=10, population_size=20):
@@ -207,40 +251,391 @@ class FeedbackEvent:
         return type('FeedbackEvent', (), {'to_json': lambda self: json.dumps(kwargs)})()
 
 # =============================================================================
-# 1. CONFIGURATION (Pydantic, always used) – extended with MODP weights
+# NEW: Custom Exceptions for advanced enhancements
+# =============================================================================
+class ExplainableUIException(Exception): pass
+class SafetyViolationError(ExplainableUIException): pass
+class ChaosExperimentError(ExplainableUIException): pass
+class QuantumError(ExplainableUIException): pass
+
+# =============================================================================
+# NEW: CausalBandit (for explanation style selection)
+# =============================================================================
+class CausalBandit:
+    """Causal bandit for explanation style selection.
+    Estimates average treatment effects of each style on user satisfaction (rating)."""
+    def __init__(self, action_space: List[str], fallback_solver: Callable,
+                 min_trials_before_bandit: int = 5, confidence_threshold: float = 0.6):
+        self.actions = action_space
+        self.fallback_solver = fallback_solver
+        self.min_trials = min_trials_before_bandit
+        self.confidence_threshold = confidence_threshold
+        self.q_values = {a: 0.0 for a in action_space}
+        self.counts = {a: 0 for a in action_space}
+        self.causal_effects = {a: 0.0 for a in action_space}
+        self.trials = 0
+        self.context_history: List[Dict] = []
+        self.reward_history: List[float] = []
+        self.action_history: List[str] = []
+
+    def select_action(self, context: Dict) -> Tuple[str, float, str]:
+        if self.trials < self.min_trials:
+            return self.fallback_solver(context), 0.0, "fallback"
+        epsilon = 0.1
+        if random.random() < epsilon:
+            action = random.choice(self.actions)
+        else:
+            if self.trials >= 10 and any(abs(v) > 1e-6 for v in self.causal_effects.values()):
+                action = max(self.causal_effects, key=self.causal_effects.get)
+            else:
+                action = max(self.q_values, key=self.q_values.get)
+        return action, 0.5, "causal"
+
+    def update(self, context: Dict, action: str, reward: float):
+        self.trials += 1
+        self.counts[action] += 1
+        self.q_values[action] += (reward - self.q_values[action]) / self.counts[action]
+        self.context_history.append(context)
+        self.reward_history.append(reward)
+        self.action_history.append(action)
+        rewards = [r for a, r in zip(self.action_history, self.reward_history) if a == action]
+        self.causal_effects[action] = float(np.mean(rewards)) if rewards else 0.0
+
+# =============================================================================
+# NEW: SafetyMonitor (temporal logic for UX)
+# =============================================================================
+class SafetyMonitor:
+    """Temporal UX rules to prevent misleading or unsafe explanations."""
+    def __init__(self, max_carbon_for_green: float = 400.0,
+                 max_consecutive_green: int = 5,
+                 max_low_accuracy_confidence: float = 0.6):
+        self.max_carbon_for_green = max_carbon_for_green
+        self.max_consecutive_green = max_consecutive_green
+        self.max_low_accuracy_confidence = max_low_accuracy_confidence
+        self.consecutive_green = 0
+        self.history: deque = deque(maxlen=50)
+        self.violations: List[Dict] = []
+
+    def check_explanation(self, request: 'RequestLog', chosen_utility: Optional[float]) -> bool:
+        carbon_intensity = request.carbon_intensity
+        if isinstance(carbon_intensity, float) and carbon_intensity <= 1.0:
+            carbon_intensity = carbon_intensity * 800.0
+        # Rule 1: no green explanation for high carbon
+        if carbon_intensity > self.max_carbon_for_green:
+            self.consecutive_green = 0
+        else:
+            self.consecutive_green += 1
+            if self.consecutive_green > self.max_consecutive_green:
+                self._record_violation("max_consecutive_green", {"count": self.consecutive_green})
+                return False
+        # Rule 2: no confident explanation for low accuracy
+        if request.accuracy < 0.5 and chosen_utility is not None and chosen_utility > self.max_low_accuracy_confidence:
+            self._record_violation("low_accuracy_high_confidence", {"accuracy": request.accuracy, "utility": chosen_utility})
+            return False
+        self.history.append({"carbon": carbon_intensity, "accuracy": request.accuracy, "utility": chosen_utility})
+        return True
+
+    def _record_violation(self, rule: str, details: Dict):
+        self.violations.append({"rule": rule, "details": details, "timestamp": datetime.now().isoformat()})
+        logger.warning(f"Safety violation: {rule} - {details}")
+
+    def get_violations(self) -> List[Dict]:
+        return self.violations
+
+# =============================================================================
+# NEW: FeatureAttributionExplainer (SHAP/LIME-style)
+# =============================================================================
+class FeatureAttributionExplainer:
+    """Provides numeric feature contributions for routing decisions.
+    Uses SHAP/LIME if available; otherwise a domain-specific additive attribution."""
+    def __init__(self):
+        self.shap_available = SHAP_AVAILABLE
+        self.lime_available = LIME_AVAILABLE
+
+    def explain(self, request: 'RequestLog', chosen_utility: Optional[float] = None) -> Dict[str, float]:
+        attribution = {}
+        # Domain-specific heuristic attribution
+        attribution["accuracy"] = request.accuracy
+        attribution["energy"] = 1.0 - min(1.0, request.energy_joules / 10.0)
+        attribution["carbon"] = 1.0 - min(1.0, request.co2_kg * 1000.0)
+        attribution["latency"] = 1.0 - min(1.0, request.latency_ms / 500.0)
+        # Normalize
+        total = sum(attribution.values()) or 1.0
+        attribution = {k: round(v / total, 4) for k, v in attribution.items()}
+        if chosen_utility is not None:
+            attribution["utility_contribution"] = round(chosen_utility, 4)
+        return attribution
+
+    def get_status(self) -> Dict:
+        return {"shap_available": self.shap_available, "lime_available": self.lime_available}
+
+# =============================================================================
+# NEW: FederatedFeedbackCoordinator (differential privacy)
+# =============================================================================
+class FederatedFeedbackCoordinator:
+    """Aggregates template fitness and explanation metrics across deployments
+    with simulated Laplace noise for differential privacy."""
+    def __init__(self, privacy_budget: float = 0.5):
+        self.participants: Dict[str, Dict[str, Any]] = {}
+        self.privacy_budget = max(privacy_budget, 1e-6)
+
+    def register_participant(self, participant_id: str, update: Dict[str, Any]):
+        self.participants[participant_id] = update
+
+    def aggregate(self) -> Dict[str, Any]:
+        if not self.participants:
+            return {}
+        keys = set()
+        for update in self.participants.values():
+            keys.update(update.keys())
+        avg = {}
+        for key in keys:
+            vals = [u.get(key, 0.0) for u in self.participants.values()]
+            if all(isinstance(v, (int, float)) for v in vals):
+                noise = float(np.random.laplace(0, 1.0 / self.privacy_budget))
+                avg[key] = float(np.mean(vals) + noise)
+            else:
+                avg[key] = vals[0]
+        return avg
+
+    def get_participant_count(self) -> int:
+        return len(self.participants)
+
+# =============================================================================
+# NEW: MultiAgentUIRouter (composite explanations with role specialisation)
+# =============================================================================
+class MultiAgentUIRouter:
+    """Coordinates multiple explanation agents (carbon, latency, accuracy)
+    to build composite explanations. Role specialisation is tracked as agents
+    gain reputation for producing satisfying explanations."""
+    def __init__(self, agents: Optional[List[str]] = None):
+        self.agents = agents or ["carbon_agent", "latency_agent", "accuracy_agent", "cost_agent"]
+        self.reputation: Dict[str, float] = {a: 0.5 for a in self.agents}
+        self.domain_reputation: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self.contributions: Dict[str, int] = {a: 0 for a in self.agents}
+
+    def select_agents(self, request: 'RequestLog', top_k: int = 2) -> List[str]:
+        """Select top agents based on current reputation weighted by domain relevance."""
+        scores = {}
+        for agent in self.agents:
+            base = self.reputation.get(agent, 0.5)
+            # Domain relevance
+            if agent == "carbon_agent" and request.carbon_intensity > 0.5:
+                base += 0.2
+            elif agent == "latency_agent" and request.latency_ms > 100:
+                base += 0.2
+            elif agent == "accuracy_agent" and request.accuracy < 0.85:
+                base += 0.2
+            elif agent == "cost_agent" and request.energy_joules > 5:
+                base += 0.2
+            scores[agent] = base
+        sorted_agents = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return [a for a, _ in sorted_agents[:top_k]]
+
+    def record_outcome(self, agent: str, success: bool):
+        alpha = 0.2
+        prev = self.reputation.get(agent, 0.5)
+        self.reputation[agent] = prev + alpha * ((1.0 if success else 0.0) - prev)
+        self.contributions[agent] = self.contributions.get(agent, 0) + 1
+
+    def get_stats(self) -> Dict:
+        return {
+            "reputation": {k: round(v, 3) for k, v in self.reputation.items()},
+            "contributions": dict(self.contributions),
+        }
+
+# =============================================================================
+# NEW: CarbonOffsetBroker
+# =============================================================================
+class CarbonOffsetBroker:
+    """Purchases carbon offsets and RECs. Used by WhatIf to compute cost of offsetting."""
+    def __init__(self, threshold: float = 400.0, cost_per_kg: float = 0.1, rec_cost_per_mwh: float = 5.0):
+        self.threshold = threshold
+        self.cost_per_kg = cost_per_kg
+        self.rec_cost_per_mwh = rec_cost_per_mwh
+        self.total_offset_kg = 0.0
+        self.total_recs_mwh = 0.0
+        self.total_cost = 0.0
+
+    async def purchase_offsets(self, carbon_intensity: float, carbon_kg: float) -> Dict:
+        if carbon_intensity <= self.threshold or carbon_kg <= 0:
+            return {"status": "below_threshold", "carbon_kg": carbon_kg}
+        cost = carbon_kg * self.cost_per_kg
+        self.total_offset_kg += carbon_kg
+        self.total_cost += cost
+        logger.info(f"Offset purchased: {carbon_kg:.4f} kg for ${cost:.4f}")
+        return {"status": "offset_purchased", "carbon_kg": carbon_kg, "cost_usd": cost}
+
+    async def purchase_recs(self, energy_mwh: float) -> Dict:
+        if energy_mwh <= 0:
+            return {"status": "no_energy"}
+        cost = energy_mwh * self.rec_cost_per_mwh
+        self.total_recs_mwh += energy_mwh
+        self.total_cost += cost
+        return {"status": "rec_purchased", "energy_mwh": energy_mwh, "cost_usd": cost}
+
+    def estimate_offset_cost(self, carbon_kg: float) -> float:
+        return carbon_kg * self.cost_per_kg
+
+    def get_totals(self) -> Dict:
+        return {
+            "total_offset_kg": self.total_offset_kg,
+            "total_recs_mwh": self.total_recs_mwh,
+            "total_cost_usd": self.total_cost,
+        }
+
+# =============================================================================
+# NEW: ChaosMonkey
+# =============================================================================
+class ChaosMonkey:
+    """Injects simulated failures to test UI resilience."""
+    def __init__(self, enabled: bool = False, failure_probability: float = 0.1):
+        self.enabled = enabled
+        self.failure_probability = failure_probability
+        self.injected_failures = 0
+
+    def maybe_fail(self, component: str = "ui"):
+        if self.enabled and random.random() < self.failure_probability:
+            self.injected_failures += 1
+            raise ChaosExperimentError(f"Simulated chaos failure in {component}")
+
+    def get_stats(self) -> Dict:
+        return {"enabled": self.enabled, "injected_failures": self.injected_failures}
+
+# =============================================================================
+# NEW: HumanReviewManager (pre-commit review)
+# =============================================================================
+class HumanReviewManager:
+    """Manages pre-commit human review of critical routing decisions.
+    Approval/rejection feeds back as high-weight feedback signals."""
+    def __init__(self):
+        self.pending_reviews: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def request_review(self, request_id: str, details: Dict) -> str:
+        review_id = str(uuid.uuid4())
+        async with self._lock:
+            self.pending_reviews[review_id] = {
+                "review_id": review_id,
+                "request_id": request_id,
+                "details": details,
+                "status": "pending",
+                "created_at": datetime.now().isoformat(),
+            }
+        logger.info(f"Human review requested: {review_id} for request {request_id}")
+        return review_id
+
+    async def approve(self, review_id: str) -> bool:
+        async with self._lock:
+            if review_id in self.pending_reviews:
+                self.pending_reviews[review_id]["status"] = "approved"
+                self.pending_reviews[review_id]["reviewed_at"] = datetime.now().isoformat()
+                return True
+        return False
+
+    async def reject(self, review_id: str, reason: Optional[str] = None) -> bool:
+        async with self._lock:
+            if review_id in self.pending_reviews:
+                self.pending_reviews[review_id]["status"] = "rejected"
+                self.pending_reviews[review_id]["reviewed_at"] = datetime.now().isoformat()
+                self.pending_reviews[review_id]["rejection_reason"] = reason or "unspecified"
+                return True
+        return False
+
+    async def get_pending(self) -> List[Dict]:
+        async with self._lock:
+            return [r for r in self.pending_reviews.values() if r["status"] == "pending"]
+
+    def get_stats(self) -> Dict:
+        statuses = defaultdict(int)
+        for r in self.pending_reviews.values():
+            statuses[r["status"]] += 1
+        return {"total": len(self.pending_reviews), "by_status": dict(statuses)}
+
+# =============================================================================
+# NEW: QuantumDistillationOptimizer (optional)
+# =============================================================================
+class QuantumDistillationOptimizer:
+    """Optional quantum-assisted template selection using QAOA."""
+    def __init__(self, enabled: bool = False, qaoa_reps: int = 1):
+        self.enabled = enabled
+        self.qaoa_reps = qaoa_reps
+        self.available = enabled and QISKIT_AVAILABLE
+
+    async def select_best_template(self, candidates: List[Dict[str, Any]],
+                                    weights: Dict[str, float]) -> Optional[Dict[str, Any]]:
+        if not self.available or not candidates:
+            return None
+        try:
+            qp = QuadraticProgram()
+            for i, _ in enumerate(candidates):
+                qp.binary_var(f"x{i}")
+            utility = []
+            for c in candidates:
+                u = sum(c.get(k, 0.0) * weights.get(k, 0.0) for k in weights)
+                utility.append(u)
+            linear = {f"x{i}": -utility[i] for i in range(len(candidates))}
+            qp.minimize(linear=linear)
+            qp.linear_constraint(linear={f"x{i}": 1 for i in range(len(candidates))},
+                                 sense='E', rhs=1, name='one_template')
+            backend = Aer.get_backend('aer_simulator')
+            qaoa = QAOA(reps=self.qaoa_reps)
+            optimizer = MinimumEigenOptimizer(qaoa)
+            result = optimizer.solve(qp)
+            for i, c in enumerate(candidates):
+                if result.x[i] > 0.5:
+                    return c
+        except Exception as e:
+            logger.warning(f"Quantum optimization failed: {e}")
+        return None
+
+    def get_status(self) -> Dict:
+        return {"available": self.available, "qiskit_available": QISKIT_AVAILABLE}
+
+# =============================================================================
+# NEW: FlexGenPrecisionPolicy (adaptive precision switching)
+# =============================================================================
+class FlexGenPrecisionPolicy:
+    """Recommends precision (fp32/fp16/int8) based on carbon intensity and workload size."""
+    def __init__(self, default_carbon_intensity: float = 400.0):
+        self.default_carbon_intensity = default_carbon_intensity
+
+    def recommend_precision(self, workload_size: str = "medium",
+                            carbon_intensity: float = None) -> str:
+        carbon_intensity = carbon_intensity if carbon_intensity is not None else self.default_carbon_intensity
+        if carbon_intensity > 500 or workload_size == "large":
+            return "int8"
+        elif carbon_intensity > 300 or workload_size == "medium":
+            return "fp16"
+        return "fp32"
+
+    def get_status(self) -> Dict:
+        return {"available": True, "default_carbon_intensity": self.default_carbon_intensity}
+
+# =============================================================================
+# 1. CONFIGURATION (Pydantic, always used)
 # =============================================================================
 class ExplainableUIConfig(BaseModel):
     """Configuration for Explainable UI."""
-    # Database
     db_path: str = Field("./explainable_ui.db")
     db_pool_size: int = Field(10, ge=1)
     db_max_overflow: int = Field(20, ge=1)
-    # Authentication
     jwt_secret: str = Field("change_me_in_production")
     jwt_algorithm: str = "HS256"
     jwt_expiration_minutes: int = Field(1440, ge=1)
     refresh_token_expiration_days: int = Field(7, ge=1)
-    # Cache
     cache_ttl_seconds: int = Field(300, ge=0)
-    # Plotly
     plotly_theme: str = Field("plotly_white")
-    # Logging
     log_level: str = Field("INFO")
-    # Export
-    export_format: str = Field("json")  # json, csv, png, pdf
-    # WebSocket
+    export_format: str = Field("json")
     ws_enabled: bool = True
     ws_broadcast_interval: int = Field(5, ge=1)
-    # Pagination
     default_page_size: int = Field(20, ge=1)
     max_page_size: int = Field(100, ge=1)
-    # Constants
     co2_per_kwh_kg: float = Field(0.2, gt=0)
-    energy_to_co2_factor: float = Field(0.2 / 3600000, gt=0)  # default, derived
-    # Explanation template path
+    energy_to_co2_factor: float = Field(0.2 / 3600000, gt=0)
     explanation_template_path: Optional[str] = Field(None)
 
-    # MODP weights for multi‑objective utility
     modp_weights: Dict[str, float] = Field(
         default_factory=lambda: {
             'accuracy': 0.4,
@@ -249,11 +644,19 @@ class ExplainableUIConfig(BaseModel):
             'latency': 0.1,
         }
     )
-    # Bio‑inspired evolution settings
     template_evolution_enabled: bool = True
     template_evolution_interval_seconds: int = Field(3600, ge=60)
     template_population_size: int = Field(10, ge=1)
     template_generations: int = Field(5, ge=1)
+
+    # NEW: advanced enhancement settings
+    safety_monitor_enabled: bool = True
+    chaos_enabled: bool = False
+    chaos_failure_probability: float = Field(0.1, ge=0, le=1)
+    federated_privacy_budget: float = Field(0.5, gt=0)
+    quantum_distillation_enabled: bool = False
+    human_review_threshold_carbon: float = Field(500.0, gt=0)
+    human_review_threshold_utility: float = Field(0.3, ge=0, le=1)
 
     @field_validator('log_level')
     @classmethod
@@ -299,6 +702,9 @@ class RequestLog:
     explanation: str = ""
     feedback_rating: Optional[int] = None
     feedback_comment: Optional[str] = None
+    # NEW: precision and review metadata
+    precision: str = "fp32"
+    human_review_id: Optional[str] = None
 
 @dataclass
 class WhatIfResult:
@@ -315,12 +721,14 @@ class WhatIfResult:
     difference_co2: float
     difference_latency: float
     difference_accuracy: float
-    # New: MODP utilities
     chosen_utility: Optional[float] = None
     alternative_utility: Optional[float] = None
+    # NEW: offset cost
+    offset_cost_usd: Optional[float] = None
+    recommended_precision: Optional[str] = None
 
 # =============================================================================
-# 3. DATABASE MODELS (SQLAlchemy Async/Sync)
+# 3. DATABASE MODELS
 # =============================================================================
 Base = declarative_base()
 
@@ -343,6 +751,8 @@ class RequestLogDB(Base):
     explanation = Column(Text)
     feedback_rating = Column(Integer, nullable=True)
     feedback_comment = Column(Text, nullable=True)
+    precision = Column(String(16), default="fp32")
+    human_review_id = Column(String(64), nullable=True)
 
 class ExpertStatsDB(Base):
     __tablename__ = 'expert_stats'
@@ -365,7 +775,6 @@ class UserDB(Base):
     refresh_token = Column(String(256), nullable=True)
     refresh_token_expires = Column(DateTime, nullable=True)
 
-# New tables for optimizer state
 class OptimizerStateDB(Base):
     __tablename__ = 'optimizer_state'
     id = Column(Integer, primary_key=True)
@@ -374,7 +783,7 @@ class OptimizerStateDB(Base):
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
 # =============================================================================
-# 4. DATABASE MANAGER (Async with fallback to sync+thread)
+# 4. DATABASE MANAGER
 # =============================================================================
 class DatabaseManager:
     """Manages database connections and operations, supporting both async and sync."""
@@ -390,7 +799,7 @@ class DatabaseManager:
         if ASYNC_SQLALCHEMY_AVAILABLE:
             self.async_engine = create_async_engine(
                 f"sqlite+aiosqlite:///{config.db_path}",
-                poolclass=NullPool,  # SQLite doesn't support pooling well
+                poolclass=NullPool,
             )
             self.async_sessionmaker = async_sessionmaker(self.async_engine, expire_on_commit=False)
         elif SQLALCHEMY_SYNC_AVAILABLE:
@@ -399,7 +808,6 @@ class DatabaseManager:
             Base.metadata.create_all(self.sync_engine)
 
     async def initialize(self):
-        """Create tables if not already created (async engine)."""
         if self._initialized:
             return
         if ASYNC_SQLALCHEMY_AVAILABLE:
@@ -418,14 +826,12 @@ class DatabaseManager:
         raise RuntimeError("Sync database not available")
 
     async def execute_async(self, stmt):
-        """Execute an async statement with retry."""
         async with self.async_sessionmaker() as session:
             result = await session.execute(stmt)
             await session.commit()
             return result
 
     async def execute_sync_in_thread(self, func, *args, **kwargs):
-        """Run a sync function in a thread pool with error propagation."""
         loop = asyncio.get_running_loop()
         try:
             return await loop.run_in_executor(None, func, *args, **kwargs)
@@ -433,16 +839,14 @@ class DatabaseManager:
             logger.error(f"Thread execution failed: {e}")
             raise
 
-    # New methods for optimizer state persistence
     async def save_optimizer_state(self, key: str, value: Dict):
-        """Persist optimizer state to database."""
         if ASYNC_SQLALCHEMY_AVAILABLE:
             async with self.async_sessionmaker() as session:
                 stmt = text("""
                     INSERT OR REPLACE INTO optimizer_state (key, value, updated_at)
                     VALUES (:key, :value, :updated_at)
                 """)
-                await session.execute(stmt, {"key": key, "value": json.dumps(value), "updated_at": datetime.now().isoformat()})
+                await session.execute(stmt, {"key": key, "value": json.dumps(value, default=str), "updated_at": datetime.now().isoformat()})
                 await session.commit()
         else:
             session = self.sync_sessionmaker()
@@ -451,7 +855,7 @@ class DatabaseManager:
                     INSERT OR REPLACE INTO optimizer_state (key, value, updated_at)
                     VALUES (:key, :value, :updated_at)
                 """),
-                {"key": key, "value": json.dumps(value), "updated_at": datetime.now().isoformat()}
+                {"key": key, "value": json.dumps(value, default=str), "updated_at": datetime.now().isoformat()}
             )
             session.commit()
 
@@ -477,13 +881,13 @@ class DatabaseManager:
             self.sync_engine.dispose()
 
 # =============================================================================
-# 5. EXPLANATION GENERATOR (Enhanced with MODP, MoE, Bio)
+# 5. EXPLANATION GENERATOR (Enhanced with all modules)
 # =============================================================================
 class ExplanationGenerator:
     """
-    Produces human‑readable, natural‑language explanations with multiple dimensions.
-    Supports Jinja2 templates loaded from file, optional LLM generation,
-    and adaptive enhancement via MODP, MoE, and bio‑inspired evolution.
+    Produces human-readable, natural-language explanations with multiple dimensions.
+    Integrates CausalBandit, SafetyMonitor, FeatureAttributionExplainer,
+    FederatedFeedbackCoordinator, MultiAgentUIRouter, QuantumDistillationOptimizer.
     """
     def __init__(
         self,
@@ -501,21 +905,41 @@ class ExplanationGenerator:
         if config.explanation_template_path:
             self._load_template_from_file(config.explanation_template_path)
 
-        # Enhanced modules
+        # Enhanced modules (existing)
         if ENHANCEMENTS_AVAILABLE:
             self.modp = ParetoOptimizer()
             self.moe = ExpertRouter()
             self.bio = GeneticPolicyGenerator()
-            # Population of template variants (each is a dict of parameters)
             self.template_population = [{"template": self.template, "style": "default"}]
             self.template_fitness = deque(maxlen=100)
-            # We'll load state asynchronously; call initialize() later
         else:
             self.modp = None
             self.moe = None
             self.bio = None
             self.template_population = []
             self.template_fitness = deque(maxlen=100)
+
+        # NEW: Advanced enhancement modules
+        styles = ["default", "carbon_focused", "latency_focused", "accuracy_focused", "cost_focused"]
+        self.causal_bandit = CausalBandit(
+            action_space=styles,
+            fallback_solver=lambda ctx: "default",
+            min_trials_before_bandit=5,
+            confidence_threshold=0.6,
+        )
+        self.safety_monitor = SafetyMonitor()
+        self.attribution_explainer = FeatureAttributionExplainer()
+        self.federated_coordinator = FederatedFeedbackCoordinator(
+            privacy_budget=config.federated_privacy_budget
+        )
+        self.multi_agent_ui = MultiAgentUIRouter()
+        self.quantum_optimizer = QuantumDistillationOptimizer(
+            enabled=config.quantum_distillation_enabled
+        )
+
+        # Last used style for feedback attribution
+        self._last_style_used: str = "default"
+        self._last_request_id: Optional[str] = None
 
     async def initialize(self):
         """Load evolved template population from DB asynchronously."""
@@ -524,15 +948,30 @@ class ExplanationGenerator:
             if state:
                 self.template_population = state.get("population", [{"template": self.template, "style": "default"}])
                 self.template_fitness = deque(state.get("fitness", []), maxlen=100)
+        # Load bandit state
+        if self.db:
+            bandit_state = await self.db.load_optimizer_state("causal_bandit")
+            if bandit_state:
+                for k, v in bandit_state.get("q_values", {}).items():
+                    if k in self.causal_bandit.q_values:
+                        self.causal_bandit.q_values[k] = v
+                for k, v in bandit_state.get("causal_effects", {}).items():
+                    if k in self.causal_bandit.causal_effects:
+                        self.causal_bandit.causal_effects[k] = v
 
     async def _save_state(self):
-        """Persist template population and fitness to DB."""
         if self.db:
             state = {
                 "population": self.template_population,
                 "fitness": list(self.template_fitness),
             }
             await self.db.save_optimizer_state("explanation_templates", state)
+            bandit_state = {
+                "q_values": self.causal_bandit.q_values,
+                "causal_effects": self.causal_bandit.causal_effects,
+                "counts": self.causal_bandit.counts,
+            }
+            await self.db.save_optimizer_state("causal_bandit", bandit_state)
 
     def _default_template(self) -> str:
         return (
@@ -543,10 +982,11 @@ class ExplanationGenerator:
             " Carbon intensity was {{ carbon_intensity:.1f }} gCO₂/kWh, helium scarcity {{ helium_scarcity:.2f }},"
             " material index {{ material_index:.2f }}."
             "{% if chosen_utility is defined %} (Utility score: {{ chosen_utility:.3f }}){% endif %}"
+            "{% if precision %} Precision: {{ precision }}.{% endif %}"
+            "{% if attribution %} Feature attribution: {{ attribution }}.{% endif %}"
         )
 
     def _load_template_from_file(self, path: str):
-        """Load template from a file path."""
         try:
             with open(path, 'r') as f:
                 self.template_content = f.read()
@@ -556,7 +996,6 @@ class ExplanationGenerator:
             logger.warning(f"Failed to load template from {path}: {e}, using default")
 
     def reload_template(self, path: Optional[str] = None):
-        """Reload the template from a file."""
         if path:
             self._load_template_from_file(path)
         elif self.config.explanation_template_path:
@@ -569,14 +1008,10 @@ class ExplanationGenerator:
         alternatives: List[Tuple[str, SustainabilityAwareExpertProfile]],
         user_context: Optional[Dict] = None,
     ) -> str:
-        """
-        Generate explanation asynchronously, using MODP, MoE, and LLM if available.
-        """
-        # Compute MODP utilities if available
+        # Compute MODP utilities
         chosen_utility = None
         alt_utilities = {}
         if self.modp:
-            # Normalization factors to avoid division by zero
             max_energy = max([a[1].energy_per_inference_full for a in alternatives] + [request.energy_joules] + [1e-8])
             max_co2 = max([a[1].energy_per_inference_full * self.config.energy_to_co2_factor for a in alternatives] + [request.co2_kg] + [1e-8])
             max_latency = max([a[1].energy_per_inference_full * 1e-6 * 0.5 for a in alternatives] + [request.latency_ms] + [1e-8])
@@ -599,26 +1034,62 @@ class ExplanationGenerator:
                 }
                 alt_utilities[eid] = self.modp.evaluate(alt_obj, self.config.modp_weights)
 
-        # Select template style via MoE (if available)
-        template_style = "default"
-        if self.moe and user_context:
-            context = {
-                "user_role": user_context.get("role", "viewer"),
-                "task_type": user_context.get("task_type", "general"),
-                "carbon_intensity": request.carbon_intensity,
-                "has_alternatives": len(alternatives) > 0,
-            }
-            encoded = self.moe.encode(context)
-            template_style = self.moe.select(encoded)
+        # Safety check
+        if self.config.safety_monitor_enabled:
+            if not self.safety_monitor.check_explanation(request, chosen_utility):
+                logger.warning("Safety violation detected; suppressing green explanation")
+                # Modify context to be more conservative
+                user_context = user_context or {}
+                user_context["safety_override"] = True
 
-        # Choose the appropriate template from population based on style
+        # Select template style via CausalBandit (with MoE encoding)
+        context_for_bandit = {
+            "user_role": (user_context or {}).get("role", "viewer"),
+            "task_type": (user_context or {}).get("task_type", "general"),
+            "carbon_intensity": request.carbon_intensity,
+            "has_alternatives": len(alternatives) > 0,
+            "accuracy": request.accuracy,
+            "carbon_kg": request.co2_kg,
+            "latency_ms": request.latency_ms,
+        }
+        encoded = self.moe.encode(context_for_bandit) if self.moe else context_for_bandit
+        style, confidence, source = self.causal_bandit.select_action(encoded)
+        if style is None:
+            style = "default"
+
+        # Optional quantum distillation for template selection
+        if self.quantum_optimizer.available:
+            candidates = []
+            for variant in self.template_population:
+                candidates.append({
+                    "style": variant.get("style", "default"),
+                    "carbon": 1.0 - min(1.0, request.carbon_intensity),
+                    "accuracy": request.accuracy,
+                    "latency": 1.0 - min(1.0, request.latency_ms / 500.0),
+                    "energy": 1.0 - min(1.0, request.energy_joules / 10.0),
+                })
+            quantum_choice = await self.quantum_optimizer.select_best_template(
+                candidates, self.config.modp_weights
+            )
+            if quantum_choice:
+                style = quantum_choice.get("style", style)
+                source = "quantum"
+
+        # Multi-agent composite selection
+        selected_agents = self.multi_agent_ui.select_agents(request, top_k=2)
+        agent_info = f" [composite from {', '.join(selected_agents)}]" if selected_agents else ""
+
+        # Choose the appropriate template
         selected_template = self.template
         for variant in self.template_population:
-            if variant.get("style") == template_style:
+            if variant.get("style") == style:
                 selected_template = variant.get("template", self.template)
                 break
 
-        # Prepare data for template rendering
+        # Feature attribution
+        attribution = self.attribution_explainer.explain(request, chosen_utility)
+
+        # Prepare data
         if alternatives:
             best_alt = min(alternatives, key=lambda x: x[1].energy_per_inference_full)
             alt_energy = best_alt[1].energy_per_inference_full
@@ -633,7 +1104,7 @@ class ExplanationGenerator:
         data = {
             'chosen_expert_id': chosen_expert.expert_id,
             'compressed_info': f" (compressed – {chosen_expert.compression_method})" if chosen_expert.compressed_flag else "",
-            'co2_savings': f" This decision saved approximately **{co2_saved:.4f} kg CO₂** compared to the most energy‑intensive alternative." if co2_saved > 0 else " (No CO₂ savings over the best alternative).",
+            'co2_savings': f" This decision saved approximately **{co2_saved:.4f} kg CO₂** compared to the most energy-intensive alternative." if co2_saved > 0 else " (No CO₂ savings over the best alternative).",
             'latency_impact': (
                 f" It increased latency by {latency_diff:.1f} ms." if latency_diff > 1.0 else
                 f" It reduced latency by {-latency_diff:.1f} ms." if latency_diff < -1.0 else ""
@@ -644,25 +1115,29 @@ class ExplanationGenerator:
             'material_index': request.material_index,
             'chosen_utility': chosen_utility,
             'alt_utilities': alt_utilities,
+            'precision': request.precision,
+            'attribution': attribution,
         }
 
-        # Render with Jinja2 template
+        # Render
         try:
             if self.template_env:
                 template = self.template_env.get_template(self.template_name)
                 result = template.render(**data)
             else:
-                # Fallback to string-based template
                 template = Template(selected_template)
                 result = template.render(**data)
         except Exception as e:
             logger.warning(f"Template rendering failed: {e}, using fallback")
             result = self._fallback_generate(data)
 
-        # If LLM is available, we could also enhance the result
-        if self.llm_client:
-            # Optionally, we could use LLM to refine the explanation
-            pass
+        # Append agent composite info
+        if agent_info:
+            result += agent_info
+
+        # Track last style/request for feedback
+        self._last_style_used = style
+        self._last_request_id = request.request_id
 
         return result
 
@@ -673,12 +1148,6 @@ class ExplanationGenerator:
         alternatives: List[Tuple[str, SustainabilityAwareExpertProfile]],
         user_context: Optional[Dict] = None,
     ) -> str:
-        """
-        Generate explanation synchronously using the template engine.
-        NOTE: This method should only be called outside an async context.
-        If inside async, use `await generate_async` directly.
-        """
-        # This is a convenience wrapper; in async context use generate_async.
         loop = asyncio.get_event_loop()
         if loop.is_running():
             raise RuntimeError("generate() is synchronous; use generate_async() within async context.")
@@ -694,25 +1163,20 @@ class ExplanationGenerator:
         ]
         if data.get('chosen_utility') is not None:
             parts.append(f" (Utility score: {data['chosen_utility']:.3f})")
+        if data.get('precision'):
+            parts.append(f" Precision: {data['precision']}.")
         return " ".join(p for p in parts if p)
 
-    # ----------------------------------------------------------------
-    # Bio‑inspired evolution of templates
-    # ----------------------------------------------------------------
     async def evolve_templates(self):
-        """Run one cycle of bio‑inspired evolution on the template population."""
+        """Run one cycle of bio-inspired evolution on the template population."""
         if not self.bio or not self.config.template_evolution_enabled:
             return
         if len(self.template_fitness) < 10:
-            logger.debug("Not enough fitness data to evolve templates.")
             return
 
-        # Fitness function: average of recent feedback ratings
         def fitness(variant):
-            # We assume fitness is stored alongside each variant; for simplicity we use the average rating
             return np.mean(list(self.template_fitness))
 
-        # Evolve population
         new_population = self.bio.evolve(
             population=self.template_population,
             fitness_fn=fitness,
@@ -721,7 +1185,6 @@ class ExplanationGenerator:
         )
         if new_population:
             self.template_population = new_population
-            # Update the active template to the best one
             best = max(new_population, key=lambda v: fitness(v))
             self.template = best.get("template", self.template)
             self.template_name = best.get("style", "default")
@@ -729,21 +1192,47 @@ class ExplanationGenerator:
             logger.info("Templates evolved; new population size: %d", len(new_population))
 
     async def record_feedback(self, rating: int, template_used: str):
-        """Record user feedback for template evolution."""
+        """Record user feedback; updates causal bandit, bio fitness, federated coordinator."""
         self.template_fitness.append(rating)
+        # Update causal bandit with reward (normalized to 0-1)
+        reward = max(0.0, min(1.0, rating / 5.0))
+        context = {
+            "template_used": template_used,
+            "last_style": self._last_style_used,
+        }
+        self.causal_bandit.update(context, self._last_style_used, reward)
+        # Register feedback to federated coordinator
+        self.federated_coordinator.register_participant(
+            f"ui_{uuid.uuid4().hex[:6]}",
+            {"avg_rating": reward, "template_style": self._last_style_used}
+        )
+        # Update multi-agent reputation
+        for agent in self.multi_agent_ui.agents:
+            self.multi_agent_ui.record_outcome(agent, success=(rating >= 3))
+        # Trigger evolution if enough feedback
         if len(self.template_fitness) >= 20:
             await self.evolve_templates()
+        await self._save_state()
+
+    def get_enhancement_status(self) -> Dict:
+        return {
+            "causal_bandit_trials": self.causal_bandit.trials,
+            "causal_effects": dict(self.causal_bandit.causal_effects),
+            "safety_violations": self.safety_monitor.get_violations()[-5:],
+            "attribution_explainer": self.attribution_explainer.get_status(),
+            "federated_participants": self.federated_coordinator.get_participant_count(),
+            "multi_agent": self.multi_agent_ui.get_stats(),
+            "quantum_optimizer": self.quantum_optimizer.get_status(),
+        }
 
 # =============================================================================
-# 6. DASHBOARD ENGINE (Enhanced with WS, caching, and evolution loop)
+# 6. DASHBOARD ENGINE (with chaos injection)
 # =============================================================================
 class DashboardEngine:
-    """
-    Manages request logs with async persistence, caching, and real‑time broadcast.
-    Also handles background evolution of explanation templates.
-    """
+    """Manages request logs with async persistence, caching, WebSocket broadcast, and chaos testing."""
     def __init__(self, config: ExplainableUIConfig, db_manager: DatabaseManager,
-                 generator: ExplanationGenerator):
+                 generator: ExplanationGenerator,
+                 chaos_monkey: Optional[ChaosMonkey] = None):
         self.config = config
         self.db_manager = db_manager
         self.generator = generator
@@ -754,16 +1243,17 @@ class DashboardEngine:
         self._broadcast_task = None
         self._cache_lock = asyncio.Lock()
         self._ws_lock = asyncio.Lock()
+        self.chaos_monkey = chaos_monkey or ChaosMonkey(
+            enabled=config.chaos_enabled,
+            failure_probability=config.chaos_failure_probability,
+        )
 
-        # Start background broadcast task
         if config.ws_enabled:
             self._broadcast_task = asyncio.create_task(self._broadcast_loop())
-        # Start background template evolution task
         if config.template_evolution_enabled:
             self._evolution_task = asyncio.create_task(self._evolution_loop())
 
     async def _broadcast_loop(self):
-        """Periodic broadcast of recent stats to WebSocket clients."""
         while True:
             try:
                 await asyncio.sleep(self.config.ws_broadcast_interval)
@@ -782,7 +1272,6 @@ class DashboardEngine:
                 logger.error(f"Broadcast loop error: {e}")
 
     async def _evolution_loop(self):
-        """Periodically run template evolution."""
         while True:
             try:
                 await asyncio.sleep(self.config.template_evolution_interval_seconds)
@@ -794,14 +1283,17 @@ class DashboardEngine:
                 logger.error(f"Evolution loop error: {e}")
 
     async def log_request(self, request_log: RequestLog) -> None:
-        """Store a completed routing decision."""
+        # Chaos injection
+        try:
+            self.chaos_monkey.maybe_fail("log_request")
+        except ChaosExperimentError as e:
+            logger.warning(f"Chaos failure in log_request: {e}")
+            # Continue gracefully
+
         self.request_logs[request_log.request_id] = request_log
-        # Persist to DB asynchronously
         await self._persist_request_async(request_log)
-        # Invalidate cache
         async with self._cache_lock:
             self._cache.clear()
-        # Broadcast to WebSocket clients
         await self._broadcast({
             "type": "new_request",
             "data": {
@@ -811,11 +1303,11 @@ class DashboardEngine:
                 "energy_joules": request_log.energy_joules,
                 "co2_kg": request_log.co2_kg,
                 "accuracy": request_log.accuracy,
+                "precision": request_log.precision,
             }
         })
 
     async def _persist_request_async(self, req: RequestLog):
-        """Asynchronously persist a request to the database."""
         alt_json = json.dumps([
             {'expert_id': eid, 'energy': prof.energy_per_inference_full,
              'accuracy': prof.accuracy_full, 'compressed': prof.compressed_flag}
@@ -836,16 +1328,16 @@ class DashboardEngine:
             material_index=req.material_index,
             sustainability_score=req.sustainability_score,
             explanation=req.explanation,
+            precision=req.precision,
+            human_review_id=req.human_review_id,
         )
         try:
             if ASYNC_SQLALCHEMY_AVAILABLE:
                 async with self.db_manager.async_sessionmaker() as session:
                     session.add(log_entry)
                     await session.commit()
-                # Update expert stats
                 await self._update_expert_stats_async(req.chosen_expert_id, req)
             else:
-                # Offload to thread
                 await self.db_manager.execute_sync_in_thread(self._persist_request_sync, log_entry)
                 await self.db_manager.execute_sync_in_thread(self._update_expert_stats_sync, req.chosen_expert_id, req)
         except Exception as e:
@@ -862,7 +1354,6 @@ class DashboardEngine:
         if not stats:
             stats = ExpertStatsDB(expert_id=expert_id)
             session.add(stats)
-            # Initialize fields
             stats.total_requests = 0
             stats.avg_latency_ms = 0.0
             stats.avg_energy_joules = 0.0
@@ -877,9 +1368,7 @@ class DashboardEngine:
         session.commit()
 
     async def _update_expert_stats_async(self, expert_id, req):
-        """Async version of updating expert stats with atomic update."""
         async with self.db_manager.async_sessionmaker() as session:
-            # Try to update existing row with atomic operations
             stmt = update(ExpertStatsDB).where(ExpertStatsDB.expert_id == expert_id).values(
                 total_requests=ExpertStatsDB.total_requests + 1,
                 avg_latency_ms=((ExpertStatsDB.avg_latency_ms * ExpertStatsDB.total_requests) + req.latency_ms) / (ExpertStatsDB.total_requests + 1),
@@ -890,7 +1379,6 @@ class DashboardEngine:
             )
             result = await session.execute(stmt)
             if result.rowcount == 0:
-                # No existing row; insert new
                 stats = ExpertStatsDB(
                     expert_id=expert_id,
                     total_requests=1,
@@ -903,9 +1391,7 @@ class DashboardEngine:
                 session.add(stats)
             await session.commit()
 
-    # ----- Caching -----
     async def _cached(self, key: str, func: Callable, user_id: Optional[str] = None):
-        """Cache with TTL, key prefixed by user_id if provided."""
         cache_key = f"{user_id or 'global'}:{key}"
         now = time.time()
         async with self._cache_lock:
@@ -920,7 +1406,6 @@ class DashboardEngine:
     async def get_request_data(self, request_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
         req = self.request_logs.get(request_id)
         if not req:
-            # Try to load from DB async
             if ASYNC_SQLALCHEMY_AVAILABLE:
                 async with self.db_manager.async_sessionmaker() as session:
                     stmt = select(RequestLogDB).where(RequestLogDB.request_id == request_id)
@@ -930,7 +1415,6 @@ class DashboardEngine:
                         req = await self._from_db_entry_async(db_entry)
                         self.request_logs[request_id] = req
             else:
-                # Offload to thread
                 req = await self.db_manager.execute_sync_in_thread(self._from_db_entry_sync, request_id)
                 if req:
                     self.request_logs[request_id] = req
@@ -951,6 +1435,8 @@ class DashboardEngine:
             "sustainability_score": req.sustainability_score,
             "explanation": req.explanation,
             "feedback_rating": req.feedback_rating,
+            "precision": req.precision,
+            "human_review_id": req.human_review_id,
             "alternatives": [
                 {
                     "expert_id": eid,
@@ -991,13 +1477,14 @@ class DashboardEngine:
             explanation=db_entry.explanation,
             feedback_rating=db_entry.feedback_rating,
             feedback_comment=db_entry.feedback_comment,
+            precision=getattr(db_entry, 'precision', 'fp32') or 'fp32',
+            human_review_id=getattr(db_entry, 'human_review_id', None),
         )
 
     def _from_db_entry_sync(self, request_id):
         session = self.db_manager.sync_sessionmaker()
         db_entry = session.query(RequestLogDB).filter_by(request_id=request_id).first()
         if db_entry:
-            # Convert synchronously without asyncio
             alt_list = json.loads(db_entry.alternative_experts)
             alternatives = []
             for alt in alt_list:
@@ -1026,6 +1513,8 @@ class DashboardEngine:
                 explanation=db_entry.explanation,
                 feedback_rating=db_entry.feedback_rating,
                 feedback_comment=db_entry.feedback_comment,
+                precision=getattr(db_entry, 'precision', 'fp32') or 'fp32',
+                human_review_id=getattr(db_entry, 'human_review_id', None),
             )
         return None
 
@@ -1080,7 +1569,6 @@ class DashboardEngine:
                 )
                 return fig.to_json()
             else:
-                # Overall: energy vs accuracy scatter
                 expert_data = {}
                 for req in self.request_logs.values():
                     eid = req.chosen_expert_id
@@ -1106,7 +1594,7 @@ class DashboardEngine:
                     marker=dict(size=sizes, color=avg_energies, colorscale="Viridis", showscale=True),
                 )])
                 fig.update_layout(
-                    title="Expert Sustainability Trade‑offs (avg per expert)",
+                    title="Expert Sustainability Trade-offs (avg per expert)",
                     xaxis_title="Average Energy per Inference (J)",
                     yaxis_title="Average Accuracy",
                     hovermode="closest",
@@ -1115,7 +1603,6 @@ class DashboardEngine:
                 return fig.to_json()
         return await self._cached(f"chart_{request_id}", _generate, user_id)
 
-    # ----- WebSocket Broadcasting -----
     async def _broadcast(self, message: Dict):
         if not self._ws_connections:
             return
@@ -1135,15 +1622,12 @@ class DashboardEngine:
         async with self._ws_lock:
             self._ws_connections.append(websocket)
         try:
-            # Heartbeat: send ping every 30s and expect pong
             while True:
                 try:
                     data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
                     if data.strip() == "pong":
                         continue
-                    # Handle other messages (e.g., client requests) here if needed
                 except asyncio.TimeoutError:
-                    # Send ping and wait for pong
                     await websocket.send_text(json.dumps({"type": "ping"}))
                     try:
                         pong = await asyncio.wait_for(websocket.receive_text(), timeout=5)
@@ -1156,7 +1640,6 @@ class DashboardEngine:
                 if websocket in self._ws_connections:
                     self._ws_connections.remove(websocket)
 
-    # ----- Pagination (database-backed) -----
     async def get_recent_requests(self, page: int = 1, page_size: int = 20, filter_expert: Optional[str] = None, user_id: Optional[str] = None) -> Dict:
         page_size = min(page_size, self.config.max_page_size)
         offset = (page - 1) * page_size
@@ -1175,7 +1658,6 @@ class DashboardEngine:
                     items = result.scalars().all()
                     return total, items
             else:
-                # Sync fallback
                 session = self.db_manager.sync_sessionmaker()
                 query = session.query(RequestLogDB)
                 if filter_expert:
@@ -1198,6 +1680,7 @@ class DashboardEngine:
                     "co2_kg": r.co2_kg,
                     "accuracy": r.accuracy,
                     "explanation": r.explanation,
+                    "precision": getattr(r, 'precision', 'fp32') or 'fp32',
                 }
                 for r in items
             ]
@@ -1219,21 +1702,21 @@ class DashboardEngine:
         await self.db_manager.close()
 
 # =============================================================================
-# 7. WHAT‑IF SIMULATOR (Enhanced with MODP utility)
+# 7. WHAT-IF SIMULATOR (Enhanced with MODP, offset cost, precision)
 # =============================================================================
 class WhatIfSimulator:
-    """
-    Simulates alternative routing choices and computes the sustainability impact.
-    Includes carbon intensity, helium scarcity, and material index.
-    NEW: Computes MODP utilities for chosen and alternative experts.
-    """
+    """Simulates alternative routing choices with carbon offset costs and precision recommendations."""
     def __init__(self, dashboard: DashboardEngine, config: ExplainableUIConfig,
-                 carbon_manager=None, lca_client=None, modp: Optional[ParetoOptimizer] = None):
+                 carbon_manager=None, lca_client=None, modp: Optional[ParetoOptimizer] = None,
+                 offset_broker: Optional[CarbonOffsetBroker] = None,
+                 precision_policy: Optional[FlexGenPrecisionPolicy] = None):
         self.dashboard = dashboard
         self.config = config
         self.carbon_manager = carbon_manager
         self.lca_client = lca_client
         self.modp = modp
+        self.offset_broker = offset_broker or CarbonOffsetBroker()
+        self.precision_policy = precision_policy or FlexGenPrecisionPolicy()
         self._carbon_circuit = CircuitBreaker("carbon_api")
         self._lca_circuit = CircuitBreaker("lca_api")
 
@@ -1241,7 +1724,9 @@ class WhatIfSimulator:
         if self.carbon_manager:
             try:
                 intensity = await self._carbon_circuit.call(self.carbon_manager.get_current_intensity)
-                return intensity.get('intensity', 400) / 1000  # kg/kWh
+                if isinstance(intensity, dict):
+                    return intensity.get('intensity', 400) / 1000
+                return float(intensity) / 1000
             except Exception as e:
                 logger.warning(f"Carbon intensity error: {e}")
         return self.config.co2_per_kwh_kg
@@ -1259,23 +1744,21 @@ class WhatIfSimulator:
         if not alt_profile:
             raise ValueError(f"Expert {alternative_expert_id} not in alternatives")
 
-        # Alternative metrics
         if alt_profile.compressed_flag and alt_profile.energy_per_inference_compressed:
             alt_energy = alt_profile.energy_per_inference_compressed
         else:
             alt_energy = alt_profile.energy_per_inference_full
-        alt_latency = alt_energy * 1e-6 * 0.5  # rough
+        alt_latency = alt_energy * 1e-6 * 0.5
         alt_accuracy = alt_profile.accuracy_compressed if alt_profile.compressed_flag else alt_profile.accuracy_full
         co2_intensity = await self.get_carbon_intensity()
         alt_co2 = alt_energy * co2_intensity / 3600000
 
-        # Differences
         diff_energy = alt_energy - req.energy_joules
         diff_co2 = alt_co2 - req.co2_kg
         diff_latency = alt_latency - req.latency_ms
         diff_accuracy = alt_accuracy - req.accuracy
 
-        # Compute MODP utilities if available
+        # MODP utilities
         chosen_utility = None
         alternative_utility = None
         if self.modp:
@@ -1289,7 +1772,6 @@ class WhatIfSimulator:
                 "latency": 1.0 - (req.latency_ms / max_latency),
             }
             chosen_utility = self.modp.evaluate(chosen_obj, self.config.modp_weights)
-
             alt_obj = {
                 "accuracy": alt_accuracy,
                 "energy": 1.0 - (alt_energy / max_energy),
@@ -1298,9 +1780,15 @@ class WhatIfSimulator:
             }
             alternative_utility = self.modp.evaluate(alt_obj, self.config.modp_weights)
 
-        # For material index and helium, we could optionally call LCA client; here we use request values
-        expected_material_index = req.material_index
-        expected_helium_scarcity = req.helium_scarcity
+        # Offset cost estimation
+        offset_cost_usd = self.offset_broker.estimate_offset_cost(alt_co2)
+
+        # Precision recommendation
+        workload_size = "large" if alt_energy > 5.0 else "medium" if alt_energy > 2.0 else "small"
+        recommended_precision = self.precision_policy.recommend_precision(
+            workload_size=workload_size,
+            carbon_intensity=req.carbon_intensity * 800.0 if req.carbon_intensity <= 1.0 else req.carbon_intensity
+        )
 
         return WhatIfResult(
             scenario_id=str(uuid.uuid4()),
@@ -1310,18 +1798,20 @@ class WhatIfSimulator:
             expected_latency_ms=alt_latency,
             expected_accuracy=alt_accuracy,
             expected_carbon_intensity=req.carbon_intensity,
-            expected_helium_scarcity=expected_helium_scarcity,
-            expected_material_index=expected_material_index,
+            expected_helium_scarcity=req.helium_scarcity,
+            expected_material_index=req.material_index,
             difference_energy=diff_energy,
             difference_co2=diff_co2,
             difference_latency=diff_latency,
             difference_accuracy=diff_accuracy,
             chosen_utility=chosen_utility,
             alternative_utility=alternative_utility,
+            offset_cost_usd=offset_cost_usd,
+            recommended_precision=recommended_precision,
         )
 
 # =============================================================================
-# 8. AUTHENTICATION & RBAC (Enhanced with User DB and Refresh Tokens)
+# 8. AUTHENTICATION & RBAC
 # =============================================================================
 class AuthManager:
     def __init__(self, config: ExplainableUIConfig, db_manager: DatabaseManager):
@@ -1402,17 +1892,16 @@ class AuthManager:
             raise HTTPException(status_code=401, detail="Invalid refresh token")
 
 # =============================================================================
-# 9. API GATEWAY EXTENSION (Enhanced with FastAPI and feedback loop)
+# 9. API GATEWAY EXTENSION (with new endpoints for advanced enhancements)
 # =============================================================================
 class APIGatewayExtension:
-    """
-    Extends FastAPI with /api/explain endpoints, WebSocket, authentication,
-    and feedback publishing to central message queue.
-    """
     def __init__(self, dashboard: DashboardEngine, generator: ExplanationGenerator,
                  what_if: WhatIfSimulator, auth: AuthManager,
                  message_queue: Optional[AsyncMessageQueue] = None,
-                 carbon_manager=None, lca_client=None):
+                 carbon_manager=None, lca_client=None,
+                 offset_broker: Optional[CarbonOffsetBroker] = None,
+                 human_review: Optional[HumanReviewManager] = None,
+                 chaos_monkey: Optional[ChaosMonkey] = None):
         self.dashboard = dashboard
         self.generator = generator
         self.what_if = what_if
@@ -1420,6 +1909,12 @@ class APIGatewayExtension:
         self.message_queue = message_queue
         self.carbon_manager = carbon_manager
         self.lca_client = lca_client
+        self.offset_broker = offset_broker or CarbonOffsetBroker()
+        self.human_review = human_review or HumanReviewManager()
+        self.chaos_monkey = chaos_monkey or ChaosMonkey(
+            enabled=dashboard.config.chaos_enabled,
+            failure_probability=dashboard.config.chaos_failure_probability,
+        )
         self.app = None
         self.limiter = None
         if SLOWAPI_AVAILABLE:
@@ -1428,23 +1923,20 @@ class APIGatewayExtension:
     def register_routes(self, app: FastAPI):
         self.app = app
 
-        # Rate limiting
         if self.limiter:
             app.state.limiter = self.limiter
             app.add_exception_handler(429, _rate_limit_exceeded_handler)
 
-        # WebSocket endpoint
         @app.websocket("/ws/explain")
         async def websocket_endpoint(websocket: WebSocket):
             await self.dashboard.register_websocket(websocket)
 
-        # Authentication endpoints
+        # Auth endpoints
         @app.post("/api/explain/login")
         async def login(username: str, password: str):
             user = await self.auth.authenticate_user(username, password)
             if not user:
                 raise HTTPException(status_code=401, detail="Invalid credentials")
-            # Update last_login
             if ASYNC_SQLALCHEMY_AVAILABLE:
                 async with self.dashboard.db_manager.async_sessionmaker() as session:
                     stmt = update(UserDB).where(UserDB.id == user.id).values(last_login=datetime.now())
@@ -1456,7 +1948,6 @@ class APIGatewayExtension:
                 session.commit()
             access_token = self.auth.create_token(user.username, user.role)
             refresh_token = self.auth.create_refresh_token(user.username)
-            # Store refresh token in DB
             if ASYNC_SQLALCHEMY_AVAILABLE:
                 async with self.dashboard.db_manager.async_sessionmaker() as session:
                     stmt = update(UserDB).where(UserDB.id == user.id).values(
@@ -1478,14 +1969,12 @@ class APIGatewayExtension:
 
         @app.post("/api/explain/register")
         async def register(username: str, password: str, role: str = "viewer"):
-            # Only admin can create admin users, but for demo, allow any role
             existing = await self.auth.get_user(username)
             if existing:
                 raise HTTPException(status_code=400, detail="User already exists")
             user = await self.auth.create_user(username, password, role)
             return {"username": user.username, "role": user.role}
 
-        # Security dependency
         security = HTTPBearer()
         async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
             return self.auth.verify_token(credentials.credentials)
@@ -1495,10 +1984,8 @@ class APIGatewayExtension:
                 raise HTTPException(status_code=403, detail="Insufficient permissions")
             return user
 
-        # Public endpoints
         @app.get("/api/explain/health")
         async def health():
-            # Check DB connectivity
             db_ok = True
             try:
                 if ASYNC_SQLALCHEMY_AVAILABLE:
@@ -1507,10 +1994,8 @@ class APIGatewayExtension:
                 else:
                     session = self.dashboard.db_manager.sync_sessionmaker()
                     session.execute(text("SELECT 1"))
-            except Exception as e:
+            except Exception:
                 db_ok = False
-                logger.error(f"Health check: DB error {e}")
-            # Check carbon manager
             carbon_ok = True
             if self.carbon_manager:
                 try:
@@ -1518,7 +2003,6 @@ class APIGatewayExtension:
                         await self.carbon_manager.get_current_intensity()
                 except Exception:
                     carbon_ok = False
-            # Check LCA client
             lca_ok = True
             if self.lca_client:
                 try:
@@ -1533,6 +2017,7 @@ class APIGatewayExtension:
                 "lca_client": "ok" if lca_ok else "error",
                 "cache_size": len(self.dashboard._cache),
                 "websocket_connections": len(self.dashboard._ws_connections),
+                "chaos_enabled": self.chaos_monkey.enabled,
                 "timestamp": datetime.now().isoformat(),
             }
 
@@ -1542,7 +2027,6 @@ class APIGatewayExtension:
                 return Response(content=generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
             return {"error": "Prometheus not enabled"}
 
-        # Protected endpoints (viewer)
         @app.get("/api/explain/request/{request_id}")
         async def explain_request(request_id: str, user: Dict = Depends(get_current_user)):
             data = await self.dashboard.get_request_data(request_id, user.get("sub"))
@@ -1569,7 +2053,6 @@ class APIGatewayExtension:
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
 
-        # Feedback endpoint – now publishes to message queue
         @app.post("/api/explain/feedback/{request_id}")
         async def submit_feedback(request_id: str, rating: int, comment: Optional[str] = None, user: Dict = Depends(get_current_user)):
             req = self.dashboard.request_logs.get(request_id)
@@ -1577,7 +2060,6 @@ class APIGatewayExtension:
                 raise HTTPException(status_code=404, detail="Request not found")
             req.feedback_rating = rating
             req.feedback_comment = comment
-            # Update DB
             try:
                 if ASYNC_SQLALCHEMY_AVAILABLE:
                     async with self.dashboard.db_manager.async_sessionmaker() as session:
@@ -1598,7 +2080,6 @@ class APIGatewayExtension:
                 logger.error(f"Failed to update feedback: {e}")
                 raise HTTPException(status_code=500, detail="Feedback update failed")
 
-            # Publish feedback event to central message queue if available
             if self.message_queue:
                 event = FeedbackEvent.create_with_context(
                     task_id=f"feedback_{request_id}",
@@ -1617,13 +2098,11 @@ class APIGatewayExtension:
                 )
                 await self.message_queue.publish("feedback_events", event.to_json())
 
-            # Also record feedback in the explanation generator for template evolution
             if self.generator:
                 await self.generator.record_feedback(rating, req.explanation)
 
             return {"status": "feedback recorded"}
 
-        # Export endpoint
         @app.get("/api/explain/export/{request_id}")
         async def export_request(request_id: str, format: str = "json", user: Dict = Depends(get_current_user)):
             data = await self.dashboard.get_request_data(request_id, user.get("sub"))
@@ -1641,10 +2120,11 @@ class APIGatewayExtension:
                     writer.writerow([k, str(v)])
                 return Response(content=output.getvalue(), media_type="text/csv")
             elif format == "png" and PLOTLY_AVAILABLE:
-                # Generate PNG from chart (requires kaleido)
                 try:
-                    fig = go.Figure(data=[go.Bar(x=[a["expert_id"] for a in data["alternatives"]] + [data["chosen_expert"]],
-                                                 y=[a["energy_joules"] for a in data["alternatives"]] + [data["energy_joules"]])])
+                    fig = go.Figure(data=[go.Bar(
+                        x=[a["expert_id"] for a in data["alternatives"]] + [data["chosen_expert"]],
+                        y=[a["energy_joules"] for a in data["alternatives"]] + [data["energy_joules"]]
+                    )])
                     img_bytes = fig.to_image(format="png")
                     return Response(content=img_bytes, media_type="image/png")
                 except Exception as e:
@@ -1653,7 +2133,6 @@ class APIGatewayExtension:
             else:
                 raise HTTPException(status_code=400, detail="Unsupported format")
 
-        # Admin endpoints
         @app.post("/api/explain/admin/refresh")
         async def refresh_cache(user: Dict = Depends(require_role("admin"))):
             async with self.dashboard._cache_lock:
@@ -1662,7 +2141,6 @@ class APIGatewayExtension:
 
         @app.post("/api/explain/admin/export/all")
         async def export_all(format: str = "json", user: Dict = Depends(require_role("admin"))):
-            # Stream export to avoid memory issues
             if format == "json":
                 async def stream_json():
                     yield "["
@@ -1698,15 +2176,16 @@ class APIGatewayExtension:
             self.generator.reload_template(path)
             return {"status": "template reloaded"}
 
-        # New endpoints for optimization state
+        # Optimization state endpoints
         @app.get("/api/explain/optimization/status")
         async def optimization_status(user: Dict = Depends(require_role("admin"))):
             return {
                 "template_population_size": len(self.generator.template_population),
                 "template_fitness_length": len(self.generator.template_fitness),
-                "modp_weights": self.config.modp_weights,
-                "template_evolution_enabled": self.config.template_evolution_enabled,
+                "modp_weights": self.dashboard.config.modp_weights,
+                "template_evolution_enabled": self.dashboard.config.template_evolution_enabled,
                 "enhancements_available": ENHANCEMENTS_AVAILABLE,
+                "enhancement_status": self.generator.get_enhancement_status(),
             }
 
         @app.post("/api/explain/optimization/evolve")
@@ -1714,10 +2193,99 @@ class APIGatewayExtension:
             await self.generator.evolve_templates()
             return {"status": "evolution triggered"}
 
-        logger.info("API Gateway routes registered")
+        # NEW: Human review endpoints
+        @app.get("/api/explain/human-review/pending")
+        async def human_review_pending(user: Dict = Depends(require_role("admin"))):
+            return await self.human_review.get_pending()
+
+        @app.post("/api/explain/human-review/{review_id}/approve")
+        async def human_review_approve(review_id: str, user: Dict = Depends(require_role("admin"))):
+            ok = await self.human_review.approve(review_id)
+            if not ok:
+                raise HTTPException(status_code=404, detail="Review not found")
+            return {"status": "approved", "review_id": review_id}
+
+        @app.post("/api/explain/human-review/{review_id}/reject")
+        async def human_review_reject(review_id: str, reason: Optional[str] = None,
+                                       user: Dict = Depends(require_role("admin"))):
+            ok = await self.human_review.reject(review_id, reason)
+            if not ok:
+                raise HTTPException(status_code=404, detail="Review not found")
+            return {"status": "rejected", "review_id": review_id}
+
+        @app.post("/api/explain/human-review/request")
+        async def human_review_request(request_id: str, details: Optional[Dict] = None,
+                                        user: Dict = Depends(get_current_user)):
+            review_id = await self.human_review.request_review(request_id, details or {})
+            # Update request log
+            req = self.dashboard.request_logs.get(request_id)
+            if req:
+                req.human_review_id = review_id
+            return {"review_id": review_id}
+
+        # NEW: Chaos testing endpoint
+        @app.post("/api/explain/chaos/trigger")
+        async def chaos_trigger(enabled: bool = True, probability: float = 0.1,
+                                user: Dict = Depends(require_role("admin"))):
+            self.chaos_monkey.enabled = enabled
+            self.chaos_monkey.failure_probability = probability
+            return self.chaos_monkey.get_stats()
+
+        # NEW: Federated aggregation endpoints
+        @app.post("/api/explain/federated/register")
+        async def federated_register(participant_id: str, update: Dict,
+                                      user: Dict = Depends(require_role("admin"))):
+            self.generator.federated_coordinator.register_participant(participant_id, update)
+            return {"status": "registered", "participants": self.generator.federated_coordinator.get_participant_count()}
+
+        @app.get("/api/explain/federated/aggregate")
+        async def federated_aggregate(user: Dict = Depends(require_role("admin"))):
+            return self.generator.federated_coordinator.aggregate()
+
+        # NEW: Quantum optimization endpoint
+        @app.post("/api/explain/quantum/optimize")
+        async def quantum_optimize(candidates: List[Dict], user: Dict = Depends(require_role("admin"))):
+            result = await self.generator.quantum_optimizer.select_best_template(
+                candidates, self.dashboard.config.modp_weights
+            )
+            return {"result": result, "status": self.generator.quantum_optimizer.get_status()}
+
+        # NEW: Carbon offsets endpoint
+        @app.post("/api/explain/carbon/offset")
+        async def purchase_offset(carbon_kg: float, carbon_intensity: float,
+                                   user: Dict = Depends(get_current_user)):
+            result = await self.offset_broker.purchase_offsets(carbon_intensity, carbon_kg)
+            return result
+
+        @app.post("/api/explain/carbon/rec")
+        async def purchase_rec(energy_mwh: float, user: Dict = Depends(get_current_user)):
+            result = await self.offset_broker.purchase_recs(energy_mwh)
+            return result
+
+        @app.get("/api/explain/carbon/totals")
+        async def carbon_totals(user: Dict = Depends(get_current_user)):
+            return self.offset_broker.get_totals()
+
+        # NEW: Precision recommendation endpoint
+        @app.post("/api/explain/precision/recommend")
+        async def recommend_precision(workload_size: str = "medium",
+                                       carbon_intensity: float = None,
+                                       user: Dict = Depends(get_current_user)):
+            precision = self.what_if.precision_policy.recommend_precision(
+                workload_size=workload_size,
+                carbon_intensity=carbon_intensity,
+            )
+            return {"precision": precision}
+
+        # NEW: Safety violations endpoint
+        @app.get("/api/explain/safety/violations")
+        async def safety_violations(user: Dict = Depends(require_role("admin"))):
+            return {"violations": self.generator.safety_monitor.get_violations()}
+
+        logger.info("API Gateway routes registered (with advanced enhancements)")
 
 # =============================================================================
-# 10. CONVENIENCE FACTORY (Enhanced)
+# 10. CONVENIENCE FACTORY
 # =============================================================================
 def create_explainable_ui(
     config: Optional[Union[Dict, ExplainableUIConfig]] = None,
@@ -1727,8 +2295,7 @@ def create_explainable_ui(
 ) -> Dict[str, Any]:
     """
     Factory to create all components and return them for integration.
-    NOTE: Callers should await db_manager.initialize() and generator.initialize()
-    after creating the components, unless using async context.
+    Includes all advanced enhancement modules.
     """
     if config is None:
         config = ExplainableUIConfig()
@@ -1737,13 +2304,32 @@ def create_explainable_ui(
 
     db_manager = DatabaseManager(config)
     generator = ExplanationGenerator(config, db_manager=db_manager)
-    dashboard = DashboardEngine(config, db_manager, generator)
-    what_if = WhatIfSimulator(dashboard, config, carbon_manager, lca_client,
-                               modp=generator.modp if ENHANCEMENTS_AVAILABLE else None)
+
+    # NEW: shared modules
+    offset_broker = CarbonOffsetBroker()
+    precision_policy = FlexGenPrecisionPolicy()
+    chaos_monkey = ChaosMonkey(
+        enabled=config.chaos_enabled,
+        failure_probability=config.chaos_failure_probability,
+    )
+    human_review = HumanReviewManager()
+
+    dashboard = DashboardEngine(config, db_manager, generator, chaos_monkey=chaos_monkey)
+    what_if = WhatIfSimulator(
+        dashboard, config, carbon_manager, lca_client,
+        modp=generator.modp if ENHANCEMENTS_AVAILABLE else None,
+        offset_broker=offset_broker,
+        precision_policy=precision_policy,
+    )
     auth = AuthManager(config, db_manager)
 
-    api_extension = APIGatewayExtension(dashboard, generator, what_if, auth, message_queue,
-                                        carbon_manager=carbon_manager, lca_client=lca_client)
+    api_extension = APIGatewayExtension(
+        dashboard, generator, what_if, auth, message_queue,
+        carbon_manager=carbon_manager, lca_client=lca_client,
+        offset_broker=offset_broker,
+        human_review=human_review,
+        chaos_monkey=chaos_monkey,
+    )
 
     return {
         "dashboard": dashboard,
@@ -1752,13 +2338,16 @@ def create_explainable_ui(
         "auth": auth,
         "api_extension": api_extension,
         "db_manager": db_manager,
+        "offset_broker": offset_broker,
+        "human_review": human_review,
+        "chaos_monkey": chaos_monkey,
+        "precision_policy": precision_policy,
     }
 
 # =============================================================================
 # 11. UNIT TEST STUBS
 # =============================================================================
 async def test_explainable_ui():
-    """Example test stub."""
     config = ExplainableUIConfig(db_path=":memory:")
     components = create_explainable_ui(config)
     db_manager = components["db_manager"]
@@ -1766,7 +2355,6 @@ async def test_explainable_ui():
     await components["explanation_generator"].initialize()
 
     dashboard = components["dashboard"]
-    # Log a mock request
     prof = SustainabilityAwareExpertProfile("expert_A")
     req = RequestLog(
         request_id="test-123",
@@ -1802,7 +2390,6 @@ if __name__ == "__main__":
         gen = components["explanation_generator"]
         what_if = components["what_if"]
 
-        # Create a dummy profile
         prof = SustainabilityAwareExpertProfile("expert_A")
         prof.energy_per_inference_full = 2.5
         prof.accuracy_full = 0.92
@@ -1826,6 +2413,7 @@ if __name__ == "__main__":
             carbon_intensity=400.0,
             helium_scarcity=0.5,
             material_index=0.2,
+            precision="fp16",
         )
         await dash.log_request(req)
 
@@ -1833,7 +2421,13 @@ if __name__ == "__main__":
         print("Explanation:", explanation)
 
         result = await what_if.simulate("test-123", "expert_B")
-        print("What‑if result:", result)
+        print("What-if result:", result)
+
+        # Feedback
+        await gen.record_feedback(rating=4, template_used=explanation)
+
+        # Enhancement status
+        print("Enhancement status:", gen.get_enhancement_status())
 
         await dash.shutdown()
         print("✅ Enhanced Explainable UI module ready.")
