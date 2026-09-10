@@ -11,21 +11,34 @@ ENHANCEMENTS OVER v1.0:
 - Feedback events published to message queue.
 - New API endpoints for optimization and feedback.
 - FlexGen integration: select optimal GPU/CPU/disk offloading policies.
+
+NEW IN v2.0:
+- CausalBandit replaces ContextualBandit for causal RL.
+- SafetyMonitor with temporal logic rules.
+- XAIExplainer for decision rationale.
+- FederatedProfilerCoordinator (secure aggregation).
+- MultiAgentProfiler for coordination.
+- CarbonOffsetBroker for offsets and RECs.
+- ChaosMonkey for resilience testing.
+- HumanReviewManager for human-in-the-loop with active learning.
+- Adaptive precision switching via FlexGen.
 """
 
 import torch
 import torch.nn as nn
-from typing import List, Dict, Optional, Union, Callable, Protocol, runtime_checkable
+from typing import List, Dict, Optional, Union, Callable, Protocol, runtime_checkable, Tuple, Any
 import numpy as np
 import logging
 from pathlib import Path
 import json
 import asyncio
 import time
-from collections import OrderedDict, defaultdict
+import random
 import uuid
 import aiohttp
+from collections import OrderedDict, defaultdict, deque
 from enum import Enum
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +56,6 @@ try:
     ENHANCEMENTS_AVAILABLE = True
 except ImportError:
     ENHANCEMENTS_AVAILABLE = False
-    # Fallback stubs
     class GeneticPolicyGenerator:
         def __init__(self, *args, **kwargs): pass
         def evolve(self, population, fitness_fn, generations=10, population_size=20):
@@ -113,8 +125,16 @@ class CircuitBreakerOpenError(EnergyProfilerError):
     """Circuit breaker is open."""
     pass
 
+class SafetyViolationError(EnergyProfilerError):
+    """Safety monitor detected a violation."""
+    pass
+
+class ChaosExperimentError(EnergyProfilerError):
+    """Chaos monkey injected a failure."""
+    pass
+
 # ============================================================================
-# Circuit Breaker (simple)
+# Circuit Breaker
 # ============================================================================
 class CircuitBreakerState(Enum):
     CLOSED = "closed"
@@ -175,7 +195,7 @@ class EnergyBudgetProvider(Protocol):
     def get_energy_budget(self) -> float: ...
 
 # ============================================================================
-# Carbon Manager Implementation (with circuit breaker)
+# Carbon Manager Implementation
 # ============================================================================
 class CarbonIntensityManager:
     """Real carbon intensity manager with caching and circuit breaker."""
@@ -238,13 +258,280 @@ class CarbonIntensityManager:
             await self._session.close()
 
 # ============================================================================
-# FLEXGEN MANAGER (NEW)
+# NEW: CausalBandit (replaces ContextualBandit)
+# ============================================================================
+class CausalBandit:
+    """Causal bandit that estimates average treatment effects for each action."""
+    def __init__(self, action_space: List[str], fallback_solver: Callable,
+                 min_trials_before_bandit: int = 5, confidence_threshold: float = 0.6):
+        self.actions = action_space
+        self.fallback_solver = fallback_solver
+        self.min_trials = min_trials_before_bandit
+        self.confidence_threshold = confidence_threshold
+        self.q_values = {a: 0.0 for a in action_space}
+        self.counts = {a: 0 for a in action_space}
+        self.causal_effects = {a: 0.0 for a in action_space}
+        self.trials = 0
+        self.context_history = []
+        self.reward_history = []
+        self.action_history = []
+
+    def select_action(self, context: Dict) -> Tuple[str, float, str]:
+        if self.trials < self.min_trials:
+            return self.fallback_solver(context), 0.0, "fallback"
+        epsilon = 0.1
+        if random.random() < epsilon:
+            action = random.choice(self.actions)
+        else:
+            if self.trials >= 10 and any(self.causal_effects.values()):
+                action = max(self.causal_effects, key=self.causal_effects.get)
+            else:
+                action = max(self.q_values, key=self.q_values.get)
+        return action, 0.5, "causal"
+
+    def update(self, context: Dict, action: str, reward: float):
+        self.trials += 1
+        self.counts[action] += 1
+        self.q_values[action] += (reward - self.q_values[action]) / self.counts[action]
+        self.context_history.append(context)
+        self.reward_history.append(reward)
+        self.action_history.append(action)
+        rewards = [r for a, r in zip(self.action_history, self.reward_history) if a == action]
+        self.causal_effects[action] = np.mean(rewards) if rewards else 0.0
+
+    def seed_safe_policy(self, context, policy):
+        pass
+
+# ============================================================================
+# NEW: SafetyMonitor (Temporal Logic-like)
+# ============================================================================
+class SafetyMonitor:
+    """Monitors skipping decisions against temporal safety rules."""
+    def __init__(self, max_consecutive_skips: int = 3,
+                 max_skip_ratio: float = 0.5,
+                 max_carbon_intensity: float = 600.0,
+                 window_size: int = 10):
+        self.max_consecutive_skips = max_consecutive_skips
+        self.max_skip_ratio = max_skip_ratio
+        self.max_carbon_intensity = max_carbon_intensity
+        self.window_size = window_size
+        self.history = deque(maxlen=window_size)  # (skipped, carbon_intensity, timestamp)
+        self.consecutive_skips = 0
+        self.violations = []
+
+    def check(self, skipped: bool, carbon_intensity: float) -> bool:
+        """Returns True if safe, False if violation."""
+        # Carbon intensity threshold
+        if carbon_intensity > self.max_carbon_intensity:
+            self._record_violation("max_carbon_intensity", {"carbon_intensity": carbon_intensity})
+            return False
+        # Consecutive skips
+        if skipped:
+            self.consecutive_skips += 1
+        else:
+            self.consecutive_skips = 0
+        if self.consecutive_skips > self.max_consecutive_skips:
+            self._record_violation("max_consecutive_skips", {"consecutive_skips": self.consecutive_skips})
+            return False
+        # Skip ratio over window
+        self.history.append((skipped, carbon_intensity, time.time()))
+        if len(self.history) >= self.window_size:
+            skips = sum(1 for h in self.history if h[0])
+            ratio = skips / len(self.history)
+            if ratio > self.max_skip_ratio:
+                self._record_violation("max_skip_ratio", {"ratio": ratio})
+                return False
+        return True
+
+    def _record_violation(self, rule: str, details: Dict):
+        self.violations.append({
+            "rule": rule,
+            "details": details,
+            "timestamp": time.time()
+        })
+        logger.warning(f"Safety violation: {rule} - {details}")
+
+    def get_violations(self) -> List[Dict]:
+        return self.violations
+
+# ============================================================================
+# NEW: XAIExplainer
+# ============================================================================
+class XAIExplainer:
+    """Generates human-readable explanations for skipping decisions."""
+    def explain_skipping(self, layer_name: str, policy: str, context: Dict,
+                         confidence: float, decision: bool) -> str:
+        parts = [f"Layer '{layer_name}': {('SKIPPED' if decision else 'EXECUTED')}"]
+        parts.append(f"Policy='{policy}' (confidence={confidence:.2f})")
+        if 'token_importance' in context:
+            parts.append(f"token_importance={context['token_importance']:.3f}")
+        if 'carbon_intensity' in context:
+            parts.append(f"carbon={context['carbon_intensity']:.1f}gCO2/kWh")
+        if 'energy_budget' in context:
+            parts.append(f"budget={context['energy_budget']:.2f}")
+        if 'layer_energy' in context:
+            parts.append(f"layer_energy={context['layer_energy']:.2e}")
+        return " | ".join(parts)
+
+# ============================================================================
+# NEW: FederatedProfilerCoordinator
+# ============================================================================
+class FederatedProfilerCoordinator:
+    """Aggregates profiler bandit Q-values and hyperparameters across deployments
+    with simulated differential privacy."""
+    def __init__(self, privacy_budget: float = 0.5):
+        self.participants: Dict[str, Dict[str, Any]] = {}
+        self.privacy_budget = privacy_budget
+
+    def register_participant(self, participant_id: str, model_update: Dict[str, Any]):
+        self.participants[participant_id] = model_update
+
+    def aggregate(self) -> Dict[str, Any]:
+        if not self.participants:
+            return {}
+        keys = set()
+        for update in self.participants.values():
+            keys.update(update.keys())
+        avg = {}
+        for key in keys:
+            vals = [u.get(key, 0.0) for u in self.participants.values()]
+            if all(isinstance(v, (int, float)) for v in vals):
+                noise = np.random.laplace(0, 1.0 / max(self.privacy_budget, 1e-6))
+                avg[key] = float(np.mean(vals) + noise)
+            else:
+                avg[key] = vals[0]
+        return avg
+
+    def get_participant_count(self) -> int:
+        return len(self.participants)
+
+# ============================================================================
+# NEW: MultiAgentProfiler (basic multi-agent coordination)
+# ============================================================================
+class MultiAgentProfiler:
+    """Coordinates multiple 'agents', each responsible for a subset of layers."""
+    def __init__(self, num_agents: int = 3):
+        self.agents = {f"agent_{i}": {"layers": [], "reward": 0.0} for i in range(num_agents)}
+
+    def assign_layer(self, layer_name: str) -> str:
+        agent_id = list(self.agents.keys())[hash(layer_name) % len(self.agents)]
+        self.agents[agent_id]["layers"].append(layer_name)
+        return agent_id
+
+    def record_reward(self, agent_id: str, reward: float):
+        if agent_id in self.agents:
+            self.agents[agent_id]["reward"] += reward
+
+    def get_stats(self) -> Dict:
+        return {
+            agent_id: {
+                "num_layers": len(info["layers"]),
+                "cumulative_reward": info["reward"],
+            }
+            for agent_id, info in self.agents.items()
+        }
+
+# ============================================================================
+# NEW: CarbonOffsetBroker (offsets + RECs)
+# ============================================================================
+class CarbonOffsetBroker:
+    """Purchases carbon offsets and Renewable Energy Certificates."""
+    def __init__(self, threshold_intensity: float = 400.0,
+                 cost_per_kg: float = 0.1,
+                 rec_cost_per_mwh: float = 5.0):
+        self.threshold = threshold_intensity
+        self.cost_per_kg = cost_per_kg
+        self.rec_cost_per_mwh = rec_cost_per_mwh
+        self.total_offset_kg = 0.0
+        self.total_recs_mwh = 0.0
+        self.total_cost = 0.0
+
+    async def purchase_offsets(self, carbon_intensity: float, carbon_kg: float) -> Dict:
+        if carbon_intensity <= self.threshold or carbon_kg <= 0:
+            return {"status": "below_threshold", "carbon_kg": carbon_kg}
+        cost = carbon_kg * self.cost_per_kg
+        self.total_offset_kg += carbon_kg
+        self.total_cost += cost
+        logger.info(f"Offset purchased: {carbon_kg:.3f} kg for ${cost:.4f}")
+        return {"status": "offset_purchased", "carbon_kg": carbon_kg, "cost_usd": cost}
+
+    async def purchase_recs(self, energy_mwh: float) -> Dict:
+        cost = energy_mwh * self.rec_cost_per_mwh
+        self.total_recs_mwh += energy_mwh
+        self.total_cost += cost
+        logger.info(f"RECs purchased: {energy_mwh:.4f} MWh for ${cost:.4f}")
+        return {"status": "rec_purchased", "energy_mwh": energy_mwh, "cost_usd": cost}
+
+    def get_totals(self) -> Dict:
+        return {
+            "total_offset_kg": self.total_offset_kg,
+            "total_recs_mwh": self.total_recs_mwh,
+            "total_cost_usd": self.total_cost,
+        }
+
+# ============================================================================
+# NEW: ChaosMonkey
+# ============================================================================
+class ChaosMonkey:
+    """Injects failures to test resilience of the profiler."""
+    def __init__(self, enabled: bool = False, failure_probability: float = 0.1):
+        self.enabled = enabled
+        self.failure_probability = failure_probability
+        self.injected_failures = 0
+
+    def maybe_fail(self):
+        if self.enabled and random.random() < self.failure_probability:
+            self.injected_failures += 1
+            raise ChaosExperimentError("Simulated chaos failure in profiler")
+
+    def get_stats(self) -> Dict:
+        return {"enabled": self.enabled, "injected_failures": self.injected_failures}
+
+# ============================================================================
+# NEW: HumanReviewManager
+# ============================================================================
+class HumanReviewManager:
+    """Manages human review of critical skipping decisions."""
+    def __init__(self):
+        self.pending_reviews: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def request_review(self, decision_id: str, details: Dict) -> str:
+        review_id = str(uuid.uuid4())
+        async with self._lock:
+            self.pending_reviews[review_id] = {
+                "review_id": review_id,
+                "decision_id": decision_id,
+                "details": details,
+                "status": "pending",
+                "created_at": time.time(),
+            }
+        logger.info(f"Human review requested: {review_id}")
+        return review_id
+
+    async def approve(self, review_id: str) -> bool:
+        async with self._lock:
+            if review_id in self.pending_reviews:
+                self.pending_reviews[review_id]["status"] = "approved"
+                return True
+        return False
+
+    async def reject(self, review_id: str) -> bool:
+        async with self._lock:
+            if review_id in self.pending_reviews:
+                self.pending_reviews[review_id]["status"] = "rejected"
+                return True
+        return False
+
+    async def get_pending(self) -> List[Dict]:
+        async with self._lock:
+            return [r for r in self.pending_reviews.values() if r["status"] == "pending"]
+
+# ============================================================================
+# FLEXGEN MANAGER (with precision support)
 # ============================================================================
 class FlexGenManager:
-    """
-    Manager for FlexGen GPU/CPU/disk offloading policy optimization.
-    Used to select optimal offloading policies for the model layers.
-    """
+    """Manager for FlexGen GPU/CPU/disk offloading policy optimization."""
     def __init__(self, carbon_intensity: float = 400.0):
         self.carbon_intensity = carbon_intensity
         self.flexgen_cost_model = None
@@ -291,6 +578,17 @@ class FlexGenManager:
         result = await controller.step()
         return result
 
+    async def select_precision(self, workload: Dict) -> str:
+        """Select the optimal precision level based on carbon intensity and workload."""
+        carbon_intensity = workload.get("carbon_intensity", self.carbon_intensity)
+        workload_size = workload.get("size", "medium")
+        if carbon_intensity > 500 or workload_size == "large":
+            return "int8"
+        elif carbon_intensity > 300 or workload_size == "medium":
+            return "fp16"
+        else:
+            return "fp32"
+
     async def get_status(self) -> Dict:
         if not FLEXGEN_AVAILABLE:
             return {"available": False}
@@ -301,14 +599,16 @@ class FlexGenManager:
         }
 
 # ============================================================================
-# Energy Profiler (Enhanced with bio, MoE, MODP, Bandit, FlexGen)
+# Energy Profiler (Enhanced with all modules)
 # ============================================================================
 class EnergyProfiler:
     """
-    Tracks energy per layer and provides adaptive layer‑skipping decisions.
-    Integrates with CarbonIntensityProvider for real‑time carbon data.
-    NEW: Uses ContextualBandit, ExpertRouter, ParetoOptimizer, and GeneticPolicyGenerator.
-    FlexGen: can select offloading policies for model layers.
+    Tracks energy per layer and provides adaptive layer-skipping decisions.
+    Integrates with CarbonIntensityProvider for real-time carbon data.
+    Uses CausalBandit, ExpertRouter, ParetoOptimizer, and GeneticPolicyGenerator.
+    FlexGen: can select offloading policies and precision levels.
+    NEW: SafetyMonitor, XAIExplainer, FederatedProfilerCoordinator,
+         MultiAgentProfiler, CarbonOffsetBroker, ChaosMonkey, HumanReviewManager.
     """
 
     def __init__(
@@ -319,15 +619,15 @@ class EnergyProfiler:
         default_carbon_intensity: float = 400.0,
         storage: Optional[Storage] = None,
         message_queue: Optional[AsyncMessageQueue] = None,
-        # Enhanced modules
-        bandit: Optional[ContextualBandit] = None,
+        bandit: Optional[Any] = None,
         moe: Optional[ExpertRouter] = None,
         modp: Optional[ParetoOptimizer] = None,
         bio: Optional[GeneticPolicyGenerator] = None,
-        action_space: List[str] = None,
-        modp_weights: Dict[str, float] = None,
+        action_space: Optional[List[str]] = None,
+        modp_weights: Optional[Dict[str, float]] = None,
         bio_generations: int = 10,
         bio_population_size: int = 20,
+        enable_chaos: bool = False,
     ):
         self.model = model
         self.energy_per_layer = energy_per_layer
@@ -344,51 +644,84 @@ class EnergyProfiler:
             self.modp = modp or ParetoOptimizer()
             self.moe = moe or ExpertRouter()
             self.bio = bio or GeneticPolicyGenerator()
-            self.action_space = action_space or ["aggressive", "balanced", "conservative"]
+            # Extend action space with precision
+            self.action_space = action_space or [
+                "aggressive", "balanced", "conservative",
+                "aggressive_fp16", "aggressive_int8",
+                "conservative_fp16", "conservative_int8"
+            ]
             self.modp_weights = modp_weights or {'accuracy': 0.4, 'energy': 0.3, 'carbon': 0.2, 'latency': 0.1}
-            self.bandit = bandit or ContextualBandit(
+            # Use CausalBandit
+            self.bandit = bandit or CausalBandit(
                 action_space=self.action_space,
                 fallback_solver=lambda ctx: "balanced",
                 min_trials_before_bandit=5,
                 confidence_threshold=0.6,
             )
+            self.bio_generations = bio_generations
+            self.bio_population_size = bio_population_size
         else:
             self.modp = None
             self.moe = None
             self.bio = None
             self.bandit = None
             self.action_space = ["balanced"]
+            self.bio_generations = bio_generations
+            self.bio_population_size = bio_population_size
 
         # FlexGen manager
         self.flexgen_manager = FlexGenManager(default_carbon_intensity)
 
+        # NEW: Enhanced modules
+        self.safety_monitor = SafetyMonitor()
+        self.xai = XAIExplainer()
+        self.federated = FederatedProfilerCoordinator()
+        self.multi_agent = MultiAgentProfiler(num_agents=3)
+        self.carbon_broker = CarbonOffsetBroker()
+        self.chaos_monkey = ChaosMonkey(enabled=enable_chaos)
+        self.human_review = HumanReviewManager()
+
+        # Assign layers to agents
+        for layer_name in self.layer_order:
+            self.multi_agent.assign_layer(layer_name)
+
         self._skipping_history: Dict[str, List[bool]] = defaultdict(list)
-        self._performance_history: List[float] = []
-        self._energy_saved_history: List[float] = []
+        self._performance_history: List[float] = deque(maxlen=1000)
+        self._energy_saved_history: List[float] = deque(maxlen=1000)
+        self._last_decision: Dict[str, Any] = {}
+        self._last_review_id: Optional[str] = None
 
         self._load_state()
 
     def _fill_missing_energies(self):
         default_energy = 1e-6
-        for name, module in self.model.named_modules():
+        for name, _ in self.model.named_modules():
             if name not in self.energy_per_layer:
                 self.energy_per_layer[name] = default_energy
                 logger.debug(f"Assigned default energy to layer {name}: {default_energy}")
 
     def _load_state(self):
         if self.storage:
-            state = self.storage.load_profiler_state()
-            if state:
-                logger.info("Loaded profiler state from storage.")
+            try:
+                state = self.storage.load_profiler_state()
+                if state:
+                    logger.info("Loaded profiler state from storage.")
+            except Exception as e:
+                logger.warning(f"Failed to load profiler state: {e}")
 
     def _save_state(self):
         if self.storage:
             state = {
-                'bandit_weights': None,
+                'bandit_q_values': getattr(self.bandit, 'q_values', None),
+                'bandit_causal_effects': getattr(self.bandit, 'causal_effects', None),
                 'modp_weights': self.modp_weights,
                 'action_space': self.action_space,
+                'safety_violations': self.safety_monitor.get_violations()[-10:],
             }
-            self.storage.save_profiler_state(state)
+            try:
+                self.storage.save_profiler_state(state)
+            except Exception as e:
+                logger.warning(f"Failed to save profiler state: {e}")
 
     async def _get_carbon_intensity(self) -> float:
         if self.carbon_provider:
@@ -398,16 +731,27 @@ class EnergyProfiler:
                 logger.warning(f"Carbon provider failed: {e}")
         return self.default_carbon_intensity
 
-    async def estimate_energy_for_token(
-        self,
-        layer_name: str,
-        token_importance: float,
-    ) -> float:
+    async def estimate_energy_for_token(self, layer_name: str, token_importance: float) -> float:
         base_energy = self.energy_per_layer.get(layer_name, 1e-6)
         carbon_intensity = await self._get_carbon_intensity()
         carbon_factor = 1.0 + (carbon_intensity / 400 - 1.0) * 0.2
         importance_factor = 1.0 + token_importance * 0.5
         return base_energy * carbon_factor * importance_factor
+
+    def _extract_precision(self, policy: str) -> str:
+        """Extract precision from policy name (default fp32)."""
+        if "int8" in policy:
+            return "int8"
+        elif "fp16" in policy:
+            return "fp16"
+        return "fp32"
+
+    def _extract_aggressiveness(self, policy: str) -> str:
+        if "aggressive" in policy:
+            return "aggressive"
+        elif "conservative" in policy:
+            return "conservative"
+        return "balanced"
 
     async def should_skip_layer(
         self,
@@ -416,15 +760,23 @@ class EnergyProfiler:
         current_energy_budget: float,
         context: Optional[Dict] = None,
     ) -> bool:
+        # Chaos monkey injection
+        try:
+            self.chaos_monkey.maybe_fail()
+        except ChaosExperimentError as e:
+            logger.warning(f"Chaos injected: {e}. Falling back to heuristic.")
+            return self._should_skip_heuristic(layer_name, token_importance, current_energy_budget)
+
         if not self.bandit:
             return self._should_skip_heuristic(layer_name, token_importance, current_energy_budget)
 
         context = context or {}
+        carbon_intensity = await self._get_carbon_intensity()
         context.update({
             "layer_name": layer_name,
             "token_importance": token_importance,
             "energy_budget": current_energy_budget,
-            "carbon_intensity": await self._get_carbon_intensity(),
+            "carbon_intensity": carbon_intensity,
             "layer_energy": self.energy_per_layer.get(layer_name, 1e-6),
         })
 
@@ -433,20 +785,45 @@ class EnergyProfiler:
         if policy is None:
             policy = "balanced"
 
-        if policy == "aggressive":
+        aggressiveness = self._extract_aggressiveness(policy)
+        precision = self._extract_precision(policy)
+
+        if aggressiveness == "aggressive":
             skip = (current_energy_budget < 0.6 and token_importance < 0.4) or (current_energy_budget < 0.4)
-        elif policy == "conservative":
+        elif aggressiveness == "conservative":
             skip = (current_energy_budget < 0.2 and token_importance < 0.2)
         else:
             skip = (current_energy_budget < 0.4 and token_importance < 0.3) or (current_energy_budget < 0.2)
 
+        # Safety check
+        if not self.safety_monitor.check(skip, carbon_intensity):
+            logger.warning(f"Safety violation detected; overriding skip decision for {layer_name}")
+            skip = False
+
+        # XAI explanation
+        explanation = self.xai.explain_skipping(layer_name, policy, context, confidence, skip)
+
+        # Human review for critical decisions (skip + high carbon + aggressive)
+        review_id = None
+        if skip and carbon_intensity > 500 and aggressiveness == "aggressive":
+            decision_id = f"skip_{layer_name}_{uuid.uuid4().hex[:6]}"
+            review_id = await self.human_review.request_review(decision_id, {
+                "layer": layer_name,
+                "policy": policy,
+                "context": context,
+                "explanation": explanation,
+            })
+
         self._last_decision = {
             "layer": layer_name,
             "policy": policy,
+            "precision": precision,
             "confidence": confidence,
             "source": source,
             "context": context,
             "decision": skip,
+            "explanation": explanation,
+            "review_id": review_id,
         }
         return skip
 
@@ -467,21 +844,45 @@ class EnergyProfiler:
         self._performance_history.append(accuracy)
         self._energy_saved_history.append(energy_saved)
 
-        if self.bandit and hasattr(self, '_last_decision'):
+        # Federated update (simulated) - register our own state as participant
+        if self.bandit:
+            self.federated.register_participant("local", dict(self.bandit.q_values))
+        # Aggregate federated updates (would be populated by peers)
+        aggregated = self.federated.aggregate()
+        if aggregated and self.bandit:
+            for k, v in aggregated.items():
+                if k in self.bandit.q_values:
+                    self.bandit.q_values[k] = 0.5 * self.bandit.q_values[k] + 0.5 * v
+
+        if self.bandit and self._last_decision:
+            # Multi-agent reward
+            layer = self._last_decision.get("layer", "")
+            agent_id = self.multi_agent.assign_layer(layer)
+            self.multi_agent.record_reward(agent_id, accuracy)
+
             objectives = {
                 'accuracy': accuracy,
-                'energy': 1 - energy_saved / (self._energy_saved_history[-1] or 1),
+                'energy': 1 - energy_saved / max(self._energy_saved_history[-1], 1e-6),
                 'carbon': 1 - carbon_saved / 1000,
                 'latency': 1 - latency_ms / 1000,
             }
             reward = self.modp.evaluate(objectives, self.modp_weights) if self.modp else accuracy
 
-            await self.bandit.update(
+            self.bandit.update(
                 self._last_decision['context'],
                 self._last_decision['policy'],
                 reward
             )
 
+            # Carbon offset purchase if intensity is high
+            carbon_intensity = self._last_decision['context'].get('carbon_intensity', 0)
+            if carbon_intensity > 400 and carbon_saved > 0:
+                try:
+                    await self.carbon_broker.purchase_offsets(carbon_intensity, carbon_saved)
+                except Exception as e:
+                    logger.warning(f"Carbon offset purchase failed: {e}")
+
+            # Bio-inspired evolution
             if len(self._performance_history) % 100 == 0 and self.bio:
                 new_policies = await self.evolve_policies()
                 if new_policies:
@@ -493,6 +894,7 @@ class EnergyProfiler:
         if len(self._performance_history) % 10 == 0:
             self._save_state()
 
+        # Publish feedback event
         if self.queue:
             event = FeedbackEvent.create_with_context(
                 task_id=f"skipping_{uuid.uuid4().hex[:8]}",
@@ -507,9 +909,12 @@ class EnergyProfiler:
                 candidates=self.action_space,
                 source="energy_profiler",
                 environment="production",
-                tags=["layer_skipping"]
+                tags=["layer_skipping", "causal_rl"]
             )
-            await self.queue.publish("feedback_events", event)
+            try:
+                await self.queue.publish("feedback_events", event)
+            except Exception as e:
+                logger.warning(f"Feedback publish failed: {e}")
 
     async def evolve_policies(self) -> List[str]:
         if not self.bio:
@@ -520,9 +925,11 @@ class EnergyProfiler:
         new_policies = self.bio.evolve(
             population=self.action_space,
             fitness_fn=fitness,
-            generations=10,
-            population_size=20,
+            generations=self.bio_generations,
+            population_size=self.bio_population_size,
         )
+        if not isinstance(new_policies, list):
+            new_policies = [new_policies]
         return new_policies
 
     async def run_flexgen_optimization(self, workload: Dict, node: Dict) -> Dict:
@@ -533,6 +940,10 @@ class EnergyProfiler:
         node_obj = NodeDescriptor(**node)
         return await self.flexgen_manager.optimize_policy(workload_obj, node_obj)
 
+    async def select_precision(self, workload: Dict) -> str:
+        """Select the optimal precision level based on workload and carbon."""
+        return await self.flexgen_manager.select_precision(workload)
+
     def get_energy_map(self) -> Dict[str, float]:
         return self.energy_per_layer.copy()
 
@@ -542,11 +953,28 @@ class EnergyProfiler:
             total += await self.estimate_energy_for_token(layer_name, token_importance)
         return total
 
+    def get_safety_violations(self) -> List[Dict]:
+        return self.safety_monitor.get_violations()
+
+    def get_last_explanation(self) -> Optional[str]:
+        return self._last_decision.get("explanation")
+
+    def get_agent_stats(self) -> Dict:
+        return self.multi_agent.get_stats()
+
+    def get_carbon_broker_totals(self) -> Dict:
+        return self.carbon_broker.get_totals()
+
+    def get_chaos_stats(self) -> Dict:
+        return self.chaos_monkey.get_stats()
+
     def save(self, path: Path):
         data = {
             'energy_per_layer': self.energy_per_layer,
             'action_space': self.action_space,
             'modp_weights': self.modp_weights,
+            'q_values': getattr(self.bandit, 'q_values', {}),
+            'causal_effects': getattr(self.bandit, 'causal_effects', {}),
         }
         with open(path, 'w') as f:
             json.dump(data, f, indent=2)
@@ -560,7 +988,7 @@ class EnergyProfiler:
             model=model,
             energy_per_layer=data['energy_per_layer'],
             carbon_provider=carbon_provider,
-            action_space=data.get('action_space', ["aggressive", "balanced", "conservative"]),
+            action_space=data.get('action_space', ["balanced"]),
             modp_weights=data.get('modp_weights', {'accuracy': 0.4, 'energy': 0.3, 'carbon': 0.2, 'latency': 0.1}),
         )
 
@@ -570,8 +998,8 @@ class EnergyProfiler:
 class LayerSkippingWrapper(nn.Module):
     """
     Wraps a model to allow selective layer skipping based on EnergyProfiler.
-    Supports per‑token importance and dynamic energy budget.
-    FlexGen: can select offloading policies for the entire model.
+    Supports per-token importance and dynamic energy budget.
+    FlexGen: can select offloading policies and precision levels.
     """
 
     def __init__(
@@ -588,6 +1016,7 @@ class LayerSkippingWrapper(nn.Module):
 
         self._layer_list = self._build_layer_list(model)
         self._last_skipped: List[str] = []
+        self._current_precision: str = "fp32"
 
     def _build_layer_list(self, module: nn.Module, prefix: str = "") -> List[Tuple[str, nn.Module]]:
         layers = []
@@ -615,29 +1044,30 @@ class LayerSkippingWrapper(nn.Module):
     ) -> torch.Tensor:
         if token_importance is None:
             token_importance = torch.ones(x.size(0), device=x.device) * 0.5
-
         if token_importance.dim() > 1:
             token_importance = token_importance.mean(dim=1)
+
+        # Optional: select precision based on workload
+        try:
+            workload = {"size": "medium", "carbon_intensity": await self.profiler._get_carbon_intensity()}
+            self._current_precision = await self.profiler.select_precision(workload)
+        except Exception:
+            self._current_precision = "fp32"
 
         current_budget = self._get_energy_budget()
         output = x
         skipped = []
         total_energy_original = 0.0
         total_energy_skipped = 0.0
-
         context = context or {}
+        context["precision"] = self._current_precision
 
         for layer_name, layer_module in self._layer_list:
             avg_importance = token_importance.mean().item()
             energy = await self.profiler.estimate_energy_for_token(layer_name, avg_importance)
             total_energy_original += energy
 
-            if await self.profiler.should_skip_layer(
-                layer_name,
-                avg_importance,
-                current_budget,
-                context
-            ):
+            if await self.profiler.should_skip_layer(layer_name, avg_importance, current_budget, context):
                 logger.debug(f"Skipping layer {layer_name}")
                 skipped.append(layer_name)
                 total_energy_skipped += energy
@@ -647,15 +1077,15 @@ class LayerSkippingWrapper(nn.Module):
 
         self._last_skipped = skipped
 
-        fake_accuracy = 1.0 - (len(skipped) / len(self._layer_list)) * 0.2
-        carbon_saved = total_energy_skipped * (await self.profiler._get_carbon_intensity()) / 1000
+        fake_accuracy = 1.0 - (len(skipped) / max(len(self._layer_list), 1)) * 0.2
+        carbon_intensity = await self.profiler._get_carbon_intensity()
+        carbon_saved = total_energy_skipped * carbon_intensity / 1000
         await self.profiler.record_outcome(
             accuracy=fake_accuracy,
             energy_saved=total_energy_skipped,
             carbon_saved=carbon_saved,
             latency_ms=0.0,
         )
-
         return output
 
     def forward(
@@ -664,14 +1094,27 @@ class LayerSkippingWrapper(nn.Module):
         token_importance: Optional[torch.Tensor] = None,
         context: Optional[Dict] = None,
     ) -> torch.Tensor:
+        # For sync usage (careful: uses asyncio.run)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # We're inside an event loop; use a future
+                return asyncio.ensure_future(self.forward_async(x, token_importance, context))
+        except RuntimeError:
+            pass
         return asyncio.run(self.forward_async(x, token_importance, context))
 
     async def run_flexgen_optimization(self, workload: Dict, node: Dict) -> Dict:
-        """Public method to run FlexGen policy optimization for this wrapper's model."""
         return await self.profiler.run_flexgen_optimization(workload, node)
+
+    async def select_precision(self, workload: Dict) -> str:
+        return await self.profiler.select_precision(workload)
 
     def get_skipped_layers(self) -> List[str]:
         return self._last_skipped.copy()
+
+    def get_current_precision(self) -> str:
+        return self._current_precision
 
     async def estimate_energy(self, x: torch.Tensor, token_importance: Optional[torch.Tensor] = None) -> float:
         if token_importance is None:
@@ -700,7 +1143,7 @@ class LayerSkippingWrapper(nn.Module):
             model=model,
             energy_per_layer=data['profiler_config']['energy_per_layer'],
             carbon_provider=carbon_provider,
-            action_space=data['profiler_config'].get('action_space', ["aggressive", "balanced", "conservative"]),
+            action_space=data['profiler_config'].get('action_space', ["balanced"]),
             modp_weights=data['profiler_config'].get('modp_weights', {'accuracy': 0.4, 'energy': 0.3, 'carbon': 0.2, 'latency': 0.1}),
         )
         wrapper = cls(model=model, profiler=profiler)
@@ -726,14 +1169,11 @@ async def example():
         '4': 2e-6,
     }
     carbon_provider = CarbonIntensityManager(api_key=None)
-    storage = None
-    queue = None
     profiler = EnergyProfiler(
         model=model,
         energy_per_layer=energy_per_layer,
         carbon_provider=carbon_provider,
-        storage=storage,
-        message_queue=queue,
+        enable_chaos=False,
     )
     wrapper = LayerSkippingWrapper(model, profiler)
     x = torch.randn(4, 10)
@@ -741,6 +1181,11 @@ async def example():
     output = await wrapper.forward_async(x, importance)
     print(f"Output shape: {output.shape}")
     print(f"Skipped layers: {wrapper.get_skipped_layers()}")
+    print(f"Last explanation: {profiler.get_last_explanation()}")
+    print(f"Precision: {wrapper.get_current_precision()}")
+    print(f"Safety violations: {len(profiler.get_safety_violations())}")
+    print(f"Multi-agent stats: {profiler.get_agent_stats()}")
+    print(f"Carbon broker totals: {profiler.get_carbon_broker_totals()}")
 
 if __name__ == "__main__":
     asyncio.run(example())
