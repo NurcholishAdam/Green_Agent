@@ -3967,9 +3967,9 @@ All ten enhancements are now complete, self-contained, and integrated with the
 MOPD pipeline described in this document. To deploy, copy each code block into the
 corresponding file in your `enhancements/modp/` folder, or run `concatenate.py`
 for a single-file distribution.
-```
 
----
+
+
 
 ## Summary of Enhancements Applied to `MOPD.md`
 
