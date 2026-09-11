@@ -1,4 +1,4 @@
-```markdown
+
 # MOPD (Multi-Teacher On-Policy Distillation) Integration — Enhanced v17.0.0
 
 This document describes the MOPD reporting and integration points in the Green_Agent
