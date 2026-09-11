@@ -303,3 +303,265 @@ class MOPDOrchestratorV17:
             "carbon_price": self.carbon_market.last_price,
             "federated_rounds": self.federated.rounds,
         }
+
+-- 1. Quantum-Distillation
+CREATE TABLE IF NOT EXISTS teacher_superpositions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id TEXT, teacher_id TEXT, teacher_weight REAL,
+    temperature REAL, amplitude REAL, kl_divergence REAL, timestamp TEXT);
+
+-- 2. Causal RL
+CREATE TABLE IF NOT EXISTS causal_graph (
+    edge_id TEXT PRIMARY KEY, source TEXT, target TEXT,
+    weight REAL, confidence REAL, timestamp TEXT);
+CREATE TABLE IF NOT EXISTS causal_experiments (
+    exp_id TEXT PRIMARY KEY, treatment TEXT, outcome TEXT,
+    ate REAL, samples INTEGER, method TEXT, timestamp TEXT);
+CREATE TABLE IF NOT EXISTS causal_interventions (
+    intervention_id TEXT PRIMARY KEY, node TEXT, do_value TEXT,
+    observed_outcome TEXT, counterfactual_json TEXT, timestamp TEXT);
+
+-- 3. Federated Green Learning
+CREATE TABLE IF NOT EXISTS federated_weights (
+    instance_id TEXT, model_id TEXT, weights BLOB,
+    weight_norm REAL, round_id INTEGER, timestamp TEXT,
+    PRIMARY KEY (instance_id, model_id));
+
+-- 4. Multi-Agent
+CREATE TABLE IF NOT EXISTS agent_registry (
+    agent_id TEXT PRIMARY KEY, role TEXT, reputation REAL,
+    utilities TEXT, capabilities TEXT, created_at TEXT, last_updated TEXT);
+CREATE TABLE IF NOT EXISTS agent_messages (
+    message_id TEXT PRIMARY KEY, topic TEXT, sender TEXT,
+    recipient TEXT, payload TEXT, timestamp TEXT);
+
+-- 5. Temporal Logic
+CREATE TABLE IF NOT EXISTS temporal_rules (
+    rule_id TEXT PRIMARY KEY, formula TEXT, operator TEXT,
+    severity TEXT, description TEXT, window_seconds REAL,
+    created_at TEXT, active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS temporal_trace (
+    step INTEGER PRIMARY KEY AUTOINCREMENT, state TEXT,
+    context TEXT, timestamp TEXT);
+CREATE TABLE IF NOT EXISTS temporal_violations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, rule_id TEXT, formula TEXT,
+    step INTEGER, state TEXT, severity TEXT,
+    approved INTEGER, resolved_at TEXT, timestamp TEXT);
+
+-- 6. XAI
+CREATE TABLE IF NOT EXISTS xai_explanations (
+    explanation_id TEXT PRIMARY KEY, decision_id TEXT, method TEXT,
+    decision_label TEXT, features TEXT, attributions TEXT,
+    natural_language TEXT, timestamp TEXT);
+CREATE TABLE IF NOT EXISTS xai_feature_importance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, explanation_id TEXT,
+    feature_name TEXT, importance REAL, rank INTEGER);
+
+-- 7. Adaptive Precision
+CREATE TABLE IF NOT EXISTS precision_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, from_p TEXT, to_p TEXT,
+    reason TEXT, energy_saved_wh REAL, accuracy_delta REAL, timestamp TEXT);
+
+-- 8. Carbon Markets / REC
+CREATE TABLE IF NOT EXISTS carbon_credit_prices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, price_usd REAL,
+    currency TEXT, source TEXT, region TEXT, timestamp TEXT);
+CREATE TABLE IF NOT EXISTS rec_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, mwh REAL, price_per_mwh REAL,
+    source TEXT, certificate_id TEXT, region TEXT,
+    retired INTEGER DEFAULT 0, timestamp TEXT);
+CREATE TABLE IF NOT EXISTS net_zero_matches (
+    match_id TEXT PRIMARY KEY, workload_kwh REAL, intensity REAL,
+    action TEXT, carbon_kg REAL, offset_cost_usd REAL,
+    credit_price_usd REAL, timestamp TEXT);
+
+-- 9. Chaos Testing
+CREATE TABLE IF NOT EXISTS chaos_experiments (
+    experiment_id TEXT PRIMARY KEY, name TEXT, fault_type TEXT,
+    blast_radius REAL, steady_before INTEGER, steady_after INTEGER,
+    status TEXT, duration_ms REAL, timestamp TEXT);
+
+-- 10. HITL
+CREATE TABLE IF NOT EXISTS hitl_approval_queue (
+    request_id TEXT PRIMARY KEY, rule_id TEXT, state TEXT,
+    severity TEXT, status TEXT, created_at TEXT, resolved_at TEXT);
+CREATE TABLE IF NOT EXISTS active_learning_samples (
+    sample_id TEXT PRIMARY KEY, model_id TEXT, strategy TEXT,
+    uncertainty REAL, selected_for_review INTEGER,
+    user_label TEXT, reviewed_at TEXT, timestamp TEXT);
+
+-- Supporting tables
+CREATE TABLE IF NOT EXISTS bio_inspired_runs (
+    run_id TEXT PRIMARY KEY, algorithm TEXT, problem_id TEXT,
+    parameters TEXT, best_solution TEXT, best_fitness REAL, timestamp TEXT);
+CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id TEXT PRIMARY KEY, weights TEXT, updated_at REAL);
+
+class Storage:
+    # 1. Quantum-Distillation
+    def save_teacher_superposition(self, student_id, teacher_id, weight,
+                                   temperature, amplitude, kl):
+        self._execute("""INSERT INTO teacher_superpositions
+            (student_id, teacher_id, teacher_weight, temperature,
+             amplitude, kl_divergence, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (student_id, teacher_id, weight, temperature, amplitude, kl,
+             datetime.now().isoformat()))
+
+    # 2. Causal RL
+    def save_causal_edge(self, source, target, weight, confidence):
+        self._execute("""INSERT OR REPLACE INTO causal_graph
+            (edge_id, source, target, weight, confidence, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (f"{source}->{target}", source, target, weight, confidence,
+             datetime.now().isoformat()))
+
+    def save_causal_experiment(self, exp_id, treatment, outcome, ate,
+                               samples, method=""):
+        self._execute("""INSERT OR REPLACE INTO causal_experiments
+            (exp_id, treatment, outcome, ate, samples, method, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (exp_id, treatment, outcome, ate, samples, method,
+             datetime.now().isoformat()))
+
+    # 3. Federated
+    def save_federated_weights(self, instance_id, model_id, weights,
+                               weight_norm=0.0, round_id=0):
+        self._execute("""INSERT OR REPLACE INTO federated_weights
+            (instance_id, model_id, weights, weight_norm, round_id, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (instance_id, model_id, weights, weight_norm, round_id,
+             datetime.now().isoformat()))
+
+    def get_federated_weights(self, model_id):
+        return self._fetchall(
+            "SELECT * FROM federated_weights WHERE model_id = ?", (model_id,))
+
+    # 4. Multi-Agent
+    def save_agent(self, agent_id, role, reputation, utilities):
+        self._execute("""INSERT OR REPLACE INTO agent_registry
+            (agent_id, role, reputation, utilities, created_at, last_updated)
+            VALUES (?, ?, ?, ?, COALESCE((SELECT created_at FROM agent_registry
+                                          WHERE agent_id = ?), ?), ?)""",
+            (agent_id, role, reputation, json.dumps(utilities),
+             agent_id, datetime.now().isoformat(),
+             datetime.now().isoformat()))
+
+    def save_agent_message(self, message_id, topic, sender, recipient, payload):
+        self._execute("""INSERT OR REPLACE INTO agent_messages
+            (message_id, topic, sender, recipient, payload, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (message_id, topic, sender, recipient,
+             json.dumps(payload, default=str), datetime.now().isoformat()))
+
+    # 5. Temporal
+    def save_temporal_rule(self, rule_id, formula, operator, severity,
+                           description, window_seconds, active=True):
+        self._execute("""INSERT OR REPLACE INTO temporal_rules
+            (rule_id, formula, operator, severity, description,
+             window_seconds, created_at, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (rule_id, formula, operator, severity, description,
+             window_seconds, datetime.now().isoformat(), int(active)))
+
+    def save_temporal_trace(self, state, context=None):
+        self._execute("""INSERT INTO temporal_trace (state, context, timestamp)
+            VALUES (?, ?, ?)""",
+            (json.dumps(state, default=str),
+             json.dumps(context, default=str) if context else None,
+             datetime.now().isoformat()))
+
+    def save_temporal_violation(self, rule_id, formula, step, state,
+                                severity="warning", approved=None):
+        self._execute("""INSERT INTO temporal_violations
+            (rule_id, formula, step, state, severity, approved,
+             resolved_at, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (rule_id, formula, step, json.dumps(state, default=str),
+             severity, int(approved) if approved is not None else None,
+             None, datetime.now().isoformat()))
+
+    # 6. XAI
+    def save_xai_explanation(self, explanation_id, decision_id, method,
+                             label, features, attributions, nl):
+        self._execute("""INSERT OR REPLACE INTO xai_explanations
+            (explanation_id, decision_id, method, decision_label,
+             features, attributions, natural_language, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (explanation_id, decision_id, method, label,
+             json.dumps(features, default=str),
+             json.dumps(attributions, default=str),
+             nl, datetime.now().isoformat()))
+        for name, val in (attributions or {}).items():
+            self._execute("""INSERT INTO xai_feature_importance
+                (explanation_id, feature_name, importance, rank)
+                VALUES (?, ?, ?, ?)""",
+                (explanation_id, str(name), float(val), 0))
+
+    # 7. Precision
+    def save_precision_switch(self, from_p, to_p, reason,
+                              saved_wh=0.0, acc_delta=0.0):
+        self._execute("""INSERT INTO precision_history
+            (from_p, to_p, reason, energy_saved_wh, accuracy_delta, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (from_p, to_p, reason, saved_wh, acc_delta,
+             datetime.now().isoformat()))
+
+    # 8. Carbon / REC
+    def save_credit_price(self, price_usd, currency="USD",
+                          source="oracle", region="global"):
+        self._execute("""INSERT INTO carbon_credit_prices
+            (price_usd, currency, source, region, timestamp)
+            VALUES (?, ?, ?, ?, ?)""",
+            (price_usd, currency, source, region,
+             datetime.now().isoformat()))
+
+    def save_rec(self, mwh, price_per_mwh, source,
+                 certificate_id="", region="global", retired=False):
+        self._execute("""INSERT INTO rec_ledger
+            (mwh, price_per_mwh, source, certificate_id, region,
+             retired, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (mwh, price_per_mwh, source, certificate_id, region,
+             int(retired), datetime.now().isoformat()))
+
+    def get_rec_balance(self):
+        row = self._fetchone("SELECT COALESCE(SUM(mwh), 0) AS s FROM rec_ledger")
+        return float(row["s"]) if row else 0.0
+
+    def save_net_zero_match(self, match_id, workload_kwh, intensity, action,
+                            carbon_kg, offset_cost, credit_price):
+        self._execute("""INSERT OR REPLACE INTO net_zero_matches
+            (match_id, workload_kwh, intensity, action, carbon_kg,
+             offset_cost_usd, credit_price_usd, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (match_id, workload_kwh, intensity, action, carbon_kg,
+             offset_cost, credit_price, datetime.now().isoformat()))
+
+    # 9. Chaos
+    def save_chaos_experiment(self, experiment_id, name, fault_type,
+                              blast_radius, steady_before, steady_after,
+                              status, duration_ms=0.0):
+        self._execute("""INSERT OR REPLACE INTO chaos_experiments
+            (experiment_id, name, fault_type, blast_radius,
+             steady_before, steady_after, status, duration_ms, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (experiment_id, name, fault_type, blast_radius,
+             int(steady_before), int(steady_after), status, duration_ms,
+             datetime.now().isoformat()))
+
+    # 10. HITL
+    def enqueue_hitl_request(self, request_id, rule_id, state,
+                             severity="critical"):
+        self._execute("""INSERT OR REPLACE INTO hitl_approval_queue
+            (request_id, rule_id, state, severity, status,
+             created_at, resolved_at)
+            VALUES (?, ?, ?, ?, 'pending', ?, NULL)""",
+            (request_id, rule_id, json.dumps(state, default=str),
+             severity, datetime.now().isoformat()))
+
+    def resolve_hitl_request(self, request_id, status="approved"):
+        self._execute("""UPDATE hitl_approval_queue
+            SET status = ?, resolved_at = ? WHERE request_id = ?""",
+            (status, datetime.now().isoformat(), request_id))
+
