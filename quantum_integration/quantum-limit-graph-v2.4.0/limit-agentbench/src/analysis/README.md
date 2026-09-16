@@ -1,6 +1,6 @@
 # `analysis/README.md`
 
-```markdown
+
 # Analysis Module
 
 **Version**: 5.0.0
