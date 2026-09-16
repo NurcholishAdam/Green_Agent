@@ -1,22 +1,125 @@
-# Requirements for Analysis Module
-# Install with: pip install -r requirements_analysis.txt
+# Requirements for the Green Agent analysis module
+# =================================================
+#
+# Install with:
+#     pip install -r requirements_analysis.txt
+#
+# Python 3.10+ required (uses PEP 604 unions, PEP 585 generics).
+#
+# --------------------------------------------------------------------
+# Dependency groups
+# --------------------------------------------------------------------
+# - core         : always needed to import the analysis modules
+# - telemetry    : system-introspective modules (self_monitor, metrics)
+# - policy       : YAML policy loading
+# - energy       : real energy measurement via codecarbon (optional)
+# - viz          : Pareto visualizer (plotly + pandas)
+# - test         : pytest and friends
+# - dev          : formatters, linters, type checkers
+#
+# Each group is separated for clarity. A production deployment should
+# install only the groups it needs:
+#
+#     pip install "numpy>=1.24,<3.0" "psutil>=5.9,<7.0" "PyYAML>=6.0,<7.0"
+#
+# --------------------------------------------------------------------
 
-# Core dependencies (already in Green_Agent)
-numpy>=1.24.0
-logging
 
-# Testing
-pytest>=7.4.0
-pytest-cov>=4.1.0
+# ====================================================================
+# core — required to import the analysis package
+# ====================================================================
+# numpy is used by legacy modules (pareto_analyzer, extended_pareto_analyzer).
+# The enhanced complexity_analyzer and green_score use only the stdlib.
+# If you have fully migrated to the enhanced modules, numpy can be omitted.
+numpy>=1.24.0,<3.0.0
 
-# Optional: Visualization (for plotting Pareto frontiers)
-matplotlib>=3.7.0
-plotly>=5.14.0
 
-# Optional: Data export
-pandas>=2.0.0
+# ====================================================================
+# telemetry — introspective resource monitoring
+# ====================================================================
+# psutil is used by:
+#   - self_monitor.py       (SelfMonitor.snapshot)
+#   - metrics_collector.py  (MetricsCollector._read_memory)
+# The enhanced versions degrade gracefully if psutil is missing, but
+# memory and CPU metrics are lost. Include it in production.
+psutil>=5.9.0,<7.0.0
 
-# Development
-black>=23.0.0  # Code formatting
-flake8>=6.0.0  # Linting
-mypy>=1.4.0    # Type checking
+
+# ====================================================================
+# policy — YAML policy loading
+# ====================================================================
+# PyYAML is used by:
+#   - policy_loader.py      (yaml.safe_load)
+# The enhanced loader returns an invalid policy with a clear error if
+# PyYAML is missing, but the loader is otherwise useless.
+# NOTE: use `safe_load` only — never `yaml.load`, which is unsafe.
+PyYAML>=6.0.0,<7.0.0
+
+
+# ====================================================================
+# energy — real energy measurement (OPTIONAL)
+# ====================================================================
+# codecarbon provides real power draw measurement. If absent, the
+# enhanced energy_meter.py falls back to a configurable constant
+# (default 5 W) and marks every reading as `simulated=True`.
+#
+# Uncomment to install:
+# codecarbon>=2.3.0,<3.0.0
+
+
+# ====================================================================
+# viz — Pareto visualization (OPTIONAL)
+# ====================================================================
+# plotly and pandas are used by pareto_visualizer.py only. They are
+# not needed for the analysis pipeline itself.
+#
+# Uncomment to install:
+# plotly>=5.14.0,<7.0.0
+# pandas>=2.0.0,<3.0.0
+#
+# matplotlib is not used by any module in the analysis folder. Kept
+# here only as an optional install for downstream notebooks.
+# matplotlib>=3.7.0,<4.0.0
+
+
+# ====================================================================
+# test — required to run the analysis test suite
+# ====================================================================
+# pytest and pytest-asyncio are required to run async tests. Without
+# pytest-asyncio, `async def test_*` functions are silently skipped.
+pytest>=7.4.0,<9.0.0
+pytest-asyncio>=0.21.0,<1.0.0
+pytest-cov>=4.1.0,<6.0.0
+
+# requests and prometheus_client are required by:
+#   - test_graph_metrics_exporter.py
+#   - test_graph_metrics_exporter_helium.py
+requests>=2.31.0,<3.0.0
+prometheus_client>=0.19.0,<1.0.0
+
+
+# ====================================================================
+# dev — formatting, linting, type checking (OPTIONAL)
+# ====================================================================
+# These are only needed for contributors. Do not install in production.
+#
+# Uncomment to install:
+# black>=23.0.0,<25.0.0
+# flake8>=6.0.0,<8.0.0
+# mypy>=1.4.0,<2.0.0
+
+
+# ====================================================================
+# What's NOT here and why
+# ====================================================================
+# logging  — part of the Python standard library since 2.3. It is not
+#            a PyPI package and listing it here breaks `pip install`.
+#            The original file included it; this has been removed.
+#
+# asyncio  — also stdlib. Not a PyPI package.
+#
+# json     — stdlib.
+#
+# dataclasses — stdlib since Python 3.7.
+#
+# typing   — stdlib.
