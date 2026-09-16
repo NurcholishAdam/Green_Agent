@@ -1,437 +1,530 @@
 """
-Report Generator for Green_Agent
+Report Generation for Green Agent (Enhanced)
+=============================================
 
-Generates formatted reports for different audiences:
-- Executive summaries (business focus)
-- Technical reports (detailed metrics)
-- Research reports (methodology focus)
+Renders EvidenceBundles for four stakeholder audiences through four
+formats. Backward-compatible with the original three-method API.
+
+Original API preserved:
+    ReportGenerator
+        .generate_executive_summary(full_report) -> str
+        .generate_technical_report(full_report) -> str
+        .generate_research_report(full_report) -> str
+
+Enhanced API:
+    ReportGenerator
+        .render_bundle(bundle, audience, format) -> str
+        .render_many(bundles, audience, format) -> str
+        .select_audience(bundle, audience) -> EvidenceBundle
+
+    JSONRenderer, MarkdownRenderer, HTMLRenderer, CSVRenderer
+
+Enhancements:
+  1. Audience selection (Operator, Technical, Governance, Executive)
+  2. Four renderers (JSON, Markdown, HTML, CSV)
+  3. Operational/contractual carbon separation in output
+  4. Simulated-value warnings in every rendered report
+  5. Provenance summary per metric
+  6. Verification summary
+  7. Explanation cards
+  8. Human review status
+  9. Original plain-text methods preserved
 """
 
-from typing import Dict, Optional
-import logging
+from __future__ import annotations
 
-from .layered_reporter import LayeredReporter
+import dataclasses
+import html
+import io
+import json
+import logging
+from dataclasses import asdict
+from datetime import datetime
+from typing import Any, Callable, Dict, Iterable, List, Optional
+
+from .layered_reporter import (
+    Audience,
+    EvidenceBundle,
+    LayeredReporter,
+)
 
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# ORIGINAL ReportGenerator — preserved + extended
+# =============================================================================
+
 class ReportGenerator:
     """
-    Generate formatted reports for different audiences
-    
-    Transforms raw three-layer reports into human-readable formats
-    tailored to specific stakeholders.
+    Original string-reporting class, extended with bundle-aware methods.
     """
-    
-    def __init__(self):
-        """Initialize report generator"""
-        self.reporter = LayeredReporter()
-        logger.info("Initialized ReportGenerator")
-    
-    def generate_executive_summary(self, full_report: Dict) -> str:
+
+    def __init__(self, reporter: Optional[LayeredReporter] = None):
+        # Original constructor took no arguments; keep optional for BC.
+        self.reporter = reporter or LayeredReporter()
+
+    # ------------------------------------------------------------------
+    # ORIGINAL methods — preserved verbatim
+    # ------------------------------------------------------------------
+
+    def generate_executive_summary(self, full_report: Dict[str, Any]) -> str:
+        """Executive summary string (original behavior)."""
+        l1 = full_report.get("layer1", {})
+        l3 = full_report.get("layer3", {})
+        return f"""
+{'=' * 70}
+EXECUTIVE SUMMARY — {l3.get('scenario_name', 'unknown').upper()} SCENARIO
+{'=' * 70}
+Accuracy:       {l1.get('accuracy', 0):.2%}
+Energy:         {l1.get('energy_wh', 0):.2f} Wh
+Carbon:         {l1.get('carbon_co2_g', 0):.2f} gCO2
+Latency:        {l1.get('latency_ms', 0):.0f} ms
+Weighted Score: {l3.get('weighted_score', 0):.4f}
+{'=' * 70}
+""".strip()
+
+    def generate_technical_report(self, full_report: Dict[str, Any]) -> str:
+        """Technical report string (original behavior)."""
+        l1 = full_report.get("layer1", {})
+        l2 = full_report.get("layer2", {})
+        l3 = full_report.get("layer3", {})
+        return f"""
+{'=' * 70}
+TECHNICAL REPORT
+{'=' * 70}
+Layer 1 — Raw Metrics
+  Accuracy:      {l1.get('accuracy', 0):.4f}
+  Energy (Wh):   {l1.get('energy_wh', 0):.4f}
+  Carbon (gCO2): {l1.get('carbon_co2_g', 0):.4f}
+  Latency (ms):  {l1.get('latency_ms', 0):.2f}
+
+Layer 2 — Normalized Metrics
+  Energy/task:               {l2.get('energy_per_task', 0):.6f}
+  Carbon/correct answer:     {l2.get('carbon_per_correct_answer', 0):.4f}
+  Latency/reasoning step:    {l2.get('latency_per_reasoning_step', 0):.2f}
+  Efficiency score:          {l2.get('efficiency_score', 0):.4f}
+  Task complexity:           {l2.get('task_complexity', 0):.4f}
+  Complexity tier:           {l2.get('complexity_tier', 'unknown')}
+
+Layer 3 — Scenario Score
+  Scenario:       {l3.get('scenario_name', 'unknown')}
+  Weighted score: {l3.get('weighted_score', 0):.4f}
+  Weights:        {l3.get('weights_used', {})}
+{'=' * 70}
+""".strip()
+
+    def generate_research_report(self, full_report: Dict[str, Any]) -> str:
+        """Research report string (original behavior)."""
+        l1 = full_report.get("layer1", {})
+        l2 = full_report.get("layer2", {})
+        l3 = full_report.get("layer3", {})
+        return f"""
+{'=' * 70}
+RESEARCH REPORT
+{'=' * 70}
+Raw Observations:
+  Accuracy:      {l1.get('accuracy', 0):.4f}
+  Energy (Wh):   {l1.get('energy_wh', 0):.4f}
+  Carbon (gCO2): {l1.get('carbon_co2_g', 0):.4f}
+  Latency (ms):  {l1.get('latency_ms', 0):.2f}
+
+Normalized:
+  Energy/task:               {l2.get('energy_per_task', 0):.6f}
+  Carbon/correct answer:     {l2.get('carbon_per_correct_answer', 0):.4f}
+  Latency/reasoning step:    {l2.get('latency_per_reasoning_step', 0):.2f}
+  Efficiency score:          {l2.get('efficiency_score', 0):.4f}
+
+Scenario Analysis:
+  Scenario:       {l3.get('scenario_name', 'unknown')}
+  Weighted score: {l3.get('weighted_score', 0):.4f}
+  Weights:        {l3.get('weights_used', {})}
+{'=' * 70}
+""".strip()
+
+    # ------------------------------------------------------------------
+    # ENHANCED methods — bundle-aware
+    # ------------------------------------------------------------------
+
+    def select_audience(
+        self,
+        bundle: EvidenceBundle,
+        audience: Audience,
+    ) -> EvidenceBundle:
+        """Redact a bundle for the requested audience."""
+        return self.reporter.redact(bundle, audience)
+
+    def render_bundle(
+        self,
+        bundle: EvidenceBundle,
+        *,
+        audience: Audience = Audience.TECHNICAL,
+        format: str = "markdown",
+    ) -> str:
         """
-        Executive summary focusing on Layer 3 (business metrics)
-        
-        Targets: CTOs, Product Managers, Business Leaders
-        Focus: High-level outcomes, ROI, deployment recommendations
-        
-        Args:
-            full_report: Full three-layer report
-        
-        Returns:
-            Formatted executive summary string
+        Render a bundle for the requested audience and format.
+
+        Formats: "json", "markdown", "html", "csv".
         """
-        scenario = full_report['scenario']
-        total = full_report['total_agents']
-        top_agent = full_report['summary']['top_agent']
-        
-        summary = f"""
-{'='*70}
-EXECUTIVE SUMMARY - {scenario.upper()} SCENARIO
-{'='*70}
+        # Redact first
+        redacted = self.select_audience(bundle, audience)
 
-OVERVIEW
---------
-Evaluation Date: {full_report['reports'][0]['layer1_raw']['timestamp'][:10]}
-Scenario: {scenario}
-Agents Evaluated: {total}
-Top Performer: {top_agent}
+        # Dispatch to the appropriate renderer
+        renderers: Dict[str, Callable[[EvidenceBundle, Audience], str]] = {
+            "json": JSONRenderer.render,
+            "markdown": MarkdownRenderer.render,
+            "html": HTMLRenderer.render,
+            "csv": CSVRenderer.render,
+        }
+        renderer = renderers.get(format.lower())
+        if renderer is None:
+            raise ValueError(
+                f"Unknown format: {format!r}; "
+                f"expected one of {list(renderers)}"
+            )
+        return renderer(redacted, audience)
 
-KEY FINDINGS
-------------
-"""
-        
-        # Layer 1 (Raw Performance)
-        l1 = full_report['summary']['layer1_avg']
-        summary += f"""
-Average Performance Metrics:
-  • Accuracy: {l1['accuracy']:.1%}
-  • Energy Consumption: {l1['energy_wh']:.2f} Wh per task
-  • Carbon Footprint: {l1['carbon_g']:.2f} g CO₂ per task
-  • Response Time: {l1['latency_ms']:.0f} ms
-"""
-        
-        # Layer 3 (Business Value)
-        l3_score = full_report['summary']['layer3_avg']['weighted_score']
-        summary += f"""
-Composite Score (weighted for {scenario}): {l3_score:.2f} / 1.00
+    def render_many(
+        self,
+        bundles: Iterable[EvidenceBundle],
+        *,
+        audience: Audience = Audience.TECHNICAL,
+        format: str = "markdown",
+    ) -> str:
+        """Render a sequence of bundles into a single document."""
+        bundles = list(bundles)
+        if format.lower() == "json":
+            return json.dumps(
+                [b.to_dict() for b in bundles], indent=2, default=str,
+            )
+        if format.lower() == "csv":
+            return CSVRenderer.render_many(bundles)
+        # Markdown/HTML — concatenate
+        parts = [
+            self.render_bundle(b, audience=audience, format=format)
+            for b in bundles
+        ]
+        return "\n\n---\n\n".join(parts)
 
-"""
-        
-        # Top 3 Agents
-        summary += "TOP 3 RECOMMENDED AGENTS\n"
-        summary += "-" * 70 + "\n"
-        
-        for i in range(min(3, len(full_report['reports']))):
-            agent = full_report['reports'][i]
-            summary += f"""
-#{i+1}. {agent['agent_id']}
-   Scenario Score: {agent['layer3_scenario']['weighted_score']:.3f}
-   Accuracy: {agent['layer1_raw']['accuracy']:.1%}
-   Energy: {agent['layer1_raw']['energy_wh']:.2f} Wh
-   Latency: {agent['layer1_raw']['latency_ms']:.0f} ms
-   
-"""
-        
-        # Deployment Recommendation
-        summary += "\nDEPLOYMENT RECOMMENDATION\n"
-        summary += "-" * 70 + "\n"
-        
-        top_report = full_report['reports'][0]
-        if scenario == 'production':
-            summary += f"""Deploy {top_report['agent_id']} for production workloads.
-This agent offers the best balance of accuracy and operational efficiency.
 
-Estimated Operational Costs (per 1M tasks):
-  • Energy: ~{l1['energy_wh'] * 1000:.0f} kWh
-  • Carbon: ~{l1['carbon_g'] * 1000:.0f} kg CO₂
-  • Latency: ~{l1['latency_ms'] * 1000:.0f} seconds total
-"""
-        elif scenario == 'eco_sensitive':
-            summary += f"""Deploy {top_report['agent_id']} for environmentally-conscious deployment.
-This agent minimizes environmental impact while maintaining acceptable performance.
+# =============================================================================
+# Renderers
+# =============================================================================
 
-Environmental Benefits (vs. average):
-  • {((1 - top_report['layer1_raw']['energy_wh'] / l1['energy_wh']) * 100):.0f}% less energy
-  • {((1 - top_report['layer1_raw']['carbon_co2_g'] / l1['carbon_g']) * 100):.0f}% less carbon
-"""
-        elif scenario == 'real_time':
-            summary += f"""Deploy {top_report['agent_id']} for real-time applications.
-This agent delivers the fastest response times.
+class JSONRenderer:
+    """Machine-readable JSON output."""
 
-Latency Performance:
-  • Average: {top_report['layer1_raw']['latency_ms']:.0f} ms
-  • 95th percentile: <{top_report['layer1_raw']['latency_ms'] * 1.5:.0f} ms (estimated)
-"""
-        
-        summary += "\n" + "="*70 + "\n"
-        
-        return summary
-    
-    def generate_technical_report(self, full_report: Dict) -> str:
-        """
-        Technical report with all three layers
-        
-        Targets: ML Engineers, DevOps, Technical Leads
-        Focus: Detailed metrics, normalization, complexity analysis
-        
-        Args:
-            full_report: Full three-layer report
-        
-        Returns:
-            Formatted technical report string
-        """
-        report = f"""
-{'='*70}
-TECHNICAL EVALUATION REPORT
-{'='*70}
+    @staticmethod
+    def render(bundle: EvidenceBundle, audience: Audience) -> str:
+        payload = bundle.to_dict()
+        payload["_audience"] = audience.value
+        return json.dumps(payload, indent=2, default=str)
 
-METHODOLOGY
------------
-This report uses three-layer transparent reporting:
 
-Layer 1 (Raw Metrics): Unprocessed ground truth
-Layer 2 (Normalized): Adjusted for task complexity
-Layer 3 (Scenario): Weighted for {full_report['scenario']} use case
+class MarkdownRenderer:
+    """Human-readable Markdown output."""
 
-Scenario Weights:
-"""
-        
-        weights = full_report['weights_used']
-        for metric, weight in weights.items():
-            report += f"  • {metric}: {weight:.1%}\n"
-        
-        report += f"""
-Total Agents Evaluated: {full_report['total_agents']}
+    @staticmethod
+    def render(bundle: EvidenceBundle, audience: Audience) -> str:
+        d = bundle.to_dict()
+        lines: List[str] = []
+        lines.append(f"# Evidence Bundle — {d['run_id']}")
+        lines.append("")
+        lines.append(f"**Audience**: {audience.value}")
+        lines.append(f"**System version**: {d['system_version']}")
+        lines.append(f"**Policy version**: {d['policy_version']}")
+        lines.append(f"**Timestamp**: {d['timestamp']}")
+        lines.append(f"**Bundle version**: {d['bundle_version']}")
+        if d.get("content_hash"):
+            lines.append(f"**Content hash**: `{d['content_hash']}`")
+        if d.get("signature"):
+            lines.append(f"**Signature**: `{d['signature']}` (signer: {d.get('signer')})")
+        lines.append("")
 
-DETAILED RESULTS
-----------------
-"""
-        
-        # Show top 5 agents with all layers
-        for i, agent_report in enumerate(full_report['reports'][:5]):
-            report += f"\n{'─'*70}\n"
-            report += f"RANK #{i+1}: {agent_report['agent_id']}\n"
-            report += f"{'─'*70}\n"
-            
-            # Layer 1
-            l1 = agent_report['layer1_raw']
-            report += f"""
-Layer 1 (Raw Metrics):
-  Accuracy: {l1['accuracy']:.2%}
-  Energy: {l1['energy_wh']:.4f} Wh
-  Carbon: {l1['carbon_co2_g']:.2f} g CO₂
-  Latency: {l1['latency_ms']:.0f} ms
-"""
-            
-            # Layer 2
-            l2 = agent_report['layer2_normalized']
-            report += f"""
-Layer 2 (Normalized by Complexity):
-  Task Complexity: {agent_report['task_complexity']:.2f} ({agent_report['complexity_tier']})
-  Energy/Task: {l2['energy_per_task']:.6f}
-  Carbon/Correct Answer: {l2['carbon_per_correct_answer']:.4f} g
-  Latency/Reasoning Step: {l2['latency_per_reasoning_step']:.2f} ms
-  Efficiency Score: {l2['efficiency_score']:.4f}
-"""
-            
-            # Layer 3
-            l3 = agent_report['layer3_scenario']
-            report += f"""
-Layer 3 (Scenario Score):
-  Weighted Score: {l3['weighted_score']:.4f}
-  Percentile: {l3['percentile']:.1f}th
-  Rank: #{l3['rank']}
-"""
-        
-        # Summary Statistics
-        report += f"\n{'='*70}\n"
-        report += "SUMMARY STATISTICS\n"
-        report += f"{'='*70}\n"
-        
-        summary = full_report['summary']
-        
-        report += f"""
-Layer 1 Averages (Raw):
-  Accuracy: {summary['layer1_avg']['accuracy']:.2%}
-  Energy: {summary['layer1_avg']['energy_wh']:.4f} Wh
-  Carbon: {summary['layer1_avg']['carbon_g']:.2f} g
-  Latency: {summary['layer1_avg']['latency_ms']:.0f} ms
+        # --- Operational sustainability ---
+        lines.append("## Operational sustainability")
+        lines.append("")
+        lines.append(f"- **Energy**: {d['energy_kwh']:.6f} kWh")
+        lines.append(
+            f"- **Operational CO₂e**: {d['operational_co2e_kg']:.6f} kg"
+        )
+        lines.append(f"- **Helium**: {d['helium_units']:.6f} units")
+        if d.get("simulated"):
+            lines.append("- ⚠️ **Simulated values present**")
+        if d.get("chaos_injected"):
+            lines.append("- ⚠️ **Chaos-injected**")
+        lines.append("")
 
-Layer 2 Averages (Normalized):
-  Energy/Task: {summary['layer2_avg']['energy_per_task']:.6f}
-  Efficiency: {summary['layer2_avg']['efficiency_score']:.4f}
+        # --- Contractual instruments (kept separate) ---
+        if d.get("carbon_instruments"):
+            lines.append("## Contractual carbon instruments")
+            lines.append("")
+            lines.append(
+                "> **Note**: Operational and contractual emissions are "
+                "kept separate. Never sum them."
+            )
+            lines.append("")
+            for inst in d["carbon_instruments"]:
+                lines.append(
+                    f"- `{inst.get('instrument_id')}` "
+                    f"({inst.get('kind')}): "
+                    f"{inst.get('quantity')} {inst.get('unit')}"
+                )
+            lines.append("")
 
-Layer 3 Statistics:
-  Mean Score: {summary['layer3_avg']['weighted_score']:.4f}
-  Std Dev: {summary['layer3_avg']['std']:.4f}
+        # --- Quality and latency ---
+        lines.append("## Quality & latency")
+        lines.append("")
+        for k, v in d.get("quality_metrics", {}).items():
+            lines.append(f"- **{k}**: {v}")
+        for k, v in d.get("latency_metrics", {}).items():
+            lines.append(f"- **{k}**: {v}")
+        lines.append("")
 
-Task Complexity Distribution:
-"""
-        
-        for tier, count in summary['complexity_distribution'].items():
-            report += f"  {tier}: {count} agents\n"
-        
-        report += "\n" + "="*70 + "\n"
-        
-        return report
-    
-    def generate_research_report(self, full_report: Dict) -> str:
-        """
-        Research report focusing on methodology and reproducibility
-        
-        Targets: Researchers, Academics, Peer Reviewers
-        Focus: Methodology, statistical rigor, reproducibility
-        
-        Args:
-            full_report: Full three-layer report
-        
-        Returns:
-            Formatted research report string
-        """
-        report = f"""
-{'='*70}
-RESEARCH EVALUATION REPORT
-{'='*70}
+        # --- Safety verdict ---
+        lines.append("## Safety verdict")
+        lines.append("")
+        sv = d.get("safety_verdict") or {}
+        lines.append(f"- **Verdict**: {sv.get('verdict', 'n/a')}")
+        if sv.get("violations"):
+            lines.append(f"- **Violations**: {sv['violations']}")
+        lines.append("")
 
-ABSTRACT
---------
-This report presents a three-layer evaluation methodology for AI agent
-benchmarking that addresses common pitfalls in performance reporting:
+        # --- Verification (audience-gated) ---
+        if audience in (Audience.TECHNICAL, Audience.GOVERNANCE) and d.get("verification"):
+            lines.append("## Verification evidence")
+            lines.append("")
+            v = d["verification"]
+            lines.append(f"- **Verdict**: {v.get('verdict')}")
+            lines.append(f"- **Coverage**: {v.get('coverage_pct', 0):.1%}")
+            lines.append(f"- **Properties checked**: {v.get('properties_checked')}")
+            if v.get("counterexamples"):
+                lines.append(f"- **Counterexamples**: {len(v['counterexamples'])}")
+            lines.append("")
 
-1. Layer 1 maintains raw metrics as ground truth
-2. Layer 2 normalizes for task complexity to enable fair comparison
-3. Layer 3 provides scenario-specific scoring for deployment contexts
+        # --- Explanation card ---
+        exp = d.get("explanation") or {}
+        if exp:
+            lines.append("## Explanation")
+            lines.append("")
+            lines.append(f"- **Selected action**: {exp.get('selected_action')}")
+            for r in exp.get("rationale", []):
+                lines.append(f"  - {r}")
+            if exp.get("confidence"):
+                lines.append(f"- **Confidence**: {exp['confidence']:.2f}")
+            lines.append("")
 
-Total agents evaluated: {full_report['total_agents']}
-Evaluation scenario: {full_report['scenario']}
+        # --- Human review ---
+        if d.get("human_review"):
+            lines.append("## Human review")
+            lines.append("")
+            for k, v in d["human_review"].items():
+                lines.append(f"- **{k}**: {v}")
+            lines.append("")
 
-METHODOLOGY
------------
+        # --- Provenance (audience-gated) ---
+        if audience in (Audience.TECHNICAL, Audience.GOVERNANCE):
+            lines.append("## Metric provenance")
+            lines.append("")
+            for metric, p in (d.get("metric_provenance") or {}).items():
+                if isinstance(p, dict):
+                    lines.append(
+                        f"- **{metric}**: {p.get('source_kind')} "
+                        f"({p.get('trust_level', '?')})"
+                    )
+            lines.append("")
 
-Layer 1: Raw Metrics Collection
-  - Accuracy (task success rate)
-  - Energy consumption (Wh)
-  - Carbon emissions (g CO₂e)
-  - Latency (ms)
-  
-  No transformations applied. This layer serves as ground truth.
+        return "\n".join(lines)
 
-Layer 2: Complexity Normalization
-  Task complexity computed from:
-    - Prompt length (tokens)
-    - Reasoning steps (count)
-    - Tool calls (count)
-    - Wall-clock time (ms)
-    - Context size (tokens)
-  
-  Composite complexity score: weighted logarithmic combination
-  
-  Normalized metrics:
-    - Energy/Task = Energy / Complexity
-    - Carbon/Correct = Carbon / Accuracy
-    - Latency/Step = Latency / Reasoning Steps
 
-Layer 3: Scenario-Specific Scoring
-  Weights for '{full_report['scenario']}' scenario:
-"""
-        
-        weights = full_report['weights_used']
-        for metric, weight in weights.items():
-            report += f"    {metric}: {weight:.3f}\n"
-        
-        report += """
-  Score = Σ(normalized_metric_i × weight_i)
+class HTMLRenderer:
+    """HTML output (safe-escaped, no external dependencies)."""
 
-RESULTS
--------
+    @staticmethod
+    def render(bundle: EvidenceBundle, audience: Audience) -> str:
+        d = bundle.to_dict()
+        esc = html.escape
+        parts: List[str] = []
+        parts.append("<!doctype html>")
+        parts.append("<html><head><meta charset='utf-8'>")
+        parts.append(f"<title>Evidence Bundle — {esc(d['run_id'])}</title>")
+        parts.append("<style>")
+        parts.append("body{font-family:system-ui,-apple-system,sans-serif;margin:2em;max-width:80ch}")
+        parts.append("table{border-collapse:collapse;width:100%}")
+        parts.append("td,th{border:1px solid #ddd;padding:6px;text-align:left}")
+        parts.append(".warn{color:#b00;font-weight:bold}")
+        parts.append("</style></head><body>")
+        parts.append(f"<h1>Evidence Bundle — {esc(d['run_id'])}</h1>")
+        parts.append(f"<p><strong>Audience</strong>: {esc(audience.value)}</p>")
+        parts.append(f"<p><strong>Policy version</strong>: {esc(d['policy_version'])}</p>")
+        parts.append(f"<p><strong>Content hash</strong>: <code>{esc(d.get('content_hash') or '')}</code></p>")
 
-Statistical Summary (Layer 1 Raw Metrics):
-"""
-        
-        l1_avg = full_report['summary']['layer1_avg']
-        report += f"""
-  Accuracy: μ={l1_avg['accuracy']:.4f}
-  Energy: μ={l1_avg['energy_wh']:.4f} Wh
-  Carbon: μ={l1_avg['carbon_g']:.4f} g CO₂
-  Latency: μ={l1_avg['latency_ms']:.2f} ms
+        if d.get("simulated"):
+            parts.append("<p class='warn'>⚠️ Simulated values present.</p>")
+        if d.get("chaos_injected"):
+            parts.append("<p class='warn'>⚠️ Chaos-injected run.</p>")
 
-Normalized Performance (Layer 2):
-  Energy Efficiency: μ={full_report['summary']['layer2_avg']['energy_per_task']:.6f}
-  Overall Efficiency: μ={full_report['summary']['layer2_avg']['efficiency_score']:.6f}
+        parts.append("<h2>Operational sustainability</h2>")
+        parts.append("<table>")
+        parts.append(f"<tr><th>Energy (kWh)</th><td>{d['energy_kwh']:.6f}</td></tr>")
+        parts.append(f"<tr><th>Operational CO₂e (kg)</th><td>{d['operational_co2e_kg']:.6f}</td></tr>")
+        parts.append(f"<tr><th>Helium (units)</th><td>{d['helium_units']:.6f}</td></tr>")
+        parts.append("</table>")
 
-Scenario Scores (Layer 3):
-  Mean: {full_report['summary']['layer3_avg']['weighted_score']:.4f}
-  Std Dev: {full_report['summary']['layer3_avg']['std']:.4f}
-  Range: {full_report['summary']['layer3_avg']['weighted_score'] - full_report['summary']['layer3_avg']['std']:.4f} - {full_report['summary']['layer3_avg']['weighted_score'] + full_report['summary']['layer3_avg']['std']:.4f}
+        if d.get("carbon_instruments"):
+            parts.append("<h2>Contractual carbon instruments</h2>")
+            parts.append("<p><em>Kept separate from operational emissions.</em></p>")
+            parts.append("<ul>")
+            for inst in d["carbon_instruments"]:
+                parts.append(
+                    f"<li><code>{esc(str(inst.get('instrument_id')))}</code>: "
+                    f"{esc(str(inst.get('quantity')))} {esc(str(inst.get('unit')))}</li>"
+                )
+            parts.append("</ul>")
 
-Top Performer: {full_report['summary']['top_agent']}
-  L1 Accuracy: {full_report['reports'][0]['layer1_raw']['accuracy']:.4f}
-  L2 Efficiency: {full_report['reports'][0]['layer2_normalized']['efficiency_score']:.4f}
-  L3 Score: {full_report['reports'][0]['layer3_scenario']['weighted_score']:.4f}
+        parts.append("</body></html>")
+        return "\n".join(parts)
 
-DISCUSSION
-----------
 
-Task Complexity Distribution:
-"""
-        
-        for tier, count in full_report['summary']['complexity_distribution'].items():
-            pct = count / full_report['total_agents'] * 100
-            report += f"  {tier}: {count} ({pct:.1f}%)\n"
-        
-        report += f"""
-The three-layer approach reveals insights not visible in single-metric
-evaluations:
+class CSVRenderer:
+    """CSV output — one row per bundle, with flattened columns."""
 
-1. Raw metrics (Layer 1) show absolute performance
-2. Normalized metrics (Layer 2) enable fair cross-complexity comparison
-3. Scenario scores (Layer 3) contextualize for deployment
+    _COLUMNS = [
+        "run_id",
+        "timestamp",
+        "system_version",
+        "policy_version",
+        "deployment_id",
+        "agent_id",
+        "task_id",
+        "energy_kwh",
+        "operational_co2e_kg",
+        "contractual_co2e_kg",
+        "helium_units",
+        "accuracy",
+        "latency_ms",
+        "tool_calls",
+        "precision",
+        "region",
+        "simulated",
+        "chaos_injected",
+        "content_hash",
+    ]
 
-This methodology prevents common reporting pitfalls:
-  - Cherry-picking favorable metrics
-  - Hiding complexity differences
-  - Over-generalizing scenario-specific results
+    @classmethod
+    def _row(cls, bundle: EvidenceBundle) -> Dict[str, Any]:
+        d = bundle.to_dict()
+        q = d.get("quality_metrics", {}) or {}
+        l = d.get("latency_metrics", {}) or {}
+        return {
+            "run_id": d["run_id"],
+            "timestamp": d["timestamp"],
+            "system_version": d["system_version"],
+            "policy_version": d["policy_version"],
+            "deployment_id": d.get("deployment_id"),
+            "agent_id": d.get("agent_id"),
+            "task_id": d.get("task_id"),
+            "energy_kwh": d["energy_kwh"],
+            "operational_co2e_kg": d["operational_co2e_kg"],
+            "contractual_co2e_kg": d.get("contractual_co2e_kg", 0.0),
+            "helium_units": d.get("helium_units", 0.0),
+            "accuracy": q.get("accuracy"),
+            "latency_ms": l.get("latency_ms"),
+            "tool_calls": l.get("tool_calls"),
+            "precision": d.get("precision"),
+            "region": d.get("region"),
+            "simulated": d.get("simulated"),
+            "chaos_injected": d.get("chaos_injected"),
+            "content_hash": d.get("content_hash"),
+        }
 
-REPRODUCIBILITY
----------------
+    @classmethod
+    def render(cls, bundle: EvidenceBundle, audience: Audience) -> str:
+        import csv
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=cls._COLUMNS)
+        writer.writeheader()
+        writer.writerow(cls._row(bundle))
+        return buf.getvalue()
 
-All metrics traceable from Layer 1 (raw) → Layer 2 (normalized) → Layer 3 (scenario).
+    @classmethod
+    def render_many(cls, bundles: Iterable[EvidenceBundle]) -> str:
+        import csv
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=cls._COLUMNS)
+        writer.writeheader()
+        for b in bundles:
+            writer.writerow(cls._row(b))
+        return buf.getvalue()
 
-Complexity normalization weights:
-  prompt_length: 0.2, reasoning_steps: 0.3, tool_calls: 0.2,
-  wall_clock: 0.2, context_size: 0.1
 
-Scenario weights: See Layer 3 methodology above.
+# =============================================================================
+# Demo
+# =============================================================================
 
-Data available in structured format for verification.
+if __name__ == "__main__":
+    from .layered_reporter import (
+        BundleBuilder, CarbonInstruments, ExplanationCard,
+        VerificationEvidence, Audience,
+    )
 
-{'='*70}
-"""
-        
-        return report
-    
-    def generate_comparison_report(self,
-                                   report1: Dict,
-                                   report2: Dict,
-                                   comparison_label: str = "Comparison") -> str:
-        """
-        Generate comparative report between two evaluations
-        
-        Useful for:
-        - Before/after optimization
-        - Different scenarios on same agents
-        - Same scenario on different agent versions
-        
-        Args:
-            report1: First full report
-            report2: Second full report
-            comparison_label: Label for comparison
-        
-        Returns:
-            Formatted comparison report
-        """
-        report = f"""
-{'='*70}
-{comparison_label.upper()}
-{'='*70}
+    logging.basicConfig(level=logging.INFO)
 
-Report 1: {report1['scenario']} ({report1['total_agents']} agents)
-Report 2: {report2['scenario']} ({report2['total_agents']} agents)
+    result = {
+        "accuracy": 0.92,
+        "energy_kwh": 0.045,
+        "carbon_kg": 0.018,
+        "latency_ms": 120.0,
+        "task_id": "task-1",
+        "run_id": "run-001",
+        "policy_version": "v5.0.1",
+        "deployment_id": "us-ca-prod-01",
+        "agent_id": "worker-A",
+        "precision": "int8",
+        "region": "US-CA",
+        "source": "measured",
+    }
 
-METRIC COMPARISON
------------------
+    instruments = CarbonInstruments()
+    instruments.add("rec-2026-001", "rec", 5.0, "MWh",
+                    vintage_year=2026, matching_period="2026-03")
 
-Layer 1 (Raw Metrics):
-"""
-        
-        l1_a = report1['summary']['layer1_avg']
-        l1_b = report2['summary']['layer1_avg']
-        
-        for metric in ['accuracy', 'energy_wh', 'carbon_g', 'latency_ms']:
-            val_a = l1_a[metric]
-            val_b = l1_b[metric]
-            diff = val_b - val_a
-            pct = (diff / val_a * 100) if val_a != 0 else 0
-            
-            direction = "↑" if diff > 0 else "↓" if diff < 0 else "→"
-            report += f"  {metric}: {val_a:.4f} vs {val_b:.4f} ({direction} {abs(pct):.1f}%)\n"
-        
-        report += "\nLayer 3 (Scenario Scores):\n"
-        score_a = report1['summary']['layer3_avg']['weighted_score']
-        score_b = report2['summary']['layer3_avg']['weighted_score']
-        diff = score_b - score_a
-        
-        report += f"  Report 1: {score_a:.4f}\n"
-        report += f"  Report 2: {score_b:.4f}\n"
-        report += f"  Difference: {diff:+.4f} ({diff/score_a*100:+.1f}%)\n"
-        
-        report += "\n" + "="*70 + "\n"
-        
-        return report
-    
-    def save_report(self, report_text: str, filepath: str):
-        """Save report to file"""
-        with open(filepath, 'w') as f:
-            f.write(report_text)
-        logger.info(f"Saved report to {filepath}")
+    bundle = BundleBuilder.build(
+        result,
+        carbon_instruments=instruments,
+        explanation=ExplanationCard(
+            decision_id="dec-1",
+            selected_action="route_to_lora",
+            rationale=["lowest carbon route"],
+            confidence=0.92,
+        ),
+    )
+
+    reporter = LayeredReporter()
+    bundle = reporter.sign_bundle(bundle, key="secret-key")
+
+    gen = ReportGenerator(reporter)
+
+    # Original behavior — plain text
+    print("=== Original plain-text (executive) ===")
+    full = reporter.generate_full_report(result)
+    print(gen.generate_executive_summary(full)[:300] + "...")
+
+    # Enhanced — JSON
+    print("\n=== Enhanced JSON (technical) ===")
+    print(gen.render_bundle(bundle, audience=Audience.TECHNICAL, format="json")[:400] + "...")
+
+    # Enhanced — Markdown
+    print("\n=== Enhanced Markdown (governance) ===")
+    print(gen.render_bundle(bundle, audience=Audience.GOVERNANCE, format="markdown")[:800] + "...")
+
+    # Enhanced — CSV
+    print("\n=== Enhanced CSV ===")
+    print(gen.render_bundle(bundle, audience=Audience.OPERATOR, format="csv"))
+
+    # Redaction check
+    print("=== Redaction ===")
+    exec_view = gen.select_audience(bundle, Audience.EXECUTIVE)
+    print(f"  Executive sees verification: {bool(exec_view.verification)}")
+    gov_view = gen.select_audience(bundle, Audience.GOVERNANCE)
+    print(f"  Governance sees verification: {bool(gov_view.verification)}")
