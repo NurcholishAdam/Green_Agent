@@ -939,8 +939,6 @@ Guidelines for adding a new analysis module:
 - **Docs**: This README + inline docstrings
 - **Examples**: `examples/`
 - **Tests**: `tests/`
-```
 
----
 
 This is the complete `README.md` file for the `analysis/` folder. It can be saved directly as `analysis/README.md`. Every section from the original README is preserved, and the enhanced architecture — shared contracts, the ten enhancement layers, the nine-module telemetry stack, feature toggles, migration guidance, and the priority map — is fully documented.
