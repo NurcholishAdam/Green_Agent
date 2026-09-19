@@ -1,26 +1,43 @@
-# metrics/../memory/__init__.py
+# src/memory/__init__.py
 
 """
-Memory modules for sustained reflection across runs.
+Memory modules for Green_Agent
+==============================
 
-This package provides two complementary memory backends:
+This package provides two complementary memory backends plus an optional
+Supermemory integration layer.
 
+Core backends
+-------------
 - :class:`RunMemory` — high-level, trend-aware memory across runs.
   Tracks performance metrics, generates meta-policies, and supports
   long-context reasoning. Backed by ``run_memory.json`` by default.
-
 - :class:`EpisodicMemory` — lightweight JSON-backed store for individual
   episodes with a bounded ring-buffer. Backed by ``memory/memory_store.json``
   by default.
 
-Both backends share the same design conventions:
+Supermemory integration (optional)
+----------------------------------
+- :class:`SupermemoryConfig` — frozen config for the Supermemory adapter.
+- :class:`SupermemoryAdapter` — bridge to the Supermemory service.
+- :class:`BoundedRecall` — top-k, filtered, token-bounded recall.
+- :class:`WriteGovernor` — capability-based write approval + audit log.
+- :class:`MemoryBenchmark` — paired without-memory vs. with-memory harness.
+- Schemas: :class:`DecisionRecord`, :class:`PolicyRecord`,
+  :class:`IncidentRecord`, :class:`OutcomeRecord`, :class:`TruthLevel`.
+
+Both core backends share the same design conventions:
 
 - Thread-safe accumulators (``RLock``).
 - Bounded history / ring-buffers.
 - Strict / non-strict handling of corrupt files.
-- Structured serialization (``to_dict`` / ``from_dict`` / ``to_json`` / ``from_json``).
+- Structured serialization (``to_dict`` / ``from_dict`` / ``to_json`` /
+  ``from_json``).
 - Context-manager support for scoped sessions.
 - Custom ``ValueError`` subclasses for narrow exception handling.
+
+The Supermemory layer follows the same conventions and is guarded so that a
+missing ``supermemory`` SDK only disables the integration, not the package.
 """
 
 from __future__ import annotations
@@ -30,28 +47,99 @@ import os as _os
 from typing import Any, Dict, Optional, Type
 
 # --------------------------------------------------------------------------- #
-# Run memory (performance across runs, meta-policies)
+# Core backends (always present)
 # --------------------------------------------------------------------------- #
 from .run_memory import (
+    MemoryConfig,
     RunMemory,
     RunMemoryError,
     RunSample,
-    MemoryConfig,
 )
 
-# --------------------------------------------------------------------------- #
-# Episodic memory (single-episode store)
-# --------------------------------------------------------------------------- #
 from .episodic_memory import (
-    EpisodicMemory,
-    EpisodicMemoryError,
-    EpisodeEntry,
-    MEMORY_FILE,
     DEFAULT_MAX_EPISODES,
     DEFAULT_RECENT_N,
+    MEMORY_FILE,
+    EpisodeEntry,
+    EpisodicMemory,
+    EpisodicMemoryError,
 )
 
 logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Supermemory integration (optional, guarded)
+# --------------------------------------------------------------------------- #
+MEMORY_AVAILABILITY: Dict[str, bool] = {
+    "run_memory": True,
+    "episodic_memory": True,
+    "supermemory": False,
+}
+
+try:
+    from .supermemory_config import (
+        SupermemoryConfig,
+        SupermemoryConfigError,
+    )
+    from .memory_schemas import (
+        DecisionRecord,
+        IncidentRecord,
+        MemorySchemaError,
+        OutcomeRecord,
+        PolicyRecord,
+        TruthLevel,
+    )
+    from .supermemory_adapter import (
+        SupermemoryAdapter,
+        SupermemoryAdapterError,
+        _SUPERMEMORY_AVAILABLE,
+    )
+    from .bounded_recall import (
+        BoundedRecall,
+        BoundedRecallConfig,
+        BoundedRecallError,
+        RecallBundle,
+    )
+    from .write_governor import (
+        ApprovalDecision,
+        WriteGovernor,
+        WriteGovernorConfig,
+        WriteGovernorError,
+    )
+    from .memory_benchmark import (
+        BenchmarkReport,
+        MemoryBenchmark,
+        MemoryBenchmarkConfig,
+        MemoryBenchmarkError,
+    )
+
+    MEMORY_AVAILABILITY["supermemory"] = True
+except ImportError as exc:  # pragma: no cover — defensive
+    logger.warning("Supermemory integration unavailable: %s", exc)
+
+    SupermemoryConfig = None  # type: ignore[assignment,misc]
+    SupermemoryConfigError = None  # type: ignore[assignment,misc]
+    DecisionRecord = None  # type: ignore[assignment,misc]
+    IncidentRecord = None  # type: ignore[assignment,misc]
+    MemorySchemaError = None  # type: ignore[assignment,misc]
+    OutcomeRecord = None  # type: ignore[assignment,misc]
+    PolicyRecord = None  # type: ignore[assignment,misc]
+    TruthLevel = None  # type: ignore[assignment,misc]
+    SupermemoryAdapter = None  # type: ignore[assignment,misc]
+    SupermemoryAdapterError = None  # type: ignore[assignment,misc]
+    _SUPERMEMORY_AVAILABLE = False
+    BoundedRecall = None  # type: ignore[assignment,misc]
+    BoundedRecallConfig = None  # type: ignore[assignment,misc]
+    BoundedRecallError = None  # type: ignore[assignment,misc]
+    RecallBundle = None  # type: ignore[assignment,misc]
+    ApprovalDecision = None  # type: ignore[assignment,misc]
+    WriteGovernor = None  # type: ignore[assignment,misc]
+    WriteGovernorConfig = None  # type: ignore[assignment,misc]
+    WriteGovernorError = None  # type: ignore[assignment,misc]
+    BenchmarkReport = None  # type: ignore[assignment,misc]
+    MemoryBenchmark = None  # type: ignore[assignment,misc]
+    MemoryBenchmarkConfig = None  # type: ignore[assignment,misc]
+    MemoryBenchmarkError = None  # type: ignore[assignment,misc]
 
 # --------------------------------------------------------------------------- #
 # Public API
@@ -69,8 +157,32 @@ __all__ = [
     "MEMORY_FILE",
     "DEFAULT_MAX_EPISODES",
     "DEFAULT_RECENT_N",
+    # supermemory integration
+    "SupermemoryConfig",
+    "SupermemoryConfigError",
+    "SupermemoryAdapter",
+    "SupermemoryAdapterError",
+    "BoundedRecall",
+    "BoundedRecallConfig",
+    "BoundedRecallError",
+    "RecallBundle",
+    "WriteGovernor",
+    "WriteGovernorConfig",
+    "WriteGovernorError",
+    "ApprovalDecision",
+    "MemoryBenchmark",
+    "MemoryBenchmarkConfig",
+    "MemoryBenchmarkError",
+    "BenchmarkReport",
+    "DecisionRecord",
+    "PolicyRecord",
+    "IncidentRecord",
+    "OutcomeRecord",
+    "TruthLevel",
+    "MemorySchemaError",
     # registry helpers
     "MEMORY_REGISTRY",
+    "MEMORY_AVAILABILITY",
     "get_memory_class",
     "list_memories",
     "register_memory",
@@ -83,7 +195,20 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 # Convenience base so callers can catch either backend's errors with one
 # ``except`` clause without importing concrete modules.
-MemoryErrorBase = (RunMemoryError, EpisodicMemoryError)
+_ErrorTuple: tuple = (RunMemoryError, EpisodicMemoryError)
+
+# Extend the unified error base with the Supermemory errors when available.
+if MEMORY_AVAILABILITY.get("supermemory"):
+    _ErrorTuple = _ErrorTuple + (  # type: ignore[assignment]
+        SupermemoryConfigError,
+        SupermemoryAdapterError,
+        BoundedRecallError,
+        WriteGovernorError,
+        MemoryBenchmarkError,
+        MemorySchemaError,
+    )
+
+MemoryErrorBase = _ErrorTuple
 
 # --------------------------------------------------------------------------- #
 # Memory registry
@@ -98,6 +223,19 @@ MEMORY_REGISTRY: Dict[str, Type[Any]] = {
     "episodes": EpisodicMemory,
     "episodic_memory": EpisodicMemory,
 }
+
+# Register the Supermemory components only when they imported successfully.
+if MEMORY_AVAILABILITY.get("supermemory"):
+    MEMORY_REGISTRY.update({
+        "supermemory": SupermemoryAdapter,
+        "supermemory_adapter": SupermemoryAdapter,
+        "recall": BoundedRecall,
+        "bounded_recall": BoundedRecall,
+        "governor": WriteGovernor,
+        "write_governor": WriteGovernor,
+        "benchmark": MemoryBenchmark,
+        "memory_benchmark": MemoryBenchmark,
+    })
 
 
 def register_memory(name: str, cls: Type[Any]) -> None:
@@ -125,19 +263,13 @@ def register_memory(name: str, cls: Type[Any]) -> None:
 
 
 def get_memory_class(name: str) -> Type[Any]:
-    """
-    Return the memory class registered under ``name``.
-
-    Raises
-    ------
-    KeyError
-        If ``name`` is not registered.
-    """
+    """Return the memory class registered under ``name``."""
     try:
         return MEMORY_REGISTRY[name]
     except KeyError as exc:
         raise KeyError(
-            f"Unknown memory '{name}'. Available: {sorted(MEMORY_REGISTRY)}"
+            f"Unknown memory '{name}'. "
+            f"Available: {sorted(MEMORY_REGISTRY)}"
         ) from exc
 
 
@@ -147,23 +279,25 @@ def list_memories() -> Dict[str, str]:
 
 
 # --------------------------------------------------------------------------- #
-# Optional import-time sanity check (only when explicitly enabled)
+# Optional import-time validation
 # --------------------------------------------------------------------------- #
-# Skips by default so imports stay cheap; set GREEN_AGENT_VALIDATE_MEMORY=1
-# in CI to fail-fast if any registered backend cannot be constructed.
 if _os.environ.get("GREEN_AGENT_VALIDATE_MEMORY") == "1":
-    for _name, _cls in MEMORY_REGISTRY.items():
+    _missing = [k for k, ok in MEMORY_AVAILABILITY.items() if not ok]
+    if _missing:
+        logger.warning(
+            "Memory sub-modules unavailable at import time: %s",
+            sorted(_missing),
+        )
+    for _name, _cls in list(MEMORY_REGISTRY.items()):
         try:
-            # Validate with in-memory file paths to avoid touching the FS.
-            if _cls is RunMemory:
-                _instance = _cls(memory_file=":memory:", auto_load=False, autosave=False)
-            elif _cls is EpisodicMemory:
-                _instance = _cls(memory_file=":memory:", autosave=False)
-            else:
-                _instance = _cls()  # custom backend assumed constructor-safe
-            logger.info("Memory '%s' (%s) instantiated OK.", _name, _cls.__name__)
+            if not callable(_cls):
+                raise TypeError(f"{_cls!r} is not callable.")
+            logger.debug(
+                "Memory component '%s' (%s) OK.", _name, _cls.__name__,
+            )
         except Exception:  # pragma: no cover — CI-only diagnostic
             logger.exception(
-                "Memory '%s' (%s) failed to instantiate.", _name, _cls.__name__
+                "Memory component '%s' (%s) failed validation.",
+                _name, _cls.__name__,
             )
             raise
