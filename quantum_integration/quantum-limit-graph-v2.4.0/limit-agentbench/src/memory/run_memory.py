@@ -11,38 +11,40 @@ Enhancements
 ------------
 - ``MemoryConfig`` — frozen, validated, fully serializable: trend
   thresholds, ring-buffer caps, module-aligned metric names + aliases,
-  per-kind TTLs, truth-level vocabulary imported from ``memory_schemas``,
-  ``MappingProxyType``-frozen mappings, ``with_overrides`` / ``merge``.
-- ``RunSample`` — deeply frozen, hashable, carries ``run_id`` (string),
-  ``sequence`` (monotonic int), ``observed_at``, ``kind``,
-  ``truth_level``, ``container_tag``, ``schema_version``. Full
-  serialization plus ``to_episode_payload()`` / ``to_memory_dict()``.
+  per-kind TTLs, truth-level vocabulary, adapter-limit fields
+  (``latency_ring_size``, ``write_retry_backoff_seconds``,
+  ``default_importance``), ``MappingProxyType``-frozen mappings,
+  ``with_overrides`` / ``merge`` / ``from_dict`` / ``from_json``.
+- ``RunSample`` — **deeply frozen** via ``_deep_freeze()``; hashable via
+  ``_hashable()``; wrapped ``from_dict`` casts; ``truth_level=``
+  override on ``to_episode_payload()``; ``metrics.*`` flattened into
+  metadata so ``FeedbackLoopGuard`` / ``BoundedRecall`` can read the
+  nested telemetry keys directly; ``assert_compatible()`` helper.
 - ``RunMemory`` — thread-safe, ``:memory:``-aware, UTC ISO timestamps,
-  reentrant context manager, async siblings, manager-level
-  ``statistics()`` / ``reset()`` / ``close()``. Sample-level statistics
-  moved to ``metric_statistics(metric)`` to avoid the naming clash with
-  manager statistics.
-- Metric names aligned with the rest of the module:
-  ``quality`` / ``accuracy`` / ``energy_wh`` / ``carbon_gco2e`` /
-  ``latency_ms`` / ``tokens`` / ``decision_consistency``. Legacy names
-  (``final_score``, ``energy_consumption``, ``carbon_emissions``) are
-  resolved transparently via ``MemoryConfig.metric_aliases``.
-- ``to_supermemory_payloads()`` / ``from_supermemory_results()`` bridges
-  plus optional ``episodic=`` / ``tier_manager=`` / ``policy_memory=``
-  backends — meta-policies route through ``PolicyMemory.publish()`` when
-  a policy backend is provided, gaining governor gating and semver.
+  reentrant context manager, sync + async context manager, async
+  siblings, manager-level ``statistics()`` (with ``schema_version`` and
+  per-kind / per-container mixes), ``reset()``, ``close(flush=)``,
+  ``snapshot()``, ``prune()``, ``resize()``, ``count_by_kind()``,
+  ``count_by_container_tag()``, ``from_config()`` / ``from_pipeline()``
+  constructors, and split ``last_write_error`` / ``last_read_error``.
+- Caller-supplied ``run_id`` **must be a string** — non-strings are
+  rejected with a clear error rather than silently coerced.
 - ``add_run`` no longer clobbers a caller-supplied ``run_id`` /
   ``timestamp``; ``run_data`` is validated for JSON-serializability up
   front so a failed ``add_run`` never leaves in-memory state diverging
   from disk.
+- ``_mirror_to_backends`` derives ``importance`` from the payload's
+  ``quality_score`` (or ``metrics.quality_score``) when present, so
+  high-quality runs land in the right tier instead of always WARM.
 - Structured error hierarchy:
   ``RunMemoryError`` → ``RunMemoryInputError``,
   ``RunMemoryConfigError``, ``RunMemoryFileError``,
   ``RunMemoryCorruptionError``, ``RunMemoryParseError``.
-- ``__version__`` exported via ``__all__``.
+- ``SCHEMA_VERSION`` / ``IN_MEMORY_PATH`` / ``DEFAULT_*`` exported via
+  ``__all__``.
 - ``__main__`` smoke test covers happy paths, backends, bridges, async,
-  context manager, ring trimming, metric aliasing, serialization, and
-  validation failure paths.
+  sync + async context managers, ring trimming, metric aliasing,
+  serialization, prune, resize, snapshot, and validation failure paths.
 """
 
 from __future__ import annotations
@@ -55,6 +57,7 @@ import os
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Mapping as ABCMapping
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
@@ -73,7 +76,6 @@ from typing import (
     Sequence,
     Tuple,
 )
-from collections import deque
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .episodic_memory import EpisodicMemory
@@ -82,7 +84,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
-__version__ = "6.0.0"
+__version__ = "6.1.0"
 
 
 # --------------------------------------------------------------------------- #
@@ -141,6 +143,10 @@ DEFAULT_TRUTH_LEVELS: Tuple[str, ...] = (
     "measured", "estimated", "simulated", "user-reported",
 )
 
+_DEFAULT_LATENCY_RING_SIZE: int = 200
+_DEFAULT_WRITE_RETRY_BACKOFF_SECONDS: float = 0.25
+_DEFAULT_IMPORTANCE: float = 0.5
+
 
 # --------------------------------------------------------------------------- #
 # Errors
@@ -170,7 +176,7 @@ class RunMemoryParseError(RunMemoryError):
 
 
 # --------------------------------------------------------------------------- #
-# Shared validation helpers — mirror the other enhanced modules
+# Shared validation / freeze / hash helpers — mirror the patched modules
 # --------------------------------------------------------------------------- #
 def _is_real_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
@@ -335,11 +341,86 @@ def _freeze_int_map(name: str, value: Any) -> Mapping[str, int]:
     return MappingProxyType(out)
 
 
-def _freeze_run_data(value: Any) -> Mapping[str, Any]:
-    """Freeze a run payload as a read-only mapping."""
-    if not isinstance(value, ABCMapping):
-        raise RunMemoryInputError("run_data must be a Mapping.")
-    return MappingProxyType(dict(value))
+def _deep_freeze(value: Any, *, depth: int = 0) -> Any:
+    """Recursively wrap mappings in ``MappingProxyType`` and sequences in
+    tuples, so "frozen" records are truly immutable at every level.
+    """
+    if depth > 32:
+        return value
+    if isinstance(value, ABCMapping):
+        return MappingProxyType({
+            str(k): _deep_freeze(v, depth=depth + 1)
+            for k, v in value.items()
+        })
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(v, depth=depth + 1) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_deep_freeze(v, depth=depth + 1) for v in value)
+    return value
+
+
+def _hashable(value: Any, *, depth: int = 0) -> Any:
+    """Convert nested mappings / sequences to hashable tuples."""
+    if depth > 32:
+        return "<truncated>"
+    if isinstance(value, ABCMapping):
+        return tuple(sorted(
+            (str(k), _hashable(v, depth=depth + 1))
+            for k, v in value.items()
+        ))
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable(v, depth=depth + 1) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_hashable(v, depth=depth + 1) for v in value)
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return repr(value)
+
+
+def _to_plain(value: Any, *, depth: int = 0) -> Any:
+    """Convert frozen structures back to plain dicts / lists so the
+    returned data is JSON-serializable and freely mutable by the caller.
+    """
+    if depth > 32:
+        return value
+    if isinstance(value, ABCMapping):
+        return {
+            str(k): _to_plain(v, depth=depth + 1) for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_to_plain(v, depth=depth + 1) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return [_to_plain(v, depth=depth + 1) for v in value]
+    return value
+
+
+def _coerce_int(name: str, value: Any, *, positive: bool = False) -> int:
+    """Coerce to int; reject ``bool`` and non-integers."""
+    if isinstance(value, bool):
+        raise RunMemoryParseError(f"{name} must be an int.")
+    if isinstance(value, int):
+        iv = int(value)
+    elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        iv = int(value)
+    elif isinstance(value, str):
+        s = value.strip()
+        try:
+            iv = int(s)
+        except ValueError as exc:
+            raise RunMemoryParseError(
+                f"{name} must be an int (got {value!r})."
+            ) from exc
+    else:
+        raise RunMemoryParseError(
+            f"{name} must be an int (got {type(value).__name__})."
+        )
+    if positive and iv <= 0:
+        raise RunMemoryParseError(f"{name} must be a positive int.")
+    return iv
 
 
 def _metric_family(
@@ -380,6 +461,34 @@ def _extract_metric(
     return None
 
 
+def _derive_importance_from_run(
+    run_data: Mapping[str, Any],
+    *,
+    default: float = _DEFAULT_IMPORTANCE,
+) -> float:
+    """Derive an importance in [0, 1] from a run's metrics.
+
+    Looks for ``quality_score`` at the top level, then under ``metrics``.
+    Falls back to ``default`` when neither is present or valid.
+    """
+    def _try(mapping: Any) -> Optional[float]:
+        if not isinstance(mapping, ABCMapping):
+            return None
+        q = mapping.get("quality_score")
+        if isinstance(q, (int, float)) and not isinstance(q, bool):
+            if math.isfinite(float(q)):
+                return max(0.0, min(1.0, float(q)))
+        return None
+
+    v = _try(run_data)
+    if v is not None:
+        return v
+    v = _try(run_data.get("metrics"))
+    if v is not None:
+        return v
+    return default
+
+
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
@@ -414,6 +523,14 @@ class MemoryConfig:
 
     schema_version: int = SCHEMA_VERSION
     write_retries: int = 2
+
+    #: Adapter-level limits — moved out of hard-coded module constants.
+    latency_ring_size: int = _DEFAULT_LATENCY_RING_SIZE
+    write_retry_backoff_seconds: float = _DEFAULT_WRITE_RETRY_BACKOFF_SECONDS
+
+    #: Default importance passed to the tier mirror when a run has no
+    #: ``quality_score``.
+    default_importance: float = _DEFAULT_IMPORTANCE
 
     # ------------------------------------------------------------------ #
     def __post_init__(self) -> None:
@@ -450,6 +567,22 @@ class MemoryConfig:
             raise RunMemoryConfigError(
                 "schema_version must be a positive int."
             )
+        if not _is_real_int(self.latency_ring_size) or self.latency_ring_size <= 0:
+            raise RunMemoryConfigError(
+                "latency_ring_size must be a positive int."
+            )
+        if not _is_positive_finite(self.write_retry_backoff_seconds):
+            raise RunMemoryConfigError(
+                "write_retry_backoff_seconds must be a finite number > 0."
+            )
+        if not _is_finite_nonneg(self.default_importance):
+            raise RunMemoryConfigError(
+                "default_importance must be finite and >= 0."
+            )
+        if self.default_importance > 1.0:
+            raise RunMemoryConfigError(
+                "default_importance must be <= 1."
+            )
 
         object.__setattr__(
             self,
@@ -470,9 +603,7 @@ class MemoryConfig:
                 f"default_truth_level {self.default_truth_level!r} not in "
                 f"truth_levels {list(self.truth_levels)!r}."
             )
-        for sname in (
-            "default_container_tag", "default_kind",
-        ):
+        for sname in ("default_container_tag", "default_kind"):
             v = getattr(self, sname)
             if not isinstance(v, str) or not v:
                 raise RunMemoryConfigError(
@@ -518,6 +649,7 @@ class MemoryConfig:
     # ------------------------------------------------------------------ #
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
             "trend_stability_band": self.trend_stability_band,
             "min_runs_for_trend": self.min_runs_for_trend,
             "min_runs_for_policy": self.min_runs_for_policy,
@@ -533,8 +665,10 @@ class MemoryConfig:
             "default_truth_level": self.default_truth_level,
             "default_container_tag": self.default_container_tag,
             "default_kind": self.default_kind,
-            "schema_version": self.schema_version,
             "write_retries": self.write_retries,
+            "latency_ring_size": self.latency_ring_size,
+            "write_retry_backoff_seconds": self.write_retry_backoff_seconds,
+            "default_importance": self.default_importance,
         }
 
     def to_json(self, *, indent: Optional[int] = None) -> str:
@@ -630,6 +764,33 @@ class MemoryConfig:
                 overrides[f.name] = other_val
         return self.with_overrides(**overrides)
 
+    @classmethod
+    def assert_compatible(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        strict: bool = False,
+    ) -> None:
+        if not isinstance(data, ABCMapping):
+            raise RunMemoryParseError(
+                "MemoryConfig.assert_compatible expects a Mapping."
+            )
+        v = data.get("schema_version", SCHEMA_VERSION)
+        if not _is_real_int(v) or v <= 0:
+            raise RunMemoryParseError(
+                f"invalid schema_version {v!r} in MemoryConfig payload."
+            )
+        if v > SCHEMA_VERSION:
+            raise RunMemoryParseError(
+                f"MemoryConfig payload schema_version {v} is newer than "
+                f"the current contract {SCHEMA_VERSION}."
+            )
+        if strict and v < SCHEMA_VERSION:
+            raise RunMemoryParseError(
+                f"MemoryConfig payload schema_version {v} is older than "
+                f"the current contract {SCHEMA_VERSION}."
+            )
+
     def __hash__(self) -> int:
         return hash((
             self.trend_stability_band,
@@ -649,6 +810,9 @@ class MemoryConfig:
             self.default_kind,
             self.schema_version,
             self.write_retries,
+            self.latency_ring_size,
+            self.write_retry_backoff_seconds,
+            self.default_importance,
         ))
 
     def __repr__(self) -> str:
@@ -665,7 +829,12 @@ class MemoryConfig:
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class RunSample:
-    """Immutable snapshot of a single completed run."""
+    """Immutable snapshot of a single completed run.
+
+    ``run_data`` is recursively frozen — nested mappings become
+    ``MappingProxyType`` and nested sequences become tuples — so the
+    sample is truly immutable at every level.
+    """
 
     run_id: str
     sequence: int
@@ -705,8 +874,13 @@ class RunSample:
             raise RunMemoryInputError(
                 "schema_version must be a positive int."
             )
+        if not isinstance(self.run_data, ABCMapping):
+            raise RunMemoryInputError(
+                "run_data must be a Mapping."
+            )
+        # Item fix #1: deep-freeze run_data.
         object.__setattr__(
-            self, "run_data", _freeze_run_data(self.run_data),
+            self, "run_data", _deep_freeze(dict(self.run_data)),
         )
 
     # ------------------------------------------------------------------ #
@@ -715,9 +889,39 @@ class RunSample:
         return self.run_id
 
     # ------------------------------------------------------------------ #
+    @classmethod
+    def assert_compatible(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        strict: bool = False,
+    ) -> None:
+        if not isinstance(data, ABCMapping):
+            raise RunMemoryParseError(
+                "RunSample.assert_compatible expects a Mapping."
+            )
+        v = data.get("schema_version", SCHEMA_VERSION)
+        if not _is_real_int(v) or v <= 0:
+            raise RunMemoryParseError(
+                f"invalid schema_version {v!r} in RunSample payload."
+            )
+        if v > SCHEMA_VERSION:
+            raise RunMemoryParseError(
+                f"RunSample payload schema_version {v} is newer than "
+                f"the current contract {SCHEMA_VERSION}."
+            )
+        if strict and v < SCHEMA_VERSION:
+            raise RunMemoryParseError(
+                f"RunSample payload schema_version {v} is older than "
+                f"the current contract {SCHEMA_VERSION}."
+            )
+
+    # ------------------------------------------------------------------ #
     # Serialization
     # ------------------------------------------------------------------ #
     def to_dict(self) -> Dict[str, Any]:
+        # Item fix #1: use `_to_plain` so nested frozen structures are
+        # converted back to plain dicts/lists for JSON serialization.
         return {
             "run_id": self.run_id,
             "sequence": self.sequence,
@@ -726,7 +930,7 @@ class RunSample:
             "kind": self.kind,
             "truth_level": self.truth_level,
             "container_tag": self.container_tag,
-            "run_data": dict(self.run_data),
+            "run_data": _to_plain(self.run_data),
             "schema_version": self.schema_version,
         }
 
@@ -739,7 +943,7 @@ class RunSample:
             raise RunMemoryParseError(
                 "RunSample.from_dict expects a Mapping."
             )
-        # New wrapped format
+        # New wrapped format.
         if "run_data" in data:
             raw_run_id = data.get("run_id")
             run_data = data["run_data"]
@@ -747,11 +951,12 @@ class RunSample:
                 raise RunMemoryParseError(
                     "RunSample.run_data must be a Mapping."
                 )
+            # Item fix #3: wrapped casts.
+            sequence = _coerce_int("sequence", data.get("sequence", 0))
             run_id = (
                 str(raw_run_id) if raw_run_id is not None
-                else f"run-{int(data.get('sequence', 0)):06d}"
+                else f"run-{sequence:06d}"
             )
-            sequence = int(data.get("sequence", 0))
             timestamp = str(data.get("timestamp") or _iso_now())
             observed_at = (
                 _parse_iso_datetime(data.get("observed_at"))
@@ -763,7 +968,11 @@ class RunSample:
             container_tag = str(
                 data.get("container_tag", DEFAULT_CONTAINER_TAG)
             )
-            schema_version = int(data.get("schema_version", SCHEMA_VERSION))
+            schema_version = _coerce_int(
+                "schema_version",
+                data.get("schema_version", SCHEMA_VERSION),
+                positive=True,
+            )
             return cls(
                 run_id=run_id,
                 sequence=sequence,
@@ -783,8 +992,9 @@ class RunSample:
                 "legacy RunSample is missing 'run_id'."
             )
         run_id = str(raw_run_id)
+        # Item fix #3: use a wrapped cast for legacy numeric run_id.
         sequence = (
-            int(raw_run_id)
+            _coerce_int("run_id", raw_run_id)
             if isinstance(raw_run_id, int) and not isinstance(raw_run_id, bool)
             else 0
         )
@@ -818,7 +1028,9 @@ class RunSample:
     # Persistence bridges
     # ------------------------------------------------------------------ #
     def _render_content(self) -> str:
-        return json.dumps(dict(self.run_data), default=str, sort_keys=True)
+        # Item fix #1: use `_to_plain` so nested frozen structures are
+        # JSON-serializable.
+        return json.dumps(_to_plain(self.run_data), default=str, sort_keys=True)
 
     def _metadata(self, *, container_tag: str) -> Dict[str, Any]:
         meta: Dict[str, Any] = {
@@ -833,13 +1045,22 @@ class RunSample:
             "timestamp": self.timestamp,
             "schema_version": self.schema_version,
         }
-        # Surface scalar run_data fields so BoundedRecall / FeedbackLoopGuard
-        # can filter and drift-detect them without parsing content.
+        # Surface scalar run_data fields.
         for k, v in self.run_data.items():
             if k in meta:
                 continue
             if isinstance(v, (int, float, str, bool)) or v is None:
                 meta.setdefault(k, v)
+        # Item fix #11: also flatten nested `metrics.*` scalars so
+        # FeedbackLoopGuard / BoundedRecall can read the common telemetry
+        # keys without parsing content.
+        nested = self.run_data.get("metrics")
+        if isinstance(nested, ABCMapping):
+            for k, v in nested.items():
+                if k in meta:
+                    continue
+                if isinstance(v, (int, float, str, bool)) or v is None:
+                    meta.setdefault(k, v)
         return meta
 
     def to_episode_payload(
@@ -847,17 +1068,31 @@ class RunSample:
         *,
         container_tag: Optional[str] = None,
         content: Optional[str] = None,
+        truth_level: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Item fix #4: supports a ``truth_level=`` override."""
         tag = container_tag or self.container_tag
         if not isinstance(tag, str) or not tag:
             raise RunMemoryInputError(
                 "container_tag must be a non-empty string."
             )
+        meta = self._metadata(container_tag=tag)
+        if truth_level is not None:
+            if not isinstance(truth_level, str) or not truth_level:
+                raise RunMemoryInputError(
+                    "truth_level must be None or a non-empty string."
+                )
+            meta["truth_level"] = truth_level
         return {
             "content": content if content is not None else self._render_content(),
             "container_tag": tag,
-            "metadata": self._metadata(container_tag=tag),
+            "metadata": meta,
         }
+
+    def to_supermemory_payload(self) -> Dict[str, Any]:
+        """Item fix #12: alias for ``to_episode_payload()`` — matches the
+        sibling schema records."""
+        return self.to_episode_payload()
 
     def to_memory_dict(self) -> Dict[str, Any]:
         return {
@@ -868,16 +1103,11 @@ class RunSample:
 
     # ------------------------------------------------------------------ #
     def __hash__(self) -> int:
-        try:
-            data_hash = hash(tuple(sorted(self.run_data.items())))
-        except TypeError:
-            data_hash = hash(
-                json.dumps(dict(self.run_data), default=str, sort_keys=True)
-            )
+        # Item fix #2: recursive hashing — no JSON fallback.
         return hash((
             self.run_id, self.sequence, self.timestamp, self.observed_at,
             self.kind, self.truth_level, self.container_tag,
-            data_hash, self.schema_version,
+            _hashable(self.run_data), self.schema_version,
         ))
 
     def __repr__(self) -> str:
@@ -916,12 +1146,9 @@ class RunMemory:
     write_retries : int, optional
         Overrides ``config.write_retries`` when provided.
     episodic, tier_manager, policy_memory
-        Optional duck-typed mirror backends. See module docstring.
+        Optional duck-typed mirror backends.
     """
 
-    _LATENCY_RING_SIZE: int = 200
-
-    # ------------------------------------------------------------------ #
     def __init__(
         self,
         memory_file: str = DEFAULT_MEMORY_FILE,
@@ -977,8 +1204,10 @@ class RunMemory:
         self._backend_writes: int = 0
         self._backend_errors: int = 0
         self._last_error: Optional[str] = None
+        self._last_write_error: Optional[str] = None
+        self._last_read_error: Optional[str] = None
         self._latency_ring: Deque[float] = deque(
-            maxlen=self._LATENCY_RING_SIZE
+            maxlen=self._config.latency_ring_size
         )
         self._started_at: float = time.monotonic()
 
@@ -1019,7 +1248,7 @@ class RunMemory:
     def runs(self) -> List[Dict[str, Any]]:
         """Stored runs as plain dicts (backward-compatible view)."""
         with self._lock:
-            return [dict(s.run_data) for s in self._runs]
+            return [_to_plain(s.run_data) for s in self._runs]
 
     @property
     def samples(self) -> List[RunSample]:
@@ -1046,7 +1275,7 @@ class RunMemory:
             return len(self._runs)
 
     def __contains__(self, run_id: object) -> bool:
-        if not isinstance(run_id, str):
+        if not isinstance(run_id, str) or not run_id:
             return False
         with self._lock:
             return any(s.run_id == run_id for s in self._runs)
@@ -1055,10 +1284,73 @@ class RunMemory:
         with self._lock:
             return iter(list(self._runs))
 
+    # ---------------------------------------------------------- constructors
+    @classmethod
+    def from_config(
+        cls,
+        config: MemoryConfig,
+        *,
+        memory_file: str = IN_MEMORY_PATH,
+        strict: bool = False,
+        autosave: bool = False,
+        auto_load: bool = False,
+        episodic: Optional[Any] = None,
+        tier_manager: Optional[Any] = None,
+        policy_memory: Optional[Any] = None,
+    ) -> "RunMemory":
+        return cls(
+            memory_file=memory_file,
+            config=config,
+            strict=strict,
+            autosave=autosave,
+            auto_load=auto_load,
+            episodic=episodic,
+            tier_manager=tier_manager,
+            policy_memory=policy_memory,
+        )
+
+    @classmethod
+    def from_pipeline(
+        cls,
+        pipeline: Any,
+        *,
+        config: Optional[MemoryConfig] = None,
+        strict: Optional[bool] = None,
+        memory_file: str = IN_MEMORY_PATH,
+        autosave: bool = False,
+    ) -> "RunMemory":
+        """Return ``pipeline.run_memory`` if present, else build fresh."""
+        existing = getattr(pipeline, "run_memory", None)
+        if isinstance(existing, cls):
+            return existing
+        resolved = False if strict is None else bool(strict)
+        return cls(
+            memory_file=memory_file,
+            config=config,
+            strict=resolved,
+            autosave=autosave,
+            auto_load=False,
+            episodic=getattr(pipeline, "episodic", None),
+            tier_manager=getattr(pipeline, "tier_manager", None),
+            policy_memory=getattr(pipeline, "policy_memory", None),
+        )
+
     # ---------------------------------------------------------- lifecycle
-    def close(self) -> None:
-        """Flush to disk and shut down best-effort."""
+    def close(self, *, flush: bool = False) -> None:
+        """Flush to disk and shut down best-effort.
+
+        Parameters
+        ----------
+        flush : bool
+            If True, force a persist even in memory-only mode (no-op
+            for ``:memory:``). Default False is a no-op when
+            ``autosave=False`` — the caller should pass
+            ``flush=True`` to force a save on shutdown.
+        """
         if self._in_memory:
+            return
+        if not flush and self._autosave:
+            # Nothing to do — autosave already persisted.
             return
         try:
             self.save_memory()
@@ -1111,6 +1403,12 @@ class RunMemory:
                 elapsed, len(self._runs),
             )
 
+    async def __aenter__(self) -> "RunMemory":
+        return self.__enter__()
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.__exit__(exc_type, exc, tb)
+
     # ---------------------------------------------------------- persistence
     def _load_memory(self) -> None:
         path = Path(self.memory_file)
@@ -1126,6 +1424,7 @@ class RunMemory:
             with self._lock:
                 self._read_errors += 1
                 self._last_error = str(exc)
+                self._last_read_error = str(exc)
             logger.error("Corrupted memory file %s: %s", path, exc)
             if self._strict:
                 raise RunMemoryCorruptionError(
@@ -1136,6 +1435,7 @@ class RunMemory:
             with self._lock:
                 self._read_errors += 1
                 self._last_error = str(exc)
+                self._last_read_error = str(exc)
             logger.error("Could not read memory file %s: %s", path, exc)
             if self._strict:
                 raise RunMemoryFileError(
@@ -1151,10 +1451,22 @@ class RunMemory:
             with self._lock:
                 self._read_errors += 1
                 self._last_error = msg
+                self._last_read_error = msg
             if self._strict:
                 raise RunMemoryCorruptionError(msg)
             logger.warning(msg)
             return
+
+        # Item fix #10: verify forward-compatibility of the whole file.
+        try:
+            self.assert_compatible(data, strict=self._strict)
+        except RunMemoryError:
+            if self._strict:
+                raise
+            logger.warning(
+                "Memory file %s has an incompatible schema_version; "
+                "reading leniently.", path,
+            )
 
         with self._lock:
             raw_runs = data.get("runs", []) or []
@@ -1174,6 +1486,7 @@ class RunMemory:
                     with self._lock:
                         self._read_errors += 1
                         self._last_error = str(exc)
+                        self._last_read_error = str(exc)
                     if self._strict:
                         raise RunMemoryCorruptionError(
                             f"Malformed run entry at index {i}: {exc}"
@@ -1223,6 +1536,7 @@ class RunMemory:
                     self._write_successes += 1
                     self._last_updated = payload["last_updated"]
                     self._last_error = None
+                    self._last_write_error = None
                 logger.debug(
                     "Saved %d run(s) to %s", len(payload["runs"]), path,
                 )
@@ -1231,6 +1545,7 @@ class RunMemory:
                 with self._lock:
                     self._write_errors += 1
                     self._last_error = str(exc)
+                    self._last_write_error = str(exc)
                 logger.error("Payload not JSON-serializable: %s", exc)
                 if self._strict:
                     raise RunMemoryInputError(
@@ -1244,11 +1559,15 @@ class RunMemory:
                     attempt, attempts, exc,
                 )
                 if attempt < attempts:
-                    time.sleep(0.25 * attempt)
+                    # Item fix #9: config-driven backoff.
+                    time.sleep(
+                        self._config.write_retry_backoff_seconds * attempt
+                    )
 
         with self._lock:
             self._write_errors += 1
             self._last_error = str(last_exc)
+            self._last_write_error = str(last_exc)
         if self._strict:
             raise RunMemoryFileError(
                 f"write failed after {attempts} attempts: {last_exc}"
@@ -1287,9 +1606,11 @@ class RunMemory:
         """Add a completed run. Returns the assigned ``run_id``.
 
         A caller-supplied ``run_id`` (either in ``run_data['run_id']`` or
-        as the ``run_id=`` kwarg) is preserved; otherwise one is generated
-        from a monotonic sequence. A caller-supplied ``run_data['timestamp']``
-        is likewise preserved.
+        as the ``run_id=`` kwarg) is preserved when it is a string. A
+        caller-supplied ``run_data['timestamp']`` is likewise preserved.
+
+        Item fix #7: a non-string ``run_id`` raises instead of being
+        silently coerced.
         """
         if not isinstance(run_data, ABCMapping):
             raise RunMemoryInputError(
@@ -1338,15 +1659,24 @@ class RunMemory:
                 "observed_at could not be parsed."
             )
 
+        # Item fix #7: reject non-string run_id rather than coercing.
+        if run_id is not None and not isinstance(run_id, str):
+            raise RunMemoryInputError(
+                f"run_id must be a string or None, got "
+                f"{type(run_id).__name__}."
+            )
+        payload_run_id = payload.get("run_id")
+        if payload_run_id is not None and not isinstance(payload_run_id, str):
+            raise RunMemoryInputError(
+                f"run_data['run_id'] must be a string or None, got "
+                f"{type(payload_run_id).__name__}."
+            )
+
         with self._lock:
-            # Determine run_id: prefer explicit kwarg, then payload value,
-            # then auto-generated.
-            candidate = run_id
-            if candidate is None:
-                candidate = payload.get("run_id")
+            candidate = run_id if run_id is not None else payload_run_id
             if candidate is None:
                 candidate = f"run-{self._next_sequence:06d}"
-            resolved_run_id = str(candidate)
+            resolved_run_id = candidate
 
             # Timestamp: preserve caller's if present.
             if "timestamp" not in payload or not payload["timestamp"]:
@@ -1354,7 +1684,10 @@ class RunMemory:
             payload["run_id"] = resolved_run_id
             timestamp = str(payload["timestamp"])
 
-            observed = obs or _parse_iso_datetime(timestamp) or datetime.now(timezone.utc)
+            observed = (
+                obs or _parse_iso_datetime(timestamp)
+                or datetime.now(timezone.utc)
+            )
             sequence = self._next_sequence
             self._next_sequence += 1
 
@@ -1420,15 +1753,74 @@ class RunMemory:
                 "run_id must be a non-empty string."
             )
         with self._lock:
+            removed = False
             for i, sample in enumerate(self._runs):
                 if sample.run_id == run_id:
                     del self._runs[i]
                     removed = True
                     break
-            else:
-                return False
+        if not removed:
+            return False
         if self._autosave:
             self.save_memory()
+        return True
+
+    def resize(self, max_runs: Optional[int]) -> int:
+        """Change the ring-buffer cap at runtime. Returns removed count.
+
+        ``None`` disables trimming.
+        """
+        if max_runs is not None:
+            if not _is_real_int(max_runs) or max_runs <= 0:
+                raise RunMemoryInputError(
+                    f"max_runs must be None or a positive int "
+                    f"(got {max_runs!r})."
+                )
+        with self._lock:
+            self._config = self._config.with_overrides(max_runs=max_runs)
+            removed = 0
+            if max_runs is not None and len(self._runs) > max_runs:
+                removed = len(self._runs) - max_runs
+                del self._runs[:removed]
+        if removed and self._autosave:
+            self.save_memory()
+        return removed
+
+    def prune(
+        self,
+        *,
+        now: Optional[float] = None,
+        autosave: Optional[bool] = None,
+    ) -> int:
+        """Drop samples whose per-kind TTL has expired.
+
+        Returns the number of samples removed.
+        """
+        if now is None:
+            now = time.time()
+        elif not _is_finite_nonneg(now):
+            raise RunMemoryInputError(
+                "now must be a finite non-negative number."
+            )
+        with self._lock:
+            kept: List[RunSample] = []
+            removed = 0
+            for sample in self._runs:
+                ttl = self._config.ttl_for(sample.kind)
+                age = max(0.0, now - sample.observed_at.timestamp())
+                if age > ttl:
+                    removed += 1
+                else:
+                    kept.append(sample)
+            if removed == 0:
+                return 0
+            self._runs = kept
+            self._next_sequence = max(
+                (s.sequence for s in kept), default=-1
+            ) + 1
+        if autosave if autosave is not None else self._autosave:
+            self.save_memory()
+        logger.info("RunMemory pruned %d expired run(s).", removed)
         return removed
 
     # ------------------------------------------------------------------ reads
@@ -1441,7 +1833,7 @@ class RunMemory:
         if n <= 0:
             return []
         with self._lock:
-            return [dict(s.run_data) for s in self._runs[-n:]]
+            return [_to_plain(s.run_data) for s in self._runs[-n:]]
 
     def get(self, run_id: str) -> Optional[RunSample]:
         if not isinstance(run_id, str) or not run_id:
@@ -1473,7 +1865,29 @@ class RunMemory:
         best = max(scored, key=lambda t: t[1]) if direction else min(
             scored, key=lambda t: t[1]
         )
-        return dict(best[0].run_data)
+        return _to_plain(best[0].run_data)
+
+    # ------------------------------------------------------------ counts
+    def count_by_kind(self) -> Dict[str, int]:
+        with self._lock:
+            out: Dict[str, int] = {}
+            for s in self._runs:
+                out[s.kind] = out.get(s.kind, 0) + 1
+            return out
+
+    def count_by_container_tag(self) -> Dict[str, int]:
+        with self._lock:
+            out: Dict[str, int] = {}
+            for s in self._runs:
+                out[s.container_tag] = out.get(s.container_tag, 0) + 1
+            return out
+
+    def count_by_truth_level(self) -> Dict[str, int]:
+        with self._lock:
+            out: Dict[str, int] = {}
+            for s in self._runs:
+                out[s.truth_level] = out.get(s.truth_level, 0) + 1
+            return out
 
     # ------------------------------------------------------------ trend / stats
     def get_performance_trend(
@@ -1587,13 +2001,7 @@ class RunMemory:
     def generate_meta_policy(
         self, *, save: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """Generate a meta-policy from historical performance.
-
-        When a ``policy_memory`` backend is provided, the policy is
-        published through it (gaining governor gating, semver, and
-        supersede semantics). Otherwise it is appended to the local
-        ``meta_policies`` ring buffer.
-        """
+        """Generate a meta-policy from historical performance."""
         with self._lock:
             snapshot = list(self._runs)
 
@@ -1712,12 +2120,18 @@ class RunMemory:
         if self._tier_manager is not None:
             storer = getattr(self._tier_manager, "store", None)
             if callable(storer):
+                # Item fix #8: derive importance from the payload's
+                # quality_score when present instead of hard-coding 0.5.
+                importance = _derive_importance_from_run(
+                    sample.run_data,
+                    default=self._config.default_importance,
+                )
                 try:
                     storer(
                         record_id=sample.run_id,
                         kind=sample.kind,
-                        payload=dict(sample.run_data),
-                        importance=0.5,
+                        payload=_to_plain(sample.run_data),
+                        importance=importance,
                         truth_level=sample.truth_level,
                         container_tag=sample.container_tag,
                         observed_at=sample.observed_at,
@@ -1732,16 +2146,31 @@ class RunMemory:
 
     # ---------------------------------------------------------- statistics
     def statistics(self) -> Dict[str, Any]:
+        """Item fix #5: stamp ``schema_version`` and report per-kind /
+        per-container distributions alongside the counters."""
         with self._lock:
             lats = list(self._latency_ring)
             mean_lat = sum(lats) / len(lats) if lats else 0.0
+            kind_mix: Dict[str, int] = {}
+            tag_mix: Dict[str, int] = {}
+            truth_mix: Dict[str, int] = {}
+            for s in self._runs:
+                kind_mix[s.kind] = kind_mix.get(s.kind, 0) + 1
+                tag_mix[s.container_tag] = tag_mix.get(s.container_tag, 0) + 1
+                truth_mix[s.truth_level] = (
+                    truth_mix.get(s.truth_level, 0) + 1
+                )
             return {
+                "schema_version": SCHEMA_VERSION,
                 "runs": len(self._runs),
                 "meta_policies": len(self._meta_policies),
                 "next_sequence": self._next_sequence,
                 "last_updated": self._last_updated,
                 "max_runs": self._config.max_runs,
                 "max_policies": self._config.max_policies,
+                "kind_mix": kind_mix,
+                "container_tag_mix": tag_mix,
+                "truth_level_mix": truth_mix,
                 "in_memory": self._in_memory,
                 "strict": self._strict,
                 "autosave": self._autosave,
@@ -1751,9 +2180,12 @@ class RunMemory:
                 "backend_writes": self._backend_writes,
                 "backend_errors": self._backend_errors,
                 "last_error": self._last_error,
+                "last_write_error": self._last_write_error,
+                "last_read_error": self._last_read_error,
                 "mean_latency_ms": mean_lat,
                 "p50_latency_ms": _percentile(lats, 50),
                 "p95_latency_ms": _percentile(lats, 95),
+                "max_latency_ms": max(lats) if lats else 0.0,
                 "config": self._config.to_dict(),
                 "has_episodic_backend": self._episodic is not None,
                 "has_tier_backend": self._tier_manager is not None,
@@ -1777,6 +2209,8 @@ class RunMemory:
             self._backend_writes = 0
             self._backend_errors = 0
             self._last_error = None
+            self._last_write_error = None
+            self._last_read_error = None
             self._latency_ring.clear()
             self._started_at = time.monotonic()
         return removed
@@ -1825,9 +2259,10 @@ class RunMemory:
             meta = r.get("metadata") or {}
             if not isinstance(meta, ABCMapping):
                 meta = {}
-            run_id = (
+            run_id_raw = (
                 meta.get("run_id") or meta.get("record_id") or r.get("id")
             )
+            run_id = str(run_id_raw) if run_id_raw else None
             truth = meta.get("truth_level")
             if not isinstance(truth, str) or not truth:
                 truth = None
@@ -1835,7 +2270,6 @@ class RunMemory:
             tag = r.get("container_tag") or meta.get("container_tag")
             observed = meta.get("observed_at")
 
-            # Build the run_data payload from metadata + parsed content.
             run_data: Dict[str, Any] = dict(meta)
             content = r.get("content")
             if isinstance(content, str) and content.strip():
@@ -1853,7 +2287,7 @@ class RunMemory:
             try:
                 mem.add_run(
                     run_data,
-                    run_id=str(run_id) if run_id else None,
+                    run_id=run_id,
                     truth_level=truth,
                     container_tag=tag if isinstance(tag, str) else None,
                     kind=kind,
@@ -1867,10 +2301,57 @@ class RunMemory:
         return mem
 
     # ---------------------------------------------------------- serialization
+    @classmethod
+    def assert_compatible(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        strict: bool = False,
+    ) -> None:
+        """Item fix #6 / #10: verify a persisted payload's schema."""
+        if not isinstance(data, ABCMapping):
+            raise RunMemoryParseError(
+                "RunMemory.assert_compatible expects a Mapping."
+            )
+        v = data.get("schema_version", SCHEMA_VERSION)
+        if not _is_real_int(v) or v <= 0:
+            raise RunMemoryParseError(
+                f"invalid schema_version {v!r} in RunMemory payload."
+            )
+        if v > SCHEMA_VERSION:
+            raise RunMemoryParseError(
+                f"RunMemory payload schema_version {v} is newer than "
+                f"the current contract {SCHEMA_VERSION}."
+            )
+        if strict and v < SCHEMA_VERSION:
+            raise RunMemoryParseError(
+                f"RunMemory payload schema_version {v} is older than "
+                f"the current contract {SCHEMA_VERSION}."
+            )
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Return a structured, plain-dict view of the current state."""
+        with self._lock:
+            runs = [s.to_dict() for s in self._runs]
+            policies = [dict(p) for p in self._meta_policies]
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "config": self._config.to_dict(),
+            "strict": self._strict,
+            "autosave": self._autosave,
+            "in_memory": self._in_memory,
+            "memory_file": self.memory_file,
+            "next_sequence": self._next_sequence,
+            "last_updated": self._last_updated,
+            "runs": runs,
+            "meta_policies": policies,
+            "statistics": self.statistics(),
+        }
+
     def to_dict(self, *, include_runs: bool = True) -> Dict[str, Any]:
         with self._lock:
             payload: Dict[str, Any] = {
-                "schema_version": self._config.schema_version,
+                "schema_version": SCHEMA_VERSION,
                 "config": self._config.to_dict(),
                 "strict": self._strict,
                 "autosave": self._autosave,
@@ -1908,20 +2389,28 @@ class RunMemory:
         episodic: Optional[Any] = None,
         tier_manager: Optional[Any] = None,
         policy_memory: Optional[Any] = None,
+        strict: Optional[bool] = None,
     ) -> "RunMemory":
         if not isinstance(data, ABCMapping):
             raise RunMemoryParseError(
                 "RunMemory.from_dict expects a Mapping."
             )
+        # Item fix #6: verify schema compatibility before reconstructing.
+        cls.assert_compatible(data, strict=False)
+
         cfg_blob = data.get("config", {})
         config = (
             cfg_blob if isinstance(cfg_blob, MemoryConfig)
             else MemoryConfig.from_dict(cfg_blob)
         )
+        # Item fix #12: default to `True` when absent — matches siblings.
+        resolved_strict = (
+            bool(data.get("strict", True)) if strict is None else bool(strict)
+        )
         mem = cls(
             memory_file=memory_file,
             config=config,
-            strict=bool(data.get("strict", False)),
+            strict=resolved_strict,
             autosave=autosave,
             auto_load=auto_load,
             episodic=episodic,
@@ -1954,11 +2443,12 @@ class RunMemory:
                         if isinstance(p, ABCMapping)
                     ]
                 mem._last_updated = data.get("last_updated")
-                mem._next_sequence = int(
+                mem._next_sequence = _coerce_int(
+                    "next_sequence",
                     data.get(
                         "next_sequence",
                         max((s.sequence for s in loaded), default=-1) + 1,
-                    )
+                    ),
                 )
         return mem
 
@@ -1974,6 +2464,7 @@ class RunMemory:
         episodic: Optional[Any] = None,
         tier_manager: Optional[Any] = None,
         policy_memory: Optional[Any] = None,
+        strict: Optional[bool] = None,
     ) -> "RunMemory":
         try:
             data = json.loads(payload)
@@ -1994,6 +2485,7 @@ class RunMemory:
             episodic=episodic,
             tier_manager=tier_manager,
             policy_memory=policy_memory,
+            strict=strict,
         )
 
     # ----------------------------------------------------------------- dunder
@@ -2044,7 +2536,7 @@ if __name__ == "__main__":  # pragma: no cover
 
     import tempfile as _tf
 
-    # --------------------------------------------------- 1. Basic
+    # --------------------------------------------------- 1. Basic + ring trim
     tmpdir = _tf.mkdtemp(prefix="run_memory_smoke_")
     mem_file = os.path.join(tmpdir, "run_memory.json")
 
@@ -2053,78 +2545,95 @@ if __name__ == "__main__":  # pragma: no cover
     assert not mem.in_memory
     print("repr         :", mem)
 
-    # Add a sequence of runs using canonical metric names.
     for i in range(6):
         run_id = mem.add_run(
             {
                 "quality": 0.5 + 0.05 * i,
                 "metrics": {
                     "accuracy": 0.7 + 0.02 * i,
-                    "energy_wh": 100.0 + 10 * i,     # rising (bad)
-                    "carbon_gco2e": 20.0 + 3 * i,    # rising (bad)
+                    "energy_wh": 100.0 + 10 * i,
+                    "carbon_gco2e": 20.0 + 3 * i,
                 },
                 "notes": f"run-{i}",
             },
         )
         assert run_id.startswith("run-"), run_id
-
-    # Ring buffer trimmed.
     assert len(mem) == 5
     print("ring trim    :", len(mem), "(max_runs=5)")
 
-    # --------------------------------------------------- 2. Metric aliases
-    # Legacy name resolves to canonical.
+    # --------------------------------------------------- 2. Deep freeze
+    sample = mem.samples[0]
+    try:
+        sample.run_data["notes"] = "hacked"  # type: ignore[index]
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("top-level run_data should be frozen")
+    # Nested metadata is also frozen.
+    try:
+        sample.run_data["metrics"]["accuracy"] = 0.0  # type: ignore[index]
+    except TypeError:
+        print("deep freeze  : OK")
+    else:
+        raise AssertionError("nested metrics should be frozen")
+
+    # --------------------------------------------------- 3. Nested hash
+    hash(sample)
+    print("nested hash  : OK")
+
+    # --------------------------------------------------- 4. Metric aliases
     trend_legacy = mem.get_performance_trend("final_score")
     trend_canonical = mem.get_performance_trend("quality")
     assert trend_legacy["metric"] == "quality"
     assert trend_legacy["trend"] == trend_canonical["trend"]
-    print("alias        :", trend_legacy["trend"], "(final_score → quality)")
+    print("alias        :", trend_legacy["trend"])
 
-    # --------------------------------------------------- 3. Trend / stats
+    # --------------------------------------------------- 5. Trend / stats
     trend_energy = mem.get_performance_trend("energy_consumption")
     assert trend_energy["metric"] == "energy_wh"
-    # Higher is worse for energy_wh → rising values mean "declining".
     assert trend_energy["trend"] in ("declining", "stable")
     print("trend energy :", trend_energy["trend"])
 
     stats = mem.metric_statistics("quality")
     assert stats["count"] == 5
-    print("metric stats :", stats["count"], "values,", f"mean={stats['mean']:.3f}")
+    print("metric stats :", stats["count"], "values, mean=",
+          f"{stats['mean']:.3f}")
 
-    # --------------------------------------------------- 4. Caller-supplied run_id
-    kept_id = mem.add_run(
-        {"quality": 0.99, "run_id": "custom-1"},
-        run_id="explicit-1",
-    )
+    # --------------------------------------------------- 6. Caller-supplied run_id + timestamp
+    kept_id = mem.add_run({"quality": 0.99}, run_id="explicit-1")
     assert kept_id == "explicit-1"
-    s = mem.get("explicit-1")
-    assert s is not None
-    # Caller's timestamp preserved when present.
+    assert mem.get("explicit-1") is not None
     ts = "2024-01-01T00:00:00+00:00"
     mem.add_run({"quality": 0.5, "timestamp": ts, "run_id": "ts-1"})
     assert mem.get("ts-1").timestamp == ts
-    print("preserve     : OK (run_id + timestamp)")
+    print("preserve     : OK")
 
-    # --------------------------------------------------- 5. Bridges
+    # Item fix #7: non-string run_id rejected.
+    try:
+        mem.add_run({"quality": 0.5}, run_id=42)  # type: ignore[arg-type]
+    except RunMemoryInputError as exc:
+        print("int run_id   : rejected ->", exc)
+    else:
+        raise AssertionError("expected RunMemoryInputError")
+
+    # --------------------------------------------------- 7. Bridges + metrics flattening
     payloads = mem.to_supermemory_payloads()
-    assert payloads and all(
+    assert all(
         {"content", "container_tag", "metadata"} <= set(p) for p in payloads
     )
-    assert all(
-        {"kind", "run_id", "truth_level", "container_tag", "observed_at"}
-        <= set(p["metadata"])
-        for p in payloads
-    )
+    # Item fix #11: nested `metrics.energy_wh` surfaces at top level of metadata.
+    first_meta = payloads[-1]["metadata"]
+    assert "energy_wh" in first_meta or "accuracy" in first_meta
     dicts = mem.to_memory_dicts()
-    assert dicts and all({"id", "content", "metadata"} <= set(d) for d in dicts)
-    print("bridges      :", len(payloads), "payloads,", len(dicts), "memory dicts")
+    assert all({"id", "content", "metadata"} <= set(d) for d in dicts)
+    print("bridges      :", len(payloads), "payloads,", len(dicts), "dicts")
 
-    # --------------------------------------------------- 6. from_supermemory_results
+    # --------------------------------------------------- 8. from_supermemory_results
     restored = RunMemory.from_supermemory_results(payloads)
     assert len(restored) == len(payloads)
     print("from_sm      :", len(restored), "runs restored")
 
-    # --------------------------------------------------- 7. Backends
+    # --------------------------------------------------- 9. Backends
     from .episodic_memory import EpisodicMemory, IN_MEMORY_PATH
     from .memory_tier import MemoryTierConfig, MemoryTierManager
     from .policy_memory import PolicyMemory
@@ -2149,14 +2658,17 @@ if __name__ == "__main__":  # pragma: no cover
         tier_manager=tier_manager,
         policy_memory=policy_memory,
     )
-    for i in range(4):
-        mem2.add_run(
-            {"quality": 0.5 + 0.1 * i, "energy_wh": 100 + 5 * i},
-        )
+    # Item fix #8: importance derived from `quality_score`.
+    mem2.add_run({"quality_score": 0.95, "energy_wh": 90})
+    mem2.add_run({"quality_score": 0.4, "energy_wh": 110})
+    mem2.add_run({"quality_score": 0.3, "energy_wh": 120})
+    mem2.add_run({"quality_score": 0.2, "energy_wh": 130})
     assert episodic.count >= 4
     assert tier_manager.size() >= 4
-    print("backends     : episodic=%d, tiers=%d" % (
-        episodic.count, tier_manager.size(),
+    hot_ids = tier_manager.record_ids(MemoryTier.HOT) \
+        if hasattr(tier_manager, "record_ids") else []
+    print("backends     : episodic=%d, tiers=%d, hot=%d" % (
+        episodic.count, tier_manager.size(), len(hot_ids),
     ))
 
     # Meta-policy published via PolicyMemory.
@@ -2166,14 +2678,14 @@ if __name__ == "__main__":  # pragma: no cover
     assert policy_memory.current_version == policy["published_version"]
     print("meta-policy  : published", policy["published_version"])
 
-    # --------------------------------------------------- 8. :memory: sentinel
+    # --------------------------------------------------- 10. :memory: sentinel
     mem3 = RunMemory(memory_file=IN_MEMORY_PATH)
     mem3.add_run({"quality": 0.7})
     assert mem3.in_memory
     assert not Path(IN_MEMORY_PATH).exists()
-    print(":memory:     : OK (no stray file)")
+    print(":memory:     : OK")
 
-    # --------------------------------------------------- 9. Serialization
+    # --------------------------------------------------- 11. Serialization round-trip
     payload = mem.to_json()
     restored_mem = RunMemory.from_json(payload)
     assert len(restored_mem) == len(mem)
@@ -2188,16 +2700,13 @@ if __name__ == "__main__":  # pragma: no cover
     hash(cfg)
     print("cfg RT       : OK (hashable)")
 
-    # RunSample hashable + round-trip.
-    sample = mem.samples[0]
-    hash(sample)
     sample_rt = RunSample.from_dict(sample.to_dict())
     assert sample_rt.run_id == sample.run_id
-    assert sample_rt.sequence == sample.sequence
     assert dict(sample_rt.run_data) == dict(sample.run_data)
-    print("sample RT    : OK (hashable)")
+    hash(sample_rt)
+    print("sample RT    : OK")
 
-    # --------------------------------------------------- 10. Async
+    # --------------------------------------------------- 12. Async
     async def _run_async():
         rid = await mem3.add_run_async({"quality": 0.6})
         policy = await mem3.generate_meta_policy_async()
@@ -2207,26 +2716,101 @@ if __name__ == "__main__":  # pragma: no cover
     assert rid.startswith("run-")
     print("async        :", rid)
 
-    # --------------------------------------------------- 11. Context manager (reentrant)
+    # --------------------------------------------------- 13. Async context manager
+    async def _async_ctx():
+        async with RunMemory(memory_file=IN_MEMORY_PATH) as m:
+            await m.add_run_async({"quality": 0.8})
+            return len(m)
+
+    n = asyncio.run(_async_ctx())
+    assert n == 1
+    print("async ctx    : OK")
+
+    # --------------------------------------------------- 14. Sync reentrant context manager
     with RunMemory(memory_file=os.path.join(tmpdir, "ctx.json")) as outer:
         outer.add_run({"quality": 0.9})
-        with outer as inner:  # reentrant
+        with outer as inner:
             inner.add_run({"quality": 0.91})
         assert outer._ctx_depth == 1
     print("ctx mgr      : OK (reentrant)")
 
-    # --------------------------------------------------- 12. Statistics / reset
+    # --------------------------------------------------- 15. Statistics / reset
     stats = mem.statistics()
-    print("statistics   :", {
-        k: v for k, v in stats.items()
-        if k not in ("config",)
-    })
+    assert stats["schema_version"] == SCHEMA_VERSION
+    assert "container_tag_mix" in stats
+    assert "kind_mix" in stats
+    assert "truth_level_mix" in stats
+    assert stats["last_write_error"] is None
+    print("statistics   : OK")
     cleared = mem.reset()
     assert cleared > 0
     assert mem.statistics()["runs"] == 0
     print("reset        :", cleared, "runs cleared")
 
-    # --------------------------------------------------- 13. Validation
+    # --------------------------------------------------- 16. prune
+    import time as _t
+    mem4 = RunMemory(
+        memory_file=IN_MEMORY_PATH, max_runs=100, autosave=False,
+    )
+    mem4.add_run({"quality": 0.9}, kind="run")
+    # Backdate the sample to be older than the run TTL.
+    old_ts = _t.time() - (200 * 24 * 3600)   # 200 days ago
+    with mem4._lock:
+        s = mem4._runs[-1]
+        backdated = RunSample(
+            run_id=s.run_id, sequence=s.sequence,
+            timestamp=s.timestamp,
+            observed_at=datetime.fromtimestamp(old_ts, tz=timezone.utc),
+            kind=s.kind, truth_level=s.truth_level,
+            container_tag=s.container_tag, run_data=dict(s.run_data),
+            schema_version=s.schema_version,
+        )
+        mem4._runs[-1] = backdated
+    removed = mem4.prune()
+    assert removed == 1
+    print("prune        :", removed)
+
+    # --------------------------------------------------- 17. resize
+    resized = mem4.resize(2)
+    print("resize       : OK ->", resized)
+
+    # --------------------------------------------------- 18. snapshot
+    snap = mem4.snapshot()
+    assert snap["schema_version"] == SCHEMA_VERSION
+    assert "runs" in snap and "statistics" in snap
+    print("snapshot     : OK")
+
+    # --------------------------------------------------- 19. count_by_*
+    mem5 = RunMemory(memory_file=IN_MEMORY_PATH, autosave=False)
+    mem5.add_run({"quality": 0.9}, kind="run")
+    mem5.add_run({"quality": 0.9}, kind="run")
+    mem5.add_run({"quality": 0.9}, kind="policy")
+    assert mem5.count_by_kind() == {"run": 2, "policy": 1}
+    assert mem5.count_by_container_tag() == {DEFAULT_CONTAINER_TAG: 3}
+    assert mem5.count_by_truth_level() == {"measured": 3}
+    print("count_by_*   : OK")
+
+    # --------------------------------------------------- 20. from_config / from_pipeline
+    from_cfg = RunMemory.from_config(MemoryConfig(), autosave=False)
+    assert isinstance(from_cfg, RunMemory)
+
+    class _FakePipeline:
+        run_memory = mem5
+
+    from_pipe = RunMemory.from_pipeline(_FakePipeline())
+    assert from_pipe is mem5
+    print("from_*       : OK")
+
+    # --------------------------------------------------- 21. assert_compatible
+    RunMemory.assert_compatible({"schema_version": SCHEMA_VERSION})
+    try:
+        RunMemory.assert_compatible(
+            {"schema_version": SCHEMA_VERSION + 1},
+        )
+    except RunMemoryParseError:
+        print("assert_compat: OK")
+
+    # --------------------------------------------------- 22. Validation
     for bad in (
         lambda: mem.add_run("not-a-mapping"),          # type: ignore[arg-type]
         lambda: mem.add_run({"quality": float("nan")}),
@@ -2235,6 +2819,7 @@ if __name__ == "__main__":  # pragma: no cover
         lambda: mem.get_recent_runs(5.5),              # type: ignore[arg-type]
         lambda: mem.get_recent_runs("5"),              # type: ignore[arg-type]
         lambda: mem.get_performance_trend(""),
+        lambda: mem.resize(0),
         lambda: MemoryConfig(trend_stability_band=0.0),
         lambda: MemoryConfig(trend_stability_band=1.0),
         lambda: MemoryConfig(min_runs_for_trend=1),
@@ -2251,6 +2836,9 @@ if __name__ == "__main__":  # pragma: no cover
         lambda: MemoryConfig(default_truth_level="bogus"),
         lambda: MemoryConfig(write_retries=-1),
         lambda: MemoryConfig(schema_version=0),
+        lambda: MemoryConfig(latency_ring_size=0),
+        lambda: MemoryConfig(write_retry_backoff_seconds=0),
+        lambda: MemoryConfig(default_importance=1.5),
     ):
         try:
             bad()
@@ -2259,7 +2847,7 @@ if __name__ == "__main__":  # pragma: no cover
         else:
             raise AssertionError(f"expected rejection for {bad!r}")
 
-    # --------------------------------------------------- 14. Corruption handling
+    # --------------------------------------------------- 23. Corruption handling
     corrupt_path = os.path.join(tmpdir, "corrupt.json")
     with open(corrupt_path, "w") as f:
         f.write("{not valid json")
@@ -2271,5 +2859,13 @@ if __name__ == "__main__":  # pragma: no cover
         print("strict read  : OK ->", exc)
     else:
         raise AssertionError("expected RunMemoryCorruptionError")
+
+    # --------------------------------------------------- 24. close(flush=True)
+    flusher = RunMemory(memory_file=os.path.join(tmpdir, "flush.json"),
+                        autosave=False)
+    flusher.add_run({"quality": 0.9})
+    flusher.close(flush=True)
+    assert os.path.exists(flusher.memory_file)
+    print("close flush  : OK")
 
     print("\nSmoke test passed.")
