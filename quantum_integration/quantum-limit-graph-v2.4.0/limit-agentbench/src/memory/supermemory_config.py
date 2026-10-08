@@ -9,21 +9,34 @@ governor.
 
 Enhancements
 ------------
-- ``SupermemoryConfig`` — frozen, validated: mode, endpoints, budgets, TTLs.
-- Immutable ``ttl_seconds`` mapping (``MappingProxyType``), config hashable.
-- ``SupermemoryMode`` enum (str-compatible) with normalization in post-init.
+- ``SupermemoryConfig`` — frozen, validated: mode, endpoints, budgets,
+  TTLs, adapter limits (``max_recall_k``, ``write_retry_backoff_seconds``,
+  ``latency_ring_size``), ``schema_version``.
+- Immutable ``ttl_seconds`` mapping (``MappingProxyType``); config
+  hashable. ``_DEFAULT_TTLS`` is also frozen at module level.
+- ``SupermemoryMode`` enum (str-compatible) with ``coerce()`` /
+  ``values()`` / ``description``.
 - ``from_env()`` reads ``GREEN_AGENT_SUPERMEMORY_*`` env vars, including
   JSON-encoded ``TRUTH_LEVELS`` / ``TTL_SECONDS`` and per-kind
-  ``TTL_<KIND>`` overrides; JSON parsing errors are wrapped.
-- ``to_dict()`` / ``from_dict()`` round-trip, with ``strict`` mode and
-  ``redact_secrets`` support.
-- ``to_json()`` / ``from_json()`` helpers.
+  ``TTL_<KIND>`` overrides; JSON parsing errors are wrapped. Integer-
+  valued floats (``3600.0``) are accepted; ``NaN`` / ``inf`` / ``bool``
+  are rejected.
+- ``with_env()`` layered builder (defaults → env → explicit overrides)
+  and ``to_env()`` exporter.
+- ``to_dict()`` / ``from_dict()`` round-trip with ``strict`` mode,
+  ``redact_secrets`` and ``schema_version``. ``to_json()`` supports
+  ``redact_secrets`` / ``redacted_value`` / ``indent``.
+- ``assert_compatible()`` classmethod.
 - ``with_overrides()`` / ``merge()`` convenience constructors.
-- URL and container-tag validation.
+- URL and container-tag validation. The container-tag regex no longer
+  accepts ``.`` or ``/`` — those aren't produced by any other module.
 - ``ttl_for()`` with explicit ``default`` and warning on fallback.
-- Rejects ``bool`` for numeric fields; rejects ``NaN``/``inf`` timeouts.
+- Rejects ``bool`` for numeric fields; rejects ``NaN`` / ``inf``
+  timeouts.
 - Custom ``SupermemoryConfigError(ValueError)``.
-- ``__main__`` smoke test.
+- ``__version__`` / ``SCHEMA_VERSION`` / ``DEFAULT_CONTAINER_TAG`` /
+  ``DEFAULT_TRUTH_LEVELS`` exported via ``__all__``.
+- ``__main__`` smoke test covering every new path.
 """
 
 from __future__ import annotations
@@ -42,7 +55,19 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-__version__ = "6.0.0"
+__version__ = "6.1.0"
+
+#: Version of the config contract itself.
+SCHEMA_VERSION: int = 1
+
+#: Module-level default container tag. Kept in sync with
+#: ``memory_schemas.DEFAULT_CONTAINER_TAG`` and ``SupermemoryAdapter``.
+DEFAULT_CONTAINER_TAG: str = "org:green-agent"
+
+#: Public truth-level vocabulary. Mirrors ``memory_schemas``.
+DEFAULT_TRUTH_LEVELS: Tuple[str, ...] = (
+    "measured", "estimated", "simulated", "user-reported",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -55,6 +80,12 @@ class SupermemoryConfigError(ValueError):
 # --------------------------------------------------------------------------- #
 # Mode enum
 # --------------------------------------------------------------------------- #
+_MODE_DESCRIPTIONS: Mapping[str, str] = MappingProxyType({
+    "local": "In-process Supermemory deployment on localhost",
+    "cloud": "Hosted Supermemory service requiring an API key",
+})
+
+
 class SupermemoryMode(str, Enum):
     """Deployment mode for the Supermemory backend.
 
@@ -69,11 +100,39 @@ class SupermemoryMode(str, Enum):
     def __str__(self) -> str:  # pragma: no cover - trivial
         return self.value
 
+    @property
+    def description(self) -> str:
+        """Human-readable description of this deployment mode."""
+        return _MODE_DESCRIPTIONS.get(self.value, "Unknown mode")
+
+    @classmethod
+    def values(cls) -> Tuple[str, ...]:
+        return tuple(member.value for member in cls)
+
+    @classmethod
+    def coerce(cls, value: Any) -> "SupermemoryMode":
+        """Normalize a value to a ``SupermemoryMode`` member."""
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value.lower())
+            except ValueError as exc:
+                raise SupermemoryConfigError(
+                    f"mode must be one of {list(cls.values())}, got "
+                    f"{value!r}."
+                ) from exc
+        raise SupermemoryConfigError(
+            f"mode must be a str or SupermemoryMode, got "
+            f"{type(value).__name__}."
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Defaults
 # --------------------------------------------------------------------------- #
-_DEFAULT_TTLS: Mapping[str, int] = {
+#: Per-kind TTLs, frozen at module level so importers can't mutate them.
+_DEFAULT_TTLS: Mapping[str, int] = MappingProxyType({
     "decision_outcome": 90 * 24 * 3600,   # 90 days
     "policy":           365 * 24 * 3600,  # 1 year
     "incident":         365 * 24 * 3600,  # 1 year
@@ -81,15 +140,21 @@ _DEFAULT_TTLS: Mapping[str, int] = {
     "grid_forecast":    6 * 3600,         # 6 hours
     "thermal_state":    30 * 60,          # 30 minutes
     "connectivity":     5 * 60,           # 5 minutes
-}
+})
 
-_DEFAULT_TRUTH_LEVELS: Tuple[str, ...] = (
-    "measured", "estimated", "simulated", "user-reported",
-)
+#: Backward-compatible private alias.
+_DEFAULT_TRUTH_LEVELS: Tuple[str, ...] = DEFAULT_TRUTH_LEVELS
 
-_CONTAINER_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_\-./]{0,127}$")
+#: Container tags are colon-separated identifiers. The regex rejects
+#: ``.`` and ``/`` because no other module produces tags containing them.
+_CONTAINER_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_\-]{0,127}$")
 
 _ENV_PREFIX = "GREEN_AGENT_SUPERMEMORY_"
+
+#: Adapter defaults — kept in sync with ``SupermemoryAdapter`` fallbacks.
+_DEFAULT_MAX_RECALL_K: int = 1_000
+_DEFAULT_RETRY_BACKOFF_SECONDS: float = 0.25
+_DEFAULT_LATENCY_RING_SIZE: int = 200
 
 
 # --------------------------------------------------------------------------- #
@@ -135,12 +200,18 @@ def _coerce_int_env(name: str, raw: str) -> int:
 
 
 def _coerce_float_env(name: str, raw: str) -> float:
+    """Parse a finite float from an env var, rejecting NaN / inf."""
     try:
-        return float(raw)
+        fv = float(raw)
     except (TypeError, ValueError) as exc:
         raise SupermemoryConfigError(
             f"Environment variable {name}={raw!r} is not a valid float."
         ) from exc
+    if not math.isfinite(fv):
+        raise SupermemoryConfigError(
+            f"Environment variable {name}={raw!r} must be finite."
+        )
+    return fv
 
 
 def _coerce_json_env(name: str, raw: str) -> Any:
@@ -150,6 +221,24 @@ def _coerce_json_env(name: str, raw: str) -> Any:
         raise SupermemoryConfigError(
             f"Environment variable {name}={raw!r} is not valid JSON."
         ) from exc
+
+
+def _coerce_ttl_value(name: str, value: Any) -> int:
+    """Coerce a TTL value from JSON; reject bool, NaN, and floats."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise SupermemoryConfigError(
+            f"{name} must be a number, got {type(value).__name__}."
+        )
+    if isinstance(value, float) and not value.is_integer():
+        raise SupermemoryConfigError(
+            f"{name} must be an integer, got {value!r}."
+        )
+    if not math.isfinite(float(value)):
+        raise SupermemoryConfigError(f"{name} must be finite.")
+    iv = int(value)
+    if iv <= 0:
+        raise SupermemoryConfigError(f"{name} must be > 0.")
+    return iv
 
 
 # --------------------------------------------------------------------------- #
@@ -165,7 +254,7 @@ class SupermemoryConfig:
     api_key: Optional[str] = None
     base_url: str = "http://localhost:6767"
     mode: SupermemoryMode = SupermemoryMode.LOCAL
-    default_container_tag: str = "org:green-agent"
+    default_container_tag: str = DEFAULT_CONTAINER_TAG
 
     max_history: int = 10_000
 
@@ -176,32 +265,34 @@ class SupermemoryConfig:
     write_retries: int = 2
     write_timeout_seconds: float = 5.0
 
-    truth_levels: Tuple[str, ...] = _DEFAULT_TRUTH_LEVELS
+    truth_levels: Tuple[str, ...] = DEFAULT_TRUTH_LEVELS
 
     ttl_seconds: Mapping[str, int] = field(
         default_factory=lambda: MappingProxyType(dict(_DEFAULT_TTLS)),
     )
 
+    # Adapter limits (read by ``SupermemoryAdapter`` via ``getattr``).
+    max_recall_k: int = _DEFAULT_MAX_RECALL_K
+    write_retry_backoff_seconds: float = _DEFAULT_RETRY_BACKOFF_SECONDS
+    latency_ring_size: int = _DEFAULT_LATENCY_RING_SIZE
+
+    # Schema version — stamped on serialized payloads.
+    schema_version: int = SCHEMA_VERSION
+
     # ------------------------------------------------------------------ #
     # Post-init: normalize + validate
     # ------------------------------------------------------------------ #
     def __post_init__(self) -> None:
-        # --- mode normalization (accept str or enum) ---
-        if isinstance(self.mode, SupermemoryMode):
-            mode = self.mode
-        elif isinstance(self.mode, str):
-            try:
-                mode = SupermemoryMode(self.mode.lower())
-            except ValueError as exc:
-                raise SupermemoryConfigError(
-                    f"mode must be 'local' or 'cloud', got {self.mode!r}."
-                ) from exc
-        else:
+        # --- schema_version ---
+        if not _is_real_int(self.schema_version) or self.schema_version <= 0:
             raise SupermemoryConfigError(
-                "mode must be a str or SupermemoryMode, got "
-                f"{type(self.mode).__name__}."
+                "schema_version must be a positive int."
             )
-        object.__setattr__(self, "mode", mode)
+
+        # --- mode normalization (accept str or enum) ---
+        object.__setattr__(
+            self, "mode", SupermemoryMode.coerce(self.mode),
+        )
 
         # --- api_key normalization ---
         if self.api_key is not None:
@@ -211,7 +302,7 @@ class SupermemoryConfig:
                 )
             object.__setattr__(self, "api_key", self.api_key or None)
 
-        if mode is SupermemoryMode.CLOUD and not self.api_key:
+        if self.mode is SupermemoryMode.CLOUD and not self.api_key:
             raise SupermemoryConfigError(
                 "api_key is required when mode='cloud'."
             )
@@ -238,6 +329,8 @@ class SupermemoryConfig:
             "max_history",
             "recall_top_k",
             "recall_token_budget",
+            "max_recall_k",
+            "latency_ring_size",
         ):
             value = getattr(self, name)
             if not _is_real_int(value) or value <= 0:
@@ -256,6 +349,7 @@ class SupermemoryConfig:
         for name in (
             "recall_timeout_seconds",
             "write_timeout_seconds",
+            "write_retry_backoff_seconds",
         ):
             value = getattr(self, name)
             if not _is_real_number(value) or value <= 0:
@@ -369,6 +463,61 @@ class SupermemoryConfig:
                 overrides[f.name] = other_val
         return self.with_overrides(**overrides)
 
+    @classmethod
+    def with_env(
+        cls,
+        env: Optional[Mapping[str, str]] = None,
+        *,
+        strict: bool = False,
+        **overrides: Any,
+    ) -> "SupermemoryConfig":
+        """Build a config from the environment, then apply overrides.
+
+        Layer order: defaults → environment → ``**overrides``.
+        """
+        base = cls.from_env(env=env, strict=strict)
+        if not overrides:
+            return base
+        return base.with_overrides(**overrides)
+
+    def to_env(
+        self,
+        *,
+        include_api_key: bool = False,
+        redacted_value: str = "***",
+    ) -> Dict[str, str]:
+        """Export this config as ``GREEN_AGENT_SUPERMEMORY_*`` env vars.
+
+        Parameters
+        ----------
+        include_api_key : bool
+            If True, include the real API key. Otherwise the key is
+            omitted entirely (safer for logging / test fixtures).
+        redacted_value : str
+            Not used when ``include_api_key=False``; kept for parity
+            with ``to_dict(redact_secrets=True)``.
+        """
+        p = _ENV_PREFIX
+        out: Dict[str, str] = {
+            p + "BASE_URL": self.base_url,
+            p + "MODE": self.mode.value,
+            p + "DEFAULT_CONTAINER_TAG": self.default_container_tag,
+            p + "MAX_HISTORY": str(self.max_history),
+            p + "RECALL_TOP_K": str(self.recall_top_k),
+            p + "RECALL_TOKEN_BUDGET": str(self.recall_token_budget),
+            p + "RECALL_TIMEOUT_SECONDS": str(self.recall_timeout_seconds),
+            p + "WRITE_RETRIES": str(self.write_retries),
+            p + "WRITE_TIMEOUT_SECONDS": str(self.write_timeout_seconds),
+            p + "MAX_RECALL_K": str(self.max_recall_k),
+            p + "WRITE_RETRY_BACKOFF_SECONDS": str(
+                self.write_retry_backoff_seconds
+            ),
+            p + "LATENCY_RING_SIZE": str(self.latency_ring_size),
+        }
+        if include_api_key and self.api_key:
+            out[p + "API_KEY"] = self.api_key
+        return out
+
     # ------------------------------------------------------------------ #
     # Serialization
     # ------------------------------------------------------------------ #
@@ -378,16 +527,9 @@ class SupermemoryConfig:
         redact_secrets: bool = False,
         redacted_value: str = "***",
     ) -> Dict[str, Any]:
-        """Return a JSON-friendly dict of this config.
-
-        Parameters
-        ----------
-        redact_secrets : bool
-            Replace ``api_key`` with ``redacted_value`` when True.
-        redacted_value : str
-            Placeholder used when ``redact_secrets`` is True.
-        """
+        """Return a JSON-friendly dict of this config."""
         return {
+            "schema_version": self.schema_version,
             "api_key": (
                 redacted_value
                 if redact_secrets and self.api_key
@@ -404,6 +546,9 @@ class SupermemoryConfig:
             "write_timeout_seconds": self.write_timeout_seconds,
             "truth_levels": list(self.truth_levels),
             "ttl_seconds": dict(self.ttl_seconds),
+            "max_recall_k": self.max_recall_k,
+            "write_retry_backoff_seconds": self.write_retry_backoff_seconds,
+            "latency_ring_size": self.latency_ring_size,
         }
 
     def safe_dict(self) -> Dict[str, Any]:
@@ -414,13 +559,45 @@ class SupermemoryConfig:
         self,
         *,
         redact_secrets: bool = False,
+        redacted_value: str = "***",
         indent: Optional[int] = None,
     ) -> str:
         return json.dumps(
-            self.to_dict(redact_secrets=redact_secrets),
+            self.to_dict(
+                redact_secrets=redact_secrets,
+                redacted_value=redacted_value,
+            ),
             indent=indent,
             sort_keys=True,
         )
+
+    @classmethod
+    def assert_compatible(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        strict: bool = False,
+    ) -> None:
+        """Raise ``SupermemoryConfigError`` if ``data`` is incompatible."""
+        if not isinstance(data, ABCMapping):
+            raise SupermemoryConfigError(
+                "SupermemoryConfig.assert_compatible expects a Mapping."
+            )
+        v = data.get("schema_version", SCHEMA_VERSION)
+        if not _is_real_int(v) or v <= 0:
+            raise SupermemoryConfigError(
+                f"invalid schema_version {v!r} in config payload."
+            )
+        if v > SCHEMA_VERSION:
+            raise SupermemoryConfigError(
+                f"config payload schema_version {v} is newer than the "
+                f"current contract {SCHEMA_VERSION}."
+            )
+        if strict and v < SCHEMA_VERSION:
+            raise SupermemoryConfigError(
+                f"config payload schema_version {v} is older than the "
+                f"current contract {SCHEMA_VERSION}."
+            )
 
     @classmethod
     def from_dict(
@@ -429,21 +606,14 @@ class SupermemoryConfig:
         *,
         strict: bool = False,
     ) -> "SupermemoryConfig":
-        """Build a config from a mapping.
-
-        Parameters
-        ----------
-        data : Mapping
-            Input mapping.
-        strict : bool
-            If True, unknown keys raise ``SupermemoryConfigError``. If
-            False (default), unknown keys are ignored for forward
-            compatibility.
-        """
+        """Build a config from a mapping."""
         if not isinstance(data, ABCMapping):
             raise SupermemoryConfigError(
                 "SupermemoryConfig.from_dict expects a Mapping."
             )
+
+        # Forward-compatibility check.
+        cls.assert_compatible(data)
 
         valid = {f.name for f in fields(cls)}
         unknown = set(data) - valid
@@ -511,27 +681,7 @@ class SupermemoryConfig:
         *,
         strict: bool = False,
     ) -> "SupermemoryConfig":
-        """Build a config from ``GREEN_AGENT_SUPERMEMORY_*`` env vars.
-
-        Recognized keys (all optional)::
-
-            API_KEY
-            BASE_URL
-            MODE
-            DEFAULT_CONTAINER_TAG
-            MAX_HISTORY
-            RECALL_TOP_K
-            RECALL_TOKEN_BUDGET
-            RECALL_TIMEOUT_SECONDS
-            WRITE_RETRIES
-            WRITE_TIMEOUT_SECONDS
-            TRUTH_LEVELS          # JSON array, e.g. ["measured","estimated"]
-            TTL_SECONDS           # JSON object, e.g. {"policy": 31536000}
-            TTL_<KIND>            # int seconds, e.g. TTL_RUN=120
-
-        ``TTL_SECONDS`` and ``TTL_<KIND>`` both merge on top of the
-        built-in default TTLs; per-kind values win over the JSON object.
-        """
+        """Build a config from ``GREEN_AGENT_SUPERMEMORY_*`` env vars."""
         e: Mapping[str, str] = env if env is not None else os.environ
         p = _ENV_PREFIX
 
@@ -558,12 +708,18 @@ class SupermemoryConfig:
             "recall_top_k",
             "recall_token_budget",
             "write_retries",
+            "max_recall_k",
+            "latency_ring_size",
         ):
             env_name = p + name.upper()
             if (v := _raw(env_name)) is not None:
                 raw[name] = _coerce_int_env(env_name, v)
 
-        for name in ("recall_timeout_seconds", "write_timeout_seconds"):
+        for name in (
+            "recall_timeout_seconds",
+            "write_timeout_seconds",
+            "write_retry_backoff_seconds",
+        ):
             env_name = p + name.upper()
             if (v := _raw(env_name)) is not None:
                 raw[name] = _coerce_float_env(env_name, v)
@@ -593,22 +749,30 @@ class SupermemoryConfig:
                     raise SupermemoryConfigError(
                         f"{p}TTL_SECONDS keys must be non-empty strings."
                     )
-                ttl_overrides[kind] = _coerce_int_env(
-                    f"{p}TTL_SECONDS[{kind!r}]", str(seconds),
+                # Integer-valued floats (3600.0) accepted; bool / NaN
+                # rejected.
+                ttl_overrides[kind] = _coerce_ttl_value(
+                    f"{p}TTL_SECONDS[{kind!r}]", seconds,
                 )
 
+        # Per-kind TTL_<KIND> overrides. Iterates the env mapping once.
         per_kind_prefix = p + "TTL_"
         reserved = {"TTL_SECONDS"}
-        for env_key, env_val in e.items():
-            if not env_key.startswith(per_kind_prefix):
-                continue
-            suffix = env_key[len(per_kind_prefix):]
-            if not suffix or suffix in reserved:
-                continue
-            if env_val is None:
-                continue
-            kind = suffix.lower()
-            ttl_overrides[kind] = _coerce_int_env(env_key, env_val)
+        # A cheap pre-check: only iterate if any key matches the prefix.
+        has_per_kind = any(
+            k.startswith(per_kind_prefix) for k in e.keys()
+        )
+        if has_per_kind:
+            for env_key, env_val in e.items():
+                if not env_key.startswith(per_kind_prefix):
+                    continue
+                suffix = env_key[len(per_kind_prefix):]
+                if not suffix or suffix in reserved:
+                    continue
+                if env_val is None:
+                    continue
+                kind = suffix.lower()
+                ttl_overrides[kind] = _coerce_int_env(env_key, env_val)
 
         if ttl_overrides:
             merged = dict(_DEFAULT_TTLS)
@@ -646,10 +810,17 @@ class SupermemoryConfig:
             self.write_timeout_seconds,
             self.truth_levels,
             tuple(sorted(self.ttl_seconds.items())),
+            self.max_recall_k,
+            self.write_retry_backoff_seconds,
+            self.latency_ring_size,
+            self.schema_version,
         ))
 
 
 __all__ = [
+    "DEFAULT_CONTAINER_TAG",
+    "DEFAULT_TRUTH_LEVELS",
+    "SCHEMA_VERSION",
     "SupermemoryConfig",
     "SupermemoryConfigError",
     "SupermemoryMode",
@@ -666,7 +837,10 @@ if __name__ == "__main__":  # pragma: no cover
     cfg = SupermemoryConfig()
     print("repr       :", cfg)
     print("version    :", __version__)
+    print("schema ver :", SCHEMA_VERSION)
+    print("default tag:", DEFAULT_CONTAINER_TAG)
     print("mode       :", cfg.mode, "| is_local:", cfg.is_local())
+    print("mode desc  :", cfg.mode.description)
     print("ttl(dec)   :", cfg.ttl_for("decision_outcome"))
     print("ttl(grid)  :", cfg.ttl_for("grid_forecast"))
     print("ttl(fall)  :", cfg.ttl_for("unknown_kind", default=1234))
@@ -679,9 +853,37 @@ if __name__ == "__main__":  # pragma: no cover
     else:
         raise AssertionError("ttl_seconds should be immutable")
 
+    # Module-level default TTLs are frozen.
+    try:
+        _DEFAULT_TTLS["policy"] = 0  # type: ignore[index]
+    except TypeError:
+        print("frozen defs: OK")
+    else:
+        raise AssertionError("_DEFAULT_TTLS should be immutable")
+
     # Hashability.
     hash(cfg)
     print("hashable   : OK")
+
+    # Adapter limits are present (item #2).
+    assert cfg.max_recall_k == 1_000
+    assert cfg.write_retry_backoff_seconds == 0.25
+    assert cfg.latency_ring_size == 200
+    print("adapter limits: OK")
+
+    # Schema version is stamped on to_dict (item #8).
+    assert cfg.to_dict()["schema_version"] == SCHEMA_VERSION
+    print("schema stamp   : OK")
+
+    # SupermemoryMode.coerce / values / description (item #4).
+    assert SupermemoryMode.coerce("local") is SupermemoryMode.LOCAL
+    assert SupermemoryMode.coerce(SupermemoryMode.CLOUD) is SupermemoryMode.CLOUD
+    assert SupermemoryMode.values() == ("local", "cloud")
+    assert "In-process" in SupermemoryMode.LOCAL.description
+    try:
+        SupermemoryMode.coerce("bogus")
+    except SupermemoryConfigError:
+        print("mode coerce: OK")
 
     # Validation failures.
     for bad in (
@@ -693,12 +895,18 @@ if __name__ == "__main__":  # pragma: no cover
         dict(recall_timeout_seconds=0),                # zero
         dict(recall_timeout_seconds=float("inf")),     # inf
         dict(base_url="not a url"),                    # bad url
-        dict(default_container_tag="bad tag"),         # bad tag
+        dict(default_container_tag="bad tag"),         # bad tag (space)
+        dict(default_container_tag="bad/tag"),         # bad tag (slash, item #6)
+        dict(default_container_tag="bad.tag"),         # bad tag (dot, item #6)
         dict(truth_levels="measured"),                 # str not sequence
         dict(truth_levels=()),                         # empty
         dict(truth_levels=("measured", "measured")),   # duplicate
         dict(ttl_seconds={"policy": 0}),               # zero ttl
         dict(ttl_seconds={"policy": True}),            # bool ttl
+        dict(max_recall_k=0),                          # zero
+        dict(latency_ring_size=-1),                    # negative
+        dict(write_retry_backoff_seconds=0),           # zero
+        dict(schema_version=0),                        # zero
     ):
         try:
             SupermemoryConfig(**bad)  # type: ignore[arg-type]
@@ -713,8 +921,22 @@ if __name__ == "__main__":  # pragma: no cover
     assert restored == cfg
     print("Round-trip : OK")
 
-    payload_r = cfg.to_dict(redact_secrets=True)
+    payload_r = cfg.to_dict(redact_secrets=True, redacted_value="<hidden>")
+    # No api_key on the default config, so redaction is a no-op.
     print("redacted   :", payload_r["api_key"])
+
+    # Redaction with a real key.
+    cfg_key = SupermemoryConfig(mode="cloud", api_key="secret-123")
+    payload_key = cfg_key.to_dict(redact_secrets=True)
+    assert payload_key["api_key"] == "***"
+    print("redaction  : OK")
+
+    # to_json with redacted_value (item #11).
+    j_redacted = cfg_key.to_json(
+        redact_secrets=True, redacted_value="<redacted>", indent=2,
+    )
+    assert "<redacted>" in j_redacted
+    print("to_json red: OK")
 
     # JSON round-trip.
     j = cfg.to_json()
@@ -743,15 +965,54 @@ if __name__ == "__main__":  # pragma: no cover
         "GREEN_AGENT_SUPERMEMORY_TRUTH_LEVELS": '["measured","estimated"]',
         "GREEN_AGENT_SUPERMEMORY_TTL_SECONDS": '{"policy": 3600}',
         "GREEN_AGENT_SUPERMEMORY_TTL_RUN": "120",
+        "GREEN_AGENT_SUPERMEMORY_MAX_RECALL_K": "500",
+        "GREEN_AGENT_SUPERMEMORY_WRITE_RETRY_BACKOFF_SECONDS": "0.5",
+        "GREEN_AGENT_SUPERMEMORY_LATENCY_RING_SIZE": "500",
     }
     cfg5 = SupermemoryConfig.from_env(env=env)
     assert cfg5.recall_top_k == 8
     assert cfg5.truth_levels == ("measured", "estimated")
     assert cfg5.ttl_seconds["policy"] == 3600
     assert cfg5.ttl_seconds["run"] == 120
-    # Unchanged kinds should still carry their defaults.
     assert cfg5.ttl_seconds["grid_forecast"] == _DEFAULT_TTLS["grid_forecast"]
+    assert cfg5.max_recall_k == 500
+    assert cfg5.write_retry_backoff_seconds == 0.5
+    assert cfg5.latency_ring_size == 500
     print("from_env   : OK")
+
+    # Integer-valued floats in TTL_SECONDS JSON (item #5).
+    env_float = {
+        "GREEN_AGENT_SUPERMEMORY_TTL_SECONDS": '{"policy": 3600.0}',
+    }
+    cfg_float = SupermemoryConfig.from_env(env=env_float)
+    assert cfg_float.ttl_seconds["policy"] == 3600
+    print("float TTL  : OK")
+
+    # bool / NaN / inf in TTL_SECONDS JSON rejected.
+    for bad_json in (
+        '{"policy": true}',
+        '{"policy": null}',
+        '{"policy": 3600.5}',
+    ):
+        try:
+            SupermemoryConfig.from_env(env={
+                "GREEN_AGENT_SUPERMEMORY_TTL_SECONDS": bad_json,
+            })
+        except SupermemoryConfigError as exc:
+            print(f"reject TTL : {bad_json} -> {exc}")
+        else:
+            raise AssertionError(f"expected rejection for {bad_json!r}")
+
+    # NaN / inf in float env vars (item #12).
+    for bad_val in ("nan", "inf", "-inf"):
+        try:
+            SupermemoryConfig.from_env(env={
+                "GREEN_AGENT_SUPERMEMORY_RECALL_TIMEOUT_SECONDS": bad_val,
+            })
+        except SupermemoryConfigError as exc:
+            print(f"reject {bad_val}: OK -> {exc}")
+        else:
+            raise AssertionError(f"expected rejection for {bad_val!r}")
 
     # Env parse failure surfaces as SupermemoryConfigError.
     try:
@@ -760,5 +1021,31 @@ if __name__ == "__main__":  # pragma: no cover
         )
     except SupermemoryConfigError as exc:
         print("env error  : OK ->", exc)
+
+    # with_env layered builder.
+    cfg6 = SupermemoryConfig.with_env(
+        env=env, recall_top_k=99, schema_version=SCHEMA_VERSION,
+    )
+    assert cfg6.recall_top_k == 99
+    assert cfg6.max_recall_k == 500  # from env, not overridden
+    print("with_env   : OK")
+
+    # to_env exporter.
+    exported = cfg5.to_env()
+    assert exported["GREEN_AGENT_SUPERMEMORY_RECALL_TOP_K"] == "8"
+    assert exported["GREEN_AGENT_SUPERMEMORY_MAX_RECALL_K"] == "500"
+    assert "GREEN_AGENT_SUPERMEMORY_API_KEY" not in exported
+    exported_key = cfg_key.to_env(include_api_key=True)
+    assert exported_key["GREEN_AGENT_SUPERMEMORY_API_KEY"] == "secret-123"
+    print("to_env     : OK")
+
+    # assert_compatible (item #9).
+    SupermemoryConfig.assert_compatible({"schema_version": SCHEMA_VERSION})
+    try:
+        SupermemoryConfig.assert_compatible(
+            {"schema_version": SCHEMA_VERSION + 1},
+        )
+    except SupermemoryConfigError:
+        print("assert_compat : OK")
 
     print("\nSmoke test passed.")
