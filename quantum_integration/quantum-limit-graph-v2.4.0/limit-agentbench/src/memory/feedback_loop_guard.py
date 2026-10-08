@@ -13,26 +13,37 @@ Enhancements
   tolerances, escalation thresholds, telemetry keys, trusted truth-level
   vocabulary, minimum measured-evidence count, container-tag expectation,
   drift statistic, truncation flags. Full serialization symmetry plus
-  ``with_overrides``/``merge``.
-- ``GuardVerdict`` — truly frozen: reasons/reason-codes as tuples,
+  ``with_overrides`` / ``merge``.
+- ``GuardVerdict`` — truly frozen: reasons / reason-codes as tuples,
   per-metric drift as ``MappingProxyType``, hashable, with
-  ``to_dict``/``from_dict``/``to_json``/``from_json`` and
-  ``to_episode_payload()`` for persistence via ``EpisodicMemory`` or
-  ``SupermemoryAdapter``.
+  ``to_dict`` / ``from_dict`` / ``to_json`` / ``from_json``,
+  ``to_episode_payload()`` and ``to_memory_dict()`` bridges for
+  persistence via ``EpisodicMemory`` / ``SupermemoryAdapter``.
+  Cross-validated evidence counts and a stamped ``schema_version``.
 - Detects stale recalls (with explicit unknown-freshness handling),
   policy drift, telemetry drift, untrusted-evidence shortfalls,
-  truncated/clamped evidence, and container-tag mismatches.
+  truncated / clamped evidence, and container-tag mismatches.
 - Escalates to human approval separately from blocking
   (``block_on_policy_drift`` vs ``escalate_on_policy_drift``).
 - Structured error hierarchy: ``FeedbackLoopGuardError`` →
   ``FeedbackLoopGuardInputError``, ``FeedbackLoopGuardConfigError``.
-- Async sibling (``check_async``) and batch helper (``check_many``).
+- Meaningful ``strict`` semantics: in strict mode, any failure raises;
+  in non-strict mode, unexpected internal failures return a fallback
+  verdict carrying ``REASON_INTERNAL_ERROR``.
+- Public ``REASON_*`` constants for stable reason-code matching.
+- Single-pass signal extraction — one walk over the evidence per check.
+- ``DEFAULT_CONTAINER_TAG`` / ``SCHEMA_VERSION`` stamped on payloads.
+- Async sibling (``check_async``), batch helper (``check_many``) and
+  async batch (``check_many_async``); ``from_config()`` /
+  ``from_pipeline()`` constructors; async context manager.
 - Observability: per-reason counters, per-check latency ring with
-  p50/p95/max, ``last_verdict``, ``last_error``.
-- ``reset()`` returns an int; ``close()`` + context-manager support.
+  p50/p95/max, ``last_verdict``, ``last_error`` set on **every** failed
+  check (not just ``check_many``).
+- ``reset()`` returns an int; ``close()`` + sync / async context-manager
+  support.
 - ``__version__`` exported via ``__all__``.
 - ``__main__`` smoke test coexisting with the enhanced ``RecallBundle``
-  validation (memories/scores/citations lengths aligned).
+  validation (memories / scores / citations lengths aligned).
 """
 
 from __future__ import annotations
@@ -66,22 +77,47 @@ from .memory_schemas import PolicyRecord
 
 logger = logging.getLogger(__name__)
 
-__version__ = "6.0.0"
+__version__ = "6.1.0"
+
+#: Version of the feedback-loop contract itself.
+SCHEMA_VERSION: int = 1
+
+#: Default container tag (matches ``SupermemoryConfig.default_container_tag``
+#: and ``memory_schemas.DEFAULT_CONTAINER_TAG``).
+DEFAULT_CONTAINER_TAG: str = "org:green-agent"
 
 
 # --------------------------------------------------------------------------- #
 # Reason codes (stable identifiers; human strings live alongside)
 # --------------------------------------------------------------------------- #
-_REASON_INSUFFICIENT_EVIDENCE = "insufficient_evidence"
-_REASON_EXCESS_EVIDENCE = "excess_evidence"
-_REASON_UNTRUSTED_EVIDENCE = "untrusted_evidence"
-_REASON_STALE_EVIDENCE = "stale_evidence"
-_REASON_UNKNOWN_STALENESS = "unknown_staleness"
-_REASON_POLICY_DRIFT = "policy_drift"
-_REASON_TELEMETRY_DRIFT = "telemetry_drift"
-_REASON_TRUNCATED_EVIDENCE = "truncated_evidence"
-_REASON_CLAMPED_K = "clamped_k"
-_REASON_CONTAINER_MISMATCH = "container_tag_mismatch"
+REASON_INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+REASON_EXCESS_EVIDENCE = "excess_evidence"
+REASON_UNTRUSTED_EVIDENCE = "untrusted_evidence"
+REASON_STALE_EVIDENCE = "stale_evidence"
+REASON_UNKNOWN_STALENESS = "unknown_staleness"
+REASON_POLICY_DRIFT = "policy_drift"
+REASON_TELEMETRY_DRIFT = "telemetry_drift"
+REASON_TRUNCATED_EVIDENCE = "truncated_evidence"
+REASON_CLAMPED_K = "clamped_k"
+REASON_CONTAINER_MISMATCH = "container_tag_mismatch"
+REASON_CHECK_FAILED = "check_failed"
+REASON_INTERNAL_ERROR = "internal_error"
+
+#: All public reason codes, handy for building match arms.
+REASON_CODES: Tuple[str, ...] = (
+    REASON_INSUFFICIENT_EVIDENCE,
+    REASON_EXCESS_EVIDENCE,
+    REASON_UNTRUSTED_EVIDENCE,
+    REASON_STALE_EVIDENCE,
+    REASON_UNKNOWN_STALENESS,
+    REASON_POLICY_DRIFT,
+    REASON_TELEMETRY_DRIFT,
+    REASON_TRUNCATED_EVIDENCE,
+    REASON_CLAMPED_K,
+    REASON_CONTAINER_MISMATCH,
+    REASON_CHECK_FAILED,
+    REASON_INTERNAL_ERROR,
+)
 
 _DRIFT_STATISTICS: Tuple[str, ...] = ("median", "mean", "p95", "max")
 
@@ -94,7 +130,7 @@ class FeedbackLoopGuardError(ValueError):
 
 
 class FeedbackLoopGuardInputError(FeedbackLoopGuardError):
-    """Invalid input to ``check``/``check_many``."""
+    """Invalid input to ``check`` / ``check_many``."""
 
 
 class FeedbackLoopGuardConfigError(FeedbackLoopGuardError):
@@ -130,6 +166,8 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
     """Parse ISO 8601 timestamps; tolerate ``Z`` and numeric epochs."""
     if value is None:
         return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         ts = float(value)
         if ts > 1e12:
@@ -224,7 +262,6 @@ class FeedbackLoopGuardConfig:
 
     # ------------------------------------------------------------------ #
     def __post_init__(self) -> None:
-        # staleness
         if not _is_positive_finite(self.staleness_seconds):
             raise FeedbackLoopGuardConfigError(
                 "staleness_seconds must be a finite number > 0."
@@ -236,8 +273,6 @@ class FeedbackLoopGuardConfig:
             raise FeedbackLoopGuardConfigError(
                 "staleness_timestamp_key must be a non-empty string."
             )
-
-        # numeric tolerances
         if not _is_finite_nonneg(self.telemetry_drift_tolerance):
             raise FeedbackLoopGuardConfigError(
                 "telemetry_drift_tolerance must be finite and >= 0."
@@ -259,8 +294,6 @@ class FeedbackLoopGuardConfig:
                 "human_escalation_threshold must be >= "
                 "telemetry_drift_tolerance."
             )
-
-        # evidence counts
         for name in (
             "min_evidence", "max_evidence", "min_measured_evidence",
         ):
@@ -270,9 +303,7 @@ class FeedbackLoopGuardConfig:
                     f"{name} must be a non-negative int (got {v!r})."
                 )
         if self.min_evidence <= 0:
-            raise FeedbackLoopGuardConfigError(
-                "min_evidence must be > 0."
-            )
+            raise FeedbackLoopGuardConfigError("min_evidence must be > 0.")
         if self.max_evidence < self.min_evidence:
             raise FeedbackLoopGuardConfigError(
                 "max_evidence must be >= min_evidence."
@@ -281,8 +312,6 @@ class FeedbackLoopGuardConfig:
             raise FeedbackLoopGuardConfigError(
                 "min_measured_evidence must be <= max_evidence."
             )
-
-        # boolean flags
         for name in (
             "block_on_policy_drift",
             "escalate_on_policy_drift",
@@ -295,33 +324,23 @@ class FeedbackLoopGuardConfig:
                 raise FeedbackLoopGuardConfigError(
                     f"{name} must be a bool."
                 )
-
-        # telemetry keys
         object.__setattr__(
-            self,
-            "telemetry_keys",
+            self, "telemetry_keys",
             _normalize_string_tuple(
                 self.telemetry_keys, name="telemetry_keys",
             ),
         )
-
-        # trusted truth levels
         object.__setattr__(
-            self,
-            "trusted_truth_levels",
+            self, "trusted_truth_levels",
             _normalize_string_tuple(
                 self.trusted_truth_levels, name="trusted_truth_levels",
             ),
         )
-
-        # drift statistic
         if self.drift_statistic not in _DRIFT_STATISTICS:
             raise FeedbackLoopGuardConfigError(
                 f"drift_statistic must be one of {_DRIFT_STATISTICS}, "
                 f"got {self.drift_statistic!r}."
             )
-
-        # expected container tag
         if self.expected_container_tag is not None:
             if (
                 not isinstance(self.expected_container_tag, str)
@@ -335,6 +354,7 @@ class FeedbackLoopGuardConfig:
     # ------------------------------------------------------------------ #
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "schema_version": SCHEMA_VERSION,
             "staleness_seconds": self.staleness_seconds,
             "staleness_timestamp_key": self.staleness_timestamp_key,
             "treat_missing_observed_at_as_stale":
@@ -418,7 +438,6 @@ class FeedbackLoopGuardConfig:
             )
         return cls.from_dict(data, strict=strict)
 
-    # ------------------------------------------------------------------ #
     def with_overrides(self, **kwargs: Any) -> "FeedbackLoopGuardConfig":
         valid = {f.name for f in fields(self)}
         unknown = set(kwargs) - valid
@@ -431,7 +450,6 @@ class FeedbackLoopGuardConfig:
     def merge(
         self, other: "FeedbackLoopGuardConfig"
     ) -> "FeedbackLoopGuardConfig":
-        """Return a new config where ``other``'s non-defaults win."""
         defaults = FeedbackLoopGuardConfig()
         overrides: Dict[str, Any] = {}
         for f in fields(self):
@@ -440,6 +458,27 @@ class FeedbackLoopGuardConfig:
             if other_val != default_val:
                 overrides[f.name] = other_val
         return self.with_overrides(**overrides)
+
+    def __hash__(self) -> int:
+        return hash((
+            self.staleness_seconds, self.staleness_timestamp_key,
+            self.treat_missing_observed_at_as_stale,
+            self.block_on_policy_drift, self.escalate_on_policy_drift,
+            self.telemetry_drift_tolerance,
+            self.human_escalation_threshold, self.telemetry_keys,
+            self.drift_statistic, self.min_evidence, self.max_evidence,
+            self.trim_excess_evidence, self.trusted_truth_levels,
+            self.min_measured_evidence, self.flag_truncated_evidence,
+            self.flag_clamped_k, self.expected_container_tag,
+        ))
+
+    def __repr__(self) -> str:
+        return (
+            "FeedbackLoopGuardConfig("
+            f"staleness={self.staleness_seconds}s, "
+            f"tolerance={self.telemetry_drift_tolerance}, "
+            f"escalate={self.human_escalation_threshold})"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -469,6 +508,7 @@ class GuardVerdict:
     timestamp: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+    schema_version: int = SCHEMA_VERSION
 
     # ------------------------------------------------------------------ #
     def __post_init__(self) -> None:
@@ -493,10 +533,26 @@ class GuardVerdict:
                 "telemetry_drift must be a finite number >= 0."
             )
 
-        frozen_drift = MappingProxyType(
-            {str(k): float(v) for k, v in dict(self.telemetry_drift_by_key).items()}
+        # Bug fix #2: reject bool / non-numeric / non-finite drift values.
+        if not isinstance(self.telemetry_drift_by_key, ABCMapping):
+            raise FeedbackLoopGuardInputError(
+                "telemetry_drift_by_key must be a Mapping."
+            )
+        frozen_drift: Dict[str, float] = {}
+        for k, v in dict(self.telemetry_drift_by_key).items():
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise FeedbackLoopGuardInputError(
+                    f"telemetry_drift_by_key[{k!r}] must be numeric."
+                )
+            fv = float(v)
+            if not math.isfinite(fv):
+                raise FeedbackLoopGuardInputError(
+                    f"telemetry_drift_by_key[{k!r}] must be finite."
+                )
+            frozen_drift[str(k)] = fv
+        object.__setattr__(
+            self, "telemetry_drift_by_key", MappingProxyType(frozen_drift),
         )
-        object.__setattr__(self, "telemetry_drift_by_key", frozen_drift)
 
         for name in (
             "policy_drift", "requires_human", "truncated_evidence",
@@ -515,12 +571,35 @@ class GuardVerdict:
                     f"{name} must be a non-negative int."
                 )
 
+        # Bug fix #8: cross-validate the evidence counts.
+        if (
+            self.trusted_evidence_count + self.untrusted_evidence_count
+            != self.evidence_count
+        ):
+            raise FeedbackLoopGuardInputError(
+                "trusted_evidence_count + untrusted_evidence_count "
+                "must equal evidence_count."
+            )
+
         if not isinstance(self.timestamp, datetime):
             raise FeedbackLoopGuardInputError("timestamp must be a datetime.")
+        if self.timestamp.tzinfo is None:
+            object.__setattr__(
+                self, "timestamp",
+                self.timestamp.replace(tzinfo=timezone.utc),
+            )
+        if not _is_real_int(self.schema_version) or self.schema_version <= 0:
+            raise FeedbackLoopGuardInputError(
+                "schema_version must be a positive int."
+            )
 
     # ------------------------------------------------------------------ #
     # Convenience
     # ------------------------------------------------------------------ #
+    @property
+    def id(self) -> str:
+        return f"verdict:{self.timestamp.isoformat()}"
+
     def is_empty(self) -> bool:
         return self.evidence_count == 0
 
@@ -543,11 +622,25 @@ class GuardVerdict:
             parts.append("requires_human=true")
         return "; ".join(parts)
 
+    def _render_content(self) -> str:
+        """Content for persistence bridges; includes human-readable reasons."""
+        lines = [self._summarize()]
+        if self.reasons:
+            lines.append("Details:")
+            for reason in self.reasons:
+                lines.append(f"  - {reason}")
+        if self.telemetry_drift_by_key:
+            lines.append("Drift by key:")
+            for k, v in sorted(self.telemetry_drift_by_key.items()):
+                lines.append(f"  {k}: {v:.4f}")
+        return "\n".join(lines)
+
     # ------------------------------------------------------------------ #
     # Serialization
     # ------------------------------------------------------------------ #
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
             "allowed": self.allowed,
             "reasons": list(self.reasons),
             "reason_codes": list(self.reason_codes),
@@ -606,6 +699,7 @@ class GuardVerdict:
                 data.get("container_tag_mismatch", False)
             ),
             timestamp=ts,
+            schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
         )
 
     @classmethod
@@ -623,23 +717,17 @@ class GuardVerdict:
         return cls.from_dict(data)
 
     # ------------------------------------------------------------------ #
-    # Persistence bridge
+    # Persistence bridges
     # ------------------------------------------------------------------ #
-    def to_episode_payload(
-        self,
-        *,
-        container_tag: Optional[str] = None,
-        content: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Return a payload shaped for ``EpisodicMemory.store`` /
-        ``SupermemoryAdapter.remember``.
-
-        The ``content`` field defaults to a short human-readable summary
-        of the verdict. ``metadata`` carries the structured fields.
-        """
-        meta: Dict[str, Any] = {
+    def _metadata(self, *, container_tag: str) -> Dict[str, Any]:
+        return {
             "kind": "guard_verdict",
+            "type": "guard_verdict",
+            "record_id": self.id,
+            "truth_level": "estimated",
+            "container_tag": container_tag,
             "observed_at": self.timestamp.isoformat(),
+            "schema_version": self.schema_version,
             "allowed": self.allowed,
             "requires_human": self.requires_human,
             "policy_drift": self.policy_drift,
@@ -656,16 +744,37 @@ class GuardVerdict:
             "reason_codes": list(self.reason_codes),
             "reason_count": len(self.reason_codes),
         }
-        if container_tag is not None:
-            if not isinstance(container_tag, str) or not container_tag:
-                raise FeedbackLoopGuardInputError(
-                    "container_tag must be None or a non-empty string."
-                )
-            meta["container_tag"] = container_tag
+
+    def to_episode_payload(
+        self,
+        *,
+        container_tag: Optional[str] = None,
+        content: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return a payload shaped for ``EpisodicMemory.store`` /
+        ``SupermemoryAdapter.remember``.
+
+        Bug fix #1: resolves ``container_tag`` to ``DEFAULT_CONTAINER_TAG``
+        when not provided (matching every other record class in the
+        module) instead of returning ``None``.
+        """
+        resolved_tag = container_tag or DEFAULT_CONTAINER_TAG
+        if not isinstance(resolved_tag, str) or not resolved_tag:
+            raise FeedbackLoopGuardInputError(
+                "container_tag must be a non-empty string."
+            )
         return {
-            "content": content if content is not None else self._summarize(),
-            "container_tag": container_tag,
-            "metadata": meta,
+            "content": content if content is not None else self._render_content(),
+            "container_tag": resolved_tag,
+            "metadata": self._metadata(container_tag=resolved_tag),
+        }
+
+    def to_memory_dict(self) -> Dict[str, Any]:
+        """Return ``{"id", "content", "metadata"}`` for ``BoundedRecall``."""
+        return {
+            "id": self.id,
+            "content": self._render_content(),
+            "metadata": self._metadata(container_tag=DEFAULT_CONTAINER_TAG),
         }
 
     # ------------------------------------------------------------------ #
@@ -687,6 +796,7 @@ class GuardVerdict:
             self.clamped_k,
             self.container_tag_mismatch,
             self.timestamp,
+            self.schema_version,
         ))
 
     def __repr__(self) -> str:
@@ -698,6 +808,19 @@ class GuardVerdict:
             f"drift={self.telemetry_drift:.2%}, "
             f"evidence={self.evidence_count})"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Signal tuple (bug fix #10 — single-pass extraction)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class _MemorySignals:
+    """Extracted signals for one memory; avoids repeated metadata scans."""
+
+    truth_level: Optional[str]
+    policy_version: Optional[str]
+    container_tag: Optional[str]
+    observed_at_raw: Any
 
 
 # --------------------------------------------------------------------------- #
@@ -714,7 +837,14 @@ class FeedbackLoopGuard:
         config: Optional[FeedbackLoopGuardConfig] = None,
         strict: bool = True,
     ) -> None:
-        self._config = config or FeedbackLoopGuardConfig()
+        if config is None:
+            config = FeedbackLoopGuardConfig()
+        elif not isinstance(config, FeedbackLoopGuardConfig):
+            raise FeedbackLoopGuardInputError(
+                "config must be a FeedbackLoopGuardConfig or None."
+            )
+        self._config = config
+        # Bug fix #4: `strict` now has observable semantics.
         self._strict = bool(strict)
 
         self._lock = threading.RLock()
@@ -739,6 +869,31 @@ class FeedbackLoopGuard:
     def strict(self) -> bool:
         return self._strict
 
+    # ---------------------------------------------------------- constructors
+    @classmethod
+    def from_config(
+        cls,
+        config: FeedbackLoopGuardConfig,
+        *,
+        strict: bool = True,
+    ) -> "FeedbackLoopGuard":
+        return cls(config=config, strict=strict)
+
+    @classmethod
+    def from_pipeline(
+        cls,
+        pipeline: Any,
+        *,
+        config: Optional[FeedbackLoopGuardConfig] = None,
+        strict: Optional[bool] = None,
+    ) -> "FeedbackLoopGuard":
+        """Return ``pipeline.guard`` if present, else build a fresh one."""
+        guard = getattr(pipeline, "guard", None)
+        if isinstance(guard, cls):
+            return guard
+        resolved = True if strict is None else bool(strict)
+        return cls(config=config, strict=resolved)
+
     # ---------------------------------------------------------- public API
     def check(
         self,
@@ -748,7 +903,12 @@ class FeedbackLoopGuard:
         current_policy: Optional[PolicyRecord] = None,
         now: Optional[float] = None,
     ) -> GuardVerdict:
-        """Return a ``GuardVerdict`` for the given evidence."""
+        """Return a ``GuardVerdict`` for the given evidence.
+
+        Input validation errors always raise. Internal failures raise in
+        ``strict`` mode; in non-strict mode, a fallback verdict with
+        ``REASON_INTERNAL_ERROR`` is returned.
+        """
         # ------------------------------------------------------- validate
         if not isinstance(recalled, RecallBundle):
             raise FeedbackLoopGuardInputError(
@@ -781,176 +941,46 @@ class FeedbackLoopGuard:
             )
 
         start = time.perf_counter()
-
-        # ------------------------------------------------------- evidence
-        memories = list(recalled.memories)
-        evidence_count = len(memories)
-
-        trusted_levels = self._config.trusted_truth_levels
-        trusted_count = 0
-        for m in memories:
-            level = self._truth_level_of(m)
-            if level is not None and level in trusted_levels:
-                trusted_count += 1
-        untrusted_count = evidence_count - trusted_count
-
-        # ------------------------------------------------------- staleness
-        staleness, staleness_known = self._staleness_of(memories, now=now)
-
-        # ------------------------------------------------------- policy
-        policy_drift = False
-        if current_policy is not None:
-            current_version = getattr(current_policy, "version", None)
-            if isinstance(current_version, str) and current_version:
-                for m in memories:
-                    v = self._policy_version_of(m)
-                    if v is not None and v != current_version:
-                        policy_drift = True
-                        break
-
-        # ------------------------------------------------------- telemetry
-        drift_by_key = self._telemetry_drift_by_key(
-            memories, current_telemetry,
-        )
-        telemetry_drift = (
-            max(drift_by_key.values()) if drift_by_key else 0.0
-        )
-
-        # ------------------------------------------------------- container
-        container_mismatch = False
-        expected_tag = self._config.expected_container_tag
-        if expected_tag is not None:
-            for m in memories:
-                tag = self._container_tag_of(m)
-                if tag is not None and tag != expected_tag:
-                    container_mismatch = True
-                    break
-
-        # ------------------------------------------------------- reasons
-        reasons: List[str] = []
-        codes: List[str] = []
-
-        if evidence_count < self._config.min_evidence:
-            reasons.append(
-                f"insufficient evidence: {evidence_count} < "
-                f"{self._config.min_evidence}"
+        try:
+            verdict = self._compute_verdict(
+                recalled=recalled,
+                current_telemetry=current_telemetry,
+                current_policy=current_policy,
+                now=now,
             )
-            codes.append(_REASON_INSUFFICIENT_EVIDENCE)
-        elif (
-            evidence_count > self._config.max_evidence
-            and not self._config.trim_excess_evidence
-        ):
-            reasons.append(
-                f"too much evidence: {evidence_count} > "
-                f"{self._config.max_evidence}"
+        except Exception as exc:
+            # Bug fix #5: set `_last_error` on every failed check.
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            with self._lock:
+                self._total_checks += 1
+                self._blocked += 1
+                self._latency_ring.append(elapsed_ms)
+                self._last_error = f"check: {type(exc).__name__}: {exc}"
+            if isinstance(exc, FeedbackLoopGuardError) or self._strict:
+                raise
+            logger.exception(
+                "check() raised unexpectedly; returning fallback verdict.",
             )
-            codes.append(_REASON_EXCESS_EVIDENCE)
-
-        if (
-            self._config.min_measured_evidence > 0
-            and trusted_count < self._config.min_measured_evidence
-        ):
-            reasons.append(
-                f"insufficient trusted evidence: {trusted_count} < "
-                f"{self._config.min_measured_evidence}"
+            fallback = GuardVerdict(
+                allowed=False,
+                reasons=(f"internal error: {type(exc).__name__}: {exc}",),
+                reason_codes=(REASON_INTERNAL_ERROR,),
+                timestamp=datetime.now(timezone.utc),
             )
-            codes.append(_REASON_UNTRUSTED_EVIDENCE)
-
-        if not staleness_known and evidence_count > 0:
-            if self._config.treat_missing_observed_at_as_stale:
-                reasons.append(
-                    "evidence freshness unknown "
-                    "(no parseable timestamp in evidence)"
-                )
-                codes.append(_REASON_UNKNOWN_STALENESS)
-        elif (
-            staleness_known
-            and staleness is not None
-            and staleness > self._config.staleness_seconds
-        ):
-            reasons.append(
-                f"evidence stale: {staleness:.0f}s > "
-                f"{self._config.staleness_seconds:.0f}s"
-            )
-            codes.append(_REASON_STALE_EVIDENCE)
-
-        if policy_drift and self._config.block_on_policy_drift:
-            reasons.append("policy drift detected")
-            codes.append(_REASON_POLICY_DRIFT)
-
-        if telemetry_drift > self._config.telemetry_drift_tolerance:
-            if drift_by_key:
-                worst_key = max(
-                    drift_by_key.items(), key=lambda kv: kv[1],
-                )[0]
-                detail = f" (worst: {worst_key})"
-            else:
-                detail = ""
-            reasons.append(
-                f"telemetry drift: {telemetry_drift:.2%}{detail} > "
-                f"{self._config.telemetry_drift_tolerance:.2%}"
-            )
-            codes.append(_REASON_TELEMETRY_DRIFT)
-
-        if (
-            recalled.truncated
-            and self._config.flag_truncated_evidence
-        ):
-            reasons.append(
-                "evidence bundle was truncated by the token budget"
-            )
-            codes.append(_REASON_TRUNCATED_EVIDENCE)
-
-        if recalled.clamped_k and self._config.flag_clamped_k:
-            reasons.append(
-                "evidence bundle was clamped by max_k"
-            )
-            codes.append(_REASON_CLAMPED_K)
-
-        if container_mismatch:
-            reasons.append(
-                f"container tag mismatch "
-                f"(expected {expected_tag!r})"
-            )
-            codes.append(_REASON_CONTAINER_MISMATCH)
-
-        # ------------------------------------------------------- escalation
-        requires_human = (
-            telemetry_drift >= self._config.human_escalation_threshold
-        )
-        if policy_drift and self._config.escalate_on_policy_drift:
-            requires_human = True
-
-        allowed = not reasons
-
-        verdict = GuardVerdict(
-            allowed=allowed,
-            reasons=tuple(reasons),
-            reason_codes=tuple(codes),
-            staleness_seconds=staleness if staleness_known else None,
-            staleness_known=staleness_known,
-            policy_drift=policy_drift,
-            telemetry_drift=telemetry_drift,
-            telemetry_drift_by_key=drift_by_key,
-            requires_human=requires_human,
-            evidence_count=evidence_count,
-            trusted_evidence_count=trusted_count,
-            untrusted_evidence_count=untrusted_count,
-            truncated_evidence=bool(recalled.truncated),
-            clamped_k=bool(recalled.clamped_k),
-            container_tag_mismatch=container_mismatch,
-        )
+            with self._lock:
+                self._last_verdict = fallback
+            return fallback
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         with self._lock:
             self._total_checks += 1
-            if allowed:
+            if verdict.allowed:
                 self._allowed += 1
             else:
                 self._blocked += 1
-            if requires_human:
+            if verdict.requires_human:
                 self._escalated += 1
-            for code in codes:
+            for code in verdict.reason_codes:
                 self._reason_counts[code] = (
                     self._reason_counts.get(code, 0) + 1
                 )
@@ -1033,69 +1063,260 @@ class FeedbackLoopGuard:
                 logger.warning("check_many[%d] failed: %s", idx, exc)
                 with self._lock:
                     self._last_error = f"check_many[{idx}]: {exc}"
+                # Bug fix #6: use the public constant instead of a magic string.
                 verdict = GuardVerdict(
                     allowed=False,
                     reasons=(f"check failed: {exc}",),
-                    reason_codes=("check_failed",),
+                    reason_codes=(REASON_CHECK_FAILED,),
                 )
             results.append(verdict)
         return results
 
-    # ---------------------------------------------------------- internals
-    def _truth_level_of(self, memory: Mapping[str, Any]) -> Optional[str]:
-        meta = memory.get("metadata")
-        if isinstance(meta, ABCMapping):
-            v = meta.get("truth_level")
-            if isinstance(v, str) and v:
-                return v
-        v = memory.get("truth_level")
-        return v if isinstance(v, str) and v else None
-
-    def _policy_version_of(
-        self, memory: Mapping[str, Any]
-    ) -> Optional[str]:
-        meta = memory.get("metadata")
-        if isinstance(meta, ABCMapping):
-            v = meta.get("policy_version")
-            if isinstance(v, str) and v:
-                return v
-        v = memory.get("policy_version")
-        return v if isinstance(v, str) and v else None
-
-    def _container_tag_of(
-        self, memory: Mapping[str, Any]
-    ) -> Optional[str]:
-        meta = memory.get("metadata")
-        if isinstance(meta, ABCMapping):
-            v = meta.get("container_tag")
-            if isinstance(v, str) and v:
-                return v
-        v = memory.get("container_tag")
-        return v if isinstance(v, str) and v else None
-
-    def _staleness_of(
+    async def check_many_async(
         self,
-        memories: Sequence[Mapping[str, Any]],
+        items: Iterable[Mapping[str, Any]],
+        *,
+        stop_on_error: bool = False,
+    ) -> List[GuardVerdict]:
+        return await asyncio.to_thread(
+            self.check_many, items, stop_on_error=stop_on_error,
+        )
+
+    # ---------------------------------------------------------- internals
+    def _compute_verdict(
+        self,
+        *,
+        recalled: RecallBundle,
+        current_telemetry: Mapping[str, float],
+        current_policy: Optional[PolicyRecord],
+        now: float,
+    ) -> GuardVerdict:
+        memories = recalled.memories
+        evidence_count = len(memories)
+
+        # Bug fix #10: single-pass signal extraction.
+        signals = [
+            self._extract_memory_signals(m) for m in memories
+        ]
+
+        trusted_levels = self._config.trusted_truth_levels
+        trusted_count = 0
+        for s in signals:
+            if s.truth_level is not None and s.truth_level in trusted_levels:
+                trusted_count += 1
+        untrusted_count = evidence_count - trusted_count
+
+        # Staleness — computed from the same signal tuples.
+        staleness, staleness_known = self._staleness_from_signals(
+            signals, now=now,
+        )
+
+        # Policy drift.
+        policy_drift = False
+        if current_policy is not None:
+            current_version = getattr(current_policy, "version", None)
+            if isinstance(current_version, str) and current_version:
+                for s in signals:
+                    if (
+                        s.policy_version is not None
+                        and s.policy_version != current_version
+                    ):
+                        policy_drift = True
+                        break
+
+        # Container mismatch.
+        container_mismatch = False
+        expected_tag = self._config.expected_container_tag
+        if expected_tag is not None:
+            for s in signals:
+                if (
+                    s.container_tag is not None
+                    and s.container_tag != expected_tag
+                ):
+                    container_mismatch = True
+                    break
+
+        # Telemetry drift.
+        drift_by_key = self._telemetry_drift_by_key(
+            memories, current_telemetry,
+        )
+        telemetry_drift = (
+            max(drift_by_key.values()) if drift_by_key else 0.0
+        )
+
+        # ------------------------------------------------------- reasons
+        reasons: List[str] = []
+        codes: List[str] = []
+
+        if evidence_count < self._config.min_evidence:
+            reasons.append(
+                f"insufficient evidence: {evidence_count} < "
+                f"{self._config.min_evidence}"
+            )
+            codes.append(REASON_INSUFFICIENT_EVIDENCE)
+        elif (
+            evidence_count > self._config.max_evidence
+            and not self._config.trim_excess_evidence
+        ):
+            reasons.append(
+                f"too much evidence: {evidence_count} > "
+                f"{self._config.max_evidence}"
+            )
+            codes.append(REASON_EXCESS_EVIDENCE)
+
+        if (
+            self._config.min_measured_evidence > 0
+            and trusted_count < self._config.min_measured_evidence
+        ):
+            reasons.append(
+                f"insufficient trusted evidence: {trusted_count} < "
+                f"{self._config.min_measured_evidence}"
+            )
+            codes.append(REASON_UNTRUSTED_EVIDENCE)
+
+        if not staleness_known and evidence_count > 0:
+            if self._config.treat_missing_observed_at_as_stale:
+                reasons.append(
+                    "evidence freshness unknown "
+                    "(no parseable timestamp in evidence)"
+                )
+                codes.append(REASON_UNKNOWN_STALENESS)
+        elif (
+            staleness_known
+            and staleness is not None
+            and staleness > self._config.staleness_seconds
+        ):
+            reasons.append(
+                f"evidence stale: {staleness:.0f}s > "
+                f"{self._config.staleness_seconds:.0f}s"
+            )
+            codes.append(REASON_STALE_EVIDENCE)
+
+        if policy_drift and self._config.block_on_policy_drift:
+            reasons.append("policy drift detected")
+            codes.append(REASON_POLICY_DRIFT)
+
+        if telemetry_drift > self._config.telemetry_drift_tolerance:
+            if drift_by_key:
+                worst_key = max(
+                    drift_by_key.items(), key=lambda kv: kv[1],
+                )[0]
+                detail = f" (worst: {worst_key})"
+            else:
+                detail = ""
+            reasons.append(
+                f"telemetry drift: {telemetry_drift:.2%}{detail} > "
+                f"{self._config.telemetry_drift_tolerance:.2%}"
+            )
+            codes.append(REASON_TELEMETRY_DRIFT)
+
+        if recalled.truncated and self._config.flag_truncated_evidence:
+            reasons.append(
+                "evidence bundle was truncated by the token budget"
+            )
+            codes.append(REASON_TRUNCATED_EVIDENCE)
+
+        if recalled.clamped_k and self._config.flag_clamped_k:
+            reasons.append(
+                "evidence bundle was clamped by max_k"
+            )
+            codes.append(REASON_CLAMPED_K)
+
+        if container_mismatch:
+            reasons.append(
+                f"container tag mismatch "
+                f"(expected {expected_tag!r})"
+            )
+            codes.append(REASON_CONTAINER_MISMATCH)
+
+        # ------------------------------------------------------- escalation
+        requires_human = (
+            telemetry_drift >= self._config.human_escalation_threshold
+        )
+        if policy_drift and self._config.escalate_on_policy_drift:
+            requires_human = True
+
+        allowed = not reasons
+
+        return GuardVerdict(
+            allowed=allowed,
+            reasons=tuple(reasons),
+            reason_codes=tuple(codes),
+            staleness_seconds=staleness if staleness_known else None,
+            staleness_known=staleness_known,
+            policy_drift=policy_drift,
+            telemetry_drift=telemetry_drift,
+            telemetry_drift_by_key=drift_by_key,
+            requires_human=requires_human,
+            evidence_count=evidence_count,
+            trusted_evidence_count=trusted_count,
+            untrusted_evidence_count=untrusted_count,
+            truncated_evidence=bool(recalled.truncated),
+            clamped_k=bool(recalled.clamped_k),
+            container_tag_mismatch=container_mismatch,
+            schema_version=SCHEMA_VERSION,
+        )
+
+    def _extract_memory_signals(
+        self, memory: Mapping[str, Any],
+    ) -> _MemorySignals:
+        """Extract truth_level / policy_version / container_tag / observed_at
+        from one memory in a single pass (bug fix #10).
+        """
+        meta: Mapping[str, Any] = {}
+        if isinstance(memory, ABCMapping):
+            raw_meta = memory.get("metadata")
+            if isinstance(raw_meta, ABCMapping):
+                meta = raw_meta
+
+        def _first_str(*values: Any) -> Optional[str]:
+            for v in values:
+                if isinstance(v, str) and v:
+                    return v
+            return None
+
+        def _first_present(*values: Any) -> Any:
+            for v in values:
+                if v is not None:
+                    return v
+            return None
+
+        truth_level = _first_str(
+            meta.get("truth_level"),
+            memory.get("truth_level") if isinstance(memory, ABCMapping) else None,
+        )
+        policy_version = _first_str(
+            meta.get("policy_version"),
+            memory.get("policy_version") if isinstance(memory, ABCMapping) else None,
+        )
+        container_tag = _first_str(
+            meta.get("container_tag"),
+            memory.get("container_tag") if isinstance(memory, ABCMapping) else None,
+        )
+        key = self._config.staleness_timestamp_key
+        observed_at_raw = _first_present(
+            meta.get(key),
+            memory.get(key) if isinstance(memory, ABCMapping) else None,
+        )
+        return _MemorySignals(
+            truth_level=truth_level,
+            policy_version=policy_version,
+            container_tag=container_tag,
+            observed_at_raw=observed_at_raw,
+        )
+
+    def _staleness_from_signals(
+        self,
+        signals: Sequence[_MemorySignals],
         *,
         now: float,
     ) -> Tuple[Optional[float], bool]:
-        """Return ``(newest_age_seconds, known)``.
-
-        ``known`` is False when the evidence contains memories but none
-        of them carry a parseable timestamp under the configured key.
-        """
-        if not memories:
+        """Return ``(newest_age_seconds, known)`` from pre-extracted signals."""
+        if not signals:
             return None, False
-        key = self._config.staleness_timestamp_key
         ages: List[float] = []
-        for memory in memories:
-            meta = memory.get("metadata")
-            raw: Any = None
-            if isinstance(meta, ABCMapping):
-                raw = meta.get(key)
-            if raw is None:
-                raw = memory.get(key)
-            dt = _parse_iso_datetime(raw)
+        for s in signals:
+            dt = _parse_iso_datetime(s.observed_at_raw)
             if dt is None:
                 continue
             age = max(0.0, now - dt.timestamp())
@@ -1137,11 +1358,11 @@ class FeedbackLoopGuard:
                 continue
             values: List[float] = []
             for m in memories:
-                meta = m.get("metadata")
+                meta = m.get("metadata") if isinstance(m, ABCMapping) else None
                 raw: Any = None
                 if isinstance(meta, ABCMapping):
                     raw = meta.get(key)
-                if raw is None:
+                if raw is None and isinstance(m, ABCMapping):
                     raw = m.get(key)
                 if (
                     isinstance(raw, (int, float))
@@ -1176,6 +1397,7 @@ class FeedbackLoopGuard:
             lats = list(self._latency_ring)
             mean_latency = (sum(lats) / len(lats)) if lats else 0.0
             return {
+                "schema_version": SCHEMA_VERSION,
                 "checks": self._total_checks,
                 "allowed": self._allowed,
                 "blocked": self._blocked,
@@ -1213,6 +1435,7 @@ class FeedbackLoopGuard:
     # ---------------------------------------------------------- serialization
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "schema_version": SCHEMA_VERSION,
             "config": self._config.to_dict(),
             "strict": self._strict,
             "statistics": self.statistics(),
@@ -1277,6 +1500,12 @@ class FeedbackLoopGuard:
     def __exit__(self, *exc: Any) -> None:
         self.close()
 
+    async def __aenter__(self) -> "FeedbackLoopGuard":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        self.close()
+
     def __repr__(self) -> str:
         with self._lock:
             return (
@@ -1289,12 +1518,27 @@ class FeedbackLoopGuard:
 
 
 __all__ = [
+    "DEFAULT_CONTAINER_TAG",
     "FeedbackLoopGuard",
     "FeedbackLoopGuardConfig",
     "FeedbackLoopGuardError",
     "FeedbackLoopGuardInputError",
     "FeedbackLoopGuardConfigError",
     "GuardVerdict",
+    "REASON_CLAMPED_K",
+    "REASON_CODES",
+    "REASON_CONTAINER_MISMATCH",
+    "REASON_CHECK_FAILED",
+    "REASON_EXCESS_EVIDENCE",
+    "REASON_INSUFFICIENT_EVIDENCE",
+    "REASON_INTERNAL_ERROR",
+    "REASON_POLICY_DRIFT",
+    "REASON_STALE_EVIDENCE",
+    "REASON_TELEMETRY_DRIFT",
+    "REASON_TRUNCATED_EVIDENCE",
+    "REASON_UNKNOWN_STALENESS",
+    "REASON_UNTRUSTED_EVIDENCE",
+    "SCHEMA_VERSION",
     "__version__",
 ]
 
@@ -1403,7 +1647,7 @@ if __name__ == "__main__":  # pragma: no cover
     )
     assert v2.allowed is False
     assert v2.requires_human is True
-    assert "telemetry_drift" in v2.reason_codes
+    assert REASON_TELEMETRY_DRIFT in v2.reason_codes
     assert "carbon_gco2e" in v2.telemetry_drift_by_key
 
     # --------------------------------------------------- 3. policy drift
@@ -1414,7 +1658,7 @@ if __name__ == "__main__":  # pragma: no cover
     )
     print("pol drift    :", v3.policy_drift, list(v3.reason_codes))
     assert v3.policy_drift is True
-    assert "policy_drift" in v3.reason_codes
+    assert REASON_POLICY_DRIFT in v3.reason_codes
     assert v3.allowed is False
     assert v3.requires_human is True
 
@@ -1425,16 +1669,16 @@ if __name__ == "__main__":  # pragma: no cover
         current_policy=current_policy,
     )
     print("stale        :", v4.allowed, list(v4.reason_codes))
-    assert "stale_evidence" in v4.reason_codes
+    assert REASON_STALE_EVIDENCE in v4.reason_codes
 
     # --------------------------------------------------- 5. unknown staleness
     v5 = guard.check(
-        recalled=_bundle(2, observed_at=None),  # no observed_at
+        recalled=_bundle(2, observed_at=None),
         current_telemetry={"energy_wh": 8.6},
         current_policy=current_policy,
     )
     print("unknown      :", v5.allowed, list(v5.reason_codes))
-    assert "unknown_staleness" in v5.reason_codes
+    assert REASON_UNKNOWN_STALENESS in v5.reason_codes
 
     # --------------------------------------------------- 6. truncated
     v6 = guard.check(
@@ -1442,7 +1686,7 @@ if __name__ == "__main__":  # pragma: no cover
         current_telemetry={"energy_wh": 8.6},
         current_policy=current_policy,
     )
-    assert "truncated_evidence" in v6.reason_codes
+    assert REASON_TRUNCATED_EVIDENCE in v6.reason_codes
     print("truncated    :", list(v6.reason_codes))
 
     # --------------------------------------------------- 7. clamped k
@@ -1451,7 +1695,7 @@ if __name__ == "__main__":  # pragma: no cover
         current_telemetry={"energy_wh": 8.6},
         current_policy=current_policy,
     )
-    assert "clamped_k" in v7.reason_codes
+    assert REASON_CLAMPED_K in v7.reason_codes
     print("clamped k    :", list(v7.reason_codes))
 
     # --------------------------------------------------- 8. untrusted evidence
@@ -1463,7 +1707,7 @@ if __name__ == "__main__":  # pragma: no cover
         current_telemetry={"energy_wh": 8.6},
         current_policy=current_policy,
     )
-    assert "untrusted_evidence" in v8.reason_codes
+    assert REASON_UNTRUSTED_EVIDENCE in v8.reason_codes
     print(
         "untrusted    :", list(v8.reason_codes),
         f"trusted={v8.trusted_evidence_count}",
@@ -1483,7 +1727,7 @@ if __name__ == "__main__":  # pragma: no cover
         current_policy=current_policy,
     )
     assert v9.container_tag_mismatch is True
-    assert "container_tag_mismatch" in v9.reason_codes
+    assert REASON_CONTAINER_MISMATCH in v9.reason_codes
     print("container    :", list(v9.reason_codes))
 
     # --------------------------------------------------- 10. async
@@ -1513,13 +1757,91 @@ if __name__ == "__main__":  # pragma: no cover
     print("check_many   :", [v.allowed for v in many])
     assert [v.allowed for v in many] == [True, False]
 
-    # --------------------------------------------------- 12. persistence bridge
-    payload = v1.to_episode_payload(container_tag="org:green-agent")
-    assert "content" in payload and "metadata" in payload
-    assert payload["metadata"]["kind"] == "guard_verdict"
-    print("ep payload   :", payload["content"][:60], "...")
+    # --------------------------------------------------- 12. check_many_async
+    many_async = asyncio.run(guard.check_many_async([
+        {
+            "recalled": _bundle(3, observed_at=now_iso),
+            "current_telemetry": {"energy_wh": 8.6},
+        },
+    ]))
+    assert len(many_async) == 1
+    print("async many   : OK")
 
-    # --------------------------------------------------- 13. serialization
+    # --------------------------------------------------- 13. bridges
+    payload = v1.to_episode_payload()
+    assert payload["container_tag"] == DEFAULT_CONTAINER_TAG
+    assert payload["metadata"]["container_tag"] == DEFAULT_CONTAINER_TAG
+    assert payload["metadata"]["schema_version"] == SCHEMA_VERSION
+    md = v1.to_memory_dict()
+    assert md["id"].startswith("verdict:")
+    assert md["metadata"]["kind"] == "guard_verdict"
+    print("bridges      : OK")
+
+    # --------------------------------------------------- 14. bug 2 — bool drift rejected
+    try:
+        GuardVerdict(
+            allowed=True,
+            telemetry_drift_by_key={"x": True},  # type: ignore[dict-item]
+        )
+    except FeedbackLoopGuardInputError as exc:
+        print("bool drift   : OK ->", exc)
+    else:
+        raise AssertionError("bool drift should be rejected")
+
+    # --------------------------------------------------- 15. bug 8 — evidence invariant
+    try:
+        GuardVerdict(
+            allowed=True,
+            evidence_count=3,
+            trusted_evidence_count=5,
+            untrusted_evidence_count=0,
+        )
+    except FeedbackLoopGuardInputError as exc:
+        print("evidence inv : OK ->", exc)
+    else:
+        raise AssertionError("evidence invariant should be enforced")
+
+    # --------------------------------------------------- 16. bug 4 — strict gating
+    # Simulate an internal error by monkeypatching _compute_verdict.
+    non_strict_guard = FeedbackLoopGuard(strict=False)
+    non_strict_guard._compute_verdict = lambda **kw: (_ for _ in ()).throw(  # type: ignore[assignment]
+        RuntimeError("boom"),
+    )
+    fb = non_strict_guard.check(
+        recalled=_bundle(1, observed_at=now_iso),
+        current_telemetry={"energy_wh": 8.6},
+    )
+    assert fb.allowed is False
+    assert REASON_INTERNAL_ERROR in fb.reason_codes
+    assert non_strict_guard.statistics()["last_error"].startswith("check:")
+    print("non-strict   : OK ->", list(fb.reason_codes))
+
+    strict_guard = FeedbackLoopGuard(strict=True)
+    strict_guard._compute_verdict = lambda **kw: (_ for _ in ()).throw(  # type: ignore[assignment]
+        RuntimeError("boom"),
+    )
+    try:
+        strict_guard.check(
+            recalled=_bundle(1, observed_at=now_iso),
+            current_telemetry={"energy_wh": 8.6},
+        )
+    except RuntimeError:
+        print("strict reraise : OK")
+
+    # --------------------------------------------------- 17. bug 5 — last_error on check failure
+    assert non_strict_guard.statistics()["last_error"] is not None
+    print("last_error set : OK")
+
+    # --------------------------------------------------- 18. from_config / from_pipeline
+    g_cfg = FeedbackLoopGuard.from_config(FeedbackLoopGuardConfig())
+    assert isinstance(g_cfg, FeedbackLoopGuard)
+    class _FakePipeline:
+        guard = guard
+    g_pipe = FeedbackLoopGuard.from_pipeline(_FakePipeline())
+    assert g_pipe is guard
+    print("from_*       : OK")
+
+    # --------------------------------------------------- 19. serialization
     cfg = FeedbackLoopGuardConfig()
     assert FeedbackLoopGuardConfig.from_dict(cfg.to_dict()) == cfg
     assert FeedbackLoopGuardConfig.from_json(cfg.to_json()) == cfg
@@ -1527,12 +1849,14 @@ if __name__ == "__main__":  # pragma: no cover
         FeedbackLoopGuardConfig().with_overrides(min_evidence=3).min_evidence
         == 3
     )
-    print("cfg RT       : OK")
+    hash(cfg)
+    print("cfg RT       : OK (hashable)")
 
     v_dict = v1.to_dict()
     v_restored = GuardVerdict.from_dict(v_dict)
     assert v_restored.allowed == v1.allowed
     assert v_restored.reason_codes == v1.reason_codes
+    assert v_restored.schema_version == SCHEMA_VERSION
     assert dict(v_restored.telemetry_drift_by_key) == dict(
         v1.telemetry_drift_by_key
     )
@@ -1544,7 +1868,15 @@ if __name__ == "__main__":  # pragma: no cover
     assert guard2.config == guard.config
     print("guard RT     : OK")
 
-    # --------------------------------------------------- 14. stats / reset
+    # --------------------------------------------------- 20. async ctx mgr
+    async def _async_ctx():
+        async with FeedbackLoopGuard() as g:
+            assert isinstance(g, FeedbackLoopGuard)
+            return True
+    assert asyncio.run(_async_ctx()) is True
+    print("async ctx    : OK")
+
+    # --------------------------------------------------- 21. statistics / reset
     stats = guard.statistics()
     print("statistics   :", {
         k: v for k, v in stats.items()
@@ -1555,7 +1887,7 @@ if __name__ == "__main__":  # pragma: no cover
     assert cleared >= 10 and guard.statistics()["checks"] == 0
     print("reset        :", cleared, "checks cleared")
 
-    # --------------------------------------------------- 15. config validation
+    # --------------------------------------------------- 22. config validation
     bad_configs = [
         dict(staleness_seconds=0),
         dict(staleness_seconds=float("nan")),
@@ -1566,7 +1898,7 @@ if __name__ == "__main__":  # pragma: no cover
         dict(human_escalation_threshold=-0.1),
         dict(human_escalation_threshold=1.5),
         dict(human_escalation_threshold=0.1,
-             telemetry_drift_tolerance=0.5),  # escalation < tolerance
+             telemetry_drift_tolerance=0.5),
         dict(min_evidence=0),
         dict(min_evidence=True),
         dict(max_evidence=0, min_evidence=1),
@@ -1588,7 +1920,7 @@ if __name__ == "__main__":  # pragma: no cover
         else:
             raise AssertionError(f"expected rejection for {bad!r}")
 
-    # --------------------------------------------------- 16. input validation
+    # --------------------------------------------------- 23. input validation
     for bad in (
         lambda: guard.check(
             recalled="not-a-bundle",  # type: ignore[arg-type]
@@ -1622,7 +1954,7 @@ if __name__ == "__main__":  # pragma: no cover
         except FeedbackLoopGuardError as exc:
             print("reject input :", exc)
 
-    # --------------------------------------------------- 17. context manager
+    # --------------------------------------------------- 24. context manager
     with FeedbackLoopGuard() as scoped:
         scoped.check(
             recalled=_bundle(2, observed_at=now_iso),
@@ -1630,5 +1962,10 @@ if __name__ == "__main__":  # pragma: no cover
             current_policy=current_policy,
         )
     print("ctx mgr      : OK")
+
+    # --------------------------------------------------- 25. reason codes exported
+    assert REASON_CODES and all(isinstance(c, str) for c in REASON_CODES)
+    assert REASON_TELEMETRY_DRIFT in REASON_CODES
+    print("reason codes : OK (", len(REASON_CODES), "codes )")
 
     print("\nSmoke test passed.")
