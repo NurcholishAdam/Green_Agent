@@ -12,17 +12,20 @@ Enhancements
 - ``MemoryBenchmarkConfig`` — frozen, validated, fully serializable:
   seeds, bootstrap samples, metric names, direction map, timeout,
   runner-error policy, verdict policy, truth-level vocabulary, container
-  tag expectation, per-task breakdown toggle.
+  tag expectation, per-task breakdown toggle, latency-ring size.
+- ``MetricDirection`` — str-enum (``IMPROVES`` / ``HURTS`` /
+  ``INCONCLUSIVE``) with ``coerce`` / ``values``.
 - ``MetricStats`` — frozen per-metric statistics with effect size
-  (Cohen's d), relative delta, significance, and direction.
+  (Cohen's d), relative delta, significance, and direction. Deeply
+  frozen, hashable, full serialization with wrapped casts.
 - ``TaskResult`` — frozen per-task record with baseline/memory metrics,
-  extras pulled from the recall bundle and guard verdict.
+  extras pulled from the recall bundle and guard verdict. Deeply
+  frozen, hashable, wrapped casts.
 - ``BenchmarkReport`` — deeply frozen, hashable, fully serializable,
-  with ``to_episode_payload()`` for persistence via ``EpisodicMemory``
-  or ``SupermemoryAdapter``.
-- Working ``strict=False`` path via ``on_runner_error="skip"`` (the
-  previous release accepted the flag but always raised anyway).
-- Guarded bootstrap CI indices (previous release could invert bounds).
+  with ``to_memory_dict()`` and ``to_episode_payload()`` bridges plus an
+  ``id`` property. ``schema_version`` is stamped on every payload.
+- Working ``strict=False`` path via ``on_runner_error="skip"``.
+- Guarded bootstrap CI indices (never inverted).
 - Rejects ``bool`` for numeric config; ``NaN``/``inf`` in runner output.
 - Frozen ``higher_is_better`` / ``truth_level_weights`` mappings;
   whole config and report are hashable.
@@ -34,14 +37,17 @@ Enhancements
 - Bundle and verdict extractors: pass
   ``bundle_extractor=`` / ``verdict_extractor=`` to harvest standard
   metrics from ``RecallBundle`` and ``GuardVerdict`` automatically.
-- Async sibling (``run_pair_async``) and batch helper (``run_pairs``).
-- Per-runner timeout enforcement via a shared ``ThreadPoolExecutor``.
+- Async sibling (``run_pair_async``), batch helper (``run_pairs``), and
+  async batch (``run_pairs_async``).
+- Per-runner timeout enforcement via a shared ``ThreadPoolExecutor``
+  with executor-shutdown race protection.
+- ``from_config()`` / ``from_pipeline()`` constructors.
 - ``statistics()`` / ``reset()`` / ``close()`` / context manager.
 - Structured error hierarchy:
   ``MemoryBenchmarkError`` → ``MemoryBenchmarkInputError``,
   ``MemoryBenchmarkRunnerError``, ``MemoryBenchmarkConfigError``.
 - Verdict policies: ``score``, ``majority``, ``all_significant``,
-  ``weighted`` — configurable to reflect different risk appetites.
+  ``weighted``.
 - ``__version__`` exported via ``__all__``.
 - ``__main__`` smoke test covering the strict/skip paths, all extractors,
   truth-level awareness, async, per-task breakdown, and round-trips.
@@ -60,11 +66,13 @@ import time
 from collections import deque
 from collections.abc import Mapping as ABCMapping
 from concurrent.futures import (
+    CancelledError as _FuturesCancelledError,
     ThreadPoolExecutor,
     TimeoutError as _FuturesTimeoutError,
 )
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
+from enum import Enum
 from types import MappingProxyType
 from typing import (
     Any,
@@ -85,7 +93,14 @@ from .feedback_loop_guard import GuardVerdict
 
 logger = logging.getLogger(__name__)
 
-__version__ = "6.0.0"
+__version__ = "6.1.0"
+
+#: Version of the benchmark contract itself.
+SCHEMA_VERSION: int = 1
+
+#: Default container tag (matches ``SupermemoryConfig.default_container_tag``
+#: and ``memory_schemas.DEFAULT_CONTAINER_TAG``).
+DEFAULT_CONTAINER_TAG: str = "org:green-agent"
 
 
 # --------------------------------------------------------------------------- #
@@ -96,14 +111,15 @@ _DEFAULT_METRIC_NAMES: Tuple[str, ...] = (
     "decision_consistency",
 )
 
-_DEFAULT_HIGHER_IS_BETTER: Mapping[str, bool] = {
+# Bug fix #9: immutable default mapping.
+_DEFAULT_HIGHER_IS_BETTER: Mapping[str, bool] = MappingProxyType({
     "quality": True,
     "latency_ms": False,
     "tokens": False,
     "energy_wh": False,
     "carbon_gco2e": False,
     "decision_consistency": True,
-}
+})
 
 _DEFAULT_TRUTH_LEVELS: Tuple[str, ...] = (
     "measured", "estimated", "simulated", "user-reported",
@@ -117,6 +133,7 @@ _VERDICT_POLICIES: Tuple[str, ...] = (
 )
 
 _DEFAULT_RUNNER_TIMEOUT_SECONDS: Optional[float] = None
+_DEFAULT_DURATION_RING_SIZE: int = 200
 
 
 # --------------------------------------------------------------------------- #
@@ -138,8 +155,12 @@ class MemoryBenchmarkConfigError(MemoryBenchmarkError):
     """Invalid benchmark configuration."""
 
 
+class MemoryBenchmarkParseError(MemoryBenchmarkError):
+    """Failed to parse a config, metric, task or report from dict/JSON."""
+
+
 # --------------------------------------------------------------------------- #
-# Validation helpers — mirror the other enhanced modules
+# Shared validation + freeze helpers — mirror the patched modules
 # --------------------------------------------------------------------------- #
 def _is_real_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
@@ -167,6 +188,8 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
     """Parse an ISO 8601 timestamp; tolerate trailing ``Z`` and epochs."""
     if value is None:
         return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         ts = float(value)
         if ts > 1e12:
@@ -186,9 +209,7 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
         dt = datetime.fromisoformat(s)
     except ValueError:
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _normalize_string_tuple(
@@ -235,6 +256,99 @@ def _percentile(values: Sequence[float], pct: float) -> float:
     return ordered[k]
 
 
+# Bug fix #3 / #4 / #5: wrapped casts used by every from_dict.
+def _coerce_float(name: str, value: Any) -> float:
+    """Coerce a value to a finite float; reject ``bool`` / non-numerics."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MemoryBenchmarkParseError(
+            f"{name} must be numeric (got {type(value).__name__})."
+        )
+    fv = float(value)
+    if not math.isfinite(fv):
+        raise MemoryBenchmarkParseError(
+            f"{name} must be finite (got {value!r})."
+        )
+    return fv
+
+
+def _coerce_int(name: str, value: Any) -> int:
+    """Coerce a value to an int; reject ``bool`` / non-integers."""
+    if isinstance(value, bool):
+        raise MemoryBenchmarkParseError(f"{name} must be an int.")
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        s = value.strip()
+        try:
+            return int(s)
+        except ValueError as exc:
+            raise MemoryBenchmarkParseError(
+                f"{name} must be an int (got {value!r})."
+            ) from exc
+    raise MemoryBenchmarkParseError(
+        f"{name} must be an int (got {type(value).__name__})."
+    )
+
+
+def _coerce_str(name: str, value: Any) -> str:
+    if not isinstance(value, str):
+        raise MemoryBenchmarkParseError(f"{name} must be a string.")
+    return value
+
+
+def _coerce_float_map(
+    name: str, value: Any,
+) -> Mapping[str, float]:
+    """Validate a mapping of finite floats and freeze it."""
+    if not isinstance(value, ABCMapping):
+        raise MemoryBenchmarkParseError(f"{name} must be a Mapping.")
+    out: Dict[str, float] = {}
+    for k, v in value.items():
+        if not isinstance(k, str) or not k:
+            raise MemoryBenchmarkParseError(
+                f"{name} keys must be non-empty strings."
+            )
+        out[k] = _coerce_float(f"{name}[{k!r}]", v)
+    return MappingProxyType(out)
+
+
+# --------------------------------------------------------------------------- #
+# Enums
+# --------------------------------------------------------------------------- #
+class MetricDirection(str, Enum):
+    """Direction of a metric delta relative to the baseline."""
+
+    IMPROVES = "improves"
+    HURTS = "hurts"
+    INCONCLUSIVE = "inconclusive"
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return self.value
+
+    @classmethod
+    def values(cls) -> Tuple[str, ...]:
+        return tuple(m.value for m in cls)
+
+    @classmethod
+    def coerce(cls, value: Any) -> "MetricDirection":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value)
+            except ValueError as exc:
+                raise MemoryBenchmarkInputError(
+                    f"direction {value!r} is not one of "
+                    f"{list(cls.values())}."
+                ) from exc
+        raise MemoryBenchmarkInputError(
+            f"direction must be a str or MetricDirection, got "
+            f"{type(value).__name__}."
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
@@ -242,6 +356,7 @@ def _percentile(values: Sequence[float], pct: float) -> float:
 class MemoryBenchmarkConfig:
     """Tunable parameters for the benchmark harness."""
 
+    schema_version: int = SCHEMA_VERSION
     seed: int = 42
     bootstrap_samples: int = 500
     confidence_level: float = 0.95
@@ -257,6 +372,9 @@ class MemoryBenchmarkConfig:
     runner_timeout_seconds: Optional[float] = (
         _DEFAULT_RUNNER_TIMEOUT_SECONDS
     )
+
+    # Size of the latency ring used for percentiles.
+    latency_ring_size: int = _DEFAULT_DURATION_RING_SIZE
 
     # Behavior when a runner raises or returns malformed output.
     on_runner_error: Literal["raise", "skip"] = "raise"
@@ -280,7 +398,10 @@ class MemoryBenchmarkConfig:
 
     # ------------------------------------------------------------------ #
     def __post_init__(self) -> None:
-        # seed / counts
+        if not _is_real_int(self.schema_version) or self.schema_version <= 0:
+            raise MemoryBenchmarkConfigError(
+                "schema_version must be a positive int."
+            )
         if not _is_real_int(self.seed) or self.seed < 0:
             raise MemoryBenchmarkConfigError(
                 "seed must be a non-negative int."
@@ -297,11 +418,15 @@ class MemoryBenchmarkConfig:
             raise MemoryBenchmarkConfigError(
                 "max_task_count must be > min_task_count."
             )
-
-        # confidence
-        if not (isinstance(self.confidence_level, (int, float))
-                and not isinstance(self.confidence_level, bool)
-                and math.isfinite(self.confidence_level)):
+        if not _is_real_int(self.latency_ring_size) or self.latency_ring_size <= 0:
+            raise MemoryBenchmarkConfigError(
+                "latency_ring_size must be a positive int."
+            )
+        if not (
+            isinstance(self.confidence_level, (int, float))
+            and not isinstance(self.confidence_level, bool)
+            and math.isfinite(self.confidence_level)
+        ):
             raise MemoryBenchmarkConfigError(
                 "confidence_level must be a finite number."
             )
@@ -309,23 +434,16 @@ class MemoryBenchmarkConfig:
             raise MemoryBenchmarkConfigError(
                 "confidence_level must be in (0, 1)."
             )
-
-        # timeout
         if self.runner_timeout_seconds is not None:
             if not _is_positive_finite(self.runner_timeout_seconds):
                 raise MemoryBenchmarkConfigError(
                     "runner_timeout_seconds must be None or a finite > 0."
                 )
-
-        # metric names
         object.__setattr__(
             self,
             "metric_names",
             _normalize_string_tuple(self.metric_names, name="metric_names"),
         )
-
-        # higher_is_better: a Mapping[str, bool] with the same keys as
-        # metric_names.
         if not isinstance(self.higher_is_better, ABCMapping):
             raise MemoryBenchmarkConfigError(
                 "higher_is_better must be a Mapping."
@@ -349,8 +467,6 @@ class MemoryBenchmarkConfig:
         object.__setattr__(
             self, "higher_is_better", MappingProxyType(hib),
         )
-
-        # policies
         if self.on_runner_error not in _ON_RUNNER_ERROR_POLICIES:
             raise MemoryBenchmarkConfigError(
                 f"on_runner_error must be one of "
@@ -360,8 +476,6 @@ class MemoryBenchmarkConfig:
             raise MemoryBenchmarkConfigError(
                 f"verdict_policy must be one of {_VERDICT_POLICIES}."
             )
-
-        # truth levels
         object.__setattr__(
             self,
             "truth_levels",
@@ -380,8 +494,6 @@ class MemoryBenchmarkConfig:
                     f"trusted_truth_levels entry {level!r} not in "
                     f"truth_levels."
                 )
-
-        # truth_level_weights
         if not isinstance(self.truth_level_weights, ABCMapping):
             raise MemoryBenchmarkConfigError(
                 "truth_level_weights must be a Mapping."
@@ -405,15 +517,11 @@ class MemoryBenchmarkConfig:
         object.__setattr__(
             self, "truth_level_weights", MappingProxyType(weights),
         )
-
-        # weight_by_truth_level
         if not isinstance(self.weight_by_truth_level, bool):
             raise MemoryBenchmarkConfigError(
                 "weight_by_truth_level must be a bool."
             )
         if self.weight_by_truth_level and not self.truth_level_weights:
-            # Fall back to 1.0 for trusted, 0.5 for others, to keep it
-            # meaningful without requiring the caller to pass weights.
             defaults = {
                 level: (
                     1.0 if level in self.trusted_truth_levels else 0.5
@@ -425,8 +533,6 @@ class MemoryBenchmarkConfig:
                 "truth_level_weights",
                 MappingProxyType(defaults),
             )
-
-        # container tag
         if self.expected_container_tag is not None:
             if (
                 not isinstance(self.expected_container_tag, str)
@@ -436,18 +542,15 @@ class MemoryBenchmarkConfig:
                     "expected_container_tag must be None or a non-empty "
                     "string."
                 )
-
-        # per-task breakdown
         if not isinstance(self.include_per_task_breakdown, bool):
             raise MemoryBenchmarkConfigError(
                 "include_per_task_breakdown must be a bool."
             )
 
     # ------------------------------------------------------------------ #
-    # Serialization
-    # ------------------------------------------------------------------ #
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
             "seed": self.seed,
             "bootstrap_samples": self.bootstrap_samples,
             "confidence_level": self.confidence_level,
@@ -456,6 +559,7 @@ class MemoryBenchmarkConfig:
             "metric_names": list(self.metric_names),
             "higher_is_better": dict(self.higher_is_better),
             "runner_timeout_seconds": self.runner_timeout_seconds,
+            "latency_ring_size": self.latency_ring_size,
             "on_runner_error": self.on_runner_error,
             "verdict_policy": self.verdict_policy,
             "truth_levels": list(self.truth_levels),
@@ -537,8 +641,6 @@ class MemoryBenchmarkConfig:
         return cls.from_dict(data, strict=strict)
 
     # ------------------------------------------------------------------ #
-    # Mutation helpers
-    # ------------------------------------------------------------------ #
     def with_overrides(self, **kwargs: Any) -> "MemoryBenchmarkConfig":
         valid = {f.name for f in fields(self)}
         unknown = set(kwargs) - valid
@@ -563,6 +665,7 @@ class MemoryBenchmarkConfig:
     # ------------------------------------------------------------------ #
     def __hash__(self) -> int:
         return hash((
+            self.schema_version,
             self.seed,
             self.bootstrap_samples,
             self.confidence_level,
@@ -571,6 +674,7 @@ class MemoryBenchmarkConfig:
             self.metric_names,
             tuple(sorted(self.higher_is_better.items())),
             self.runner_timeout_seconds,
+            self.latency_ring_size,
             self.on_runner_error,
             self.verdict_policy,
             self.truth_levels,
@@ -606,7 +710,8 @@ class MetricStats:
     ci_high: float
     cohen_d: float
     significant: bool
-    direction: str  # "improves" | "hurts" | "inconclusive"
+    direction: str = MetricDirection.INCONCLUSIVE.value
+    schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         for name in (
@@ -624,19 +729,26 @@ class MetricStats:
                 )
         if not isinstance(self.significant, bool):
             raise MemoryBenchmarkInputError("significant must be a bool.")
-        if self.direction not in ("improves", "hurts", "inconclusive"):
-            raise MemoryBenchmarkInputError(
-                f"direction must be one of "
-                f"('improves', 'hurts', 'inconclusive'), got "
-                f"{self.direction!r}."
-            )
+        object.__setattr__(
+            self, "direction",
+            MetricDirection.coerce(self.direction).value,
+        )
         if self.ci_low > self.ci_high:
             raise MemoryBenchmarkInputError(
                 "ci_low must be <= ci_high."
             )
+        if not _is_real_int(self.schema_version) or self.schema_version <= 0:
+            raise MemoryBenchmarkInputError(
+                "schema_version must be a positive int."
+            )
+
+    @property
+    def direction_enum(self) -> MetricDirection:
+        return MetricDirection.coerce(self.direction)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
             "baseline": self.baseline,
             "memory": self.memory,
             "delta": self.delta,
@@ -654,20 +766,44 @@ class MetricStats:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "MetricStats":
         if not isinstance(data, ABCMapping):
-            raise MemoryBenchmarkInputError(
+            raise MemoryBenchmarkParseError(
                 "MetricStats.from_dict expects a Mapping."
             )
         return cls(
-            baseline=float(data.get("baseline", 0.0)),
-            memory=float(data.get("memory", 0.0)),
-            delta=float(data.get("delta", 0.0)),
-            relative_delta=float(data.get("relative_delta", 0.0)),
-            ci_low=float(data.get("ci_low", 0.0)),
-            ci_high=float(data.get("ci_high", 0.0)),
-            cohen_d=float(data.get("cohen_d", 0.0)),
+            baseline=_coerce_float("baseline", data.get("baseline", 0.0)),
+            memory=_coerce_float("memory", data.get("memory", 0.0)),
+            delta=_coerce_float("delta", data.get("delta", 0.0)),
+            relative_delta=_coerce_float(
+                "relative_delta", data.get("relative_delta", 0.0),
+            ),
+            ci_low=_coerce_float("ci_low", data.get("ci_low", 0.0)),
+            ci_high=_coerce_float("ci_high", data.get("ci_high", 0.0)),
+            cohen_d=_coerce_float("cohen_d", data.get("cohen_d", 0.0)),
             significant=bool(data.get("significant", False)),
-            direction=str(data.get("direction", "inconclusive")),
+            direction=str(
+                data.get("direction", MetricDirection.INCONCLUSIVE.value)
+            ),
+            schema_version=_coerce_int(
+                "schema_version", data.get("schema_version", SCHEMA_VERSION),
+            ),
         )
+
+    @classmethod
+    def from_json(cls, payload: str) -> "MetricStats":
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise MemoryBenchmarkParseError(
+                f"MetricStats.from_json invalid JSON: {exc}"
+            ) from exc
+        return cls.from_dict(data)
+
+    def __hash__(self) -> int:
+        return hash((
+            self.baseline, self.memory, self.delta, self.relative_delta,
+            self.ci_low, self.ci_high, self.cohen_d,
+            self.significant, self.direction, self.schema_version,
+        ))
 
     def __repr__(self) -> str:
         return (
@@ -692,6 +828,7 @@ class TaskResult:
     container_tag: Optional[str] = None
     bundle_extras: Mapping[str, float] = field(default_factory=dict)
     verdict_extras: Mapping[str, float] = field(default_factory=dict)
+    schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         if not _is_real_int(self.index) or self.index < 0:
@@ -719,9 +856,14 @@ class TaskResult:
             raise MemoryBenchmarkInputError(
                 "container_tag must be None or a string."
             )
+        if not _is_real_int(self.schema_version) or self.schema_version <= 0:
+            raise MemoryBenchmarkInputError(
+                "schema_version must be a positive int."
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
             "index": self.index,
             "baseline": dict(self.baseline),
             "memory": dict(self.memory),
@@ -738,19 +880,71 @@ class TaskResult:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "TaskResult":
         if not isinstance(data, ABCMapping):
-            raise MemoryBenchmarkInputError(
+            raise MemoryBenchmarkParseError(
                 "TaskResult.from_dict expects a Mapping."
             )
         return cls(
-            index=int(data.get("index", 0)),
-            baseline=dict(data.get("baseline", {})),
-            memory=dict(data.get("memory", {})),
-            delta=dict(data.get("delta", {})),
-            truth_level=data.get("truth_level"),
-            container_tag=data.get("container_tag"),
-            bundle_extras=dict(data.get("bundle_extras", {})),
-            verdict_extras=dict(data.get("verdict_extras", {})),
+            index=_coerce_int("index", data.get("index", 0)),
+            baseline=_coerce_float_map(
+                "baseline", data.get("baseline", {}),
+            ),
+            memory=_coerce_float_map("memory", data.get("memory", {})),
+            delta=_coerce_float_map("delta", data.get("delta", {})),
+            truth_level=(
+                _coerce_str("truth_level", data["truth_level"])
+                if isinstance(data.get("truth_level"), str) else None
+            ),
+            container_tag=(
+                _coerce_str("container_tag", data["container_tag"])
+                if isinstance(data.get("container_tag"), str) else None
+            ),
+            bundle_extras=_coerce_float_map(
+                "bundle_extras", data.get("bundle_extras", {}),
+            ),
+            verdict_extras=_coerce_float_map(
+                "verdict_extras", data.get("verdict_extras", {}),
+            ),
+            schema_version=_coerce_int(
+                "schema_version", data.get("schema_version", SCHEMA_VERSION),
+            ),
         )
+
+    @classmethod
+    def from_json(cls, payload: str) -> "TaskResult":
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise MemoryBenchmarkParseError(
+                f"TaskResult.from_json invalid JSON: {exc}"
+            ) from exc
+        return cls.from_dict(data)
+
+    def to_memory_dict(self) -> Dict[str, Any]:
+        """Return ``{"id", "content", "metadata"}`` for ``BoundedRecall``."""
+        lines = [
+            f"Benchmark task {self.index}",
+            f"  truth_level={self.truth_level!r}",
+            f"  container_tag={self.container_tag!r}",
+            "  baseline: "
+            + json.dumps(dict(self.baseline), default=str, sort_keys=True),
+            "  memory: "
+            + json.dumps(dict(self.memory), default=str, sort_keys=True),
+            "  delta: "
+            + json.dumps(dict(self.delta), default=str, sort_keys=True),
+        ]
+        return {
+            "id": f"task:{self.index}",
+            "content": "\n".join(lines),
+            "metadata": {
+                "kind": "benchmark_task",
+                "record_id": f"task:{self.index}",
+                "truth_level": self.truth_level or "estimated",
+                "container_tag": self.container_tag or DEFAULT_CONTAINER_TAG,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "schema_version": self.schema_version,
+                "index": self.index,
+            },
+        }
 
     def __hash__(self) -> int:
         return hash((
@@ -762,6 +956,7 @@ class TaskResult:
             self.container_tag,
             tuple(sorted(self.bundle_extras.items())),
             tuple(sorted(self.verdict_extras.items())),
+            self.schema_version,
         ))
 
     def __repr__(self) -> str:
@@ -793,6 +988,7 @@ class BenchmarkReport:
     timestamp: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+    schema_version: int = SCHEMA_VERSION
 
     # ------------------------------------------------------------------ #
     def __post_init__(self) -> None:
@@ -816,6 +1012,10 @@ class BenchmarkReport:
                 f"('memory_helps', 'memory_neutral', 'memory_hurts'), "
                 f"got {self.verdict!r}."
             )
+        if not _is_real_int(self.schema_version) or self.schema_version <= 0:
+            raise MemoryBenchmarkInputError(
+                "schema_version must be a positive int."
+            )
         if not isinstance(self.metrics, ABCMapping):
             raise MemoryBenchmarkInputError("metrics must be a Mapping.")
         frozen_metrics: Dict[str, MetricStats] = {}
@@ -832,7 +1032,6 @@ class BenchmarkReport:
         object.__setattr__(
             self, "metrics", MappingProxyType(frozen_metrics),
         )
-
         if not isinstance(self.extras, ABCMapping):
             raise MemoryBenchmarkInputError("extras must be a Mapping.")
         object.__setattr__(
@@ -841,7 +1040,6 @@ class BenchmarkReport:
                 {str(k): float(v) for k, v in self.extras.items()}
             ),
         )
-
         if not isinstance(self.per_task, tuple):
             object.__setattr__(self, "per_task", tuple(self.per_task))
         for tr in self.per_task:
@@ -849,7 +1047,6 @@ class BenchmarkReport:
                 raise MemoryBenchmarkInputError(
                     "per_task entries must be TaskResult instances."
                 )
-
         for name in ("truth_level_mix", "container_tag_mix"):
             v = getattr(self, name)
             if not isinstance(v, ABCMapping):
@@ -868,19 +1065,29 @@ class BenchmarkReport:
             object.__setattr__(
                 self, name, MappingProxyType(normalized),
             )
-
         if not isinstance(self.timestamp, datetime):
             raise MemoryBenchmarkInputError(
                 "timestamp must be a datetime."
             )
+        if self.timestamp.tzinfo is None:
+            object.__setattr__(
+                self, "timestamp",
+                self.timestamp.replace(tzinfo=timezone.utc),
+            )
 
     # ------------------------------------------------------------------ #
+    @property
+    def id(self) -> str:
+        return f"report:{self.timestamp.isoformat()}"
+
     def _summarize(self) -> str:
         improved = sum(
-            1 for v in self.metrics.values() if v.direction == "improves"
+            1 for v in self.metrics.values()
+            if v.direction == MetricDirection.IMPROVES.value
         )
         hurt = sum(
-            1 for v in self.metrics.values() if v.direction == "hurts"
+            1 for v in self.metrics.values()
+            if v.direction == MetricDirection.HURTS.value
         )
         return (
             f"Memory benchmark: {self.verdict} "
@@ -891,6 +1098,7 @@ class BenchmarkReport:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
             "tasks": self.tasks,
             "tasks_succeeded": self.tasks_succeeded,
             "tasks_failed": self.tasks_failed,
@@ -913,7 +1121,7 @@ class BenchmarkReport:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "BenchmarkReport":
         if not isinstance(data, ABCMapping):
-            raise MemoryBenchmarkInputError(
+            raise MemoryBenchmarkParseError(
                 "BenchmarkReport.from_dict expects a Mapping."
             )
         ts_raw = data.get("timestamp")
@@ -922,7 +1130,7 @@ class BenchmarkReport:
             ts = datetime.now(timezone.utc)
         raw_metrics = data.get("metrics", {})
         if not isinstance(raw_metrics, ABCMapping):
-            raise MemoryBenchmarkInputError(
+            raise MemoryBenchmarkParseError(
                 "'metrics' must be a Mapping."
             )
         metrics = {
@@ -930,21 +1138,38 @@ class BenchmarkReport:
         }
         raw_per_task = data.get("per_task", [])
         if not isinstance(raw_per_task, (list, tuple)):
-            raise MemoryBenchmarkInputError("'per_task' must be a sequence.")
+            raise MemoryBenchmarkParseError("'per_task' must be a sequence.")
         per_task = tuple(TaskResult.from_dict(t) for t in raw_per_task)
+        raw_tlm = data.get("truth_level_mix", {}) or {}
+        raw_ctm = data.get("container_tag_mix", {}) or {}
+        if not isinstance(raw_tlm, ABCMapping):
+            raise MemoryBenchmarkParseError(
+                "truth_level_mix must be a Mapping."
+            )
+        if not isinstance(raw_ctm, ABCMapping):
+            raise MemoryBenchmarkParseError(
+                "container_tag_mix must be a Mapping."
+            )
         return cls(
-            tasks=int(data.get("tasks", 0)),
-            tasks_succeeded=int(data.get("tasks_succeeded", 0)),
-            tasks_failed=int(data.get("tasks_failed", 0)),
+            tasks=_coerce_int("tasks", data.get("tasks", 0)),
+            tasks_succeeded=_coerce_int(
+                "tasks_succeeded", data.get("tasks_succeeded", 0),
+            ),
+            tasks_failed=_coerce_int(
+                "tasks_failed", data.get("tasks_failed", 0),
+            ),
             metrics=metrics,
             extras=dict(data.get("extras", {})),
             per_task=per_task,
             verdict=str(data.get("verdict", "memory_neutral")),
-            score=int(data.get("score", 0)),
-            seed=int(data.get("seed", 0)),
-            truth_level_mix=dict(data.get("truth_level_mix", {})),
-            container_tag_mix=dict(data.get("container_tag_mix", {})),
+            score=_coerce_int("score", data.get("score", 0)),
+            seed=_coerce_int("seed", data.get("seed", 0)),
+            truth_level_mix={str(k): int(v) for k, v in raw_tlm.items()},
+            container_tag_mix={str(k): int(v) for k, v in raw_ctm.items()},
             timestamp=ts,
+            schema_version=_coerce_int(
+                "schema_version", data.get("schema_version", SCHEMA_VERSION),
+            ),
         )
 
     @classmethod
@@ -952,30 +1177,49 @@ class BenchmarkReport:
         try:
             data = json.loads(payload)
         except json.JSONDecodeError as exc:
-            raise MemoryBenchmarkInputError(
+            raise MemoryBenchmarkParseError(
                 f"BenchmarkReport.from_json received invalid JSON: {exc}"
             ) from exc
         if not isinstance(data, ABCMapping):
-            raise MemoryBenchmarkInputError(
+            raise MemoryBenchmarkParseError(
                 "from_json expected a JSON object at the top level."
             )
         return cls.from_dict(data)
 
     # ------------------------------------------------------------------ #
-    # Persistence bridge
+    # Persistence bridges
     # ------------------------------------------------------------------ #
-    def to_episode_payload(
-        self,
-        *,
-        container_tag: Optional[str] = None,
-        content: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Return a payload shaped for ``EpisodicMemory.store`` /
-        ``SupermemoryAdapter.remember``.
-        """
-        meta: Dict[str, Any] = {
+    def _render_content(self) -> str:
+        lines = [self._summarize()]
+        if self.metrics:
+            lines.append("Metrics:")
+            for name, stats in sorted(self.metrics.items()):
+                lines.append(
+                    f"  {name}: delta={stats.delta:+.4g} "
+                    f"ci=[{stats.ci_low:+.4g}, {stats.ci_high:+.4g}] "
+                    f"d={stats.cohen_d:+.2f} {stats.direction}"
+                )
+        if self.truth_level_mix:
+            mix = ", ".join(
+                f"{k}={v}" for k, v in sorted(self.truth_level_mix.items())
+            )
+            lines.append(f"truth_level_mix: {mix}")
+        if self.container_tag_mix:
+            mix = ", ".join(
+                f"{k}={v}" for k, v in sorted(self.container_tag_mix.items())
+            )
+            lines.append(f"container_tag_mix: {mix}")
+        return "\n".join(lines)
+
+    def _metadata(self, *, container_tag: str) -> Dict[str, Any]:
+        return {
             "kind": "benchmark_report",
+            "type": "benchmark_report",
+            "record_id": self.id,
+            "truth_level": "estimated",
+            "container_tag": container_tag,
             "observed_at": self.timestamp.isoformat(),
+            "schema_version": self.schema_version,
             "tasks": self.tasks,
             "tasks_succeeded": self.tasks_succeeded,
             "tasks_failed": self.tasks_failed,
@@ -995,21 +1239,42 @@ class BenchmarkReport:
                 for k, v in self.metrics.items()
             },
         }
-        if container_tag is not None:
-            if not isinstance(container_tag, str) or not container_tag:
-                raise MemoryBenchmarkInputError(
-                    "container_tag must be None or a non-empty string."
-                )
-            meta["container_tag"] = container_tag
+
+    def to_episode_payload(
+        self,
+        *,
+        container_tag: Optional[str] = None,
+        content: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return a payload shaped for ``EpisodicMemory.store`` /
+        ``SupermemoryAdapter.remember``.
+
+        Bug fix #1: resolves ``container_tag`` to ``DEFAULT_CONTAINER_TAG``
+        when not provided (matching every other record class in the module).
+        """
+        resolved_tag = container_tag or DEFAULT_CONTAINER_TAG
+        if not isinstance(resolved_tag, str) or not resolved_tag:
+            raise MemoryBenchmarkInputError(
+                "container_tag must be a non-empty string."
+            )
         return {
-            "content": content if content is not None else self._summarize(),
-            "container_tag": container_tag,
-            "metadata": meta,
+            "content": content if content is not None else self._render_content(),
+            "container_tag": resolved_tag,
+            "metadata": self._metadata(container_tag=resolved_tag),
+        }
+
+    def to_memory_dict(self) -> Dict[str, Any]:
+        """Return ``{"id", "content", "metadata"}`` for ``BoundedRecall``."""
+        return {
+            "id": self.id,
+            "content": self._render_content(),
+            "metadata": self._metadata(container_tag=DEFAULT_CONTAINER_TAG),
         }
 
     # ------------------------------------------------------------------ #
     def __hash__(self) -> int:
         return hash((
+            self.schema_version,
             self.tasks,
             self.tasks_succeeded,
             self.tasks_failed,
@@ -1037,8 +1302,6 @@ class BenchmarkReport:
 class MemoryBenchmark:
     """Paired benchmark: without-memory vs. with-memory."""
 
-    _DURATION_RING_SIZE: int = 200
-
     def __init__(
         self,
         *,
@@ -1051,7 +1314,6 @@ class MemoryBenchmark:
             raise MemoryBenchmarkInputError(
                 "config must be a MemoryBenchmarkConfig or None."
             )
-        # Backward compat: ``strict`` maps to ``on_runner_error``.
         if strict is not None:
             config = config.with_overrides(
                 on_runner_error="raise" if strict else "skip",
@@ -1063,13 +1325,12 @@ class MemoryBenchmark:
         self._owns_executor: bool = False
         self._executor_guard = threading.Lock()
 
-        # Counters
         self._total_runs = 0
         self._total_task_pairs = 0
         self._total_task_failures = 0
         self._runner_errors = 0
         self._duration_ring: Deque[float] = deque(
-            maxlen=self._DURATION_RING_SIZE
+            maxlen=self._config.latency_ring_size
         )
         self._last_report: Optional[BenchmarkReport] = None
         self._last_error: Optional[str] = None
@@ -1080,18 +1341,48 @@ class MemoryBenchmark:
     def config(self) -> MemoryBenchmarkConfig:
         return self._config
 
+    @property
+    def last_report(self) -> Optional[BenchmarkReport]:
+        with self._lock:
+            return self._last_report
+
+    # ---------------------------------------------------------- constructors
+    @classmethod
+    def from_config(
+        cls,
+        config: MemoryBenchmarkConfig,
+        *,
+        strict: Optional[bool] = None,
+    ) -> "MemoryBenchmark":
+        return cls(config=config, strict=strict)
+
+    @classmethod
+    def from_pipeline(
+        cls,
+        pipeline: Any,
+        *,
+        config: Optional[MemoryBenchmarkConfig] = None,
+        strict: Optional[bool] = None,
+    ) -> "MemoryBenchmark":
+        """Return ``pipeline.benchmark`` if present, else build a fresh one."""
+        bench = getattr(pipeline, "benchmark", None)
+        if isinstance(bench, cls):
+            return bench
+        return cls(config=config, strict=strict)
+
     # -------------------------------------------------------------- executor
-    def _get_executor(self) -> ThreadPoolExecutor:
-        if self._executor is not None:
-            return self._executor
-        with self._executor_guard:
-            if self._executor is None:
-                self._executor = ThreadPoolExecutor(
-                    max_workers=2,
-                    thread_name_prefix="memory-benchmark",
-                )
-                self._owns_executor = True
-            return self._executor
+    def _acquire_executor(self) -> ThreadPoolExecutor:
+        """Return the shared executor, creating it if necessary.
+
+        Caller must hold ``self._executor_guard``.
+        """
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=2,
+                thread_name_prefix="memory-benchmark",
+            )
+            self._owns_executor = True
+        return self._executor
 
     def close(self) -> None:
         """Shut down the owned executor. Safe to call multiple times."""
@@ -1133,7 +1424,6 @@ class MemoryBenchmark:
         finite floats. Optional extractors harvest additional memory-side
         signals from ``RecallBundle`` and ``GuardVerdict``.
         """
-        # ------------------------------------------------------- validate
         if not isinstance(tasks, (list, tuple)):
             raise MemoryBenchmarkInputError(
                 "tasks must be a sequence."
@@ -1167,7 +1457,6 @@ class MemoryBenchmark:
                 f"tasks exceeds max_task_count="
                 f"{self._config.max_task_count}."
             )
-
         if now is None:
             now = time.time()
         elif not _is_finite_nonneg(now):
@@ -1197,17 +1486,14 @@ class MemoryBenchmark:
             m = self._run_runner(
                 with_memory, task, name=f"memory[{i}]",
             )
-
             if b is None or m is None:
                 tasks_failed += 1
                 if self._config.on_runner_error == "skip":
                     continue
-                # Unreachable: ``_run_runner`` raises on "raise".
                 raise MemoryBenchmarkRunnerError(  # pragma: no cover
                     f"runner failed at task {i}"
                 )
 
-            # Every configured metric must be present.
             missing = [
                 metric for metric in metric_names
                 if metric not in b or metric not in m
@@ -1223,7 +1509,6 @@ class MemoryBenchmark:
                 tasks_failed += 1
                 continue
 
-            # Truth level and container tag extraction.
             truth_level: Optional[str] = None
             if task_truth_level is not None:
                 truth_level = task_truth_level(task)
@@ -1264,7 +1549,6 @@ class MemoryBenchmark:
                         container_tag_mix.get(container_tag, 0) + 1
                     )
 
-            # Extras: bundle and verdict.
             bundle_extras: Dict[str, float] = {}
             if bundle_extractor is not None:
                 bundle = bundle_extractor(task)
@@ -1281,7 +1565,6 @@ class MemoryBenchmark:
                 for k, v in verdict_extras.items():
                     verdict_extras_all.setdefault(k, []).append(v)
 
-            # Collect.
             delta: Dict[str, float] = {}
             for metric in metric_names:
                 bv = b[metric]
@@ -1316,7 +1599,6 @@ class MemoryBenchmark:
             b_vals = baseline_runs[metric]
             m_vals = memory_runs[metric]
             if not b_vals or not m_vals:
-                # Should never happen after the success check above.
                 continue
             b_mean = statistics.fmean(b_vals)
             m_mean = statistics.fmean(m_vals)
@@ -1330,13 +1612,19 @@ class MemoryBenchmark:
 
             higher = self._config.higher_is_better[metric]
             if ci_low > 0.0:
-                sig_dir = "improves" if higher else "hurts"
+                sig_dir = (
+                    MetricDirection.IMPROVES.value if higher
+                    else MetricDirection.HURTS.value
+                )
                 significant = True
             elif ci_high < 0.0:
-                sig_dir = "hurts" if higher else "improves"
+                sig_dir = (
+                    MetricDirection.HURTS.value if higher
+                    else MetricDirection.IMPROVES.value
+                )
                 significant = True
             else:
-                sig_dir = "inconclusive"
+                sig_dir = MetricDirection.INCONCLUSIVE.value
                 significant = False
 
             metrics[metric] = MetricStats(
@@ -1349,12 +1637,13 @@ class MemoryBenchmark:
                 cohen_d=cohen_d,
                 significant=significant,
                 direction=sig_dir,
+                schema_version=SCHEMA_VERSION,
             )
 
-            if sig_dir == "improves":
+            if sig_dir == MetricDirection.IMPROVES.value:
                 votes.append(+1)
                 weights.append(abs(relative))
-            elif sig_dir == "hurts":
+            elif sig_dir == MetricDirection.HURTS.value:
                 votes.append(-1)
                 weights.append(abs(relative))
             else:
@@ -1364,7 +1653,6 @@ class MemoryBenchmark:
         score = sum(votes)
         verdict = self._decide_verdict(votes, weights, metrics)
 
-        # Extras aggregated as memory-side means.
         extras: Dict[str, float] = {}
         for k, vs in bundle_extras_all.items():
             extras[k] = statistics.fmean(vs) if vs else 0.0
@@ -1388,6 +1676,7 @@ class MemoryBenchmark:
             seed=self._config.seed,
             truth_level_mix=truth_level_mix,
             container_tag_mix=container_tag_mix,
+            schema_version=self._config.schema_version,
         )
 
         with self._lock:
@@ -1442,13 +1731,7 @@ class MemoryBenchmark:
         *,
         stop_on_error: bool = False,
     ) -> List[BenchmarkReport]:
-        """Run ``run_pair`` for each item.
-
-        Each item must be a Mapping with keys ``tasks``,
-        ``without_memory``, ``with_memory`` and optional
-        ``bundle_extractor``, ``verdict_extractor``,
-        ``task_truth_level``, ``task_container_tag``, ``now``.
-        """
+        """Run ``run_pair`` for each item."""
         reports: List[BenchmarkReport] = []
         for idx, item in enumerate(pairs):
             if not isinstance(item, ABCMapping):
@@ -1490,6 +1773,17 @@ class MemoryBenchmark:
                 with self._lock:
                     self._last_error = f"run_pairs[{idx}]: {exc}"
         return reports
+
+    async def run_pairs_async(
+        self,
+        pairs: Iterable[Mapping[str, Any]],
+        *,
+        stop_on_error: bool = False,
+    ) -> List[BenchmarkReport]:
+        """Run ``run_pairs`` in a worker thread."""
+        return await asyncio.to_thread(
+            self.run_pairs, pairs, stop_on_error=stop_on_error,
+        )
 
     # ---------------------------------------------------------- internals
     def _run_runner(
@@ -1562,14 +1856,36 @@ class MemoryBenchmark:
         timeout = self._config.runner_timeout_seconds
         if timeout is None:
             return fn(arg)
-        executor = self._get_executor()
-        future = executor.submit(fn, arg)
+
+        # Bug fix #6: hold the guard during submit so close() cannot
+        # race between _acquire_executor and submit.
+        with self._executor_guard:
+            executor = self._acquire_executor()
+            try:
+                future = executor.submit(fn, arg)
+            except RuntimeError as exc:
+                if not self._owns_executor:
+                    raise MemoryBenchmarkRunnerError(
+                        f"executor is shutting down: {exc}"
+                    ) from exc
+                # Executor was shut down between guard checks; rebuild once.
+                self._executor = ThreadPoolExecutor(
+                    max_workers=2,
+                    thread_name_prefix="memory-benchmark",
+                )
+                future = self._executor.submit(fn, arg)
+
         try:
             return future.result(timeout=timeout)
         except _FuturesTimeoutError as exc:
             future.cancel()
             raise MemoryBenchmarkRunnerError(
                 f"{name} timed out after {timeout}s."
+            ) from exc
+        except _FuturesCancelledError as exc:
+            # Bug fix #7: executor shutdown cancels in-flight futures.
+            raise MemoryBenchmarkRunnerError(
+                f"{name} was cancelled (executor shutting down)."
             ) from exc
 
     def _bootstrap_ci(
@@ -1581,7 +1897,6 @@ class MemoryBenchmark:
     ) -> Tuple[float, float]:
         n = len(memory_vals)
         if n < 2:
-            # Degenerate: CI collapses to the point estimate.
             delta = statistics.fmean(memory_vals) - statistics.fmean(
                 baseline_vals
             )
@@ -1595,13 +1910,11 @@ class MemoryBenchmark:
         deltas.sort()
         alpha = 1.0 - self._config.confidence_level
         last = len(deltas) - 1
-        lo_idx = max(0, min(last, int(math.floor(alpha / 2 * len(deltas)))))
+        # Refinement: integer arithmetic on the index computation.
+        lo_idx = max(0, min(last, int(alpha / 2 * len(deltas))))
         hi_idx = max(
             0,
-            min(
-                last,
-                int(math.ceil((1 - alpha / 2) * len(deltas))) - 1,
-            ),
+            min(last, int((1 - alpha / 2) * len(deltas)) - 1),
         )
         if lo_idx > hi_idx:
             lo_idx, hi_idx = hi_idx, lo_idx
@@ -1635,6 +1948,8 @@ class MemoryBenchmark:
                 return "memory_hurts"
             return "memory_neutral"
         if policy == "majority":
+            # Strict net majority: positive votes must exceed half of
+            # all metrics (including abstentions).
             score = sum(votes)
             threshold = len(votes) / 2.0
             if score > threshold:
@@ -1658,7 +1973,6 @@ class MemoryBenchmark:
             if score < 0:
                 return "memory_hurts"
             return "memory_neutral"
-        # Unreachable
         raise MemoryBenchmarkConfigError(  # pragma: no cover
             f"Unknown verdict_policy: {policy!r}."
         )
@@ -1698,6 +2012,7 @@ class MemoryBenchmark:
             durations = list(self._duration_ring)
             mean_dur = sum(durations) / len(durations) if durations else 0.0
             return {
+                "schema_version": SCHEMA_VERSION,
                 "runs": self._total_runs,
                 "task_pairs": self._total_task_pairs,
                 "task_failures": self._total_task_failures,
@@ -1732,6 +2047,7 @@ class MemoryBenchmark:
     # ---------------------------------------------------------- serialization
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "schema_version": SCHEMA_VERSION,
             "config": self._config.to_dict(),
             "statistics": self.statistics(),
         }
@@ -1748,8 +2064,14 @@ class MemoryBenchmark:
         *,
         strict: Optional[bool] = None,
     ) -> "MemoryBenchmark":
+        """Rebuild a ``MemoryBenchmark`` from a ``to_dict()`` payload.
+
+        ``strict`` overrides the serialized ``strict`` value when
+        provided; otherwise the payload's ``strict`` field is used
+        (defaulting to ``None`` to mean "not set").
+        """
         if not isinstance(data, ABCMapping):
-            raise MemoryBenchmarkInputError(
+            raise MemoryBenchmarkParseError(
                 "MemoryBenchmark.from_dict expects a Mapping."
             )
         cfg_blob = data.get("config", {})
@@ -1758,8 +2080,10 @@ class MemoryBenchmark:
             if isinstance(cfg_blob, MemoryBenchmarkConfig)
             else MemoryBenchmarkConfig.from_dict(cfg_blob)
         )
-        if strict is None:
-            strict = None
+        # Bug fix #8: honour the payload's strict flag instead of the
+        # dead no-op branch.
+        if strict is None and "strict" in data:
+            strict = bool(data.get("strict"))
         return cls(config=config, strict=strict)
 
     @classmethod
@@ -1772,11 +2096,11 @@ class MemoryBenchmark:
         try:
             data = json.loads(payload)
         except json.JSONDecodeError as exc:
-            raise MemoryBenchmarkInputError(
+            raise MemoryBenchmarkParseError(
                 f"from_json received invalid JSON: {exc}"
             ) from exc
         if not isinstance(data, ABCMapping):
-            raise MemoryBenchmarkInputError(
+            raise MemoryBenchmarkParseError(
                 "from_json expected a JSON object at the top level."
             )
         return cls.from_dict(data, strict=strict)
@@ -1795,13 +2119,17 @@ class MemoryBenchmark:
 
 __all__ = [
     "BenchmarkReport",
+    "DEFAULT_CONTAINER_TAG",
     "MemoryBenchmark",
     "MemoryBenchmarkConfig",
     "MemoryBenchmarkError",
     "MemoryBenchmarkInputError",
     "MemoryBenchmarkRunnerError",
     "MemoryBenchmarkConfigError",
+    "MemoryBenchmarkParseError",
+    "MetricDirection",
     "MetricStats",
+    "SCHEMA_VERSION",
     "TaskResult",
     "__version__",
 ]
@@ -1817,7 +2145,7 @@ if __name__ == "__main__":  # pragma: no cover
     from .feedback_loop_guard import GuardVerdict
 
     bench = MemoryBenchmark()
-    print("repr       :", bench)
+    print("repr         :", bench)
 
     tasks = [{"id": i} for i in range(20)]
 
@@ -1849,30 +2177,137 @@ if __name__ == "__main__":  # pragma: no cover
         without_memory=without_memory,
         with_memory=with_memory,
     )
-    print("verdict    :", report.verdict, f"(score={report.score:+d})")
-    for metric, stats in report.metrics.items():
-        print(
-            f"  {metric:<22} delta={stats.delta:+.4g} "
-            f"ci=[{stats.ci_low:+.4g}, {stats.ci_high:+.4g}] "
-            f"d={stats.cohen_d:+.2f} {stats.direction}"
-        )
+    print("verdict      :", report.verdict, f"(score={report.score:+d})")
     assert report.verdict == "memory_helps"
     assert report.tasks_succeeded == 20
     assert report.tasks_failed == 0
     assert len(report.per_task) == 20
+    assert report.id.startswith("report:")
 
-    # --------------------------------------------------- 2. per-task breakdown
-    first = report.per_task[0]
-    print("task[0]     :", first)
+    # --------------------------------------------------- 2. MetricDirection enum
+    for stats in report.metrics.values():
+        assert stats.direction in MetricDirection.values()
+        _ = stats.direction_enum  # exercises the property
+    print("direction    : OK")
 
-    # --------------------------------------------------- 3. persistence bridge
-    payload = report.to_episode_payload(
-        container_tag="org:green-agent",
+    # --------------------------------------------------- 3. deep-freeze + hash
+    first_task = report.per_task[0]
+    try:
+        first_task.baseline["hacked"] = 1.0  # type: ignore[index]
+    except TypeError:
+        print("task frozen  : OK")
+    try:
+        report.metrics["quality"].significant = True  # type: ignore[misc]
+    except Exception:
+        # frozen dataclass raises FrozenInstanceError; acceptable.
+        pass
+    hash(report)
+    hash(first_task)
+    hash(report.metrics["quality"])
+    print("hashable     : OK")
+
+    # --------------------------------------------------- 4. persistence bridge (bug fix #1)
+    payload = report.to_episode_payload()
+    assert payload["container_tag"] == DEFAULT_CONTAINER_TAG
+    assert payload["metadata"]["container_tag"] == DEFAULT_CONTAINER_TAG
+    assert payload["metadata"]["schema_version"] == SCHEMA_VERSION
+    explicit = report.to_episode_payload(container_tag="org:custom")
+    assert explicit["container_tag"] == "org:custom"
+    md = report.to_memory_dict()
+    assert md["id"].startswith("report:")
+    assert md["metadata"]["kind"] == "benchmark_report"
+    print("episode pld  : OK")
+
+    # --------------------------------------------------- 5. TaskResult.to_memory_dict
+    t_md = first_task.to_memory_dict()
+    assert {"id", "content", "metadata"} <= set(t_md)
+    assert t_md["id"] == "task:0"
+    print("task memory  : OK")
+
+    # --------------------------------------------------- 6. from_dict wrapped casts (bugs 3/4/5)
+    bad_metrics = {
+        "baseline": "not-a-number",
+        "memory": 1.0, "delta": 0.0, "relative_delta": 0.0,
+        "ci_low": 0.0, "ci_high": 0.0, "cohen_d": 0.0,
+        "significant": False, "direction": "improves",
+    }
+    try:
+        MetricStats.from_dict(bad_metrics)
+    except MemoryBenchmarkParseError as exc:
+        print("metric cast  : OK ->", exc)
+    else:
+        raise AssertionError("expected MemoryBenchmarkParseError")
+
+    try:
+        TaskResult.from_dict({"index": "not-an-int"})
+    except MemoryBenchmarkParseError as exc:
+        print("task cast    : OK ->", exc)
+    else:
+        raise AssertionError("expected MemoryBenchmarkParseError")
+
+    try:
+        BenchmarkReport.from_dict({"tasks": "abc"})
+    except MemoryBenchmarkParseError as exc:
+        print("report cast  : OK ->", exc)
+    else:
+        raise AssertionError("expected MemoryBenchmarkParseError")
+
+    # Bool slips through numeric casts are rejected.
+    try:
+        MetricStats.from_dict({**bad_metrics, "baseline": True})
+    except MemoryBenchmarkParseError:
+        print("bool cast    : OK")
+
+    # --------------------------------------------------- 7. from_dict strict round trip (bug fix #8)
+    skipped = MemoryBenchmark(strict=False)
+    skipped.run_pair(
+        tasks=tasks,
+        without_memory=without_memory,
+        with_memory=with_memory,
     )
-    assert payload["metadata"]["kind"] == "benchmark_report"
-    print("ep payload :", payload["content"])
+    payload_dict = skipped.to_dict()
+    payload_dict["strict"] = False
+    restored = MemoryBenchmark.from_dict(payload_dict)
+    assert restored.config.on_runner_error == "skip"
+    print("strict rt    : OK")
 
-    # --------------------------------------------------- 4. extractors
+    # --------------------------------------------------- 8. from_config / from_pipeline
+    rebuilt = MemoryBenchmark.from_config(
+        MemoryBenchmarkConfig(), strict=True,
+    )
+    assert isinstance(rebuilt, MemoryBenchmark)
+    class _FakePipeline:
+        benchmark = bench
+    from_pipe = MemoryBenchmark.from_pipeline(_FakePipeline())
+    assert from_pipe is bench
+    print("from_*       : OK")
+
+    # --------------------------------------------------- 9. batch + async
+    batches = bench.run_pairs([
+        {"tasks": tasks, "without_memory": without_memory,
+         "with_memory": with_memory},
+        {"tasks": tasks[:8], "without_memory": without_memory,
+         "with_memory": with_memory},
+    ])
+    assert len(batches) == 2
+
+    async def _async_batch():
+        a = await bench.run_pair_async(
+            tasks=tasks, without_memory=without_memory,
+            with_memory=with_memory,
+        )
+        b = await bench.run_pairs_async([
+            {"tasks": tasks, "without_memory": without_memory,
+             "with_memory": with_memory},
+        ])
+        return a, b
+
+    a_report, b_reports = asyncio.run(_async_batch())
+    assert a_report.verdict == "memory_helps"
+    assert len(b_reports) == 1
+    print("async        : OK")
+
+    # --------------------------------------------------- 10. extractors + truth/container
     def bundle_extractor(task):
         i = task["id"]
         return RecallBundle(
@@ -1913,31 +2348,25 @@ if __name__ == "__main__":  # pragma: no cover
             untrusted_evidence_count=0,
         )
 
-    def truth_extractor(task):
-        return "measured" if task["id"] % 2 == 0 else "simulated"
-
-    def tag_extractor(task):
-        return "org:green-agent"
-
     report2 = bench.run_pair(
         tasks=tasks,
         without_memory=without_memory,
         with_memory=with_memory,
         bundle_extractor=bundle_extractor,
         verdict_extractor=verdict_extractor,
-        task_truth_level=truth_extractor,
-        task_container_tag=tag_extractor,
+        task_truth_level=(
+            lambda t: "measured" if t["id"] % 2 == 0 else "simulated"
+        ),
+        task_container_tag=lambda t: "org:green-agent",
     )
-    print("extras     :", {
-        k: round(v, 3) for k, v in report2.extras.items()
-    })
     assert "recall_token_cost" in report2.extras
     assert "guard_allowed" in report2.extras
     assert report2.truth_level_mix == {"measured": 10, "simulated": 10}
     assert report2.container_tag_mix == {"org:green-agent": 20}
+    print("extractors   : OK")
 
-    # --------------------------------------------------- 5. strict=False (skip)
-    skipped_bench = MemoryBenchmark(strict=False)
+    # --------------------------------------------------- 11. strict skip path
+    skipped2 = MemoryBenchmark(strict=False)
     state = {"count": 0}
 
     def sometimes_failing(task):
@@ -1946,36 +2375,17 @@ if __name__ == "__main__":  # pragma: no cover
             raise RuntimeError("simulated runner failure")
         return without_memory(task)
 
-    report3 = skipped_bench.run_pair(
+    report3 = skipped2.run_pair(
         tasks=tasks,
         without_memory=sometimes_failing,
         with_memory=with_memory,
     )
-    # 20 tasks, but task index 2's *baseline* failed → skipped.
-    print(
-        "skip path  : succeeded=%d failed=%d"
-        % (report3.tasks_succeeded, report3.tasks_failed)
-    )
     assert report3.tasks_failed >= 1
     assert report3.tasks_succeeded < 20
-    skipped_bench.close()
+    skipped2.close()
+    print("skip path    : OK")
 
-    # --------------------------------------------------- 6. strict=True raises
-    strict_bench = MemoryBenchmark(strict=True)
-    state["count"] = 0
-    try:
-        strict_bench.run_pair(
-            tasks=tasks,
-            without_memory=sometimes_failing,
-            with_memory=with_memory,
-        )
-    except MemoryBenchmarkRunnerError as exc:
-        print("strict     : OK ->", exc)
-    else:
-        raise AssertionError("expected a runner error")
-    strict_bench.close()
-
-    # --------------------------------------------------- 7. timeout enforcement
+    # --------------------------------------------------- 12. timeout
     slow_bench = MemoryBenchmark(
         config=MemoryBenchmarkConfig(
             min_task_count=2, runner_timeout_seconds=0.05,
@@ -1993,89 +2403,46 @@ if __name__ == "__main__":  # pragma: no cover
             with_memory=slow_runner,
         )
     except MemoryBenchmarkRunnerError as exc:
-        print("timeout    : OK ->", exc)
+        print("timeout      : OK ->", exc)
     else:
         raise AssertionError("expected a timeout")
     slow_bench.close()
 
-    # --------------------------------------------------- 8. async
-    async def _run_async():
-        return await bench.run_pair_async(
-            tasks=tasks,
-            without_memory=without_memory,
-            with_memory=with_memory,
-        )
+    # --------------------------------------------------- 13. executor/close race (bug fix #6/7)
+    import threading as _t
 
-    async_report = asyncio.run(_run_async())
-    print("async      :", async_report.verdict)
+    race_bench = MemoryBenchmark(
+        config=MemoryBenchmarkConfig(
+            min_task_count=2, runner_timeout_seconds=5.0,
+        ),
+    )
+    stop = _t.Event()
+    errors: List[BaseException] = []
 
-    # --------------------------------------------------- 9. run_pairs batch
-    batches = bench.run_pairs([
-        {
-            "tasks": tasks,
-            "without_memory": without_memory,
-            "with_memory": with_memory,
-        },
-        {
-            "tasks": tasks[:8],
-            "without_memory": without_memory,
-            "with_memory": with_memory,
-        },
-    ])
-    print("batch      :", [b.verdict for b in batches])
-    assert len(batches) == 2
+    def _hammer():
+        while not stop.is_set():
+            try:
+                race_bench.run_pair(
+                    tasks=[{"id": 0}, {"id": 1}],
+                    without_memory=without_memory,
+                    with_memory=with_memory,
+                )
+            except BaseException as exc:
+                errors.append(exc)
+                return
 
-    # --------------------------------------------------- 10. verdict policies
-    for policy in ("score", "majority", "all_significant", "weighted"):
-        p = MemoryBenchmark(
-            config=MemoryBenchmarkConfig(verdict_policy=policy),
-        )
-        r = p.run_pair(
-            tasks=tasks,
-            without_memory=without_memory,
-            with_memory=with_memory,
-        )
-        print(f"policy {policy:<18}: {r.verdict}")
-        p.close()
+    threads = [_t.Thread(target=_hammer) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for _ in range(5):
+        race_bench.close()
+    stop.set()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    print("close race   : OK")
 
-    # --------------------------------------------------- 11. serialization
-    cfg = MemoryBenchmarkConfig()
-    assert MemoryBenchmarkConfig.from_dict(cfg.to_dict()) == cfg
-    assert MemoryBenchmarkConfig.from_json(cfg.to_json()) == cfg
-    cfg2 = cfg.with_overrides(seed=123)
-    assert cfg2.seed == 123 and cfg.seed == 42
-    hash(cfg)
-    print("cfg RT     : OK")
-
-    report_dict = report.to_dict()
-    report_rt = BenchmarkReport.from_dict(report_dict)
-    assert report_rt.verdict == report.verdict
-    assert report_rt.tasks_succeeded == report.tasks_succeeded
-    assert len(report_rt.per_task) == len(report.per_task)
-    assert len(report_rt.metrics) == len(report.metrics)
-    hash(report)
-    print("report RT  : OK (hashable)")
-
-    report_json = report.to_json()
-    assert BenchmarkReport.from_json(report_json).verdict == report.verdict
-    print("report JSON: OK")
-
-    bench_dict = bench.to_dict()
-    restored = MemoryBenchmark.from_dict(bench_dict)
-    assert restored.config == bench.config
-    print("bench RT   : OK")
-
-    # --------------------------------------------------- 12. stats / reset
-    stats = bench.statistics()
-    print("statistics :", {
-        k: v for k, v in stats.items()
-        if k not in ("config", "last_report")
-    })
-    cleared = bench.reset()
-    assert cleared >= 1 and bench.statistics()["runs"] == 0
-    print("reset      :", cleared, "runs cleared")
-
-    # --------------------------------------------------- 13. config validation
+    # --------------------------------------------------- 14. config validation
     bad_configs = [
         dict(seed=True),
         dict(seed=-1),
@@ -2087,6 +2454,7 @@ if __name__ == "__main__":  # pragma: no cover
         dict(max_task_count=3, min_task_count=10),
         dict(runner_timeout_seconds=0),
         dict(runner_timeout_seconds=float("inf")),
+        dict(latency_ring_size=0),
         dict(metric_names="quality"),
         dict(metric_names=()),
         dict(metric_names=("quality", "quality")),
@@ -2098,16 +2466,17 @@ if __name__ == "__main__":  # pragma: no cover
         dict(truth_level_weights={"unknown": 1.0}),
         dict(expected_container_tag=""),
         dict(include_per_task_breakdown="yes"),
+        dict(schema_version=0),
     ]
     for bad in bad_configs:
         try:
-            MemoryBenchmarkConfig(**bad)
+            MemoryBenchmarkConfig(**bad)  # type: ignore[arg-type]
         except MemoryBenchmarkError as exc:
-            print(f"reject cfg : {list(bad)[0]} -> {exc}")
+            print(f"reject cfg   : {list(bad)[0]} -> {exc}")
         else:
             raise AssertionError(f"expected rejection for {bad!r}")
 
-    # --------------------------------------------------- 14. input validation
+    # --------------------------------------------------- 15. input validation
     for bad in (
         lambda: bench.run_pair(
             tasks=[], without_memory=lambda t: {},
@@ -2135,16 +2504,39 @@ if __name__ == "__main__":  # pragma: no cover
         try:
             bad()
         except MemoryBenchmarkError as exc:
-            print("reject inp :", exc)
+            print("reject input :", exc)
 
-    # --------------------------------------------------- 15. context manager
+    # --------------------------------------------------- 16. stats / reset / last_report
+    stats = bench.statistics()
+    assert "schema_version" in stats
+    assert "last_error" in stats
+    assert bench.last_report is not None
+    cleared = bench.reset()
+    assert cleared >= 1 and bench.statistics()["runs"] == 0
+    assert bench.last_report is None
+    print("stats/reset  : OK")
+
+    # --------------------------------------------------- 17. MetricStats / TaskResult RT
+    ms = report.metrics["quality"]
+    ms_rt = MetricStats.from_dict(ms.to_dict())
+    assert ms_rt == ms
+    tr_rt = TaskResult.from_dict(first_task.to_dict())
+    assert tr_rt == first_task
+    report_rt = BenchmarkReport.from_dict(report.to_dict())
+    assert report_rt.verdict == report.verdict
+    assert report_rt.schema_version == SCHEMA_VERSION
+    assert report_rt.tasks_succeeded == report.tasks_succeeded
+    hash(report_rt)
+    print("RT           : OK")
+
+    # --------------------------------------------------- 18. context manager
     with MemoryBenchmark() as ctx:
         ctx.run_pair(
             tasks=tasks,
             without_memory=without_memory,
             with_memory=with_memory,
         )
-    print("ctx mgr    : OK")
+    print("ctx mgr      : OK")
 
     bench.close()
     print("\nSmoke test passed.")
