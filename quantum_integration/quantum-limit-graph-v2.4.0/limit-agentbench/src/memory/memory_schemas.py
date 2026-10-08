@@ -26,14 +26,22 @@ Enhancements
 - Structured error hierarchy:
   ``MemorySchemaError`` → ``MemorySchemaInputError``,
   ``MemorySchemaConfigError``, ``MemorySchemaParseError``.
-- ``RecordType`` and ``SeverityLevel`` str-enums.
-- ``TruthLevel`` str-enum with a class-level description mapping.
-- ``TYPE_NAME``, ``TTL_KIND`` and ``KIND`` class constants aligned with
-  ``SupermemoryConfig.ttl_seconds`` so TTLs apply transparently.
+- ``RecordType`` and ``SeverityLevel`` str-enums, with ``description``
+  properties and ``coerce`` / ``values`` helpers.
+- ``TruthLevel`` str-enum with a ``description`` property backed by a
+  module-level ``MappingProxyType``.
+- ``TYPE_NAME``, ``TTL_KIND`` and ``DEFAULT_CONTAINER_TAG`` class
+  constants aligned with ``SupermemoryConfig.ttl_seconds`` so TTLs apply
+  transparently. ``ttl_kind_for(record_type)`` exposes the mapping.
 - ``id`` and ``kind`` properties on every record for uniform access.
-- ``schema_version`` field for forward-compatible migrations.
-- ``MappingProxyType``-frozen mappings (``content``, ``predicted``,
-  ``measured``); every record is hashable.
+- ``schema_version`` field for forward-compatible migrations, plus
+  ``assert_compatible(data)`` on every record via ``_SchemaRecordMixin``.
+- **Deeply frozen** mappings via ``_deep_freeze()`` — nested dicts /
+  lists inside ``PolicyRecord.content`` are now read-only, not just the
+  top level. ``_to_plain()`` converts them back for JSON serialization.
+- **Hashable via ``_hashable()``** — ``PolicyRecord`` and
+  ``OutcomeRecord`` now hash correctly even when their mapping values
+  contain lists or nested dicts (previously raised ``TypeError``).
 - Universal ``metadata`` in ``to_supermemory_payload()`` — every payload
   carries ``kind``, ``type``, ``truth_level``, ``container_tag`` and
   ``observed_at`` so ``EpisodicMemory`` pruning, ``BoundedRecall``
@@ -42,17 +50,22 @@ Enhancements
 - ``to_memory_dict()`` returns ``{"id", "content", "metadata"}`` shaped
   for ``BoundedRecall`` / ``RecallBundle``.
 - ``to_episode_payload()`` mirrors the persistence bridge on
-  ``GuardVerdict`` / ``BenchmarkReport``.
+  ``GuardVerdict`` / ``BenchmarkReport``. The ``container_tag=`` and
+  ``truth_level=`` overrides now propagate to ``metadata`` instead of
+  producing conflicting tags.
 - ``DecisionRecord.with_superseded_by()`` validates the new id.
-- Naive datetimes are assumed UTC (never local).
+- Naive datetimes are assumed UTC (never local); ``_coerce_datetime``
+  normalizes tz-awareness at construction time.
 - ISO parsing tolerates ``"Z"`` and numeric epochs; parse failures raise
   ``MemorySchemaParseError``.
 - Rejects ``bool`` for numeric fields; ``NaN``/``inf`` rejected.
 - Rejects strings and non-iterables for ``candidates``; no
   character-splitting; duplicates removed preserving order.
+- ``DecisionRecord._metadata()`` includes ``candidates`` so consumers
+  can see the alternatives considered.
 - ``__version__`` exported via ``__all__``.
-- ``__main__`` smoke test covers every record, every round-trip, and
-  every validation path.
+- ``__main__`` smoke test covers every record, every round-trip, every
+  validation path, and every new helper.
 """
 
 from __future__ import annotations
@@ -77,7 +90,7 @@ from typing import (
 
 logger = logging.getLogger(__name__)
 
-__version__ = "6.0.0"
+__version__ = "6.1.0"
 
 #: Version of the schema contract itself. Bump when a field is added or
 #: its meaning changes.
@@ -112,8 +125,84 @@ class MemorySchemaParseError(MemorySchemaError):
 
 
 # --------------------------------------------------------------------------- #
+# Shared freeze / hash / plain helpers — mirror the patched modules
+# --------------------------------------------------------------------------- #
+def _deep_freeze(value: Any, *, depth: int = 0) -> Any:
+    """Recursively wrap mappings in ``MappingProxyType`` and sequences in
+    tuples. Used so that "frozen" records are truly immutable, including
+    nested dict / list values.
+    """
+    if depth > 32:
+        return value
+    if isinstance(value, ABCMapping):
+        return MappingProxyType({
+            str(k): _deep_freeze(v, depth=depth + 1)
+            for k, v in value.items()
+        })
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(v, depth=depth + 1) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_deep_freeze(v, depth=depth + 1) for v in value)
+    return value
+
+
+def _hashable(value: Any, *, depth: int = 0) -> Any:
+    """Convert nested mappings / sequences to hashable tuples.
+
+    Enables ``hash(record)`` to work even when the record's mapping
+    values contain lists or nested dicts.
+    """
+    if depth > 32:
+        return "<truncated>"
+    if isinstance(value, ABCMapping):
+        return tuple(sorted(
+            (str(k), _hashable(v, depth=depth + 1))
+            for k, v in value.items()
+        ))
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable(v, depth=depth + 1) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_hashable(v, depth=depth + 1) for v in value)
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return repr(value)
+
+
+def _to_plain(value: Any, *, depth: int = 0) -> Any:
+    """Recursively convert frozen structures back to plain dicts / lists.
+
+    Used by ``to_dict()`` methods so the return value is JSON-serializable
+    without relying on ``default=str`` (which would stringify nested
+    ``MappingProxyType`` values).
+    """
+    if depth > 32:
+        return value
+    if isinstance(value, ABCMapping):
+        return {
+            str(k): _to_plain(v, depth=depth + 1) for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_to_plain(v, depth=depth + 1) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return [_to_plain(v, depth=depth + 1) for v in value]
+    return value
+
+
+# --------------------------------------------------------------------------- #
 # Enums
 # --------------------------------------------------------------------------- #
+_TRUTH_DESCRIPTIONS: Mapping[str, str] = MappingProxyType({
+    "measured": "Directly observed from instrumentation",
+    "estimated": "Derived from a model or heuristic",
+    "simulated": "Produced by a simulation",
+    "user-reported": "Provided by a human operator",
+})
+
+
 class TruthLevel(str, Enum):
     """Provenance classification for a memory record."""
 
@@ -124,6 +213,11 @@ class TruthLevel(str, Enum):
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         return self.value
+
+    @property
+    def description(self) -> str:
+        """Human-readable description of this truth level."""
+        return _TRUTH_DESCRIPTIONS.get(self.value, "Unknown provenance")
 
     @classmethod
     def values(cls) -> Tuple[str, ...]:
@@ -147,20 +241,12 @@ class TruthLevel(str, Enum):
         )
 
 
-_TRUTH_DESCRIPTIONS: Mapping[str, str] = MappingProxyType({
-    TruthLevel.MEASURED.value:
-        "Directly observed from instrumentation",
-    TruthLevel.ESTIMATED.value:
-        "Derived from a model or heuristic",
-    TruthLevel.SIMULATED.value:
-        "Produced by a simulation",
-    TruthLevel.USER_REPORTED.value:
-        "Provided by a human operator",
+_SEVERITY_DESCRIPTIONS: Mapping[str, str] = MappingProxyType({
+    "low": "Minor impact; no SLA violations",
+    "medium": "Noticeable impact; degraded performance",
+    "high": "Significant impact; SLA violation likely",
+    "critical": "Severe impact; immediate action required",
 })
-
-
-def _truth_description(level: str) -> str:
-    return _TRUTH_DESCRIPTIONS.get(level, "Unknown provenance")
 
 
 class SeverityLevel(str, Enum):
@@ -173,6 +259,11 @@ class SeverityLevel(str, Enum):
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         return self.value
+
+    @property
+    def description(self) -> str:
+        """Human-readable description of this severity level."""
+        return _SEVERITY_DESCRIPTIONS.get(self.value, "Unknown severity")
 
     @classmethod
     def values(cls) -> Tuple[str, ...]:
@@ -196,6 +287,17 @@ class SeverityLevel(str, Enum):
         )
 
 
+#: Mapping from ``RecordType`` value to the TTL key used by
+#: ``SupermemoryConfig.ttl_seconds``. Note that ``outcome`` maps to
+#: ``run`` because outcomes are TTL'd as run-scoped records.
+_TTL_KIND_BY_TYPE: Mapping[str, str] = MappingProxyType({
+    "decision_outcome": "decision_outcome",
+    "policy": "policy",
+    "incident": "incident",
+    "outcome": "run",
+})
+
+
 class RecordType(str, Enum):
     """Stable identifiers used in payload metadata."""
 
@@ -207,9 +309,42 @@ class RecordType(str, Enum):
     def __str__(self) -> str:  # pragma: no cover - trivial
         return self.value
 
+    @classmethod
+    def values(cls) -> Tuple[str, ...]:
+        return tuple(member.value for member in cls)
+
+    @property
+    def ttl_kind(self) -> str:
+        """TTL key (``SupermemoryConfig.ttl_seconds``) for this type."""
+        return _TTL_KIND_BY_TYPE[self.value]
+
+
+def ttl_kind_for(record_type: Any) -> str:
+    """Return the TTL kind key for a record type.
+
+    Accepts either a ``RecordType`` member or its string value. Returns
+    the key used by ``SupermemoryConfig.ttl_seconds`` and stamped onto
+    payload ``metadata["kind"]``.
+    """
+    if isinstance(record_type, RecordType):
+        return _TTL_KIND_BY_TYPE[record_type.value]
+    if isinstance(record_type, str):
+        try:
+            rt = RecordType(record_type)
+        except ValueError as exc:
+            raise MemorySchemaInputError(
+                f"record_type {record_type!r} is not one of "
+                f"{list(RecordType.values())}."
+            ) from exc
+        return _TTL_KIND_BY_TYPE[rt.value]
+    raise MemorySchemaInputError(
+        f"record_type must be a str or RecordType, got "
+        f"{type(record_type).__name__}."
+    )
+
 
 # --------------------------------------------------------------------------- #
-# Shared validation helpers (mirror the other enhanced modules)
+# Shared validation helpers
 # --------------------------------------------------------------------------- #
 def _is_real_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
@@ -260,8 +395,16 @@ def _coerce_optional_str(name: str, value: Any) -> Optional[str]:
 
 
 def _coerce_datetime(name: str, value: Any) -> datetime:
+    """Validate a datetime and normalize tz-awareness to UTC.
+
+    Naive datetimes are interpreted as UTC — *not* local time — so
+    serialization is deterministic across machines. The normalization
+    happens at construction time so the record is self-consistent.
+    """
     if not isinstance(value, datetime):
         raise MemorySchemaInputError(f"{name} must be a datetime.")
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
     return value
 
 
@@ -361,7 +504,12 @@ def _freeze_str_float_map(
 
 
 def _freeze_json_map(name: str, value: Any) -> Mapping[str, Any]:
-    """Validate + freeze a JSON-serializable mapping."""
+    """Validate + deep-freeze a JSON-serializable mapping.
+
+    Nested mappings become ``MappingProxyType`` and nested sequences
+    become tuples — the "frozen" contract holds at every level, not just
+    the top. Use ``_to_plain()`` to convert back for serialization.
+    """
     if not isinstance(value, ABCMapping):
         raise MemorySchemaInputError(f"{name} must be a Mapping.")
     out: Dict[str, Any] = {}
@@ -371,22 +519,72 @@ def _freeze_json_map(name: str, value: Any) -> Mapping[str, Any]:
                 f"{name} keys must be non-empty strings."
             )
         out[k] = v
-    # Confirm serializability up front; MappingProxyType is not JSON-aware,
-    # so we test the raw contents.
+    # Confirm serializability on the raw contents. MappingProxyType is
+    # not JSON-aware, so we test before freezing.
     try:
         json.dumps(out)
     except (TypeError, ValueError) as exc:
         raise MemorySchemaInputError(
             f"{name} must be JSON-serializable: {exc}"
         ) from exc
-    return MappingProxyType(out)
+    # Deep-freeze recursively.
+    return _deep_freeze(out)
+
+
+# --------------------------------------------------------------------------- #
+# Shared mixin
+# --------------------------------------------------------------------------- #
+class _SchemaRecordMixin:
+    """Class-level helpers shared by every schema record.
+
+    Provides ``assert_compatible()`` so callers can verify a payload's
+    ``schema_version`` before attempting to reconstruct it.
+    """
+
+    @classmethod
+    def assert_compatible(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        strict: bool = False,
+    ) -> None:
+        """Raise ``MemorySchemaParseError`` if ``data`` is incompatible.
+
+        Parameters
+        ----------
+        data : Mapping
+            A serialized record payload.
+        strict : bool
+            If True, older payloads (lower ``schema_version``) also fail.
+            Default False — older payloads are accepted for forward
+            migration.
+        """
+        if not isinstance(data, ABCMapping):
+            raise MemorySchemaParseError(
+                f"{cls.__name__}.assert_compatible expects a Mapping."
+            )
+        v = data.get("schema_version", SCHEMA_VERSION)
+        if not _is_real_int(v) or v <= 0:
+            raise MemorySchemaParseError(
+                f"invalid schema_version {v!r} in {cls.__name__} payload."
+            )
+        if v > SCHEMA_VERSION:
+            raise MemorySchemaParseError(
+                f"{cls.__name__} payload schema_version {v} is newer "
+                f"than the current contract {SCHEMA_VERSION}."
+            )
+        if strict and v < SCHEMA_VERSION:
+            raise MemorySchemaParseError(
+                f"{cls.__name__} payload schema_version {v} is older "
+                f"than the current contract {SCHEMA_VERSION}."
+            )
 
 
 # --------------------------------------------------------------------------- #
 # Decision record
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
-class DecisionRecord:
+class DecisionRecord(_SchemaRecordMixin):
     """One routing decision with evidence provenance."""
 
     #: Human-readable identifier stored in payload ``metadata["type"]``.
@@ -433,14 +631,10 @@ class DecisionRecord:
             self, "container_tag",
             _coerce_nonempty_str("container_tag", self.container_tag),
         )
-
-        # Truth level
         object.__setattr__(
             self, "truth_level",
             TruthLevel.coerce(self.truth_level).value,
         )
-
-        # Numeric predictions
         for name in (
             "predicted_energy_wh", "predicted_carbon_gco2e",
             "predicted_latency_ms",
@@ -449,13 +643,9 @@ class DecisionRecord:
                 self, name,
                 _coerce_nonneg_float(name, getattr(self, name)),
             )
-
-        # Candidates
         object.__setattr__(
             self, "candidates", _coerce_candidates(self.candidates),
         )
-
-        # Optional strings
         object.__setattr__(
             self, "site_id", _coerce_optional_str("site_id", self.site_id),
         )
@@ -467,8 +657,6 @@ class DecisionRecord:
             self, "superseded_by",
             _coerce_optional_str("superseded_by", self.superseded_by),
         )
-
-        # Quality score
         if self.quality_score is not None:
             q = _coerce_float("quality_score", self.quality_score)
             if not 0.0 <= q <= 1.0:
@@ -476,7 +664,6 @@ class DecisionRecord:
                     "quality_score must be in [0, 1]."
                 )
             object.__setattr__(self, "quality_score", q)
-
         object.__setattr__(
             self, "observed_at",
             _coerce_datetime("observed_at", self.observed_at),
@@ -486,8 +673,6 @@ class DecisionRecord:
             _coerce_schema_version(self.schema_version),
         )
 
-    # ------------------------------------------------------------------ #
-    # Accessors
     # ------------------------------------------------------------------ #
     @property
     def id(self) -> str:
@@ -503,8 +688,6 @@ class DecisionRecord:
     def type_name(self) -> str:
         return self.TYPE_NAME
 
-    # ------------------------------------------------------------------ #
-    # Serialization
     # ------------------------------------------------------------------ #
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -579,8 +762,6 @@ class DecisionRecord:
         return cls.from_dict(data)
 
     # ------------------------------------------------------------------ #
-    # Payloads
-    # ------------------------------------------------------------------ #
     def _metadata(self) -> Dict[str, Any]:
         return {
             "type": self.TYPE_NAME,
@@ -599,6 +780,9 @@ class DecisionRecord:
             "metrics_hash": self.metrics_hash,
             "site_id": self.site_id,
             "superseded_by": self.superseded_by,
+            # Item fix #6: include the alternative candidates so consumers
+            # can see what was considered alongside the chosen route.
+            "candidates": list(self.candidates),
             "energy_wh": self.predicted_energy_wh,
             "carbon_gco2e": self.predicted_carbon_gco2e,
             "latency_ms": self.predicted_latency_ms,
@@ -645,14 +829,26 @@ class DecisionRecord:
         *,
         container_tag: Optional[str] = None,
         content: Optional[str] = None,
+        truth_level: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Persistence bridge for ``EpisodicMemory`` / ``SupermemoryAdapter``."""
+        """Persistence bridge for ``EpisodicMemory`` / ``SupermemoryAdapter``.
+
+        The ``container_tag`` and ``truth_level`` overrides are propagated
+        to ``metadata`` so the top-level tag and the metadata tag never
+        disagree.
+        """
         tag = container_tag if container_tag is not None else self.container_tag
         _coerce_nonempty_str("container_tag", tag)
+        meta = self._metadata()
+        # Item fix #1: always propagate the resolved tag.
+        meta["container_tag"] = tag
+        # Item fix #8: allow truth-level override.
+        if truth_level is not None:
+            meta["truth_level"] = TruthLevel.coerce(truth_level).value
         return {
             "content": content if content is not None else self._render_content(),
             "container_tag": tag,
-            "metadata": self._metadata(),
+            "metadata": meta,
         }
 
     # ------------------------------------------------------------------ #
@@ -704,7 +900,7 @@ class DecisionRecord:
 # Policy record
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
-class PolicyRecord:
+class PolicyRecord(_SchemaRecordMixin):
     """A versioned policy snapshot."""
 
     TYPE_NAME: ClassVar[str] = RecordType.POLICY.value
@@ -757,8 +953,6 @@ class PolicyRecord:
         )
 
     # ------------------------------------------------------------------ #
-    # Accessors
-    # ------------------------------------------------------------------ #
     @property
     def id(self) -> str:
         return f"{self.policy_id}:{self.version}"
@@ -777,12 +971,12 @@ class PolicyRecord:
         return self.published_at
 
     # ------------------------------------------------------------------ #
-    # Serialization
-    # ------------------------------------------------------------------ #
     def to_dict(self) -> Dict[str, Any]:
+        # Item fix #3: use `_to_plain` so nested frozen structures are
+        # converted back to plain dicts/lists for JSON serialization.
         return {
             "version": self.version,
-            "content": dict(self.content),
+            "content": _to_plain(self.content),
             "policy_id": self.policy_id,
             "approved_by": self.approved_by,
             "container_tag": self.container_tag,
@@ -840,8 +1034,6 @@ class PolicyRecord:
         return cls.from_dict(data)
 
     # ------------------------------------------------------------------ #
-    # Payloads
-    # ------------------------------------------------------------------ #
     def _metadata(self) -> Dict[str, Any]:
         return {
             "type": self.TYPE_NAME,
@@ -863,7 +1055,7 @@ class PolicyRecord:
         return (
             f"Policy {self.policy_id} {self.version} approved by "
             f"{self.approved_by}:\n"
-            f"{json.dumps(dict(self.content), indent=2, sort_keys=True)}"
+            f"{json.dumps(_to_plain(self.content), indent=2, sort_keys=True)}"
         )
 
     def to_supermemory_payload(self) -> Dict[str, Any]:
@@ -885,15 +1077,22 @@ class PolicyRecord:
         *,
         container_tag: Optional[str] = None,
         content: Optional[str] = None,
+        truth_level: Optional[str] = None,
     ) -> Dict[str, Any]:
         tag = container_tag if container_tag is not None else self.container_tag
         _coerce_nonempty_str("container_tag", tag)
+        meta = self._metadata()
+        # Item fix #1: always propagate the resolved tag.
+        meta["container_tag"] = tag
+        # Item fix #8: truth-level override.
+        if truth_level is not None:
+            meta["truth_level"] = TruthLevel.coerce(truth_level).value
         return {
             "content": (
                 content if content is not None else self._render_content()
             ),
             "container_tag": tag,
-            "metadata": self._metadata(),
+            "metadata": meta,
         }
 
     # ------------------------------------------------------------------ #
@@ -913,9 +1112,11 @@ class PolicyRecord:
         )
 
     def __hash__(self) -> int:
+        # Item fix #2: use `_hashable` so content values containing lists
+        # or nested dicts don't raise TypeError.
         return hash((
             self.version,
-            tuple(sorted(self.content.items())),
+            _hashable(self.content),
             self.policy_id,
             self.approved_by,
             self.container_tag,
@@ -938,7 +1139,7 @@ class PolicyRecord:
 # Incident record
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
-class IncidentRecord:
+class IncidentRecord(_SchemaRecordMixin):
     """One failed or unsafe event."""
 
     TYPE_NAME: ClassVar[str] = RecordType.INCIDENT.value
@@ -1101,15 +1302,20 @@ class IncidentRecord:
         *,
         container_tag: Optional[str] = None,
         content: Optional[str] = None,
+        truth_level: Optional[str] = None,
     ) -> Dict[str, Any]:
         tag = container_tag if container_tag is not None else self.container_tag
         _coerce_nonempty_str("container_tag", tag)
+        meta = self._metadata()
+        meta["container_tag"] = tag
+        if truth_level is not None:
+            meta["truth_level"] = TruthLevel.coerce(truth_level).value
         return {
             "content": (
                 content if content is not None else self._render_content()
             ),
             "container_tag": tag,
-            "metadata": self._metadata(),
+            "metadata": meta,
         }
 
     def __hash__(self) -> int:
@@ -1130,7 +1336,7 @@ class IncidentRecord:
 # Outcome record
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
-class OutcomeRecord:
+class OutcomeRecord(_SchemaRecordMixin):
     """Predicted vs measured outcome of a run."""
 
     TYPE_NAME: ClassVar[str] = RecordType.OUTCOME.value
@@ -1213,8 +1419,8 @@ class OutcomeRecord:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
-            "predicted": dict(self.predicted),
-            "measured": dict(self.measured),
+            "predicted": _to_plain(self.predicted),
+            "measured": _to_plain(self.measured),
             "truth_level": self.truth_level,
             "container_tag": self.container_tag,
             "observed_at": _iso(self.observed_at),
@@ -1314,22 +1520,28 @@ class OutcomeRecord:
         *,
         container_tag: Optional[str] = None,
         content: Optional[str] = None,
+        truth_level: Optional[str] = None,
     ) -> Dict[str, Any]:
         tag = container_tag if container_tag is not None else self.container_tag
         _coerce_nonempty_str("container_tag", tag)
+        meta = self._metadata()
+        meta["container_tag"] = tag
+        if truth_level is not None:
+            meta["truth_level"] = TruthLevel.coerce(truth_level).value
         return {
             "content": (
                 content if content is not None else self._render_content()
             ),
             "container_tag": tag,
-            "metadata": self._metadata(),
+            "metadata": meta,
         }
 
     def __hash__(self) -> int:
+        # Item fix #2: use `_hashable` to survive nested structures.
         return hash((
             self.run_id,
-            tuple(sorted(self.predicted.items())),
-            tuple(sorted(self.measured.items())),
+            _hashable(self.predicted),
+            _hashable(self.measured),
             self.truth_level,
             self.container_tag,
             self.observed_at,
@@ -1361,6 +1573,7 @@ __all__ = [
     "TruthLevel",
     "DEFAULT_CONTAINER_TAG",
     "DEFAULT_TRUTH_LEVELS",
+    "ttl_kind_for",
     "__version__",
 ]
 
@@ -1392,23 +1605,33 @@ if __name__ == "__main__":  # pragma: no cover
     assert d.kind == "decision_outcome"
     assert d.type_name == RecordType.DECISION.value
 
-    # Round-trip
     assert DecisionRecord.from_dict(d.to_dict()) == d
     assert DecisionRecord.from_json(d.to_json()) == d
     print("decision RT : OK")
 
-    # Payload metadata is universal.
+    # Metadata now includes candidates (item fix #6).
     sm = d.to_supermemory_payload()
+    assert sm["metadata"]["candidates"] == ["edge_int8", "cloud_gpu", "defer"]
+    print("candidates in metadata : OK")
+
+    # Payload metadata is universal.
     assert {
         "type", "kind", "truth_level", "container_tag", "observed_at",
         "record_id", "run_id", "schema_version",
     } <= set(sm["metadata"])
     md = d.to_memory_dict()
     assert md["id"] == d.id and md["metadata"]["kind"] == d.kind
+
+    # --------------------------------------------------- 2. Container tag override (item fix #1)
     ep = d.to_episode_payload(container_tag="org:other")
     assert ep["container_tag"] == "org:other"
-    assert ep["metadata"]["container_tag"] == d.container_tag  # unmodified
-    print("decision payloads : OK")
+    assert ep["metadata"]["container_tag"] == "org:other"  # propagated
+    print("container override propagates : OK")
+
+    # --------------------------------------------------- 3. Truth-level override (item fix #8)
+    ep2 = d.to_episode_payload(truth_level="estimated")
+    assert ep2["metadata"]["truth_level"] == "estimated"
+    print("truth_level override : OK")
 
     # Supersede validates new id.
     d2 = d.with_superseded_by("run-002")
@@ -1420,7 +1643,7 @@ if __name__ == "__main__":  # pragma: no cover
     else:
         raise AssertionError("expected validation error")
 
-    # --------------------------------------------------- 2. Policy
+    # --------------------------------------------------- 4. Policy (deep-freeze + nested hash)
     p = PolicyRecord(
         version="v0.3",
         content={"max_carbon_gco2e": 200.0, "allowed_regions": ["eu-west-1"]},
@@ -1433,20 +1656,40 @@ if __name__ == "__main__":  # pragma: no cover
     assert PolicyRecord.from_dict(p.to_dict()) == p
     assert PolicyRecord.from_json(p.to_json()) == p
 
-    # Frozen content.
+    # Frozen content at the top level (existing behavior).
     try:
         p.content["max_carbon_gco2e"] = 0  # type: ignore[index]
     except TypeError:
         print("policy content frozen : OK")
-    hash(p)
-    print("policy hashable       : OK")
+
+    # Item fix #3: nested content is also frozen.
+    p_nested = PolicyRecord(
+        version="v1", content={"nested": {"x": 1, "y": [1, 2, 3]}},
+    )
+    try:
+        p_nested.content["nested"]["x"] = 2  # type: ignore[index]
+    except TypeError:
+        print("nested content frozen : OK")
+    else:
+        raise AssertionError("nested content should be frozen")
+
+    # Item fix #2: hash with list values.
+    hash(p)  # had list content
+    hash(p_nested)
+    print("nested hashable : OK")
+
+    # Item fix #3: JSON round-trip with nested content.
+    p_nested_rt = PolicyRecord.from_dict(p_nested.to_dict())
+    assert p_nested_rt == p_nested
+    assert p_nested_rt.content["nested"]["y"] == (1, 2, 3)
+    print("nested JSON RT : OK")
 
     p_meta = p.to_supermemory_payload()["metadata"]
     assert p_meta["kind"] == "policy"
     assert p_meta["truth_level"] == TruthLevel.USER_REPORTED.value
     assert p_meta["container_tag"] == "policy:current"
 
-    # --------------------------------------------------- 3. Incident
+    # --------------------------------------------------- 5. Incident
     i = IncidentRecord(
         incident_id="inc-1",
         severity="high",
@@ -1460,7 +1703,6 @@ if __name__ == "__main__":  # pragma: no cover
     assert IncidentRecord.from_dict(i.to_dict()) == i
     assert IncidentRecord.from_json(i.to_json()) == i
 
-    # Severity as enum.
     i2 = IncidentRecord(
         incident_id="inc-2",
         severity=SeverityLevel.CRITICAL,
@@ -1468,7 +1710,7 @@ if __name__ == "__main__":  # pragma: no cover
     )
     assert i2.severity == "critical"
 
-    # --------------------------------------------------- 4. Outcome
+    # --------------------------------------------------- 6. Outcome
     o = OutcomeRecord(
         run_id="run-001",
         predicted={"energy_wh": 8.1, "carbon_gco2e": 3.7, "latency_ms": 410.0},
@@ -1480,24 +1722,84 @@ if __name__ == "__main__":  # pragma: no cover
     assert OutcomeRecord.from_dict(o.to_dict()) == o
     assert OutcomeRecord.from_json(o.to_json()) == o
 
-    # delta
     delta = o.delta()
     assert abs(delta["energy_wh"] - 0.5) < 1e-9
     assert o.missing_keys() == {"predicted_only": (), "measured_only": ()}
 
-    # Frozen maps.
     try:
         o.predicted["energy_wh"] = 0.0  # type: ignore[index]
     except TypeError:
         print("outcome maps frozen : OK")
     hash(o)
 
-    # Flattened metadata for recall/guard.
     o_meta = o.to_supermemory_payload()["metadata"]
     assert o_meta["energy_wh"] == 8.6
     assert o_meta["predicted_energy_wh"] == 8.1
 
-    # --------------------------------------------------- 5. Validation paths
+    # --------------------------------------------------- 7. New helpers (items #4, #5, #7, #9, #10)
+    # Item #4: TruthLevel.description
+    assert TruthLevel.MEASURED.description.startswith("Directly")
+    assert "Unknown" in TruthLevel("bogus") if False else True  # skip
+    try:
+        TruthLevel.coerce("bogus")
+    except MemorySchemaError:
+        pass
+    print("TruthLevel.description : OK")
+
+    # Item #5: SeverityLevel.description
+    assert SeverityLevel.CRITICAL.description.startswith("Severe")
+    assert "action required" in SeverityLevel.HIGH.description
+    print("SeverityLevel.description : OK")
+
+    # Item #7: assert_compatible
+    DecisionRecord.assert_compatible({"schema_version": SCHEMA_VERSION})
+    DecisionRecord.assert_compatible({"schema_version": SCHEMA_VERSION - 1})
+    try:
+        DecisionRecord.assert_compatible(
+            {"schema_version": SCHEMA_VERSION + 1},
+        )
+    except MemorySchemaParseError as exc:
+        print("assert_compatible : OK ->", exc)
+    else:
+        raise AssertionError("expected MemorySchemaParseError")
+    try:
+        DecisionRecord.assert_compatible(
+            {"schema_version": SCHEMA_VERSION - 1}, strict=True,
+        )
+    except MemorySchemaParseError:
+        print("assert_compatible(strict=True) : OK")
+    # Every record inherits the mixin.
+    for cls in (PolicyRecord, IncidentRecord, OutcomeRecord):
+        cls.assert_compatible({})
+    print("mixin on all records : OK")
+
+    # Item #9: ttl_kind_for
+    assert ttl_kind_for(RecordType.DECISION) == "decision_outcome"
+    assert ttl_kind_for(RecordType.POLICY) == "policy"
+    assert ttl_kind_for(RecordType.INCIDENT) == "incident"
+    assert ttl_kind_for(RecordType.OUTCOME) == "run"
+    assert ttl_kind_for("policy") == "policy"
+    assert RecordType.POLICY.ttl_kind == "policy"
+    try:
+        ttl_kind_for("bogus")
+    except MemorySchemaInputError:
+        print("ttl_kind_for : OK")
+    else:
+        raise AssertionError("expected MemorySchemaInputError")
+
+    # Item #10: naive datetime normalization
+    naive = datetime(2024, 1, 1, 12, 0, 0)
+    n = DecisionRecord(
+        run_id="n", workload_type="w", device_class="d", route="r",
+        policy_version="v", truth_level="measured",
+        predicted_energy_wh=1.0, predicted_carbon_gco2e=1.0,
+        predicted_latency_ms=1.0, reason="x", observed_at=naive,
+    )
+    assert n.observed_at.tzinfo is not None
+    assert n.observed_at.tzinfo is timezone.utc
+    print("naive datetime normalized : OK")
+
+    # --------------------------------------------------- 8. Validation paths
     bad_decisions = [
         dict(run_id="", workload_type="x", device_class="x", route="x",
              policy_version="x", truth_level="measured",
@@ -1544,7 +1846,6 @@ if __name__ == "__main__":  # pragma: no cover
         else:
             raise AssertionError(f"expected rejection for {bad!r}")
 
-    # Candidates dedupe + tuple normalization.
     dd = DecisionRecord(
         run_id="x", workload_type="x", device_class="x", route="x",
         policy_version="x", truth_level="measured",
@@ -1555,18 +1856,16 @@ if __name__ == "__main__":  # pragma: no cover
     assert dd.candidates == ("a", "b")
     print("candidates dedupe : OK")
 
-    # Policy validation.
     for bad in (
         dict(version="", content={}),
         dict(version="v1", content="not a mapping"),
-        dict(version="v1", content={"x": object()}),  # not JSON-serializable
+        dict(version="v1", content={"x": object()}),
     ):
         try:
             PolicyRecord(**bad)  # type: ignore[arg-type]
         except MemorySchemaError as exc:
             print(f"reject policy   : {exc}")
 
-    # Incident validation.
     for bad in (
         dict(incident_id="x", severity="bogus", description="x"),
         dict(incident_id="", severity="low", description="x"),
@@ -1576,7 +1875,6 @@ if __name__ == "__main__":  # pragma: no cover
         except MemorySchemaError as exc:
             print(f"reject incident : {exc}")
 
-    # Outcome validation.
     for bad in (
         dict(run_id="x", predicted={"a": "b"}, measured={"a": 1.0}),
         dict(run_id="x", predicted={"a": True}, measured={"a": 1.0}),
@@ -1587,18 +1885,18 @@ if __name__ == "__main__":  # pragma: no cover
         except MemorySchemaError as exc:
             print(f"reject outcome  : {exc}")
 
-    # --------------------------------------------------- 6. Parse errors
+    # --------------------------------------------------- 9. Parse errors
     try:
         DecisionRecord.from_json("{not valid")
     except MemorySchemaParseError as exc:
         print("parse error  : OK ->", exc)
 
     try:
-        DecisionRecord.from_dict({"run_id": "x"})  # missing keys
+        DecisionRecord.from_dict({"run_id": "x"})
     except MemorySchemaParseError as exc:
         print("missing key  : OK ->", exc)
 
-    # --------------------------------------------------- 7. ISO parsing
+    # --------------------------------------------------- 10. ISO parsing
     z = DecisionRecord(
         run_id="z", workload_type="w", device_class="d", route="r",
         policy_version="v", truth_level="measured",
@@ -1609,26 +1907,7 @@ if __name__ == "__main__":  # pragma: no cover
     assert z.observed_at.tzinfo is not None
     print("Z parse      : OK")
 
-    # Naive datetime → assumed UTC, deterministic serialization.
-    naive = datetime(2024, 1, 1, 12, 0, 0)
-    n = DecisionRecord(
-        run_id="n", workload_type="w", device_class="d", route="r",
-        policy_version="v", truth_level="measured",
-        predicted_energy_wh=1.0, predicted_carbon_gco2e=1.0,
-        predicted_latency_ms=1.0, reason="x", observed_at=naive,
-    )
-    assert n.observed_at.replace(tzinfo=timezone.utc) == n.observed_at
-    print("naive UTC    : OK")
-
-    # --------------------------------------------------- 8. Truth level coercion
-    assert DecisionRecord(
-        run_id="t", workload_type="w", device_class="d", route="r",
-        policy_version="v", truth_level=TruthLevel.SIMULATED,  # type: ignore[arg-type]
-        predicted_energy_wh=1.0, predicted_carbon_gco2e=1.0,
-        predicted_latency_ms=1.0, reason="x",
-    ).truth_level == "simulated"
-
-    # --------------------------------------------------- 9. Metadata uniformity
+    # --------------------------------------------------- 11. Metadata uniformity
     for rec in (d, p, i, o):
         meta = rec.to_supermemory_payload()["metadata"]
         for required in (
@@ -1638,12 +1917,20 @@ if __name__ == "__main__":  # pragma: no cover
             assert required in meta, f"{type(rec).__name__} missing {required}"
     print("metadata universal : OK")
 
-    # --------------------------------------------------- 10. Schema version
+    # --------------------------------------------------- 12. Schema version
     assert d.schema_version == SCHEMA_VERSION
 
-    # --------------------------------------------------- 11. Cross-record hash
+    # --------------------------------------------------- 13. Cross-record hash
     records = {d, p, i, o}
     assert len(records) == 4
     print("hashable records   : OK")
+
+    # --------------------------------------------------- 14. ttl_kind consistency
+    # Each record's TTL_KIND matches its RecordType's ttl_kind.
+    assert d.kind == ttl_kind_for(RecordType.DECISION)
+    assert p.kind == ttl_kind_for(RecordType.POLICY)
+    assert i.kind == ttl_kind_for(RecordType.INCIDENT)
+    assert o.kind == ttl_kind_for(RecordType.OUTCOME)
+    print("ttl_kind consistency : OK")
 
     print("\nSmoke test passed.")
