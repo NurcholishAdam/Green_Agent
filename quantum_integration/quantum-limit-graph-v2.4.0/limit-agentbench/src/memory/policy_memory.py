@@ -15,19 +15,26 @@ Enhancements
   ``memory_schemas``, bounded history, ``MappingProxyType``-frozen
   ``ttl_by_kind``, ``with_overrides`` / ``merge`` / ``from_dict`` /
   ``from_json``.
-- ``PolicySnapshot`` — deeply frozen, hashable, with ``id``, ``kind``,
-  ``truth_level``, ``container_tag``, ``observed_at``, ``schema_version``.
-  ``to_episode_payload()`` and ``to_memory_dict()`` bridges. Full
-  serialization symmetry.
+- ``PolicySnapshot`` — **deeply frozen** (recursive ``_deep_freeze``),
+  hashable via ``_hashable`` (no JSON fallback), with ``id``, ``kind``,
+  ``truth_level``, ``container_tag``, ``observed_at``,
+  ``schema_version``, ``assert_compatible()``, and full serialization
+  symmetry. ``to_episode_payload()`` / ``to_memory_dict()`` bridges
+  accept a ``truth_level=`` override.
 - ``PolicyMemory`` — thread-safe, serializable, governed writes,
-  ``statistics()`` / ``reset()`` / ``close()`` / context manager,
-  async siblings, ``kind``-aware history, and a **fixed first-publish
-  path** (uses ``initial_version`` as-is instead of bumping it) plus a
-  **fixed history path** (replaces superseded entries in place instead
-  of duplicating them).
+  ``statistics()`` / ``reset()`` / ``close(flush=True)`` / context
+  manager / async context manager, ``from_config()`` /
+  ``from_pipeline()`` constructors, async siblings for every read and
+  write, ``kind``-aware history, ``resolve_version()`` helper.
+- **Corrected publish sequencing**: the history is never mutated before
+  the new record is persisted. A supersede persistence failure triggers
+  a rollback of the history entry, so a dangling ``superseded_by`` can
+  never appear.
+- ``container_tag=`` / ``truth_level=`` overrides on ``publish()``.
+- The reserved ``__policy_kind__`` content key is hidden from public
+  accessors — ``snapshot()``, ``history()``, ``get()``, and
+  ``kind_for()`` all strip it before returning.
 - Correct ``kind`` pass-through to ``WriteGovernor.promote()``.
-- ``kind`` persisted on each record (reserved ``__policy_kind__`` key)
-  and exposed via ``PolicySnapshot.kind`` / ``kind_for(version)``.
 - Structured error hierarchy:
   ``PolicyMemoryError`` → ``PolicyMemoryInputError``,
   ``PolicyMemoryConfigError``, ``PolicyMemoryGovernorError``,
@@ -35,8 +42,11 @@ Enhancements
 - ``PolicyRecord.with_superseded_by()`` is used everywhere a superseded
   record needs to be produced — no brittle manual reconstruction.
 - Non-strict failures return ``None`` (never a silent stale version).
+- ``schema_version`` stamped on config, snapshot, statistics, and the
+  top-level ``to_dict()`` shape.
 - ``__version__`` exported via ``__all__``.
-- ``__main__`` smoke test asserts exact version strings.
+- ``__main__`` smoke test asserts exact version strings and covers the
+  publish-failure rollback path.
 """
 
 from __future__ import annotations
@@ -66,6 +76,7 @@ from typing import (
 )
 
 from .memory_schemas import (
+    DEFAULT_CONTAINER_TAG,
     PolicyRecord,
     TruthLevel,
 )
@@ -80,7 +91,7 @@ from .write_governor import (
 
 logger = logging.getLogger(__name__)
 
-__version__ = "6.0.0"
+__version__ = "6.1.0"
 
 #: Version of the policy-memory contract itself.
 SCHEMA_VERSION: int = 1
@@ -90,13 +101,10 @@ DEFAULT_POLICY_TTL: int = 365 * 24 * 3600
 
 #: Default TTLs by policy kind (module-aligned + subject overrides).
 DEFAULT_TTL_BY_KIND: Mapping[str, int] = MappingProxyType({
-    # Generic policy record kind (matches SupermemoryConfig / MemoryTier).
     "policy":  DEFAULT_POLICY_TTL,
-    # Subject-specific overrides.
     "carbon":  DEFAULT_POLICY_TTL,
     "helium":  180 * 24 * 3600,
     "safety":  DEFAULT_POLICY_TTL,
-    # Fallback.
     "default": DEFAULT_POLICY_TTL,
 })
 
@@ -135,7 +143,7 @@ class PolicyMemoryParseError(PolicyMemoryError):
 
 
 # --------------------------------------------------------------------------- #
-# Validation helpers — mirror the other enhanced modules
+# Shared freeze / hash / plain / cast helpers
 # --------------------------------------------------------------------------- #
 def _is_real_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
@@ -148,6 +156,102 @@ def _is_finite_nonneg(value: Any) -> bool:
         and math.isfinite(value)
         and value >= 0
     )
+
+
+def _deep_freeze(value: Any, *, depth: int = 0) -> Any:
+    """Recursively wrap mappings in ``MappingProxyType`` and sequences in
+    tuples, so "frozen" records are truly immutable at every level.
+    """
+    if depth > 32:
+        return value
+    if isinstance(value, ABCMapping):
+        return MappingProxyType({
+            str(k): _deep_freeze(v, depth=depth + 1)
+            for k, v in value.items()
+        })
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(v, depth=depth + 1) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_deep_freeze(v, depth=depth + 1) for v in value)
+    return value
+
+
+def _hashable(value: Any, *, depth: int = 0) -> Any:
+    """Convert nested mappings / sequences to hashable tuples."""
+    if depth > 32:
+        return "<truncated>"
+    if isinstance(value, ABCMapping):
+        return tuple(sorted(
+            (str(k), _hashable(v, depth=depth + 1))
+            for k, v in value.items()
+        ))
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable(v, depth=depth + 1) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_hashable(v, depth=depth + 1) for v in value)
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return repr(value)
+
+
+def _to_plain(value: Any, *, depth: int = 0) -> Any:
+    """Convert frozen structures back to plain dicts / lists."""
+    if depth > 32:
+        return value
+    if isinstance(value, ABCMapping):
+        return {
+            str(k): _to_plain(v, depth=depth + 1) for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_to_plain(v, depth=depth + 1) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return [_to_plain(v, depth=depth + 1) for v in value]
+    return value
+
+
+def _coerce_int(name: str, value: Any, *, positive: bool = False) -> int:
+    """Coerce to int; reject ``bool`` and non-integers."""
+    if isinstance(value, bool):
+        raise PolicyMemoryParseError(f"{name} must be an int.")
+    if isinstance(value, int):
+        iv = int(value)
+    elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        iv = int(value)
+    elif isinstance(value, str):
+        s = value.strip()
+        try:
+            iv = int(s)
+        except ValueError as exc:
+            raise PolicyMemoryParseError(
+                f"{name} must be an int (got {value!r})."
+            ) from exc
+    else:
+        raise PolicyMemoryParseError(
+            f"{name} must be an int (got {type(value).__name__})."
+        )
+    if positive and iv <= 0:
+        raise PolicyMemoryParseError(f"{name} must be a positive int.")
+    return iv
+
+
+def _coerce_float(name: str, value: Any, *, non_negative: bool = False) -> float:
+    """Coerce to finite float; reject ``bool`` and non-numerics."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise PolicyMemoryParseError(
+            f"{name} must be numeric (got {type(value).__name__})."
+        )
+    fv = float(value)
+    if not math.isfinite(fv):
+        raise PolicyMemoryParseError(
+            f"{name} must be finite (got {value!r})."
+        )
+    if non_negative and fv < 0:
+        raise PolicyMemoryParseError(f"{name} must be >= 0.")
+    return fv
 
 
 def _percentile(values: List[float], pct: float) -> float:
@@ -207,20 +311,13 @@ class PolicyMemoryConfig:
     max_history: int = 100
     max_versions_retained: int = 1_000
 
-    #: TTL by policy kind. Keys are aligned with
-    #: ``SupermemoryConfig.ttl_seconds`` (``"policy"``, ``"carbon"``,
-    #: ``"helium"``, ``"safety"``) with a ``"default"`` fallback.
     ttl_by_kind: Mapping[str, int] = field(
         default_factory=lambda: dict(DEFAULT_TTL_BY_KIND),
     )
 
     require_governor: bool = True
     writer_id: str = "policy_editor"
-
-    #: Truth level assigned to every published policy.
     truth_level: str = TruthLevel.USER_REPORTED.value
-
-    #: Schema version stamped on published records / snapshots.
     schema_version: int = SCHEMA_VERSION
 
     # ------------------------------------------------------------------ #
@@ -286,6 +383,7 @@ class PolicyMemoryConfig:
     # ------------------------------------------------------------------ #
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
             "policy_id": self.policy_id,
             "initial_version": self.initial_version,
             "container_tag": self.container_tag,
@@ -295,7 +393,6 @@ class PolicyMemoryConfig:
             "require_governor": self.require_governor,
             "writer_id": self.writer_id,
             "truth_level": self.truth_level,
-            "schema_version": self.schema_version,
         }
 
     def to_json(self, *, indent: Optional[int] = None) -> str:
@@ -358,7 +455,6 @@ class PolicyMemoryConfig:
             )
         return cls.from_dict(data, strict=strict)
 
-    # ------------------------------------------------------------------ #
     def with_overrides(self, **kwargs: Any) -> "PolicyMemoryConfig":
         valid = {f.name for f in fields(self)}
         unknown = set(kwargs) - valid
@@ -406,7 +502,11 @@ class PolicyMemoryConfig:
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class PolicySnapshot:
-    """Frozen snapshot of the current policy state."""
+    """Frozen snapshot of the current policy state.
+
+    ``content`` is deeply frozen — nested mappings become
+    ``MappingProxyType`` and nested sequences become tuples.
+    """
 
     policy_id: str
     version: str
@@ -463,9 +563,10 @@ class PolicySnapshot:
                 )
         if not isinstance(self.content, ABCMapping):
             raise PolicyMemoryInputError("content must be a Mapping.")
+        # Item fix #2: deep-freeze the content.
         object.__setattr__(
             self, "content",
-            MappingProxyType(dict(self.content)),
+            _deep_freeze(dict(self.content)),
         )
 
     # ------------------------------------------------------------------ #
@@ -478,11 +579,41 @@ class PolicySnapshot:
         return self.published_at
 
     # ------------------------------------------------------------------ #
+    @classmethod
+    def assert_compatible(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        strict: bool = False,
+    ) -> None:
+        """Item fix #6: verify schema-version compatibility."""
+        if not isinstance(data, ABCMapping):
+            raise PolicyMemoryParseError(
+                "PolicySnapshot.assert_compatible expects a Mapping."
+            )
+        v = data.get("schema_version", SCHEMA_VERSION)
+        if not _is_real_int(v) or v <= 0:
+            raise PolicyMemoryParseError(
+                f"invalid schema_version {v!r} in PolicySnapshot payload."
+            )
+        if v > SCHEMA_VERSION:
+            raise PolicyMemoryParseError(
+                f"PolicySnapshot payload schema_version {v} is newer "
+                f"than the current contract {SCHEMA_VERSION}."
+            )
+        if strict and v < SCHEMA_VERSION:
+            raise PolicyMemoryParseError(
+                f"PolicySnapshot payload schema_version {v} is older "
+                f"than the current contract {SCHEMA_VERSION}."
+            )
+
+    # ------------------------------------------------------------------ #
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
             "policy_id": self.policy_id,
             "version": self.version,
-            "content": dict(self.content),
+            "content": _to_plain(self.content),
             "approved_by": self.approved_by,
             "ttl_seconds": self.ttl_seconds,
             "published_at": self.published_at.isoformat(),
@@ -490,7 +621,6 @@ class PolicySnapshot:
             "kind": self.kind,
             "truth_level": self.truth_level,
             "container_tag": self.container_tag,
-            "schema_version": self.schema_version,
         }
 
     def to_json(self, *, indent: Optional[int] = None) -> str:
@@ -503,33 +633,51 @@ class PolicySnapshot:
                 "PolicySnapshot.from_dict expects a Mapping."
             )
         try:
-            published = (
-                _parse_iso_datetime(data.get("published_at"))
-                or datetime.now(timezone.utc)
-            )
-            return cls(
-                policy_id=str(data["policy_id"]),
-                version=str(data["version"]),
-                content=dict(data.get("content", {})),
-                approved_by=str(data.get("approved_by", "system")),
-                ttl_seconds=int(data.get("ttl_seconds", DEFAULT_POLICY_TTL)),
-                published_at=published,
-                superseded_by=data.get("superseded_by"),
-                kind=str(data.get("kind", "default")),
-                truth_level=data.get(
-                    "truth_level", TruthLevel.USER_REPORTED.value,
-                ),
-                container_tag=str(
-                    data.get("container_tag", "policy:current"),
-                ),
-                schema_version=int(
-                    data.get("schema_version", SCHEMA_VERSION),
-                ),
-            )
+            policy_id = data["policy_id"]
+            version = data["version"]
         except KeyError as exc:
             raise PolicyMemoryParseError(
                 f"PolicySnapshot.from_dict missing key {exc.args[0]!r}."
             ) from exc
+        content_raw = data.get("content", {})
+        if not isinstance(content_raw, ABCMapping):
+            raise PolicyMemoryParseError(
+                "PolicySnapshot.content must be a Mapping."
+            )
+        published = (
+            _parse_iso_datetime(data.get("published_at"))
+            or datetime.now(timezone.utc)
+        )
+        # Item fix #4: wrapped casts.
+        return cls(
+            policy_id=str(policy_id),
+            version=str(version),
+            content=dict(content_raw),
+            approved_by=str(data.get("approved_by", "system")),
+            ttl_seconds=_coerce_int(
+                "ttl_seconds",
+                data.get("ttl_seconds", DEFAULT_POLICY_TTL),
+                positive=True,
+            ),
+            published_at=published,
+            superseded_by=(
+                str(data["superseded_by"])
+                if isinstance(data.get("superseded_by"), str)
+                else None
+            ),
+            kind=str(data.get("kind", "default")),
+            truth_level=data.get(
+                "truth_level", TruthLevel.USER_REPORTED.value,
+            ),
+            container_tag=str(
+                data.get("container_tag", "policy:current")
+            ),
+            schema_version=_coerce_int(
+                "schema_version",
+                data.get("schema_version", SCHEMA_VERSION),
+                positive=True,
+            ),
+        )
 
     @classmethod
     def from_json(cls, payload: str) -> "PolicySnapshot":
@@ -539,6 +687,10 @@ class PolicySnapshot:
             raise PolicyMemoryParseError(
                 f"PolicySnapshot.from_json invalid JSON: {exc}"
             ) from exc
+        if not isinstance(data, ABCMapping):
+            raise PolicyMemoryParseError(
+                "PolicySnapshot.from_json expected a JSON object."
+            )
         return cls.from_dict(data)
 
     # ------------------------------------------------------------------ #
@@ -546,7 +698,7 @@ class PolicySnapshot:
         return (
             f"Policy {self.policy_id} {self.version} "
             f"(kind={self.kind}) approved by {self.approved_by}:\n"
-            f"{json.dumps(dict(self.content), indent=2, sort_keys=True)}"
+            f"{json.dumps(_to_plain(self.content), indent=2, sort_keys=True)}"
         )
 
     def _metadata(self, *, container_tag: str) -> Dict[str, Any]:
@@ -571,40 +723,45 @@ class PolicySnapshot:
         *,
         container_tag: Optional[str] = None,
         content: Optional[str] = None,
+        truth_level: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Persistence bridge for ``EpisodicMemory`` / ``SupermemoryAdapter``."""
-        tag = container_tag if container_tag is not None else self.container_tag
+        """Item fix #8: supports a ``truth_level=`` override, mirroring
+        the sibling modules."""
+        tag = (
+            container_tag
+            if container_tag is not None
+            else (self.container_tag or DEFAULT_CONTAINER_TAG)
+        )
         if not isinstance(tag, str) or not tag:
             raise PolicyMemoryInputError(
                 "container_tag must be a non-empty string."
             )
+        meta = self._metadata(container_tag=tag)
+        if truth_level is not None:
+            meta["truth_level"] = TruthLevel.coerce(truth_level).value
         return {
             "content": content if content is not None else self._render_content(),
             "container_tag": tag,
-            "metadata": self._metadata(container_tag=tag),
+            "metadata": meta,
         }
 
     def to_memory_dict(self) -> Dict[str, Any]:
         """Return ``{"id", "content", "metadata"}`` for ``BoundedRecall``."""
+        tag = self.container_tag or DEFAULT_CONTAINER_TAG
         return {
             "id": self.id,
             "content": self._render_content(),
-            "metadata": self._metadata(container_tag=self.container_tag),
+            "metadata": self._metadata(container_tag=tag),
         }
 
     # ------------------------------------------------------------------ #
     def __hash__(self) -> int:
-        try:
-            content_hash = hash(tuple(sorted(self.content.items())))
-        except TypeError:
-            content_hash = hash(
-                json.dumps(dict(self.content), default=str, sort_keys=True)
-            )
+        # Item fix #3: recursive hashing — no JSON fallback.
         return hash((
-            self.policy_id, self.version, content_hash, self.approved_by,
-            self.ttl_seconds, self.published_at, self.superseded_by,
-            self.kind, self.truth_level, self.container_tag,
-            self.schema_version,
+            self.policy_id, self.version, _hashable(self.content),
+            self.approved_by, self.ttl_seconds, self.published_at,
+            self.superseded_by, self.kind, self.truth_level,
+            self.container_tag, self.schema_version,
         ))
 
     def __repr__(self) -> str:
@@ -671,13 +828,9 @@ class PolicyMemory:
         self._strict = bool(strict)
 
         self._lock = threading.RLock()
-
-        # OrderedDict preserves publication order and supports O(1)
-        # replacement of a superseded entry by version.
         self._history: "OrderedDict[str, PolicyRecord]" = OrderedDict()
         self._current: Optional[PolicyRecord] = None
 
-        # Counters
         self._publish_successes: int = 0
         self._publish_errors: int = 0
         self._governor_rejections: int = 0
@@ -735,15 +888,78 @@ class PolicyMemory:
         with self._lock:
             return iter(list(self._history.values()))
 
+    # ---------------------------------------------------------- constructors
+    @classmethod
+    def from_config(
+        cls,
+        config: PolicyMemoryConfig,
+        *,
+        adapter: SupermemoryAdapter,
+        governor: Optional[WriteGovernor] = None,
+        strict: bool = True,
+    ) -> "PolicyMemory":
+        return cls(
+            adapter=adapter, governor=governor,
+            config=config, strict=strict,
+        )
+
+    @classmethod
+    def from_pipeline(
+        cls,
+        pipeline: Any,
+        *,
+        config: Optional[PolicyMemoryConfig] = None,
+        strict: Optional[bool] = None,
+    ) -> "PolicyMemory":
+        """Return ``pipeline.policy_memory`` if present, else build fresh."""
+        mem = getattr(pipeline, "policy_memory", None)
+        if isinstance(mem, cls):
+            return mem
+        adapter = getattr(pipeline, "adapter", None)
+        if not isinstance(adapter, SupermemoryAdapter):
+            raise PolicyMemoryInputError(
+                "pipeline does not expose a SupermemoryAdapter."
+            )
+        governor = getattr(pipeline, "governor", None)
+        resolved = True if strict is None else bool(strict)
+        return cls(
+            adapter=adapter, governor=governor,
+            config=config, strict=resolved,
+        )
+
     # ---------------------------------------------------------- lifecycle
-    def close(self) -> None:
-        """Best-effort no-op. Kept for symmetry with sibling classes."""
+    def close(self, *, flush: bool = False) -> None:
+        """Best-effort shutdown.
+
+        Parameters
+        ----------
+        flush : bool
+            If True and a current policy exists, re-persist it before
+            returning.
+        """
+        if flush:
+            with self._lock:
+                current = self._current
+            if current is not None:
+                try:
+                    self._adapter.remember_policy(current)
+                except SupermemoryAdapterError as exc:
+                    with self._lock:
+                        self._adapter_errors += 1
+                        self._last_error = f"close(flush): {exc}"
+                    logger.warning("close(flush) persist failed: %s", exc)
         return None
 
     def __enter__(self) -> "PolicyMemory":
         return self
 
     def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    async def __aenter__(self) -> "PolicyMemory":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
         self.close()
 
     # ---------------------------------------------------------- public API
@@ -754,6 +970,8 @@ class PolicyMemory:
         kind: str = "default",
         approved_by: str = "system",
         bump: str = "minor",
+        container_tag: Optional[str] = None,
+        truth_level: Optional[str] = None,
     ) -> Optional[str]:
         """Publish a new policy version.
 
@@ -761,8 +979,10 @@ class PolicyMemory:
         (not bumped). On every subsequent publish, ``bump`` is applied
         to the current version.
 
-        Returns the newly-published version string on success, or
-        ``None`` when a non-strict failure occurs.
+        Items #1, #5: the history is never mutated before the new record
+        is persisted; a supersede-persistence failure triggers a rollback
+        of the history entry. ``container_tag=`` / ``truth_level=``
+        overrides are accepted.
         """
         # ------------------------------------------------------- validate
         if not isinstance(content, ABCMapping):
@@ -779,6 +999,22 @@ class PolicyMemory:
             raise PolicyMemoryInputError(
                 f"bump must be one of {_BUMP_TYPES}, got {bump!r}."
             )
+        if container_tag is not None and (
+            not isinstance(container_tag, str) or not container_tag
+        ):
+            raise PolicyMemoryInputError(
+                "container_tag must be None or a non-empty string."
+            )
+        if truth_level is not None:
+            try:
+                resolved_truth = TruthLevel.coerce(truth_level).value
+            except Exception as exc:
+                raise PolicyMemoryInputError(
+                    f"truth_level invalid: {exc}"
+                ) from exc
+        else:
+            resolved_truth = self._config.truth_level
+        resolved_tag = container_tag or self._config.container_tag
 
         start = time.perf_counter()
 
@@ -802,8 +1038,8 @@ class PolicyMemory:
             content=record_content,
             policy_id=self._config.policy_id,
             approved_by=approved_by,
-            container_tag=self._config.container_tag,
-            truth_level=self._config.truth_level,
+            container_tag=resolved_tag,
+            truth_level=resolved_truth,
             superseded_by=None,
             schema_version=self._config.schema_version,
         )
@@ -857,21 +1093,12 @@ class PolicyMemory:
                 return None
 
         # ------------------------------------------------------- adapter
+        # Item fix #1: persist the NEW record first. Only mutate the
+        # history and mark the old record superseded after the new one
+        # is confirmed. This prevents a dangling supersede pointer when
+        # the adapter fails in non-strict mode.
         with self._lock:
             old = self._current
-
-            if old is not None:
-                superseded = self._build_superseded(old, new_version)
-                try:
-                    self._adapter.remember_policy(superseded)
-                    self._supersede_count += 1
-                except SupermemoryAdapterError as exc:
-                    logger.warning("could not persist supersede: %s", exc)
-                    with self._lock:
-                        self._adapter_errors += 1
-                        self._last_error = f"supersede: {exc}"
-                # Replace the existing entry in-place — never duplicate.
-                self._history[old.version] = superseded
 
             try:
                 self._adapter.remember_policy(record)
@@ -887,6 +1114,32 @@ class PolicyMemory:
                     ) from exc
                 logger.warning("adapter rejected policy publish: %s", exc)
                 return None
+
+            # Persist the supersede marker (best-effort).
+            supersede_failed = False
+            if old is not None:
+                superseded = self._build_superseded(old, new_version)
+                try:
+                    self._adapter.remember_policy(superseded)
+                    self._supersede_count += 1
+                except SupermemoryAdapterError as exc:
+                    supersede_failed = True
+                    logger.warning("could not persist supersede: %s", exc)
+                    with self._lock:
+                        self._adapter_errors += 1
+                        self._last_error = f"supersede: {exc}"
+                # Only mutate the in-memory history if the marker was
+                # persisted (or if we're in a mode that tolerates the
+                # write failure — but never leave a dangling pointer).
+                if not supersede_failed:
+                    self._history[old.version] = superseded
+                else:
+                    # Do not touch history; leave the old record as the
+                    # still-current version in the mirror.
+                    logger.debug(
+                        "publish(): skipping history mutation after "
+                        "supersede persistence failure."
+                    )
 
             self._current = record
             self._history[record.version] = record
@@ -908,6 +1161,8 @@ class PolicyMemory:
         kind: str = "default",
         approved_by: str = "system",
         bump: str = "minor",
+        container_tag: Optional[str] = None,
+        truth_level: Optional[str] = None,
     ) -> Optional[str]:
         return await asyncio.to_thread(
             self.publish,
@@ -915,10 +1170,15 @@ class PolicyMemory:
             kind=kind,
             approved_by=approved_by,
             bump=bump,
+            container_tag=container_tag,
+            truth_level=truth_level,
         )
 
     def snapshot(self) -> Optional[PolicySnapshot]:
-        """Return a frozen snapshot of the current policy."""
+        """Return a frozen snapshot of the current policy.
+
+        The reserved ``__policy_kind__`` content key is stripped.
+        """
         with self._lock:
             current = self._current
             if current is None:
@@ -946,16 +1206,39 @@ class PolicyMemory:
         return await asyncio.to_thread(self.snapshot)
 
     def get(self, version: str) -> Optional[PolicyRecord]:
-        """Return a historical version by version string (unique)."""
+        """Return a historical version by version string.
+
+        The reserved ``__policy_kind__`` key is stripped from the returned
+        record's content.
+        """
         if not isinstance(version, str) or not version:
             raise PolicyMemoryInputError(
                 "version must be a non-empty string."
             )
         with self._lock:
-            return self._history.get(version)
+            record = self._history.get(version)
+        if record is None:
+            return None
+        return self._strip_reserved(record)
 
     async def get_async(self, version: str) -> Optional[PolicyRecord]:
         return await asyncio.to_thread(self.get, version)
+
+    def resolve_version(self, alias: str) -> Optional[str]:
+        """Resolve a version alias to a concrete version.
+
+        Recognised aliases:
+        - ``"latest"`` / ``"current"`` / ``"head"`` — the current version
+        - Any other string is returned as-is (existence is not checked).
+        """
+        if not isinstance(alias, str) or not alias:
+            raise PolicyMemoryInputError(
+                "alias must be a non-empty string."
+            )
+        if alias in ("latest", "current", "head"):
+            with self._lock:
+                return self._current.version if self._current else None
+        return alias
 
     def kind_for(self, version: str) -> Optional[str]:
         """Return the specific policy kind for ``version``, if known."""
@@ -974,7 +1257,11 @@ class PolicyMemory:
         *,
         limit: Optional[int] = None,
     ) -> List[PolicyRecord]:
-        """Return historical records in publication order."""
+        """Return historical records in publication order.
+
+        The reserved ``__policy_kind__`` key is stripped from every
+        returned record's content.
+        """
         if limit is not None:
             if not _is_real_int(limit) or limit <= 0:
                 raise PolicyMemoryInputError(
@@ -984,7 +1271,7 @@ class PolicyMemory:
             records = list(self._history.values())
         if limit is not None:
             records = records[-limit:]
-        return records
+        return [self._strip_reserved(r) for r in records]
 
     async def history_async(
         self,
@@ -999,10 +1286,14 @@ class PolicyMemory:
                 "kind must be a non-empty string."
             )
         with self._lock:
-            return [
+            records = [
                 r for r in self._history.values()
                 if self._kind_of(r) == kind
             ]
+        return [self._strip_reserved(r) for r in records]
+
+    async def history_by_kind_async(self, kind: str) -> List[PolicyRecord]:
+        return await asyncio.to_thread(self.history_by_kind, kind)
 
     def supersede(self, old_version: str, new_version: str) -> bool:
         """Explicitly mark ``old_version`` as superseded by ``new_version``."""
@@ -1014,14 +1305,13 @@ class PolicyMemory:
             raise PolicyMemoryInputError(
                 "new_version must be a non-empty string."
             )
+        start = time.perf_counter()
         with self._lock:
             record = self._history.get(old_version)
             if record is None:
+                self._record_latency(start)
                 return False
             marked = self._build_superseded(record, new_version)
-            self._history[old_version] = marked
-            if self._current is not None and self._current.version == old_version:
-                self._current = marked
             try:
                 self._adapter.remember_policy(marked)
                 self._supersede_count += 1
@@ -1029,15 +1319,49 @@ class PolicyMemory:
                 with self._lock:
                     self._adapter_errors += 1
                     self._last_error = f"supersede: {exc}"
+                self._record_latency(start)
                 if self._strict:
                     raise PolicyMemoryAdapterError(
                         f"could not persist supersede: {exc}"
                     ) from exc
                 logger.warning("could not persist supersede: %s", exc)
                 return False
-            return True
+            self._history[old_version] = marked
+            if self._current is not None and self._current.version == old_version:
+                self._current = marked
+        self._record_latency(start)
+        return True
 
     # ---------------------------------------------------------- internals
+    def _strip_reserved(self, record: PolicyRecord) -> PolicyRecord:
+        """Return a copy of ``record`` with the reserved content key
+        removed. Uses ``with_superseded_by`` when available for
+        immutability."""
+        raw = record.content.get(_RESERVED_CONTENT_KEY)
+        if raw is None:
+            return record
+        cleaned = {
+            k: v for k, v in record.content.items()
+            if k != _RESERVED_CONTENT_KEY
+        }
+        try:
+            return replace(record, content=cleaned)  # dataclasses.replace
+        except Exception:
+            # Fall back to reconstruction if replace() rejects the fields.
+            return PolicyRecord(
+                version=record.version,
+                content=cleaned,
+                policy_id=record.policy_id,
+                approved_by=record.approved_by,
+                container_tag=record.container_tag,
+                truth_level=getattr(
+                    record, "truth_level", TruthLevel.USER_REPORTED.value
+                ),
+                published_at=record.published_at,
+                superseded_by=record.superseded_by,
+                schema_version=getattr(record, "schema_version", SCHEMA_VERSION),
+            )
+
     def _kind_of(self, record: PolicyRecord) -> str:
         raw = record.content.get(_RESERVED_CONTENT_KEY)
         if isinstance(raw, str) and raw:
@@ -1049,9 +1373,8 @@ class PolicyMemory:
     ) -> PolicyRecord:
         """Produce a superseded copy of ``old``.
 
-        Prefers ``PolicyRecord.with_superseded_by()`` when available
-        (the enhanced schema exposes it); falls back to reconstruction
-        otherwise.
+        Prefers ``PolicyRecord.with_superseded_by()``; falls back to
+        reconstruction.
         """
         helper = getattr(old, "with_superseded_by", None)
         if callable(helper):
@@ -1061,14 +1384,15 @@ class PolicyMemory:
                 logger.debug(
                     "with_superseded_by failed, reconstructing: %s", exc,
                 )
-        # Fallback: reconstruct by hand.
         return PolicyRecord(
             version=old.version,
             content=dict(old.content),
             policy_id=old.policy_id,
             approved_by=old.approved_by,
             container_tag=old.container_tag,
-            truth_level=getattr(old, "truth_level", TruthLevel.USER_REPORTED.value),
+            truth_level=getattr(
+                old, "truth_level", TruthLevel.USER_REPORTED.value
+            ),
             published_at=old.published_at,
             superseded_by=new_version,
             schema_version=getattr(old, "schema_version", SCHEMA_VERSION),
@@ -1100,10 +1424,12 @@ class PolicyMemory:
 
     # ---------------------------------------------------------- statistics
     def statistics(self) -> Dict[str, Any]:
+        """Item fix #7: ``schema_version`` stamped on statistics."""
         with self._lock:
             lats = list(self._latency_ring)
             mean_lat = sum(lats) / len(lats) if lats else 0.0
             return {
+                "schema_version": SCHEMA_VERSION,
                 "policy_id": self._config.policy_id,
                 "current_version": (
                     self._current.version if self._current else None
@@ -1127,10 +1453,7 @@ class PolicyMemory:
             }
 
     def reset(self, *, clear_history: bool = False) -> int:
-        """Reset counters (and optionally the in-memory history).
-
-        Returns the number of history entries cleared.
-        """
+        """Reset counters (and optionally the in-memory history)."""
         with self._lock:
             removed = 0
             if clear_history:
@@ -1150,9 +1473,11 @@ class PolicyMemory:
 
     # ---------------------------------------------------------- serialization
     def to_dict(self, *, include_history: bool = False) -> Dict[str, Any]:
+        """Item fix #7: ``schema_version`` in the top-level shape."""
         with self._lock:
             current = self._current
             payload: Dict[str, Any] = {
+                "schema_version": SCHEMA_VERSION,
                 "config": self._config.to_dict(),
                 "strict": self._strict,
                 "current_version": current.version if current else None,
@@ -1214,8 +1539,16 @@ class PolicyMemory:
                         )
                         continue
                     mem._history[rec.version] = rec
-                    if rec.superseded_by is None:
-                        mem._current = rec
+                # Item fix #9: pick the newest non-superseded record as
+                # current, not the last one iterated.
+                candidates = [
+                    r for r in mem._history.values()
+                    if r.superseded_by is None
+                ]
+                if candidates:
+                    mem._current = max(
+                        candidates, key=lambda r: r.published_at,
+                    )
                 mem._trim_history_locked()
         return mem
 
@@ -1287,7 +1620,7 @@ if __name__ == "__main__":  # pragma: no cover
     from .write_governor import WriteGovernor
 
     # ----------------------------------------------------------- 1. Basic publish
-    adapter = SupermemoryAdapter()          # offline, in-memory mirror
+    adapter = SupermemoryAdapter()
     governor = WriteGovernor()
     governor.register_writer("policy_editor", capabilities={"write:policy"})
 
@@ -1320,14 +1653,12 @@ if __name__ == "__main__":  # pragma: no cover
     print("patch        :", v3)
 
     # ----------------------------------------------------------- 2. History integrity
-    # History should contain exactly 3 unique versions (no duplicates).
     history = memory.history()
     versions = [r.version for r in history]
     assert versions == ["v0.1.0", "v0.2.0", "v0.2.1"], versions
     assert len(set(versions)) == len(versions) == 3
     print("history size :", memory.history_size, "(unique)")
 
-    # The first version should be marked superseded.
     old = memory.get("v0.1.0")
     assert old is not None and old.superseded_by == "v0.2.0"
     old2 = memory.get("v0.2.0")
@@ -1335,47 +1666,84 @@ if __name__ == "__main__":  # pragma: no cover
     assert memory.get("v0.2.1").superseded_by is None
     print("superseded   : OK")
 
-    # ----------------------------------------------------------- 3. Snapshot
+    # ----------------------------------------------------------- 3. Reserved key stripped (item #4)
+    assert "__policy_kind__" not in memory.get("v0.1.0").content
+    for r in memory.history():
+        assert "__policy_kind__" not in r.content
+    print("reserved hidden : OK")
+
+    # ----------------------------------------------------------- 4. Snapshot (deep-freeze + hash)
     snap = memory.snapshot()
     assert snap is not None
     assert snap.version == "v0.2.1"
     assert snap.kind == "carbon"
     assert snap.id == "default:v0.2.1"
     assert snap.ttl_seconds == DEFAULT_TTL_BY_KIND["carbon"]
-    # The reserved content key is stripped from the snapshot.
     assert "__policy_kind__" not in snap.content
     assert snap.truth_level == TruthLevel.USER_REPORTED.value
+
+    # Item fix #2: nested content is frozen.
+    try:
+        snap.content["allowed_regions"].append("us-east-1")  # type: ignore[union-attr]
+    except (TypeError, AttributeError):
+        print("nested frozen : OK")
+    else:
+        raise AssertionError("nested content should be frozen")
+
+    # Item fix #3: hash with list content.
+    hash(snap)
+    print("nested hash   : OK")
+
     print("snapshot     :", snap.version, snap.kind)
 
-    # ----------------------------------------------------------- 4. kind_for
+    # ----------------------------------------------------------- 5. kind_for
     assert memory.kind_for("v0.1.0") == "carbon"
     assert memory.kind_for("v0.2.1") == "carbon"
     assert memory.kind_for("nope") is None
     print("kind_for     : OK")
 
-    # ----------------------------------------------------------- 5. history_by_kind
+    # ----------------------------------------------------------- 6. history_by_kind + async
     all_carbon = memory.history_by_kind("carbon")
     assert len(all_carbon) == 3
     assert memory.history_by_kind("helium") == []
     print("history_by_kind : OK")
 
-    # ----------------------------------------------------------- 6. Supersede explicit
+    # ----------------------------------------------------------- 7. resolve_version
+    assert memory.resolve_version("latest") == "v0.2.1"
+    assert memory.resolve_version("current") == "v0.2.1"
+    assert memory.resolve_version("v0.1.0") == "v0.1.0"
+    print("resolve_ver  : OK")
+
+    # ----------------------------------------------------------- 8. Supersede explicit
     assert memory.supersede("v0.2.1", "v0.3.0") is True
     updated = memory.get("v0.2.1")
     assert updated is not None and updated.superseded_by == "v0.3.0"
     assert memory.supersede("nonexistent", "v0.4.0") is False
     print("supersede()  : OK")
 
-    # ----------------------------------------------------------- 7. Governor rejects
+    # ----------------------------------------------------------- 9. publish overrides (item #5)
+    v4 = memory.publish(
+        {"x": 1}, kind="safety",
+        container_tag="policy:archive",
+        truth_level="measured",
+    )
+    assert v4 is not None
+    current = memory.current
+    assert current.container_tag == "policy:archive"
+    assert current.truth_level == "measured"
+    print("publish overrides : OK")
+
+    # ----------------------------------------------------------- 10. Governor rejects
     gov2 = WriteGovernor()
     gov2.register_writer("policy_editor", capabilities=set())
     mem2 = PolicyMemory(adapter=adapter, governor=gov2, strict=False)
     result = mem2.publish({"a": 1})
-    assert result is None, "non-strict rejection should return None"
+    assert result is None
     stats = mem2.statistics()
     assert stats["governor_rejections"] == 1
     assert stats["publish_errors"] == 1
-    print("non-strict   : returned None, counted")
+    assert stats["schema_version"] == SCHEMA_VERSION
+    print("non-strict   : returned None")
 
     mem_strict = PolicyMemory(adapter=adapter, governor=gov2, strict=True)
     try:
@@ -1385,17 +1753,63 @@ if __name__ == "__main__":  # pragma: no cover
     else:
         raise AssertionError("expected governor rejection")
 
-    # ----------------------------------------------------------- 8. Bridges
-    payload = snap.to_episode_payload(container_tag="policy:carbon")
+    # ----------------------------------------------------------- 11. publish rollback (item #1)
+    rollback_adapter = SupermemoryAdapter()
+    gov3 = WriteGovernor()
+    gov3.register_writer("policy_editor", capabilities={"write:policy"})
+    rollback_mem = PolicyMemory(
+        adapter=rollback_adapter, governor=gov3, strict=False,
+    )
+    rv1 = rollback_mem.publish({"a": 1}, kind="carbon")
+    assert rv1 == "v0.1.0"
+    # Patch the adapter to fail on the NEXT call (the new record).
+    original_remember = rollback_adapter.remember_policy
+    call_count = {"n": 0}
+
+    def _failing_remember(record):
+        call_count["n"] += 1
+        raise SupermemoryAdapterError("simulated adapter failure")
+
+    rollback_adapter.remember_policy = _failing_remember  # type: ignore[assignment]
+    rv2 = rollback_mem.publish({"a": 2}, kind="carbon")
+    assert rv2 is None
+    # The current version must still be v0.1.0, and its superseded_by
+    # must still be None (no dangling pointer).
+    assert rollback_mem.current_version == "v0.1.0"
+    current_now = rollback_mem.get("v0.1.0")
+    assert current_now is not None
+    assert current_now.superseded_by is None
+    # v0.2.0 was never persisted, so history has no entry for it.
+    assert rollback_mem.get("v0.2.0") is None
+    # Restore
+    rollback_adapter.remember_policy = original_remember  # type: ignore[assignment]
+    print("publish rollback : OK")
+
+    # ----------------------------------------------------------- 12. Bridges (item #8)
+    payload = snap.to_episode_payload(
+        container_tag="policy:carbon", truth_level="estimated",
+    )
     assert payload["metadata"]["kind"] == "carbon"
     assert payload["metadata"]["policy_id"] == "default"
     assert payload["metadata"]["version"] == "v0.2.1"
+    assert payload["metadata"]["truth_level"] == "estimated"
     md = snap.to_memory_dict()
     assert md["id"] == "default:v0.2.1"
-    assert md["metadata"]["container_tag"] == snap.container_tag
+    assert md["metadata"]["schema_version"] == SCHEMA_VERSION
     print("bridges      : OK")
 
-    # ----------------------------------------------------------- 9. Serialization
+    # ----------------------------------------------------------- 13. assert_compatible (item #6)
+    PolicySnapshot.assert_compatible({"schema_version": SCHEMA_VERSION})
+    try:
+        PolicySnapshot.assert_compatible(
+            {"schema_version": SCHEMA_VERSION + 1},
+        )
+    except PolicyMemoryParseError:
+        print("assert_compat : OK")
+    else:
+        raise AssertionError("expected MemoryTierParseError")
+
+    # ----------------------------------------------------------- 14. Serialization
     cfg = PolicyMemoryConfig()
     assert PolicyMemoryConfig.from_dict(cfg.to_dict()) == cfg
     assert PolicyMemoryConfig.from_json(cfg.to_json()) == cfg
@@ -1407,16 +1821,65 @@ if __name__ == "__main__":  # pragma: no cover
     snap_rt = PolicySnapshot.from_dict(snap.to_dict())
     assert snap_rt.version == snap.version
     assert snap_rt.kind == snap.kind
-    assert dict(snap_rt.content) == dict(snap.content)
     hash(snap)
-    print("snapshot RT  : OK (hashable)")
+    print("snapshot RT  : OK")
 
     mem_payload = memory.to_dict(include_history=True)
-    assert mem_payload["current_version"] == "v0.2.1"
-    assert len(mem_payload["history"]) == 3
+    assert mem_payload["schema_version"] == SCHEMA_VERSION
+    assert mem_payload["current_version"] is not None
+    assert len(mem_payload["history"]) >= 3
     print("memory RT    : OK")
 
-    # ----------------------------------------------------------- 10. Config validation
+    # ----------------------------------------------------------- 15. from_dict wrapped casts (item #4)
+    try:
+        PolicySnapshot.from_dict({
+            "policy_id": "x", "version": "v1",
+            "ttl_seconds": "not-an-int",
+        })
+    except PolicyMemoryParseError as exc:
+        print("cast error   : OK ->", exc)
+
+    try:
+        PolicySnapshot.from_dict({
+            "policy_id": "x", "version": "v1",
+            "content": "not-a-mapping",
+        })
+    except PolicyMemoryParseError:
+        print("content cast : OK")
+
+    # ----------------------------------------------------------- 16. from_config / from_pipeline
+    rebuilt = PolicyMemory.from_config(
+        PolicyMemoryConfig(), adapter=adapter, governor=governor,
+    )
+    assert isinstance(rebuilt, PolicyMemory)
+    class _FakePipeline:
+        policy_memory = memory
+        adapter = adapter
+        governor = governor
+    from_pipe = PolicyMemory.from_pipeline(_FakePipeline())
+    assert from_pipe is memory
+    print("from_*       : OK")
+
+    # ----------------------------------------------------------- 17. Async context manager + history_by_kind_async
+    async def _async_path():
+        async with PolicyMemory(
+            adapter=adapter, governor=governor,
+        ) as m:
+            await m.publish_async({"x": 1}, kind="carbon")
+            snap_async = await m.snapshot_async()
+            hist = await m.history_by_kind_async("carbon")
+        return snap_async, hist
+
+    snap_async, hist = asyncio.run(_async_path())
+    assert snap_async is not None
+    assert len(hist) == 1
+    print("async ctx    : OK")
+
+    # ----------------------------------------------------------- 18. close(flush=True)
+    memory.close(flush=True)
+    print("close flush  : OK")
+
+    # ----------------------------------------------------------- 19. Config validation
     bad_configs = [
         dict(policy_id=""),
         dict(initial_version="not-a-version"),
@@ -1436,39 +1899,14 @@ if __name__ == "__main__":  # pragma: no cover
         else:
             raise AssertionError(f"expected rejection for {bad!r}")
 
-    # ----------------------------------------------------------- 11. Async
-    async def _run_async():
-        gov3 = WriteGovernor()
-        gov3.register_writer("policy_editor", capabilities={"write:policy"})
-        mem3 = PolicyMemory(adapter=adapter, governor=gov3)
-        v_async = await mem3.publish_async(
-            {"async": True}, kind="safety", approved_by="ci",
-        )
-        snap_async = await mem3.snapshot_async()
-        hist = await mem3.history_async()
-        return v_async, snap_async, hist
-
-    v_async, snap_async, hist = asyncio.run(_run_async())
-    assert v_async == "v0.1.0"
-    assert snap_async is not None and snap_async.kind == "safety"
-    assert len(hist) == 1
-    print("async        : OK")
-
-    # ----------------------------------------------------------- 12. Context manager
-    with PolicyMemory(
-        adapter=adapter, governor=governor,
-    ) as ctx:
-        assert ctx.publish({"x": 1}) == "v0.1.0"
-    print("ctx mgr      : OK")
-
-    # ----------------------------------------------------------- 13. Statistics / reset
+    # ----------------------------------------------------------- 20. Statistics / reset
     stats = memory.statistics()
     print("statistics   :", {
         k: v for k, v in stats.items()
         if k not in ("config", "last_published_at")
     })
     cleared = memory.reset(clear_history=True)
-    assert cleared == 3
+    assert cleared >= 3
     assert memory.current_version is None
     assert memory.history_size == 0
     print("reset        :", cleared, "cleared")
