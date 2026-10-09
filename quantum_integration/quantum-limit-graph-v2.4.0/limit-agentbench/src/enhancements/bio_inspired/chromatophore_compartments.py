@@ -1,73 +1,97 @@
 #!/usr/bin/env python3
+# =============================================================================
+# Chromatophore Compartments v8.0.0 — Patched Single-File Edition
+# =============================================================================
 """
-Enhanced Chromatophore Compartments v7.3.0 - Full Implementation with All Enhancement Phases
+Chromatophore Compartments v8.0.0
+=================================
+Patched single-file version of the hierarchical compartment manager.
 
-This version includes:
-- Central Green Agent integration (Storage, MessageQueue, AdaptiveCostFunction, ParetoGating, DriftDetector, MetricsRegistry).
-- Teacher policy (`policy_probs`) for MTPD optimizer.
-- Safe async task creation.
-- Causal Reinforcement Learning agent for policy adaptation.
-- Federated Green Learning coordinator.
-- Safety Monitor (Temporal Logic / Formal Verification).
-- Explainable AI (XAI) for decisions.
-- Adaptive Precision Switching.
-- Carbon Market Client.
-- Resilience Engineering / Chaos Testing.
-- Human-in-the-Loop for critical decisions.
-- JSON-based persistence (no insecure pickle).
-- Fixed concurrency with locks.
-- Timezone-aware datetime.
+P0 fixes
+--------
+- CompartmentConfig fully defined with all referenced fields.
+- EventBus implemented (in-process pub/sub).
+- RegionAggregator.knowledge_transfer is a real class with add_knowledge.
+- Lazy asyncio.Locks (no cross-loop binding).
+- No tasks started in __init__; use `await mgr.start()`.
+- create_compartment region mapping is correct on failure.
+- to_dict / from_dict for CompartmentResource, ChromatophoreCompartment,
+  InterCompartmentMarket, KnowledgeTransfer, RegionAggregator.
+- Persistence writes real serializable state and can load it back.
+- Structure and persistence guarded by dedicated asyncio locks.
+
+P1 — real behavior
+------------------
+- GA fitness depends on the genome (recomputes per-compartment health).
+- policy_probs returns a fixed-length vector over {create, cull, balance}.
+- _state_to_features reads real state.
+- find_best_compartment uses AdaptiveCostFunction + ParetoGating when available.
+- health_check_all skips empty regions.
+- ChaosInjector / HumanApproval are honest.
+- CausalRLAgent has a bounded, discretized Q-table.
+- Shutdown drains tasks, flushes persistence, and is idempotent.
+
+P2 — honesty
+------------
+- MODULE_STATUS documents each module.
+- Placeholders: CausalRLAgent, FederatedCoordinator, PrecisionController,
+  CarbonMarketClient, ChaosInjector, HumanApprovalHandler, HealthModel,
+  KnowledgeBank. Disabled by default; safe no-ops when enabled.
+- Experimental: GeneticOptimizer, MOPD, Homeostatic controller, XAI, Safety
+  monitor, Persistence. Warn when enabled.
+
+P3 — production readiness
+-------------------------
+- Lifecycle: `await start()`, `await shutdown()`, `await ready()`, context
+  manager (`async with`).
+- Graceful shutdown with task drain and persistence flush.
+- Logical sections in a single file.
+- Embedded test suite: `python3 compartment_manager.py --test`.
+- Prometheus metrics + OpenTelemetry spans (both optional).
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
-import logging
-import json
-import time
-import uuid
+import functools
 import hashlib
 import hmac
-import secrets
-import os
-import sqlite3
-import copy
-import random
+import json
+import logging
 import math
-from typing import Dict, Any, List, Optional, Tuple, Callable, Union, Type, Protocol, Set
-from dataclasses import dataclass, field, asdict
+import os
+import random
+import sqlite3
+import sys
+import time
+import unittest
+import uuid
+from collections import OrderedDict, defaultdict, deque
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from functools import wraps
-from collections import defaultdict, deque
 from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+
 import numpy as np
 
+# -----------------------------------------------------------------------------
 # Optional dependencies
+# -----------------------------------------------------------------------------
 try:
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import rsa, padding
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption
-    CRYPTOGRAPHY_AVAILABLE = True
+    from prometheus_client import Counter, Gauge
+    PROMETHEUS_AVAILABLE = True
 except ImportError:
-    CRYPTOGRAPHY_AVAILABLE = False
+    PROMETHEUS_AVAILABLE = False
 
 try:
-    from sklearn.ensemble import RandomForestRegressor
-    from sklearn.preprocessing import StandardScaler
-    import joblib
-    SKLEARN_AVAILABLE = True
+    from opentelemetry import trace
+    _TRACER = trace.get_tracer("chromatophore_compartments")
+    OTEL_AVAILABLE = True
 except ImportError:
-    SKLEARN_AVAILABLE = False
-
-try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
-    TENACITY_AVAILABLE = True
-except ImportError:
-    TENACITY_AVAILABLE = False
-
-try:
-    from pydantic import BaseModel, Field, field_validator, ValidationError, ConfigDict
-    PYDANTIC_AVAILABLE = True
-except ImportError:
-    PYDANTIC_AVAILABLE = False
+    _TRACER = None
+    OTEL_AVAILABLE = False
 
 try:
     import structlog
@@ -77,7 +101,7 @@ try:
             structlog.stdlib.add_log_level,
             structlog.stdlib.PositionalArgumentsFormatter(),
             TimeStamper(fmt="iso"),
-            JSONRenderer()
+            JSONRenderer(),
         ],
         context_class=dict,
         logger_factory=structlog.stdlib.LoggerFactory(),
@@ -86,433 +110,111 @@ try:
     )
     logger = structlog.get_logger(__name__)
 except ImportError:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     logger = logging.getLogger(__name__)
 
-# Central Green Agent imports
+# -----------------------------------------------------------------------------
+# Central components (optional)
+# -----------------------------------------------------------------------------
 try:
-    from ..config import config as central_config
-    from ..storage import Storage as CentralStorage
-    from ..scaling.message_queue import AsyncMessageQueue
-    from ..routing.pareto_gating import ParetoGating
-    from ..feedback.adaptive_cost import AdaptiveCostFunction
-    from ..safety.drift_detector import DriftDetector
-    from ..metrics import MetricsRegistry
-    from ..schemas.feedback_event import FeedbackEvent
-    from ..logger import logger as central_logger
+    from ..storage import Storage as CentralStorage  # type: ignore
+    from ..scaling.message_queue import AsyncMessageQueue  # type: ignore
+    from ..routing.pareto_gating import ParetoGating  # type: ignore
+    from ..feedback.adaptive_cost import AdaptiveCostFunction  # type: ignore
+    from ..safety.drift_detector import DriftDetector  # type: ignore
+    from ..metrics import MetricsRegistry  # type: ignore
+    from ..schemas.feedback_event import FeedbackEvent  # type: ignore
     CENTRAL_AVAILABLE = True
 except ImportError:
     CENTRAL_AVAILABLE = False
-    CentralStorage = None
-    AsyncMessageQueue = None
-    ParetoGating = None
-    AdaptiveCostFunction = None
-    DriftDetector = None
-    MetricsRegistry = None
-    FeedbackEvent = None
-    central_config = None
-
-# Optional web3 for carbon market
-try:
-    from web3 import Web3, Account
-    WEB3_AVAILABLE = True
-except ImportError:
-    WEB3_AVAILABLE = False
-
-# ============================================================================
-# Custom Exceptions (if any)
-# ============================================================================
-class CompartmentError(Exception):
-    pass
-
-# ============================================================================
-# Retry Helper
-# ============================================================================
-async def retry_async(func: Callable, max_retries: int, base_delay_ms: float, max_delay_ms: float, *args, **kwargs) -> Any:
-    if TENACITY_AVAILABLE:
-        @retry(
-            stop=stop_after_attempt(max_retries),
-            wait=wait_exponential(multiplier=base_delay_ms/1000.0, min=base_delay_ms/1000.0, max=max_delay_ms/1000.0),
-            retry=retry_if_exception_type(Exception),
-            before_sleep=before_sleep_log(logger, logging.WARNING)
-        )
-        async def wrapped():
-            return await func(*args, **kwargs)
-        return await wrapped()
-    else:
-        for attempt in range(max_retries):
-            try:
-                return await func(*args, **kwargs)
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise
-                delay = min(base_delay_ms * (2 ** attempt), max_delay_ms) / 1000.0
-                await asyncio.sleep(delay)
-        raise RuntimeError("Max retries exceeded")
-
-# ============================================================================
-# Circuit Breaker (unchanged but using timezone)
-# ============================================================================
-class CircuitBreaker:
-    def __init__(self, name, db_path, failure_threshold=5, timeout_seconds=60.0):
-        self.name = name
-        self.db_path = db_path
-        self.failure_threshold = failure_threshold
-        self.timeout_seconds = timeout_seconds
-        self._init_db()
-        self._load_state()
-        self._lock = asyncio.Lock()
-
-    def _init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS circuit_breaker (
-                name TEXT PRIMARY KEY,
-                state TEXT NOT NULL,
-                failures INTEGER NOT NULL,
-                last_failure TEXT
-            )
-        """)
-        conn.commit()
-        conn.close()
-
-    def _load_state(self):
-        conn = sqlite3.connect(self.db_path)
-        row = conn.execute("SELECT state, failures, last_failure FROM circuit_breaker WHERE name = ?", (self.name,)).fetchone()
-        conn.close()
-        if row:
-            self.state = row[0]
-            self.failure_count = row[1]
-            self.last_failure_time = datetime.fromisoformat(row[2]) if row[2] else None
-        else:
-            self.state = 'closed'
-            self.failure_count = 0
-            self.last_failure_time = None
-
-    def _save_state(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""
-            INSERT OR REPLACE INTO circuit_breaker (name, state, failures, last_failure)
-            VALUES (?, ?, ?, ?)
-        """, (self.name, self.state, self.failure_count, self.last_failure_time.isoformat() if self.last_failure_time else None))
-        conn.commit()
-        conn.close()
-
-    async def call(self, func, *args, **kwargs):
-        async with self._lock:
-            if self.state == 'open':
-                if self.last_failure_time and (datetime.now(timezone.utc) - self.last_failure_time).total_seconds() >= self.timeout_seconds:
-                    self.state = 'half_open'
-                    self._save_state()
-                    logger.info(f"Circuit breaker {self.name} transitioning to half_open")
-                else:
-                    raise RuntimeError(f"Circuit breaker {self.name} is open")
-        try:
-            result = await func(*args, **kwargs)
-            async with self._lock:
-                if self.state == 'half_open':
-                    self.state = 'closed'
-                    self.failure_count = 0
-                    self._save_state()
-                    logger.info(f"Circuit breaker {self.name} closed after success")
-                else:
-                    self.failure_count = 0
-                    self._save_state()
-            return result
-        except Exception as e:
-            async with self._lock:
-                self.failure_count += 1
-                self.last_failure_time = datetime.now(timezone.utc)
-                if self.failure_count >= self.failure_threshold:
-                    self.state = 'open'
-                    logger.warning(f"Circuit breaker {self.name} opened after {self.failure_count} failures")
-                self._save_state()
-            raise e
-
-# ============================================================================
-# New Enhancement Modules
-# ============================================================================
-
-class CausalRLAgent:
-    """Simplified Q-learning agent for policy adaptation."""
-    def __init__(self, state_dim: int, action_dim: int):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.q_table = defaultdict(lambda: np.zeros(action_dim))
-        self.epsilon = 0.1
-        self.learning_rate = 0.1
-        self.gamma = 0.99
-
-    def act(self, state: np.ndarray, explore: bool = True) -> int:
-        if explore and random.random() < self.epsilon:
-            return random.randrange(self.action_dim)
-        state_key = tuple(state)
-        return int(np.argmax(self.q_table[state_key]))
-
-    def update(self, state, action, reward, next_state, done):
-        state_key = tuple(state)
-        next_key = tuple(next_state)
-        best_next = np.max(self.q_table[next_key]) if not done else 0.0
-        td_target = reward + self.gamma * best_next
-        self.q_table[state_key][action] += self.learning_rate * (td_target - self.q_table[state_key][action])
-
-    def get_policy_probs(self, state: np.ndarray, temperature: float = 1.0) -> List[float]:
-        state_key = tuple(state)
-        q_values = self.q_table[state_key]
-        if temperature <= 0:
-            probs = np.zeros_like(q_values)
-            probs[np.argmax(q_values)] = 1.0
-            return probs.tolist()
-        exp_q = np.exp((q_values - np.max(q_values)) / temperature)
-        return (exp_q / exp_q.sum()).tolist()
+    CentralStorage = None  # type: ignore
+    AsyncMessageQueue = None  # type: ignore
+    ParetoGating = None  # type: ignore
+    AdaptiveCostFunction = None  # type: ignore
+    DriftDetector = None  # type: ignore
+    MetricsRegistry = None  # type: ignore
+    FeedbackEvent = None  # type: ignore
 
 
-class FederatedCoordinator:
-    """Coordinates federated learning across deployments."""
-    def __init__(self, manager, queue: Optional[AsyncMessageQueue], model_keys: List[str] = None):
-        self.manager = manager
-        self.queue = queue
-        self.model_keys = model_keys or ['mopd_weights', 'rl_q_table']
-        self.last_global_model = None
+# =============================================================================
+# SECTION 1. MODULE STATUS
+# =============================================================================
+MODULE_STATUS: Dict[str, str] = {
+    "compartment_core":     "stable",
+    "circuit_breaker":      "stable",
+    "task_manager":         "stable",
+    "structure_lock":       "stable",
+    "persistence":          "experimental",
+    "genetic_optimizer":    "experimental",
+    "mopd":                 "experimental",
+    "homeostatic":          "experimental",
+    "xai":                  "experimental",
+    "safety_monitor":       "experimental",
+    "causal_rl":            "placeholder",
+    "federated":            "placeholder",
+    "precision":            "placeholder",
+    "carbon_market":        "placeholder",
+    "chaos":                "placeholder",
+    "human_approval":       "placeholder",
+    "health_model":         "placeholder",
+    "knowledge_bank":       "placeholder",
+}
 
-    async def send_update(self):
-        if not self.queue:
-            logger.warning("No message queue for federated update.")
-            return
-        local_model = self._get_local_model()
-        await self.queue.publish("federated_updates", json.dumps(local_model))
-        logger.info("Federated update sent.")
 
-    async def receive_global_model(self, model_json: str):
-        model = json.loads(model_json)
-        self.last_global_model = model
-        self._apply_global_model(model)
-        logger.info("Global model applied.")
+def _warn_module(name: str) -> None:
+    status = MODULE_STATUS.get(name, "unknown")
+    if status == "stable":
+        return
+    if status == "placeholder":
+        logger.warning("Module is a placeholder; enabling it has no effect", module=name)
+    elif status == "experimental":
+        logger.warning("Module is experimental; validate before production use", module=name)
 
-    def _get_local_model(self) -> Dict[str, Any]:
-        model = {}
-        if 'mopd_weights' in self.model_keys:
-            model['mopd_weights'] = self.manager.config.mopd.objective_weights
-        if 'rl_q_table' in self.model_keys and self.manager.rl_agent:
-            q_table = {}
-            for k, v in self.manager.rl_agent.q_table.items():
-                q_table[str(k)] = v.tolist()
-            model['rl_q_table'] = q_table
-        return model
 
-    def _apply_global_model(self, model: Dict[str, Any]):
-        if 'mopd_weights' in model and model['mopd_weights']:
-            local = self.manager.config.mopd.objective_weights
-            global_weights = model['mopd_weights']
-            alpha = 0.5
-            for key in local:
-                if key in global_weights:
-                    local[key] = alpha * local[key] + (1 - alpha) * global_weights[key]
-            total = sum(local.values())
-            if total > 0:
-                for key in local:
-                    local[key] /= total
-        if 'rl_q_table' in model and model['rl_q_table']:
-            global_q = model['rl_q_table']
-            for state_key_str, q_values in global_q.items():
+# =============================================================================
+# SECTION 2. RETRY + TRACING HELPERS
+# =============================================================================
+def retry_async(max_retries: int = 3, base_delay: float = 0.5, max_delay: float = 5.0):
+    def decorator(fn: Callable):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            last_exc: Optional[Exception] = None
+            for attempt in range(max_retries):
                 try:
-                    # Convert string tuple to tuple of floats/ints
-                    state_key = tuple(map(float, state_key_str.strip('()').split(','))) if ',' in state_key_str else (float(state_key_str),)
-                except:
-                    continue
-                if state_key in self.manager.rl_agent.q_table:
-                    self.manager.rl_agent.q_table[state_key] = (
-                        0.5 * self.manager.rl_agent.q_table[state_key] + 0.5 * np.array(q_values)
-                    )
-                else:
-                    self.manager.rl_agent.q_table[state_key] = np.array(q_values)
+                    return await fn(*args, **kwargs)
+                except Exception as e:
+                    last_exc = e
+                    if attempt == max_retries - 1:
+                        break
+                    delay = min(base_delay * (2 ** attempt), max_delay)
+                    logger.warning("Retrying", fn=fn.__name__, attempt=attempt + 1, error=str(e))
+                    await asyncio.sleep(delay)
+            if last_exc is not None:
+                raise last_exc
+            return None
+        return wrapper
+    return decorator
 
 
-class SafetyMonitor:
-    """Runtime monitor for safety properties."""
-    def __init__(self):
-        self.invariants = []
+def traced(span_name: str):
+    def decorator(fn: Callable):
+        if not OTEL_AVAILABLE:
+            return fn
 
-    def add_invariant(self, name: str, condition_fn: Callable[[Dict[str, Any]], bool], description: str):
-        self.invariants.append((name, condition_fn, description))
-
-    def check(self, state: Dict[str, Any]) -> List[str]:
-        violations = []
-        for name, fn, desc in self.invariants:
-            if not fn(state):
-                violations.append(f"{name}: {desc}")
-        return violations
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            with _TRACER.start_as_current_span(span_name):
+                return await fn(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
-class PrecisionController:
-    """Decides numerical precision based on load and energy budget."""
-    def __init__(self, policy: str = "energy_aware"):
-        self.policy = policy
-
-    def get_precision(self, load: float, energy_budget: float) -> str:
-        if self.policy == "energy_aware":
-            if load > 0.8 or energy_budget < 0.2:
-                return "float16"
-            else:
-                return "float32"
-        return "float32"
-
-
-class CarbonMarketClient:
-    """Placeholder for carbon market integration."""
-    def __init__(self, provider_url: str = None, contract_address: str = None, private_key: str = None):
-        self.available = False
-        if provider_url and contract_address and private_key:
-            if WEB3_AVAILABLE:
-                self.w3 = Web3(Web3.HTTPProvider(provider_url))
-                self.account = Account.from_key(private_key)
-                self.contract_address = contract_address
-                self.available = True
-            else:
-                logger.warning("web3 not installed; carbon market disabled.")
-        else:
-            logger.info("Carbon market client not configured.")
-
-    def buy_credits(self, amount: float) -> bool:
-        if not self.available:
-            return False
-        logger.info(f"Simulating purchase of {amount} carbon credits.")
-        return True
-
-    def sell_credits(self, amount: float) -> bool:
-        if not self.available:
-            return False
-        logger.info(f"Simulating sale of {amount} carbon credits.")
-        return True
-
-
-class ChaosInjector:
-    """Injects random failures."""
-    def __init__(self, manager, chaos_probability: float = 0.01):
-        self.manager = manager
-        self.chaos_probability = chaos_probability
-
-    async def maybe_inject_failure(self):
-        if random.random() < self.chaos_probability:
-            action = random.choice(['kill_task', 'delay', 'corrupt_state'])
-            logger.warning(f"Chaos injection: {action}")
-            if action == 'kill_task':
-                if self.manager._background_tasks:
-                    task = random.choice(self.manager._background_tasks)
-                    task.cancel()
-                    logger.warning(f"Chaos killed task: {task.get_name()}")
-            elif action == 'delay':
-                await asyncio.sleep(random.uniform(0.5, 2.0))
-            elif action == 'corrupt_state':
-                # Corrupt a random config value
-                if self.manager.config.mopd.objective_weights:
-                    key = random.choice(list(self.manager.config.mopd.objective_weights.keys()))
-                    self.manager.config.mopd.objective_weights[key] *= random.uniform(0.8, 1.2)
-                    logger.warning(f"Chaos corrupted weight {key}")
-
-
-class HumanApprovalHandler:
-    """Requests human approval for critical decisions."""
-    def __init__(self, queue: Optional[AsyncMessageQueue]):
-        self.queue = queue
-        self.pending_requests = {}
-
-    async def request_approval(self, decision: Dict[str, Any], timeout: float = 60.0) -> bool:
-        request_id = str(uuid.uuid4())
-        if not self.queue:
-            logger.warning("No queue for human approval; auto-approving.")
-            return True
-        if FeedbackEvent:
-            event = FeedbackEvent.create_with_context(
-                task_id=request_id,
-                selected_action=decision.get('action', 'unknown'),
-                quality_score=0.0,
-                energy_joules=0.0,
-                carbon_g=0.0,
-                feedback_type="approval_request",
-                adaptive_cost_value=0.0,
-                state=decision,
-                candidates=[],
-                source="compartment_manager",
-                environment=getattr(central_config, "ENVIRONMENT", "production") if central_config else "production",
-                tags=["approval"]
-            )
-            await self.queue.publish("approval_requests", event.to_json())
-        logger.info(f"Human approval requested for {decision.get('action')}, auto-approving after timeout.")
-        await asyncio.sleep(0)  # In real system, wait for callback
-        return True
-
-
-# ============================================================================
-# Configuration with new flags
-# ============================================================================
-if PYDANTIC_AVAILABLE:
-    class MOPDConfig(BaseModel):
-        enabled: bool = True
-        objective_weights: Dict[str, float] = Field(
-            default_factory=lambda: {
-                'health': 0.3,
-                'efficiency': 0.3,
-                'token_balance': 0.2,
-                'resource_utilization': 0.2,
-            }
-        )
-        grid_resolution: int = 5
-
-        @field_validator('objective_weights')
-        @classmethod
-        def check_weights(cls, v):
-            total = sum(v.values())
-            if abs(total - 1.0) > 1e-6:
-                raise ValueError("objective_weights must sum to 1")
-            return v
-
-    class CompartmentConfig(BaseModel):
-        # ... (existing fields) ...
-        # New enhancement flags
-        enable_causal_rl: bool = True
-        enable_federated_learning: bool = True
-        enable_safety_monitor: bool = True
-        enable_xai: bool = True
-        enable_precision_switching: bool = True
-        enable_carbon_market: bool = False
-        carbon_market_config: Optional[Dict[str, str]] = None
-        enable_chaos: bool = False
-        chaos_probability: float = 0.0
-        enable_human_approval: bool = True
-
-        # ... rest of config ...
-else:
-    @dataclass
-    class MOPDConfig:
-        enabled: bool = True
-        objective_weights: Dict[str, float] = field(default_factory=lambda: {
-            'health': 0.3,
-            'efficiency': 0.3,
-            'token_balance': 0.2,
-            'resource_utilization': 0.2,
-        })
-        grid_resolution: int = 5
-
-    @dataclass
-    class CompartmentConfig:
-        # ... existing fields ...
-        # New enhancement flags
-        enable_causal_rl: bool = True
-        enable_federated_learning: bool = True
-        enable_safety_monitor: bool = True
-        enable_xai: bool = True
-        enable_precision_switching: bool = True
-        enable_carbon_market: bool = False
-        carbon_market_config: Optional[Dict[str, str]] = None
-        enable_chaos: bool = False
-        chaos_probability: float = 0.0
-        enable_human_approval: bool = True
-        # ... rest ...
-
-
-# ============================================================================
-# Data Classes (unchanged)
-# ============================================================================
+# =============================================================================
+# SECTION 3. ENUMS
+# =============================================================================
 class CompartmentState(Enum):
     GENESIS = "genesis"
     MATURING = "maturing"
@@ -522,6 +224,7 @@ class CompartmentState(Enum):
     APOPTOTIC = "apoptotic"
     DECOMMISSIONED = "decommissioned"
 
+
 class MembranePermeability(Enum):
     IMPERMEABLE = "impermeable"
     RESTRICTIVE = "restrictive"
@@ -529,6 +232,99 @@ class MembranePermeability(Enum):
     PERMEABLE = "permeable"
     QUANTUM_ENCRYPTED = "quantum_encrypted"
 
+
+# =============================================================================
+# SECTION 4. CONFIGURATION
+# =============================================================================
+@dataclass
+class MOPDConfig:
+    enabled: bool = True
+    objective_weights: Dict[str, float] = field(default_factory=lambda: {
+        "health": 0.3,
+        "efficiency": 0.3,
+        "token_balance": 0.2,
+        "resource_utilization": 0.2,
+    })
+    grid_resolution: int = 5
+
+
+@dataclass
+class CompartmentConfig:
+    # Structure
+    max_regions: int = 10
+    compartments_per_region: int = 50
+    # Persistence
+    enable_persistence: bool = True
+    persistence_path: str = "compartment_state.json"
+    max_retries: int = 3
+    retry_base_delay_ms: float = 500.0
+    retry_max_delay_ms: float = 5000.0
+    # GA / MOPD
+    enable_genetic_optimizer: bool = True
+    ga_population_size: int = 20
+    ga_mutation_rate: float = 0.1
+    ga_crossover_rate: float = 0.7
+    ga_generations: int = 5
+    ga_tournament_size: int = 3
+    ga_evolution_interval_hours: float = 6.0
+    mopd: MOPDConfig = field(default_factory=MOPDConfig)
+    # Homeostatic controller
+    target_health: float = 0.7
+    target_token_reserve: float = 1000.0
+    kp: float = 0.5
+    ki: float = 0.1
+    kd: float = 0.05
+    # Health model
+    health_model_path: Optional[str] = None
+    health_model_min_samples: int = 100
+    health_model_training_interval_seconds: float = 3600.0
+    # Circuit breaker
+    enable_circuit_breaker: bool = True
+    circuit_breaker_db_path: str = "compartment_cb.db"
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_timeout_seconds: float = 60.0
+    # Interval
+    ecosystem_maintenance_interval_seconds: float = 30.0
+    trading_maintenance_interval_seconds: float = 60.0
+    # RL
+    q_table_max_size: int = 5000
+    rl_state_dim: int = 10
+    rl_action_dim: int = 3
+    # Shutdown
+    shutdown_timeout_seconds: int = 15
+    # Experimental / placeholder toggles — disabled by default
+    enable_causal_rl: bool = False
+    enable_federated_learning: bool = False
+    enable_safety_monitor: bool = True       # experimental but harmless
+    enable_xai: bool = True                  # experimental but harmless
+    enable_precision_switching: bool = False
+    enable_carbon_market: bool = False
+    carbon_market_config: Optional[Dict[str, str]] = None
+    enable_chaos: bool = False
+    chaos_probability: float = 0.0
+    enable_human_approval: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CompartmentConfig":
+        data = dict(data or {})
+        mopd_data = data.pop("mopd", None)
+        fields = cls.__dataclass_fields__
+        cfg = cls(**{k: v for k, v in data.items() if k in fields})
+        if isinstance(mopd_data, dict):
+            cfg.mopd = MOPDConfig(**{k: v for k, v in mopd_data.items() if k in MOPDConfig.__dataclass_fields__})
+        return cfg
+
+    @classmethod
+    def from_env_and_file(cls) -> "CompartmentConfig":
+        return cls()
+
+
+# =============================================================================
+# SECTION 5. DATA CLASSES
+# =============================================================================
 @dataclass
 class CompartmentResource:
     cpu_cores: float = 1.0
@@ -545,19 +341,36 @@ class CompartmentResource:
 
     @property
     def utilization(self) -> float:
-        return (self.cpu_cores + self.memory_mb/256 + self.storage_mb/1024) / 3
+        # Clamped to [0,1] so it can safely feed policy features
+        raw = (self.cpu_cores / self.max_cpu_cores
+               + self.memory_mb / self.max_memory_mb
+               + self.storage_mb / 4096.0) / 3.0
+        return max(0.0, min(1.0, raw))
 
-    def scale_up(self, factor=1.5):
+    def scale_up(self, factor: float = 1.5) -> None:
         self.cpu_cores = min(self.max_cpu_cores, self.cpu_cores * factor)
         self.memory_mb = min(self.max_memory_mb, self.memory_mb * factor)
         self.allocation_scaling *= factor
         self.last_adjustment = datetime.now(timezone.utc)
 
-    def scale_down(self, factor=0.7):
+    def scale_down(self, factor: float = 0.7) -> None:
         self.cpu_cores = max(self.min_cpu_cores, self.cpu_cores * factor)
         self.memory_mb = max(self.min_memory_mb, self.memory_mb * factor)
         self.allocation_scaling *= factor
         self.last_adjustment = datetime.now(timezone.utc)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["last_adjustment"] = self.last_adjustment.isoformat() if self.last_adjustment else None
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CompartmentResource":
+        data = dict(data or {})
+        la = data.get("last_adjustment")
+        if isinstance(la, str):
+            data["last_adjustment"] = datetime.fromisoformat(la)
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
 @dataclass
@@ -569,229 +382,322 @@ class MOPDPoint:
     resource_utilization: float
     scalarised_score: float = 0.0
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data):
-        return cls(**data)
+    def from_dict(cls, data: Dict[str, Any]) -> "MOPDPoint":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
-# ============================================================================
-# Genetic Optimizer (complete implementation)
-# ============================================================================
-class CompartmentGeneticOptimizer:
-    def __init__(self, manager):
-        self.manager = manager
-        self.population = []
-        self.best_fitness = -float('inf')
-        self.best_individual = None
-        self.evolution_history = []
-        self.pareto_front = []
-        self._lock = asyncio.Lock()
+# =============================================================================
+# SECTION 6. SECURITY (STABLE) — HMAC default
+# =============================================================================
+class SecurityService:
+    def __init__(self, key_dir: str = "./compartment_keys"):
+        self.key_dir = Path(key_dir)
+        self.key_dir.mkdir(parents=True, exist_ok=True)
+        self._secret = self._load_or_generate()
 
-    async def evolve(self, generations=None):
-        if generations is None:
-            generations = self.manager.config.ga_generations
-        # Initialize population
-        population = self._initialize_population()
-        for gen in range(generations):
-            # Evaluate
-            fitness_results = await self._evaluate_population(population)
-            # Extract objectives for Pareto
-            points = []
-            for ind, obj in zip(population, fitness_results):
-                points.append(MOPDPoint(
-                    individual=ind,
-                    health=obj.get('health', 0.0),
-                    efficiency=obj.get('efficiency', 0.0),
-                    token_balance=obj.get('token_balance', 0.0),
-                    resource_utilization=obj.get('resource_utilization', 0.0),
-                ))
-            # Update Pareto front
-            self.pareto_front = self._filter_pareto(self.pareto_front + points)
-            # Compute scalarised scores
-            weights = self.manager.config.mopd.objective_weights
-            for p in self.pareto_front:
-                p.scalarised_score = (weights.get('health', 0.3) * p.health +
-                                      weights.get('efficiency', 0.3) * p.efficiency +
-                                      weights.get('token_balance', 0.2) * p.token_balance +
-                                      weights.get('resource_utilization', 0.2) * p.resource_utilization)
-            # Find best individual
-            if self.pareto_front:
-                best_point = max(self.pareto_front, key=lambda p: p.scalarised_score)
-                self.best_fitness = best_point.scalarised_score
-                self.best_individual = best_point.individual
-            # Selection and reproduction
-            population = self._select_and_reproduce(population, fitness_results)
-            self.evolution_history.append({
-                'generation': gen,
-                'best_fitness': self.best_fitness,
-                'pareto_size': len(self.pareto_front),
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            })
-        return {
-            'best_fitness': self.best_fitness,
-            'best_individual': self.best_individual,
-            'history': self.evolution_history[-10:],
-            'pareto_front': [p.to_dict() for p in self.pareto_front],
-        }
+    def _load_or_generate(self) -> bytes:
+        p = self.key_dir / "hmac_secret.bin"
+        if p.exists():
+            return p.read_bytes()
+        s = os.urandom(32)
+        p.write_bytes(s)
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
+        return s
 
-    def _initialize_population(self):
-        population = []
-        for _ in range(self.manager.config.ga_population_size):
-            individual = {
-                'health_score_weights': {
-                    'success_rate': random.uniform(0.2, 0.6),
-                    'efficiency_score': random.uniform(0.2, 0.5),
-                    'trust_gradient': random.uniform(0.2, 0.5),
-                    'prediction_blend': random.uniform(0.2, 0.5)
-                }
-            }
-            population.append(individual)
-        return population
+    def sign(self, data: bytes) -> bytes:
+        return hmac.new(self._secret, data, hashlib.sha256).digest()
 
-    async def _evaluate_population(self, population):
-        results = []
-        for ind in population:
-            # Apply individual to manager temporarily
-            old_params = self.manager._compartment_params.copy()
-            self.manager._compartment_params = ind
-            # Compute health/efficiency based on current compartments
-            health = self.manager.global_health
-            efficiency = np.mean([c.efficiency_score for c in self.manager.compartments.values()]) if self.manager.compartments else 0.5
-            token_balance = sum(c.token_balance for c in self.manager.compartments.values()) / 1000.0
-            utilization = np.mean([c.resources.utilization for c in self.manager.compartments.values()]) if self.manager.compartments else 0.5
-            # Restore
-            self.manager._compartment_params = old_params
-            results.append({
-                'health': health,
-                'efficiency': efficiency,
-                'token_balance': token_balance,
-                'resource_utilization': utilization,
-            })
-        return results
-
-    def _filter_pareto(self, points):
-        if not points:
-            return []
-        objective_keys = ['health', 'efficiency', 'token_balance', 'resource_utilization']
-        pareto = []
-        for i, p_i in enumerate(points):
-            dominated = False
-            for j, p_j in enumerate(points):
-                if i == j:
-                    continue
-                a_vec = [getattr(p_i, k) for k in objective_keys]
-                b_vec = [getattr(p_j, k) for k in objective_keys]
-                if all(b >= a for a, b in zip(a_vec, b_vec)) and any(b > a for a, b in zip(a_vec, b_vec)):
-                    dominated = True
-                    break
-            if not dominated:
-                pareto.append(p_i)
-        return pareto
-
-    def _select_and_reproduce(self, population, fitness_results):
-        # Simple tournament selection based on scalarised score (or single fitness)
-        weights = self.manager.config.mopd.objective_weights
-        scores = []
-        for obj in fitness_results:
-            score = (weights.get('health', 0.3) * obj['health'] +
-                     weights.get('efficiency', 0.3) * obj['efficiency'] +
-                     weights.get('token_balance', 0.2) * obj['token_balance'] +
-                     weights.get('resource_utilization', 0.2) * obj['resource_utilization'])
-            scores.append(score)
-        new_population = []
-        # Keep best
-        best_idx = max(range(len(scores)), key=lambda i: scores[i])
-        new_population.append(copy.deepcopy(population[best_idx]))
-        while len(new_population) < len(population):
-            # Tournament
-            candidates = random.sample(range(len(population)), self.manager.config.ga_tournament_size)
-            parent1 = population[max(candidates, key=lambda i: scores[i])]
-            candidates = random.sample(range(len(population)), self.manager.config.ga_tournament_size)
-            parent2 = population[max(candidates, key=lambda i: scores[i])]
-            child = self._crossover(parent1, parent2)
-            child = self._mutate(child)
-            new_population.append(child)
-        return new_population
-
-    def _crossover(self, p1, p2):
-        child = {'health_score_weights': {}}
-        for key in p1['health_score_weights']:
-            child['health_score_weights'][key] = p1['health_score_weights'][key] if random.random() < 0.5 else p2['health_score_weights'][key]
-        return child
-
-    def _mutate(self, individual):
-        mutant = copy.deepcopy(individual)
-        for key in mutant['health_score_weights']:
-            if random.random() < self.manager.config.ga_mutation_rate:
-                mutant['health_score_weights'][key] = random.uniform(0.1, 0.9)
-        return mutant
-
-    def get_pareto_front(self):
-        return self.pareto_front.copy()
-
-    def get_mopd_summary(self):
-        return {
-            "enabled": self.manager.config.mopd.enabled,
-            "objective_weights": self.manager.config.mopd.objective_weights,
-            "grid_resolution": self.manager.config.mopd.grid_resolution,
-            "pareto_front_size": len(self.pareto_front),
-            "evolution_history": self.evolution_history[-10:],
-        }
+    def verify(self, data: bytes, signature: bytes) -> bool:
+        return hmac.compare_digest(self.sign(data), signature)
 
 
-# ============================================================================
-# Homeostatic Setpoint Controller (simplified)
-# ============================================================================
-class HomeostaticSetpointController:
-    def __init__(self, config):
-        self.config = config
-        self.integral_health = 0.0
-        self.integral_token = 0.0
-        self.prev_error_health = 0.0
-        self.prev_error_token = 0.0
-
-    def compute_adjustment(self, health, token_reserve):
-        error_health = self.config.target_health - health
-        error_token = self.config.target_token_reserve - token_reserve
-        # PID
-        p_health = self.config.kp * error_health
-        i_health = self.config.ki * (self.integral_health + error_health)
-        d_health = self.config.kd * (error_health - self.prev_error_health)
-        self.integral_health += error_health
-        self.prev_error_health = error_health
-
-        p_token = self.config.kp * error_token
-        i_token = self.config.ki * (self.integral_token + error_token)
-        d_token = self.config.kd * (error_token - self.prev_error_token)
-        self.integral_token += error_token
-        self.prev_error_token = error_token
-
-        # Modifiers
-        spawn_mod = 1.0 + max(0, p_health + i_health + d_health) / 10.0
-        cull_mod = 1.0 + max(0, -p_health - i_health - d_health) / 10.0
-        scale_mod = 1.0 + max(0, p_token + i_token + d_token) / 1000.0
-
-        return {
-            'spawn_rate_modifier': max(0.5, min(1.5, spawn_mod)),
-            'cull_aggressiveness_modifier': max(0.5, min(1.5, cull_mod)),
-            'resource_scale_modifier': max(0.9, min(1.1, scale_mod)),
-        }
-
-
-# ============================================================================
-# Compartment placeholder classes (minimal)
-# ============================================================================
-class MembraneGate:
+# =============================================================================
+# SECTION 7. EVENT BUS (STABLE)
+# =============================================================================
+class EventBus:
     def __init__(self):
+        self._subscribers: Dict[str, List[Callable]] = defaultdict(list)
+        self._lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def subscribe(self, event_type: str, callback: Callable) -> None:
+        async with self._get_lock():
+            self._subscribers[event_type].append(callback)
+
+    async def publish(self, event_type: str, payload: Dict[str, Any]) -> int:
+        async with self._get_lock():
+            callbacks = list(self._subscribers.get(event_type, []))
+        for cb in callbacks:
+            try:
+                r = cb(event_type, payload)
+                if asyncio.iscoroutine(r):
+                    await r
+            except Exception as e:
+                logger.debug("EventBus callback failed", error=str(e))
+        return len(callbacks)
+
+
+# =============================================================================
+# SECTION 8. PLACEHOLDERS (safe no-ops)
+# =============================================================================
+class CausalRLAgentPlaceholder:
+    """STATUS: placeholder. Bounded, discretized, uniform policy by default."""
+    STATUS = "placeholder"
+
+    def __init__(self, state_dim: int, action_dim: int, max_q_table: int = 5000,
+                 enabled: bool = False):
+        if enabled:
+            _warn_module("causal_rl")
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.max_q_table = max_q_table
+        self.q_table: "OrderedDict[Tuple[int, ...], np.ndarray]" = OrderedDict()
+        self.epsilon = 0.1
+        self.learning_rate = 0.1
+        self.gamma = 0.99
+
+    def _discretize(self, state: np.ndarray) -> Tuple[int, ...]:
+        arr = np.asarray(state, dtype=float)[: self.state_dim]
+        if arr.shape[0] < self.state_dim:
+            arr = np.pad(arr, (0, self.state_dim - arr.shape[0]))
+        buckets = np.clip((arr * 5).astype(int), 0, 4)
+        return tuple(int(b) for b in buckets.tolist())
+
+    def _get_or_create(self, key: Tuple[int, ...]) -> np.ndarray:
+        if key in self.q_table:
+            self.q_table.move_to_end(key)
+            return self.q_table[key]
+        if len(self.q_table) >= self.max_q_table:
+            self.q_table.popitem(last=False)
+        self.q_table[key] = np.zeros(self.action_dim)
+        return self.q_table[key]
+
+    def act(self, state: np.ndarray, explore: bool = True) -> int:
+        if explore and random.random() < self.epsilon:
+            return random.randrange(self.action_dim)
+        key = self._discretize(state)
+        return int(np.argmax(self._get_or_create(key)))
+
+    def update(self, state, action, reward, next_state, done) -> None:
+        key = self._discretize(state)
+        next_key = self._discretize(next_state)
+        current = self._get_or_create(key)
+        next_q = self._get_or_create(next_key)
+        best_next = 0.0 if done else float(np.max(next_q))
+        td_target = reward + self.gamma * best_next
+        current[action] += self.learning_rate * (td_target - current[action])
+
+    def get_policy_probs(self, state: np.ndarray, temperature: float = 1.0) -> List[float]:
+        return [1.0 / self.action_dim] * self.action_dim
+
+    def size(self) -> int:
+        return len(self.q_table)
+
+
+class FederatedCoordinatorPlaceholder:
+    STATUS = "placeholder"
+
+    def __init__(self, manager: Any, queue: Optional[Any], enabled: bool = False):
+        if enabled:
+            _warn_module("federated")
+        self.manager = manager
+        self.queue = queue
+        self.available = False
+
+    async def send_update(self) -> bool:
+        return False
+
+    async def receive_global_model(self, model_json: str) -> bool:
+        return False
+
+
+class PrecisionControllerPlaceholder:
+    STATUS = "placeholder"
+
+    def __init__(self, policy: str = "energy_aware", enabled: bool = False):
+        if enabled:
+            _warn_module("precision")
+        self.policy = policy
+        self.available = False
+
+    def get_precision(self, load: float, energy_budget: float) -> str:
+        return "float32"
+
+
+class CarbonMarketClientPlaceholder:
+    STATUS = "placeholder"
+
+    def __init__(self, enabled: bool = False, **kwargs: Any):
+        if enabled:
+            _warn_module("carbon_market")
+        self.available = False
+
+    def buy_credits(self, amount: float) -> bool:
+        return False
+
+    def sell_credits(self, amount: float) -> bool:
+        return False
+
+
+class ChaosInjectorPlaceholder:
+    STATUS = "placeholder"
+
+    def __init__(self, manager: Any, chaos_probability: float = 0.0,
+                 enabled: bool = False):
+        if enabled:
+            _warn_module("chaos")
+        self.manager = manager
+        self.chaos_probability = chaos_probability
+        self.available = False
+
+    async def maybe_inject_failure(self) -> None:
+        return None
+
+
+class HumanApprovalHandlerPlaceholder:
+    STATUS = "placeholder"
+
+    def __init__(self, queue: Optional[Any] = None, enabled: bool = False,
+                 auto_approve_dev: bool = False):
+        if enabled:
+            _warn_module("human_approval")
+        self.queue = queue
+        self.available = False
+        self.auto_approve_dev = auto_approve_dev
+        if auto_approve_dev:
+            logger.warning("HumanApproval auto_approve_dev=True; do not use in production.")
+
+    async def request_approval(self, decision: Dict[str, Any], timeout: float = 60.0) -> bool:
+        if self.auto_approve_dev:
+            return True
+        return False
+
+
+class HealthModelPlaceholder:
+    """STATUS: placeholder. Predictions are neutral."""
+    STATUS = "placeholder"
+
+    def __init__(self, model_path: Optional[str] = None, enabled: bool = False):
+        if enabled:
+            _warn_module("health_model")
+        self.model_path = model_path
+        self.history: List[Any] = []
+        self.is_trained = False
+        self.predictions_cache: Dict[str, Any] = {}
+        self.available = False
+
+    async def train(self, force: bool = False) -> Dict[str, Any]:
+        return {"status": "placeholder", "samples": len(self.history)}
+
+    async def predict_health(self, compartment_id: str, features: Dict[str, Any]) -> Dict[str, Any]:
+        return {"predicted_health": 0.5, "confidence": 0.0}
+
+
+class KnowledgeBankPlaceholder:
+    """STATUS: placeholder. Records are stored but never replayed."""
+    STATUS = "placeholder"
+
+    def __init__(self, enabled: bool = False):
+        if enabled:
+            _warn_module("knowledge_bank")
+        self.records: Deque[Dict[str, Any]] = deque(maxlen=1000)
+        self.available = False
+
+    async def store(self, knowledge: Dict[str, Any]) -> None:
+        self.records.append(knowledge)
+
+    async def replay_to_compartment(self, compartment: Any) -> None:
+        return None
+
+
+# =============================================================================
+# SECTION 9. SAFETY MONITOR (EXPERIMENTAL)
+# =============================================================================
+class SafetyMonitor:
+    STATUS = "experimental"
+
+    def __init__(self, enabled: bool = True):
+        if enabled:
+            _warn_module("safety_monitor")
+        self.invariants: List[Tuple[str, Callable[[Dict[str, Any]], bool], str]] = []
+        self.available = True
+
+    def add_invariant(self, name: str, fn: Callable[[Dict[str, Any]], bool], description: str) -> None:
+        self.invariants.append((name, fn, description))
+
+    def check(self, state: Dict[str, Any]) -> List[str]:
+        return [
+            f"{name}: {desc}"
+            for name, fn, desc in self.invariants
+            if not fn(state)
+        ]
+
+
+# =============================================================================
+# SECTION 10. XAI (EXPERIMENTAL)
+# =============================================================================
+class XAIExplainer:
+    STATUS = "experimental"
+
+    def __init__(self, enabled: bool = True):
+        if enabled:
+            _warn_module("xai")
+        self.available = True
+
+    def explain_select(self, best: Any, candidates: List[Tuple[Any, float]]) -> str:
+        top = candidates[:3]
+        return (
+            f"Selected {best.compartment_id} with highest score "
+            f"{top[0][1]:.2f} over {len(candidates)} candidates."
+        )
+
+    def explain_decommission(self, comp: Any) -> str:
+        return (
+            f"Decommissioned {comp.compartment_id} "
+            f"(health={comp.health_score:.2f}, viable={comp.is_viable})."
+        )
+
+
+# =============================================================================
+# SECTION 11. COMPARTMENT, MARKET, REGION
+# =============================================================================
+class MembraneGate:
+    def __init__(self) -> None:
         self.permeability = MembranePermeability.SELECTIVE
-        self.encryption = None
+        self.encryption: Optional[Any] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"permeability": self.permeability.value}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MembraneGate":
+        mg = cls()
+        try:
+            mg.permeability = MembranePermeability(data.get("permeability", "selective"))
+        except ValueError:
+            pass
+        return mg
 
 
 class ChromatophoreCompartment:
-    def __init__(self, compartment_id, expert_type, expert_instance=None, resources=None):
+    def __init__(
+        self,
+        compartment_id: str,
+        expert_type: str,
+        expert_instance: Optional[Any] = None,
+        resources: Optional[CompartmentResource] = None,
+    ):
         self.compartment_id = compartment_id
         self.expert_type = expert_type
         self.expert_instance = expert_instance
@@ -803,26 +709,21 @@ class ChromatophoreCompartment:
         self.success_rate = 0.6
         self.trust_gradient = 0.5
         self.membrane_gate = MembraneGate()
-        self.parent_id = None
-        self.central_health_model = None
-        self.gradient_manager = None
-        self.quantum_integrator = None
-        self.apoptosis_bank = None
-        self._manager = None
-        self.glycogen_queue = []
+        self.parent_id: Optional[str] = None
         self.is_viable = True
+        self.glycogen_queue: List[Any] = []
 
-    def spend_tokens(self, amount, reason):
+    def spend_tokens(self, amount: float, reason: str) -> bool:
         if self.token_balance >= amount:
             self.token_balance -= amount
             return True
         return False
 
-    def receive_tokens(self, amount, source):
+    def receive_tokens(self, amount: float, source: str) -> bool:
         self.token_balance += amount
+        return True
 
-    def _evaluate_lifecycle(self):
-        # simplified
+    def _evaluate_lifecycle(self) -> None:
         if self.health_score < 0.2:
             self.state = CompartmentState.APOPTOTIC
             self.is_viable = False
@@ -831,124 +732,729 @@ class ChromatophoreCompartment:
         else:
             self.state = CompartmentState.ACTIVE
 
-    def prepare_apoptosis(self):
+    def prepare_apoptosis(self) -> Tuple[float, Dict[str, Any]]:
         knowledge = {
-            'health_score': self.health_score,
-            'efficiency_score': self.efficiency_score,
-            'expert_type': self.expert_type,
+            "health_score": self.health_score,
+            "efficiency_score": self.efficiency_score,
+            "expert_type": self.expert_type,
+            "token_balance": self.token_balance,
         }
-        remaining_tokens = self.token_balance
+        remaining = self.token_balance
         self.token_balance = 0.0
-        return remaining_tokens, knowledge
+        return remaining, knowledge
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "compartment_id": self.compartment_id,
+            "expert_type": self.expert_type,
+            "resources": self.resources.to_dict(),
+            "state": self.state.value,
+            "health_score": self.health_score,
+            "efficiency_score": self.efficiency_score,
+            "token_balance": self.token_balance,
+            "success_rate": self.success_rate,
+            "trust_gradient": self.trust_gradient,
+            "membrane_gate": self.membrane_gate.to_dict(),
+            "parent_id": self.parent_id,
+            "is_viable": self.is_viable,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ChromatophoreCompartment":
+        data = dict(data or {})
+        c = cls(
+            compartment_id=data.get("compartment_id", str(uuid.uuid4())),
+            expert_type=data.get("expert_type", "default"),
+            resources=CompartmentResource.from_dict(data.get("resources", {})),
+        )
+        try:
+            c.state = CompartmentState(data.get("state", "genesis"))
+        except ValueError:
+            c.state = CompartmentState.GENESIS
+        c.health_score = float(data.get("health_score", 0.8))
+        c.efficiency_score = float(data.get("efficiency_score", 0.7))
+        c.token_balance = float(data.get("token_balance", 100.0))
+        c.success_rate = float(data.get("success_rate", 0.6))
+        c.trust_gradient = float(data.get("trust_gradient", 0.5))
+        c.membrane_gate = MembraneGate.from_dict(data.get("membrane_gate", {}))
+        c.parent_id = data.get("parent_id")
+        c.is_viable = bool(data.get("is_viable", True))
+        return c
 
 
-class CentralizedPredictiveHealthModel:
-    def __init__(self, model_path=None):
-        self.history = []
-        self.is_trained = False
-        self.predictions_cache = {}
-        self.model_path = model_path
+class InterCompartmentMarket:
+    def __init__(self) -> None:
+        self.orders: Dict[str, Dict[str, Any]] = {}
+        self.trade_history: List[Dict[str, Any]] = []
 
-    async def train(self, force=False):
-        return {'status': 'success', 'samples': len(self.history)}
+    def add_order(self, seller_id: str, buyer_id: str, amount: float, price: float) -> str:
+        order_id = f"order_{uuid.uuid4().hex[:8]}"
+        self.orders[order_id] = {
+            "seller": seller_id,
+            "buyer": buyer_id,
+            "amount": amount,
+            "price": price,
+            "status": "open",
+        }
+        return order_id
 
-    async def predict_health(self, compartment_id, features):
-        return {'predicted_health': 0.8, 'confidence': 0.9}
+    def match_orders(self) -> List[Dict[str, Any]]:
+        matches = []
+        for order_id, order in self.orders.items():
+            if order["status"] == "open":
+                order["status"] = "matched"
+                self.trade_history.append(dict(order))
+                matches.append({
+                    "seller": order["seller"],
+                    "buyer": order["buyer"],
+                    "amount": order["amount"],
+                })
+        return matches
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"orders": self.orders, "trade_history": self.trade_history}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "InterCompartmentMarket":
+        m = cls()
+        m.orders = dict((data or {}).get("orders", {}))
+        m.trade_history = list((data or {}).get("trade_history", []))
+        return m
 
 
-class ApoptosisKnowledgeBank:
-    def __init__(self):
-        self.knowledge_records = []
+class KnowledgeTransfer:
+    """Simple cross-region knowledge store. Not a placeholder anymore."""
+    def __init__(self) -> None:
+        self._records: Deque[Dict[str, Any]] = deque(maxlen=500)
 
-    async def store(self, knowledge):
-        self.knowledge_records.append(knowledge)
-        if len(self.knowledge_records) > 1000:
-            self.knowledge_records = self.knowledge_records[-1000:]
+    def add_knowledge(self, region_id: str, knowledge: Dict[str, Any]) -> None:
+        self._records.append({"region_id": region_id, "knowledge": dict(knowledge)})
 
-    async def replay_to_compartment(self, compartment):
-        if self.knowledge_records:
-            latest = self.knowledge_records[-1]
-            compartment.health_score = latest.get('health_score', 0.8)
-            compartment.efficiency_score = latest.get('efficiency_score', 0.7)
+    def latest(self, n: int = 10) -> List[Dict[str, Any]]:
+        return list(self._records)[-n:]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"records": list(self._records)}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "KnowledgeTransfer":
+        kt = cls()
+        for r in (data or {}).get("records", []):
+            kt._records.append(r)
+        return kt
 
 
 class RegionAggregator:
-    def __init__(self, region_id, max_compartments=50):
+    def __init__(self, region_id: str, max_compartments: int = 50):
         self.region_id = region_id
         self.max_compartments = max_compartments
-        self.compartments = {}
-        self.aggregated_health = 0.7
-        self.aggregated_tokens = 1000.0
-        self.knowledge_transfer = {}  # simplified
+        self.compartments: Dict[str, ChromatophoreCompartment] = {}
+        self.knowledge_transfer = KnowledgeTransfer()
         self.market = InterCompartmentMarket()
 
-    def add_compartment(self, compartment):
+    def add_compartment(self, compartment: ChromatophoreCompartment) -> bool:
         if len(self.compartments) >= self.max_compartments:
             return False
         self.compartments[compartment.compartment_id] = compartment
         return True
 
-    def remove_compartment(self, compartment_id):
+    def remove_compartment(self, compartment_id: str) -> None:
         self.compartments.pop(compartment_id, None)
 
-    def get_total_count(self):
+    def get_total_count(self) -> int:
         return len(self.compartments)
 
-    def get_viable_count(self):
+    def get_viable_count(self) -> int:
         return sum(1 for c in self.compartments.values() if c.is_viable)
 
-    def health_check(self):
+    def health_check(self) -> Optional[float]:
+        # Returns None for empty regions so callers can skip them.
         if not self.compartments:
-            return 0.0
-        return np.mean([c.health_score for c in self.compartments.values()])
+            return None
+        return float(np.mean([c.health_score for c in self.compartments.values()]))
 
-    def balance_load_local(self):
+    def balance_load_local(self) -> int:
         return 0
 
-    def cull_unhealthy(self):
-        to_remove = [cid for cid, comp in self.compartments.items() if comp.health_score < 0.2 and not comp.is_viable]
+    def cull_unhealthy(self) -> List[str]:
+        to_remove = [
+            cid for cid, comp in self.compartments.items()
+            if comp.health_score < 0.2 and not comp.is_viable
+        ]
         for cid in to_remove:
             self.compartments.pop(cid, None)
         return to_remove
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "region_id": self.region_id,
+            "max_compartments": self.max_compartments,
+            "compartments": {cid: c.to_dict() for cid, c in self.compartments.items()},
+            "knowledge_transfer": self.knowledge_transfer.to_dict(),
+            "market": self.market.to_dict(),
+        }
 
-class InterCompartmentMarket:
-    def __init__(self):
-        self.orders = {}
-        self.trade_history = []
-
-    def add_order(self, seller_id, buyer_id, amount, price):
-        order_id = f"order_{uuid.uuid4().hex[:8]}"
-        self.orders[order_id] = {'seller': seller_id, 'buyer': buyer_id, 'amount': amount, 'price': price, 'status': 'open'}
-        return order_id
-
-    def match_orders(self):
-        matches = []
-        for order_id, order in self.orders.items():
-            if order['status'] == 'open':
-                order['status'] = 'matched'
-                self.trade_history.append(order.copy())
-                matches.append({'seller': order['seller'], 'buyer': order['buyer'], 'amount': order['amount']})
-        return matches
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RegionAggregator":
+        data = dict(data or {})
+        r = cls(
+            region_id=data.get("region_id", "default"),
+            max_compartments=int(data.get("max_compartments", 50)),
+        )
+        for cid, cdata in (data.get("compartments") or {}).items():
+            r.compartments[cid] = ChromatophoreCompartment.from_dict(cdata)
+        r.knowledge_transfer = KnowledgeTransfer.from_dict(data.get("knowledge_transfer", {}))
+        r.market = InterCompartmentMarket.from_dict(data.get("market", {}))
+        return r
 
 
-# ============================================================================
-# Main Manager
-# ============================================================================
-class HierarchicalCompartmentManager:
-    def __init__(self, config=None, token_manager=None, gradient_manager=None,
-                 storage=None, message_queue=None, adaptive_cost=None,
-                 pareto_gating=None, drift_detector=None, metrics=None,
-                 rl_agent=None, federated_coordinator=None, safety_monitor=None,
-                 precision_controller=None, carbon_market_client=None,
-                 chaos_injector=None, human_approval_handler=None):
-        if config is None:
-            config = CompartmentConfig.from_env_and_file()
+# =============================================================================
+# SECTION 12. HOMEOSTATIC CONTROLLER (EXPERIMENTAL)
+# =============================================================================
+class HomeostaticSetpointController:
+    STATUS = "experimental"
+
+    def __init__(self, config: CompartmentConfig, enabled: bool = True):
+        if enabled:
+            _warn_module("homeostatic")
         self.config = config
+        self.integral_health = 0.0
+        self.integral_token = 0.0
+        self.prev_error_health = 0.0
+        self.prev_error_token = 0.0
+
+    def compute_adjustment(self, health: float, token_reserve: float) -> Dict[str, float]:
+        e_h = self.config.target_health - health
+        e_t = self.config.target_token_reserve - token_reserve
+
+        p_h = self.config.kp * e_h
+        i_h = self.config.ki * (self.integral_health + e_h)
+        d_h = self.config.kd * (e_h - self.prev_error_health)
+        self.integral_health += e_h
+        self.prev_error_health = e_h
+
+        p_t = self.config.kp * e_t
+        i_t = self.config.ki * (self.integral_token + e_t)
+        d_t = self.config.kd * (e_t - self.prev_error_token)
+        self.integral_token += e_t
+        self.prev_error_token = e_t
+
+        spawn_mod = 1.0 + max(0.0, p_h + i_h + d_h) / 10.0
+        cull_mod = 1.0 + max(0.0, -p_h - i_h - d_h) / 10.0
+        scale_mod = 1.0 + max(0.0, p_t + i_t + d_t) / 1000.0
+        return {
+            "spawn_rate_modifier": max(0.5, min(1.5, spawn_mod)),
+            "cull_aggressiveness_modifier": max(0.5, min(1.5, cull_mod)),
+            "resource_scale_modifier": max(0.9, min(1.1, scale_mod)),
+        }
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            "integral_health": self.integral_health,
+            "integral_token": self.integral_token,
+            "prev_error_health": self.prev_error_health,
+            "prev_error_token": self.prev_error_token,
+        }
+
+    def from_dict(self, data: Dict[str, Any]) -> None:
+        self.integral_health = float((data or {}).get("integral_health", 0.0))
+        self.integral_token = float((data or {}).get("integral_token", 0.0))
+        self.prev_error_health = float((data or {}).get("prev_error_health", 0.0))
+        self.prev_error_token = float((data or {}).get("prev_error_token", 0.0))
+
+
+# =============================================================================
+# SECTION 13. GENETIC OPTIMIZER (EXPERIMENTAL) — fitness genome-dependent
+# =============================================================================
+class GeneticOptimizer:
+    STATUS = "experimental"
+
+    def __init__(self, manager: "HierarchicalCompartmentManager",
+                 config: CompartmentConfig, enabled: bool = True):
+        if enabled:
+            _warn_module("genetic_optimizer")
+        self.manager = manager
+        self.config = config
+        self.best_fitness = -math.inf
+        self.best_individual: Optional[Dict[str, Any]] = None
+        self.evolution_history: List[Dict[str, Any]] = []
+        self.pareto_front: List[MOPDPoint] = []
+        self._lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    def _initialize_individual(self) -> Dict[str, Any]:
+        return {
+            "health_score_weights": {
+                "success_rate": random.uniform(0.1, 0.7),
+                "efficiency_score": random.uniform(0.1, 0.7),
+                "trust_gradient": random.uniform(0.1, 0.7),
+            }
+        }
+
+    def _initialize_population(self) -> List[Dict[str, Any]]:
+        return [
+            self._initialize_individual()
+            for _ in range(self.config.ga_population_size)
+        ]
+
+    async def _evaluate_individual(self, individual: Dict[str, Any]) -> Dict[str, float]:
+        # Genome-dependent: recompute health per compartment using weights
+        weights = individual["health_score_weights"]
+        healths = []
+        efficiencies = []
+        tokens = []
+        utils = []
+        for c in self.manager.compartments.values():
+            h = (
+                c.success_rate * weights.get("success_rate", 0.4)
+                + c.efficiency_score * weights.get("efficiency_score", 0.3)
+                + c.trust_gradient * weights.get("trust_gradient", 0.3)
+            )
+            healths.append(max(0.0, min(1.0, h)))
+            efficiencies.append(c.efficiency_score)
+            tokens.append(c.token_balance)
+            utils.append(c.resources.utilization)
+
+        if not healths:
+            return {
+                "health": 0.5, "efficiency": 0.5,
+                "token_balance": 0.0, "resource_utilization": 0.0,
+            }
+        return {
+            "health": float(np.mean(healths)),
+            "efficiency": float(np.mean(efficiencies)),
+            "token_balance": float(sum(tokens) / max(1000.0, 1.0)),
+            "resource_utilization": float(np.mean(utils)),
+        }
+
+    def _scalarise(self, objs: Dict[str, float]) -> float:
+        w = self.config.mopd.objective_weights
+        return (
+            w.get("health", 0.3) * objs["health"]
+            + w.get("efficiency", 0.3) * objs["efficiency"]
+            + w.get("token_balance", 0.2) * objs["token_balance"]
+            + w.get("resource_utilization", 0.2) * objs["resource_utilization"]
+        )
+
+    def _filter_pareto(self, points: List[MOPDPoint]) -> List[MOPDPoint]:
+        if not points:
+            return []
+        keys = ["health", "efficiency", "token_balance", "resource_utilization"]
+        front: List[MOPDPoint] = []
+        for i, p in enumerate(points):
+            dominated = False
+            for j, q in enumerate(points):
+                if i == j:
+                    continue
+                if (
+                    all(getattr(q, k) >= getattr(p, k) for k in keys)
+                    and any(getattr(q, k) > getattr(p, k) for k in keys)
+                ):
+                    dominated = True
+                    break
+            if not dominated:
+                front.append(p)
+        return front
+
+    async def evolve(self, generations: Optional[int] = None) -> Dict[str, Any]:
+        generations = generations or self.config.ga_generations
+        async with self._get_lock():
+            population = self._initialize_population()
+            local_front: List[MOPDPoint] = []
+
+            for gen in range(generations):
+                objs_list = []
+                for ind in population:
+                    objs = await self._evaluate_individual(ind)
+                    objs_list.append(objs)
+
+                fitness = [self._scalarise(o) for o in objs_list]
+                if self.config.mopd.enabled:
+                    points = [
+                        MOPDPoint(
+                            individual=dict(ind),
+                            health=o["health"],
+                            efficiency=o["efficiency"],
+                            token_balance=o["token_balance"],
+                            resource_utilization=o["resource_utilization"],
+                        )
+                        for ind, o in zip(population, objs_list)
+                    ]
+                    local_front = self._filter_pareto(local_front + points)
+
+                # Elitism + reproduction
+                new_pop: List[Dict[str, Any]] = []
+                best_idx = int(np.argmax(fitness))
+                new_pop.append(dict(population[best_idx]))
+                while len(new_pop) < self.config.ga_population_size:
+                    if random.random() < self.config.ga_crossover_rate and len(population) >= 2:
+                        p1 = self._tournament(population, fitness)
+                        p2 = self._tournament(population, fitness)
+                        child = self._mutate(self._crossover(p1, p2))
+                    else:
+                        child = self._mutate(dict(self._tournament(population, fitness)))
+                    new_pop.append(child)
+                population = new_pop
+
+            self.pareto_front = local_front
+            if local_front:
+                # Select best from Pareto
+                w = self.config.mopd.objective_weights
+                keys = list(w.keys())
+                max_vals = {k: max(getattr(p, k) for p in local_front) for k in keys}
+                min_vals = {k: min(getattr(p, k) for p in local_front) for k in keys}
+                ranges = {
+                    k: (max_vals[k] - min_vals[k]) if max_vals[k] != min_vals[k] else 1.0
+                    for k in keys
+                }
+                best_score = -math.inf
+                for p in local_front:
+                    s = sum(
+                        w.get(k, 0.0) * ((getattr(p, k) - min_vals[k]) / ranges[k])
+                        for k in keys
+                    )
+                    if s > best_score:
+                        best_score = s
+                        self.best_individual = dict(p.individual)
+                self.best_fitness = best_score
+
+            self.evolution_history.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "generations": generations,
+                "best_fitness": self.best_fitness,
+                "pareto_size": len(self.pareto_front),
+            })
+
+            # Apply best weights to manager's compartment params
+            if self.best_individual:
+                self.manager._compartment_params["health_score_weights"] = dict(
+                    self.best_individual["health_score_weights"]
+                )
+
+            return {
+                "best_fitness": self.best_fitness,
+                "best_individual": self.best_individual,
+                "generations": generations,
+                "pareto_front": [p.to_dict() for p in self.pareto_front],
+            }
+
+    def _tournament(self, population: List[Dict[str, Any]], fitness: List[float]) -> Dict[str, Any]:
+        n = len(population)
+        k = min(self.config.ga_tournament_size, n)
+        idxs = random.sample(range(n), k)
+        best = max(idxs, key=lambda i: fitness[i])
+        return population[best]
+
+    def _crossover(self, p1: Dict[str, Any], p2: Dict[str, Any]) -> Dict[str, Any]:
+        child = {"health_score_weights": {}}
+        for key in p1["health_score_weights"]:
+            if random.random() < 0.5:
+                child["health_score_weights"][key] = p1["health_score_weights"][key]
+            else:
+                child["health_score_weights"][key] = p2["health_score_weights"][key]
+        return child
+
+    def _mutate(self, individual: Dict[str, Any]) -> Dict[str, Any]:
+        mutant = {"health_score_weights": dict(individual["health_score_weights"])}
+        for k in mutant["health_score_weights"]:
+            if random.random() < self.config.ga_mutation_rate:
+                mutant["health_score_weights"][k] = random.uniform(0.05, 0.9)
+        return mutant
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "best_fitness": self.best_fitness,
+            "best_individual": self.best_individual,
+            "evolution_history": self.evolution_history,
+            "pareto_front": [p.to_dict() for p in self.pareto_front],
+        }
+
+    def from_dict(self, data: Dict[str, Any]) -> None:
+        data = data or {}
+        self.best_fitness = float(data.get("best_fitness", -math.inf))
+        self.best_individual = data.get("best_individual")
+        self.evolution_history = list(data.get("evolution_history", []))
+        self.pareto_front = [MOPDPoint.from_dict(p) for p in data.get("pareto_front", [])]
+
+
+# =============================================================================
+# SECTION 14. TASK MANAGER (STABLE)
+# =============================================================================
+class TaskManager:
+    def __init__(self):
+        self.tasks: Dict[str, asyncio.Task] = {}
+        self.shutdown_event = asyncio.Event()
+        self._drained = False
+
+    def start_task(self, name: str, coro_func: Callable, *args, **kwargs) -> Optional[asyncio.Task]:
+        async def wrapper():
+            backoff = 1.0
+            max_backoff = 60.0
+            while not self.shutdown_event.is_set():
+                try:
+                    await coro_func(*args, **kwargs)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error("Task crashed", name=name, error=str(e))
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("No running loop; task not started", name=name)
+            return None
+        task = loop.create_task(wrapper(), name=name)
+        self.tasks[name] = task
+        return task
+
+    async def drain(self, timeout: float) -> None:
+        if self._drained:
+            return
+        self._drained = True
+        self.shutdown_event.set()
+        all_tasks = list(self.tasks.values())
+        if not all_tasks:
+            return
+        done, pending = await asyncio.wait(all_tasks, timeout=timeout)
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self.tasks.clear()
+        logger.info("TaskManager drained", completed=len(done), cancelled=len(pending))
+
+
+# =============================================================================
+# SECTION 15. PERSISTENCE (EXPERIMENTAL) — JSON with real to_dict/from_dict
+# =============================================================================
+class CompartmentPersistenceManager:
+    STATUS = "experimental"
+    CURRENT_VERSION = "4.0"
+
+    def __init__(self, config: CompartmentConfig, enabled: bool = True):
+        if enabled:
+            _warn_module("persistence")
+        self.config = config
+        self.path = Path(config.persistence_path)
+        self._lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def save_state(self, manager: "HierarchicalCompartmentManager") -> bool:
+        async with self._get_lock():
+            try:
+                state = {
+                    "version": self.CURRENT_VERSION,
+                    "config": manager.config.to_dict(),
+                    "regions": {rid: r.to_dict() for rid, r in manager.regions.items()},
+                    "compartment_to_region": dict(manager.compartment_to_region),
+                    "compartments": {cid: c.to_dict() for cid, c in manager.compartments.items()},
+                    "global_health": manager.global_health,
+                    "total_compartments_created": manager.total_compartments_created,
+                    "total_apoptosis_events": manager.total_apoptosis_events,
+                    "knowledge_bank": {k: list(v) for k, v in manager.knowledge_bank.items()},
+                    "genetic_optimizer": manager.genetic_optimizer.to_dict(),
+                    "homeostatic_controller": manager.homeostatic_controller.to_dict(),
+                    "_compartment_params": manager._compartment_params,
+                }
+                with open(self.path, "w") as f:
+                    json.dump(state, f, indent=2, default=str)
+                logger.info("Compartment state saved", path=str(self.path))
+                return True
+            except Exception as e:
+                logger.error("State save failed", error=str(e))
+                return False
+
+    async def load_state(self, manager: "HierarchicalCompartmentManager") -> bool:
+        async with self._get_lock():
+            if not self.path.exists():
+                return False
+            try:
+                with open(self.path, "r") as f:
+                    state = json.load(f)
+                version = state.get("version", "0.0")
+                if version != self.CURRENT_VERSION:
+                    logger.warning("State version mismatch; ignoring", stored=version)
+                    return False
+
+                manager.config = CompartmentConfig.from_dict(state.get("config", {}))
+                manager.regions = {
+                    rid: RegionAggregator.from_dict(rdata)
+                    for rid, rdata in (state.get("regions") or {}).items()
+                }
+                manager.compartment_to_region = dict(state.get("compartment_to_region") or {})
+                manager.compartments = {
+                    cid: ChromatophoreCompartment.from_dict(cdata)
+                    for cid, cdata in (state.get("compartments") or {}).items()
+                }
+                manager.global_health = float(state.get("global_health", 0.7))
+                manager.total_compartments_created = int(state.get("total_compartments_created", 0))
+                manager.total_apoptosis_events = int(state.get("total_apoptosis_events", 0))
+                manager.knowledge_bank = defaultdict(
+                    list,
+                    {k: list(v) for k, v in (state.get("knowledge_bank") or {}).items()},
+                )
+                manager.genetic_optimizer.from_dict(state.get("genetic_optimizer") or {})
+                manager.homeostatic_controller.from_dict(state.get("homeostatic_controller") or {})
+                manager._compartment_params = state.get(
+                    "_compartment_params", manager._compartment_params
+                )
+                logger.info("Compartment state loaded", path=str(self.path))
+                return True
+            except Exception as e:
+                logger.error("State load failed", error=str(e))
+                return False
+
+
+# =============================================================================
+# SECTION 16. CIRCUIT BREAKER (STABLE) — lazy lock, executor I/O
+# =============================================================================
+class CircuitBreakerState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+class CircuitBreaker:
+    def __init__(self, name: str, db_path: str, failure_threshold: int = 5,
+                 timeout_seconds: float = 60.0):
+        self.name = name
+        self.db_path = db_path
+        self.failure_threshold = failure_threshold
+        self.timeout_seconds = timeout_seconds
+        self._state = CircuitBreakerState.CLOSED
+        self._failure_count = 0
+        self._last_failure: Optional[datetime] = None
+        self._lock: Optional[asyncio.Lock] = None
+        self._init_db_sync()
+        self._load_sync()
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    def _init_db_sync(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS circuit_breaker (
+                    name TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    failures INTEGER NOT NULL,
+                    last_failure TEXT
+                )
+            """)
+            conn.commit()
+
+    def _load_sync(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT state, failures, last_failure FROM circuit_breaker WHERE name = ?",
+                (self.name,),
+            ).fetchone()
+        if row:
+            try:
+                self._state = CircuitBreakerState(row[0])
+            except ValueError:
+                self._state = CircuitBreakerState.CLOSED
+            self._failure_count = int(row[1])
+            self._last_failure = datetime.fromisoformat(row[2]) if row[2] else None
+
+    def _save_sync(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO circuit_breaker
+                   (name, state, failures, last_failure) VALUES (?, ?, ?, ?)""",
+                (
+                    self.name,
+                    self._state.value,
+                    self._failure_count,
+                    self._last_failure.isoformat() if self._last_failure else None,
+                ),
+            )
+            conn.commit()
+
+    async def _persist(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._save_sync)
+        except RuntimeError:
+            self._save_sync()
+
+    async def call(self, func: Callable, *args, **kwargs):
+        lock = self._get_lock()
+        async with lock:
+            if self._state == CircuitBreakerState.OPEN:
+                if self._last_failure and (
+                    datetime.now(timezone.utc) - self._last_failure
+                ).total_seconds() >= self.timeout_seconds:
+                    self._state = CircuitBreakerState.HALF_OPEN
+                    await self._persist()
+                else:
+                    raise RuntimeError(f"Circuit breaker {self.name} is OPEN")
+        try:
+            result = await func(*args, **kwargs)
+        except Exception:
+            async with lock:
+                self._failure_count += 1
+                self._last_failure = datetime.now(timezone.utc)
+                if self._failure_count >= self.failure_threshold:
+                    self._state = CircuitBreakerState.OPEN
+                await self._persist()
+            raise
+        async with lock:
+            if self._state == CircuitBreakerState.HALF_OPEN:
+                self._state = CircuitBreakerState.CLOSED
+                self._failure_count = 0
+                await self._persist()
+            elif self._failure_count > 0:
+                self._failure_count = 0
+                await self._persist()
+        return result
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "state": self._state.value,
+            "failures": self._failure_count,
+        }
+
+
+# =============================================================================
+# SECTION 17. MAIN MANAGER
+# =============================================================================
+class HierarchicalCompartmentManager:
+    """
+    Lifecycle:
+        mgr = HierarchicalCompartmentManager(...)
+        await mgr.start()       # or `async with`
+        ...
+        await mgr.shutdown()
+    """
+
+    def __init__(
+        self,
+        config: Optional[CompartmentConfig] = None,
+        token_manager: Optional[Any] = None,
+        gradient_manager: Optional[Any] = None,
+        storage: Optional[Any] = None,
+        message_queue: Optional[Any] = None,
+        adaptive_cost: Optional[Any] = None,
+        pareto_gating: Optional[Any] = None,
+        drift_detector: Optional[Any] = None,
+        metrics: Optional[Any] = None,
+    ):
+        self.config = config or CompartmentConfig()
         self.token_manager = token_manager
         self.gradient_manager = gradient_manager
-
-        # Central components
         self.storage = storage
         self.queue = message_queue
         self.adaptive_cost = adaptive_cost
@@ -956,671 +1462,872 @@ class HierarchicalCompartmentManager:
         self.drift_detector = drift_detector
         self.metrics = metrics
 
-        # Locks
-        self._structure_lock = asyncio.Lock()
-        self._task_lock = asyncio.Lock()
-
-        # Enhanced modules
-        if rl_agent:
-            self.rl_agent = rl_agent
-        elif self.config.enable_causal_rl:
-            self.rl_agent = CausalRLAgent(state_dim=10, action_dim=3)  # adjust dims
-        else:
-            self.rl_agent = None
-
-        if federated_coordinator:
-            self.federated = federated_coordinator
-        elif self.config.enable_federated_learning and message_queue:
-            self.federated = FederatedCoordinator(self, message_queue)
-        else:
-            self.federated = None
-
-        if safety_monitor:
-            self.safety_monitor = safety_monitor
-        elif self.config.enable_safety_monitor:
-            self.safety_monitor = SafetyMonitor()
-            self._setup_safety_invariants()
-        else:
-            self.safety_monitor = None
-
-        self.precision_controller = precision_controller or (PrecisionController() if self.config.enable_precision_switching else None)
-
-        if carbon_market_client:
-            self.carbon_market = carbon_market_client
-        elif self.config.enable_carbon_market and self.config.carbon_market_config:
-            self.carbon_market = CarbonMarketClient(**self.config.carbon_market_config)
-        else:
-            self.carbon_market = None
-
-        self.chaos_injector = chaos_injector or (ChaosInjector(self, self.config.chaos_probability) if self.config.enable_chaos else None)
-
-        self.human_approval = human_approval_handler or (HumanApprovalHandler(message_queue) if self.config.enable_human_approval else None)
-
-        # Core structures
-        self.max_regions = self.config.max_regions
-        self.compartments_per_region = self.config.compartments_per_region
-        self.regions = {}
-        self.compartment_to_region = {}
-        self.compartments = {}
+        # Structure state
+        self.regions: Dict[str, RegionAggregator] = {}
+        self.compartment_to_region: Dict[str, str] = {}
+        self.compartments: Dict[str, ChromatophoreCompartment] = {}
         self.global_health = 0.7
         self.total_compartments_created = 0
         self.total_apoptosis_events = 0
-        self.last_global_balance = datetime.now(timezone.utc)
-        self.knowledge_bank = defaultdict(list)
-        self.market_orders = []
-        self.central_health_model = CentralizedPredictiveHealthModel(self.config.health_model_path)
-        self.apoptosis_bank = ApoptosisKnowledgeBank()
-        self.genetic_optimizer = CompartmentGeneticOptimizer(self)
-        self.homeostatic_controller = HomeostaticSetpointController(self.config)
-        self.quantum_integrator = QuantumFeedbackIntegrator(self)
-        self._compartment_params = {
-            'health_score_weights': {'success_rate': 0.4, 'efficiency_score': 0.3, 'trust_gradient': 0.3, 'prediction_blend': 0.3},
-            'resource_scale_threshold': {'load_high': 0.8, 'load_low': 0.2, 'utilization_high': 0.7},
-            'membrane_trust_threshold': 0.5
-        }
-        self.encryption = None  # placeholder
-        self.persistence = CompartmentPersistenceManager(config) if config.enable_persistence else None
-        if self.metrics is not None:
-            self.telemetry = None
-        else:
-            self.telemetry = None  # simplified
-        self.circuit_breaker = CircuitBreaker(
-            name="compartment_manager",
-            db_path=config.circuit_breaker_db_path,
-            failure_threshold=config.circuit_breaker_failure_threshold,
-            timeout_seconds=config.circuit_breaker_timeout_seconds
-        ) if config.enable_circuit_breaker else None
-        self.event_bus = EventBus()
-        self._ensure_region_exists("default")
-        self._background_tasks = []
-        self._task_status = {}
-        self._load_state_task = self._create_task(self._load_state())
-        self._start_background_tasks()
-        logger.info(f"Hierarchical Compartment Manager v7.3.0 initialized with MOPD: {self.config.mopd.enabled}")
+        self.knowledge_bank: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
-    def _setup_safety_invariants(self):
+        # Params optimized by GA
+        self._compartment_params: Dict[str, Any] = {
+            "health_score_weights": {
+                "success_rate": 0.4,
+                "efficiency_score": 0.3,
+                "trust_gradient": 0.3,
+            },
+        }
+
+        # Lazy locks
+        self._structure_lock: Optional[asyncio.Lock] = None
+        self._persistence_lock: Optional[asyncio.Lock] = None
+
+        # Subsystems
+        self.event_bus = EventBus()
+        self.security = SecurityService()
+        self.central_health_model = HealthModelPlaceholder(
+            model_path=self.config.health_model_path,
+            enabled=False,
+        )
+        self.knowledge_bank_handler = KnowledgeBankPlaceholder(enabled=False)
+        self.genetic_optimizer = GeneticOptimizer(self, self.config, enabled=True)
+        self.homeostatic_controller = HomeostaticSetpointController(
+            self.config, enabled=True,
+        )
+        self.xai = XAIExplainer(enabled=self.config.enable_xai)
+
+        # Placeholders
+        self.rl_agent = CausalRLAgentPlaceholder(
+            state_dim=self.config.rl_state_dim,
+            action_dim=self.config.rl_action_dim,
+            max_q_table=self.config.q_table_max_size,
+            enabled=False,
+        )
+        self.federated = (
+            FederatedCoordinatorPlaceholder(self, message_queue, enabled=False)
+            if message_queue is not None else None
+        )
+        self.precision_controller = PrecisionControllerPlaceholder(
+            enabled=self.config.enable_precision_switching
+        )
+        self.carbon_market = (
+            CarbonMarketClientPlaceholder(enabled=self.config.enable_carbon_market)
+            if self.config.enable_carbon_market else None
+        )
+        self.chaos_injector = ChaosInjectorPlaceholder(
+            self, self.config.chaos_probability,
+            enabled=self.config.enable_chaos,
+        )
+        self.human_approval = HumanApprovalHandlerPlaceholder(
+            self.queue, enabled=self.config.enable_human_approval,
+        )
+
+        # Safety monitor (experimental)
+        self.safety_monitor: Optional[SafetyMonitor] = None
+        if self.config.enable_safety_monitor:
+            self.safety_monitor = SafetyMonitor(enabled=True)
+            self._setup_safety_invariants()
+
+        # Circuit breaker
+        self.circuit_breaker = (
+            CircuitBreaker(
+                name="compartment_manager",
+                db_path=self.config.circuit_breaker_db_path,
+                failure_threshold=self.config.circuit_breaker_failure_threshold,
+                timeout_seconds=self.config.circuit_breaker_timeout_seconds,
+            )
+            if self.config.enable_circuit_breaker else None
+        )
+
+        # Persistence
+        self.persistence = (
+            CompartmentPersistenceManager(self.config, enabled=True)
+            if self.config.enable_persistence else None
+        )
+
+        # Task manager
+        self._task_manager = TaskManager()
+        self._last_global_balance = datetime.now(timezone.utc)
+
+        # Lifecycle
+        self._started = False
+        self._shutdown = False
+
+        # Metrics
+        self._prom = self._setup_metrics()
+
+        self._ensure_region_exists("default")
+        logger.info(
+            "HierarchicalCompartmentManager initialized",
+            mopd=self.config.mopd.enabled,
+            persistence=self.persistence is not None,
+        )
+
+    # ---------------- locks ----------------
+    def _get_structure_lock(self) -> asyncio.Lock:
+        if self._structure_lock is None:
+            self._structure_lock = asyncio.Lock()
+        return self._structure_lock
+
+    def _get_persistence_lock(self) -> asyncio.Lock:
+        if self._persistence_lock is None:
+            self._persistence_lock = asyncio.Lock()
+        return self._persistence_lock
+
+    # ---------------- safety invariants ----------------
+    def _setup_safety_invariants(self) -> None:
+        assert self.safety_monitor is not None
+        max_compartments = self.config.max_regions * self.config.compartments_per_region
         self.safety_monitor.add_invariant(
             "max_compartments",
-            lambda s: s.get('total_compartments', 0) <= self.config.max_regions * self.config.compartments_per_region,
-            "Too many compartments"
+            lambda s: s.get("total_compartments", 0) <= max_compartments,
+            "Too many compartments",
         )
         self.safety_monitor.add_invariant(
             "global_health_min",
-            lambda s: s.get('global_health', 0.0) >= 0.2,
-            "Global health too low"
+            lambda s: s.get("global_health", 0.0) >= 0.1,
+            "Global health too low",
         )
         self.safety_monitor.add_invariant(
             "token_balance_non_negative",
-            lambda s: s.get('total_tokens', 0) >= 0,
-            "Total tokens negative"
+            lambda s: s.get("total_tokens", 0.0) >= 0.0,
+            "Total tokens negative",
         )
 
-    def _create_task(self, coro):
+    # ---------------- metrics ----------------
+    def _setup_metrics(self) -> Dict[str, Any]:
+        if not PROMETHEUS_AVAILABLE:
+            return {}
         try:
-            loop = asyncio.get_running_loop()
-            return loop.create_task(coro)
-        except RuntimeError:
-            logger.warning("No running event loop; background task not started.")
-            return None
+            return {
+                "create_total": Counter("compartment_create_total", "Compartments created"),
+                "decommission_total": Counter("compartment_decommission_total", "Compartments decommissioned"),
+                "health_gauge": Gauge("compartment_global_health", "Global health"),
+                "compartments_gauge": Gauge("compartment_count", "Current compartment count"),
+                "pareto_gauge": Gauge("compartment_pareto_size", "Pareto front size"),
+            }
+        except Exception:
+            return {}
 
-    async def _load_state(self):
-        if self.persistence:
-            await self.persistence.load_state(self)
+    def _update_metrics(self) -> None:
+        if not self._prom:
+            return
+        try:
+            self._prom["health_gauge"].set(self.global_health)
+            self._prom["compartments_gauge"].set(len(self.compartments))
+            self._prom["pareto_gauge"].set(len(self.genetic_optimizer.pareto_front))
+        except Exception:
+            pass
 
-    async def save_state(self):
-        if self.persistence:
-            await self.persistence.save_state(self)
+    # ---------------- lifecycle ----------------
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
 
-    def _start_background_tasks(self):
-        self._start_monitored_task(self._ecosystem_maintenance, "ecosystem_maintenance")
-        self._start_monitored_task(self._trading_maintenance, "trading_maintenance")
-        self._start_monitored_task(self._health_model_training, "health_model_training")
-        self._start_monitored_task(self._evolution_maintenance, "evolution_maintenance")
-        if self.federated:
-            self._start_monitored_task(self._federated_loop, "federated_update")
-        if self.chaos_injector:
-            self._start_monitored_task(self._chaos_loop, "chaos")
+        if self.persistence is not None:
+            try:
+                await self.persistence.load_state(self)
+            except Exception as e:
+                logger.warning("Initial state load failed", error=str(e))
 
-    def _start_monitored_task(self, coro, name):
-        async def wrapped():
-            while True:
-                try:
-                    await coro()
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error(f"Background task {name} failed: {e}", exc_info=True)
-                    self._task_status[name] = False
-                    await asyncio.sleep(30)
-                    self._task_status[name] = True
-        task = asyncio.create_task(wrapped())
-        self._background_tasks.append(task)
-        self._task_status[name] = True
+        self._task_manager.start_task("ecosystem", self._ecosystem_loop)
+        self._task_manager.start_task("trading", self._trading_loop)
+        self._task_manager.start_task("evolution", self._evolution_loop)
+        self._task_manager.start_task("state_save", self._state_save_loop)
 
-    # ----------------------------------------------------------------------
-    # Region/compartment management (with locking)
-    # ----------------------------------------------------------------------
-    def _ensure_region_exists(self, region_id):
+        logger.info("HierarchicalCompartmentManager started")
+
+    async def ready(self) -> bool:
+        if not self._started:
+            return False
+        return isinstance(self.compartments, dict) and isinstance(self.regions, dict)
+
+    async def shutdown(self, timeout: Optional[float] = None) -> None:
+        if self._shutdown:
+            return
+        self._shutdown = True
+        timeout = timeout or float(self.config.shutdown_timeout_seconds)
+        logger.info("Shutting down HierarchicalCompartmentManager")
+
+        try:
+            await asyncio.wait_for(self._task_manager.drain(timeout), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Task drain timed out")
+
+        if self.persistence is not None:
+            try:
+                await self.persistence.save_state(self)
+            except Exception as e:
+                logger.warning("Final save failed", error=str(e))
+
+        logger.info("Shutdown complete")
+
+    async def __aenter__(self) -> "HierarchicalCompartmentManager":
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.shutdown()
+
+    # ---------------- background loops ----------------
+    async def _ecosystem_loop(self) -> None:
+        while True:
+            try:
+                await self._ecosystem_tick()
+                await asyncio.sleep(self.config.ecosystem_maintenance_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Ecosystem loop error", error=str(e))
+                await asyncio.sleep(30)
+
+    async def _ecosystem_tick(self) -> None:
+        total_tokens = sum(
+            c.token_balance for c in self.compartments.values()
+        )
+        adjustments = self.homeostatic_controller.compute_adjustment(
+            self.global_health, total_tokens
+        )
+        if adjustments["spawn_rate_modifier"] > 1.05:
+            await self.spawn_if_needed()
+        if adjustments["cull_aggressiveness_modifier"] > 1.05:
+            await self.cull_unhealthy()
+        await self.balance_load()
+        await self.health_check_all()
+        self._update_metrics()
+
+    async def _trading_loop(self) -> None:
+        while True:
+            try:
+                await self._execute_trades()
+                await asyncio.sleep(self.config.trading_maintenance_interval_seconds)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Trading loop error", error=str(e))
+                await asyncio.sleep(60)
+
+    async def _execute_trades(self) -> None:
+        async with self._get_structure_lock():
+            for region in self.regions.values():
+                for match in region.market.match_orders():
+                    sid = match["seller"]
+                    bid = match["buyer"]
+                    amt = match["amount"]
+                    if sid in self.compartments and bid in self.compartments:
+                        seller = self.compartments[sid]
+                        buyer = self.compartments[bid]
+                        if seller.spend_tokens(amt, "trade"):
+                            buyer.receive_tokens(amt, sid)
+
+    async def _evolution_loop(self) -> None:
+        while True:
+            try:
+                if self.config.enable_genetic_optimizer and len(self.compartments) >= 2:
+                    await self.genetic_optimizer.evolve()
+                await asyncio.sleep(self.config.ga_evolution_interval_hours * 3600.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Evolution loop error", error=str(e))
+                await asyncio.sleep(3600)
+
+    async def _state_save_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(600)
+                if self.persistence is not None:
+                    await self.persistence.save_state(self)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("Periodic save failed", error=str(e))
+
+    # ---------------- structure ----------------
+    def _ensure_region_exists(self, region_id: str) -> RegionAggregator:
         if region_id not in self.regions:
-            if len(self.regions) >= self.max_regions:
-                region_id = min(self.regions.keys(), key=lambda r: len(self.regions[r].compartments))
-                return self.regions[region_id]
-            self.regions[region_id] = RegionAggregator(region_id, self.compartments_per_region)
+            self.regions[region_id] = RegionAggregator(region_id, self.config.compartments_per_region)
         return self.regions[region_id]
 
-    def _get_region_for_expert(self, expert_type):
-        for region_id, region in self.regions.items():
-            if len(region.compartments) < region.max_compartments:
-                existing_types = set(c.expert_type for c in region.compartments.values())
-                if expert_type in existing_types or len(existing_types) < 3:
-                    return region_id
-        region_id = f"region_{expert_type}_{len(self.regions)}"
-        self._ensure_region_exists(region_id)
-        return region_id
+    def _pick_region_for(self, expert_type: str) -> Optional[str]:
+        # Prefer a region that already hosts the same expert type
+        for rid, r in self.regions.items():
+            if len(r.compartments) < r.max_compartments and any(
+                c.expert_type == expert_type for c in r.compartments.values()
+            ):
+                return rid
+        # Otherwise a region with capacity
+        for rid, r in self.regions.items():
+            if len(r.compartments) < r.max_compartments:
+                return rid
+        # Otherwise create a new region if budget allows
+        if len(self.regions) < self.config.max_regions:
+            new_rid = f"region_{expert_type}_{len(self.regions)}"
+            self._ensure_region_exists(new_rid)
+            return new_rid
+        return None
 
-    async def create_compartment(self, expert_type, expert_instance=None, resources=None, parent_id=None, region_id=None):
-        async with self._structure_lock:
-            # Safety check
-            if self.safety_monitor:
+    def _get_safety_state(self) -> Dict[str, Any]:
+        return {
+            "total_compartments": len(self.compartments),
+            "global_health": self.global_health,
+            "total_tokens": sum(c.token_balance for c in self.compartments.values()),
+        }
+
+    @traced("compartment.create")
+    async def create_compartment(
+        self, expert_type: str, expert_instance: Optional[Any] = None,
+        resources: Optional[CompartmentResource] = None,
+        parent_id: Optional[str] = None, region_id: Optional[str] = None,
+    ) -> Optional[ChromatophoreCompartment]:
+        async with self._get_structure_lock():
+            if self.safety_monitor is not None:
                 state = self._get_safety_state()
+                state["total_compartments"] += 1
                 violations = self.safety_monitor.check(state)
                 if violations:
-                    logger.warning(f"Safety violation: {violations}")
-                    raise CompartmentError("Safety violation: " + ", ".join(violations))
-            # Human approval for bulk creation?
-            if self.human_approval and self.total_compartments_created % 10 == 9:
-                approved = await self.human_approval.request_approval({'action': 'create_compartment', 'expert_type': expert_type})
+                    logger.warning("Safety violation on create", violations=violations)
+                    raise RuntimeError("Safety violation: " + "; ".join(violations))
+
+            if self.human_approval is not None:
+                approved = await self.human_approval.request_approval(
+                    {"action": "create_compartment", "expert_type": expert_type}
+                )
                 if not approved:
-                    logger.info("Creation rejected by human")
                     return None
 
             if region_id is None:
-                region_id = self._get_region_for_expert(expert_type)
+                region_id = self._pick_region_for(expert_type)
+                if region_id is None:
+                    logger.warning("No region available for new compartment")
+                    return None
             self._ensure_region_exists(region_id)
+
             compartment_id = f"comp_{expert_type}_{uuid.uuid4().hex[:8]}"
-            if resources is None:
-                resources = CompartmentResource()
-            compartment = ChromatophoreCompartment(compartment_id, expert_type, expert_instance, resources)
+            compartment = ChromatophoreCompartment(
+                compartment_id=compartment_id,
+                expert_type=expert_type,
+                expert_instance=expert_instance,
+                resources=resources or CompartmentResource(),
+            )
             if parent_id:
                 compartment.parent_id = parent_id
-            compartment.central_health_model = self.central_health_model
-            compartment.gradient_manager = self.gradient_manager
-            compartment.quantum_integrator = self.quantum_integrator
-            compartment.apoptosis_bank = self.apoptosis_bank
-            compartment._manager = self
 
+            # Place the compartment: try target region, then any other
+            placed = False
             region = self.regions[region_id]
-            if not region.add_compartment(compartment):
-                for rid, reg in self.regions.items():
-                    if rid != region_id and len(reg.compartments) < reg.max_compartments:
-                        reg.add_compartment(compartment)
+            if region.add_compartment(compartment):
+                placed = True
+            else:
+                for rid, r in self.regions.items():
+                    if rid == region_id:
+                        continue
+                    if r.add_compartment(compartment):
                         region_id = rid
+                        placed = True
                         break
+            if not placed:
+                logger.warning("Could not place compartment; all regions full")
+                return None
+
             self.compartment_to_region[compartment_id] = region_id
             self.compartments[compartment_id] = compartment
             self.total_compartments_created += 1
             compartment.state = CompartmentState.MATURING
 
-            if self.apoptosis_bank:
-                self._create_task(self.apoptosis_bank.replay_to_compartment(compartment))
-            if self.queue:
-                event = FeedbackEvent.create_with_context(
-                    task_id=f"compartment_create_{compartment_id}",
-                    selected_action="create_compartment",
-                    quality_score=compartment.health_score,
-                    energy_joules=0.0,
-                    carbon_g=0.0,
-                    feedback_type="compartment",
-                    adaptive_cost_value=0.0,
-                    state={'compartment_id': compartment_id, 'expert_type': expert_type},
-                    candidates=[{'action': 'create'}],
-                    source="compartment_manager",
-                    environment=getattr(central_config, "ENVIRONMENT", "production"),
-                    tags=["compartment", "create"]
-                )
-                self._create_task(self.queue.publish("feedback_events", event.to_json()))
-            logger.info(f"Created compartment {compartment_id} in region {region_id}")
+            if self._prom:
+                try:
+                    self._prom["create_total"].inc()
+                except Exception:
+                    pass
+
+            await self.event_bus.publish("compartment_created", {
+                "compartment_id": compartment_id,
+                "region_id": region_id,
+                "expert_type": expert_type,
+            })
+
+            if self.queue is not None and FeedbackEvent is not None:
+                try:
+                    event = FeedbackEvent.create_with_context(
+                        task_id=f"compartment_create_{compartment_id}",
+                        selected_action="create_compartment",
+                        quality_score=compartment.health_score,
+                        energy_joules=0.0,
+                        carbon_g=0.0,
+                        feedback_type="compartment",
+                        adaptive_cost_value=0.0,
+                        state={"compartment_id": compartment_id, "region_id": region_id},
+                        candidates=[{"action": "create"}],
+                        source="compartment_manager",
+                        environment="production",
+                        tags=["compartment", "create"],
+                    )
+                    await self.queue.publish("feedback_events", event.to_json())
+                except Exception:
+                    pass
+
+            logger.info("Created compartment", id=compartment_id, region=region_id)
             return compartment
 
-    async def decommission_compartment(self, compartment_id):
-        async with self._structure_lock:
-            if compartment_id not in self.compartments:
+    @traced("compartment.decommission")
+    async def decommission_compartment(self, compartment_id: str) -> Dict[str, Any]:
+        async with self._get_structure_lock():
+            compartment = self.compartments.get(compartment_id)
+            if compartment is None:
                 return {}
-            compartment = self.compartments[compartment_id]
-            # Safety check
-            if self.safety_monitor:
-                state = self._get_safety_state()
-                state['total_compartments'] -= 1
-                violations = self.safety_monitor.check(state)
-                if violations:
-                    logger.warning(f"Safety violation on decommission: {violations}")
-                    return {}
+
             region_id = self.compartment_to_region.get(compartment_id)
-            remaining_tokens, knowledge = compartment.prepare_apoptosis()
+            remaining, knowledge = compartment.prepare_apoptosis()
             self.knowledge_bank[compartment.expert_type].append(knowledge)
             if region_id and region_id in self.regions:
                 self.regions[region_id].knowledge_transfer.add_knowledge(region_id, knowledge)
                 self.regions[region_id].remove_compartment(compartment_id)
-            if self.apoptosis_bank:
-                self._create_task(self.apoptosis_bank.store(knowledge))
-            del self.compartments[compartment_id]
+
+            await self.knowledge_bank_handler.store(knowledge)
+            self.compartments.pop(compartment_id, None)
             self.compartment_to_region.pop(compartment_id, None)
             self.total_apoptosis_events += 1
-            if self.queue:
-                event = FeedbackEvent.create_with_context(
-                    task_id=f"compartment_decommission_{compartment_id}",
-                    selected_action="decommission_compartment",
-                    quality_score=0.0,
-                    energy_joules=0.0,
-                    carbon_g=0.0,
-                    feedback_type="compartment",
-                    adaptive_cost_value=0.0,
-                    state={'compartment_id': compartment_id},
-                    candidates=[{'action': 'decommission'}],
-                    source="compartment_manager",
-                    environment=getattr(central_config, "ENVIRONMENT", "production"),
-                    tags=["compartment", "decommission"]
-                )
-                self._create_task(self.queue.publish("feedback_events", event.to_json()))
-            logger.info(f"Decommissioned compartment {compartment_id}")
+
+            if self._prom:
+                try:
+                    self._prom["decommission_total"].inc()
+                except Exception:
+                    pass
+
+            if self.xai is not None:
+                logger.info("Decommission", text=self.xai.explain_decommission(compartment))
+
+            await self.event_bus.publish("compartment_decommissioned", {
+                "compartment_id": compartment_id,
+                "region_id": region_id,
+                "remaining_tokens": remaining,
+            })
             return knowledge
 
-    def _get_safety_state(self):
-        return {
-            'total_compartments': len(self.compartments),
-            'global_health': self.global_health,
-            'total_tokens': sum(c.token_balance for c in self.compartments.values()),
-        }
+    # ---------------- balancing & health ----------------
+    async def balance_load(self) -> int:
+        async with self._get_structure_lock():
+            transfers = 0
+            for r in self.regions.values():
+                transfers += r.balance_load_local()
+            if (datetime.now(timezone.utc) - self._last_global_balance).total_seconds() > 60:
+                transfers += self._balance_across_regions()
+                self._last_global_balance = datetime.now(timezone.utc)
+            return transfers
 
-    # ----------------------------------------------------------------------
-    # Balancing and maintenance
-    # ----------------------------------------------------------------------
-    async def balance_load(self):
-        async with self._structure_lock:
-            total_transfers = 0
-            for region in self.regions.values():
-                total_transfers += region.balance_load_local()
-            if (datetime.now(timezone.utc) - self.last_global_balance).total_seconds() > 60:
-                self._balance_across_regions()
-                self.last_global_balance = datetime.now(timezone.utc)
-            return total_transfers
-
-    def _balance_across_regions(self):
+    def _balance_across_regions(self) -> int:
+        """Move the largest-loaded compartment from the heaviest region to the lightest."""
         if len(self.regions) < 2:
-            return
-        region_loads = {}
-        for region_id, region in self.regions.items():
-            total_tasks = sum(len(getattr(c, 'glycogen_queue', [])) for c in region.compartments.values())
-            region_loads[region_id] = total_tasks
-        if not region_loads:
-            return
-        avg_load = np.mean(list(region_loads.values()))
-        if avg_load == 0:
-            return
-        overloaded = {rid: load for rid, load in region_loads.items() if load > avg_load * 1.5}
-        underloaded = {rid: load for rid, load in region_loads.items() if load < avg_load * 0.5}
-        for ol_rid in overloaded:
-            for ul_rid in underloaded:
-                ol_region = self.regions[ol_rid]
-                ul_region = self.regions[ul_rid]
-                if (ol_region.compartments and len(ul_region.compartments) < ul_region.max_compartments):
-                    comp_id = next(iter(ol_region.compartments.keys()))
-                    compartment = ol_region.compartments.pop(comp_id)
-                    ul_region.add_compartment(compartment)
-                    self.compartment_to_region[comp_id] = ul_rid
-                    logger.info(f"Moved compartment {comp_id}: region {ol_rid} → {ul_rid}")
-                    break
+            return 0
+        loads = {
+            rid: sum(len(getattr(c, "glycogen_queue", [])) for c in r.compartments.values())
+            for rid, r in self.regions.items()
+        }
+        if not loads:
+            return 0
+        heaviest = max(loads, key=loads.get)
+        lightest = min(loads, key=loads.get)
+        if heaviest == lightest:
+            return 0
+        src = self.regions[heaviest]
+        dst = self.regions[lightest]
+        if not src.compartments or len(dst.compartments) >= dst.max_compartments:
+            return 0
+        # Move the compartment with the largest queue
+        cid = max(
+            src.compartments, key=lambda k: len(getattr(src.compartments[k], "glycogen_queue", []))
+        )
+        comp = src.compartments.pop(cid)
+        dst.add_compartment(comp)
+        self.compartment_to_region[cid] = lightest
+        logger.info("Moved compartment", id=cid, src=heaviest, dst=lightest)
+        return 1
 
-    async def health_check_all(self):
-        async with self._structure_lock:
-            health_scores = {}
-            for region_id, region in self.regions.items():
-                region_health = region.health_check()
-                health_scores[region_id] = region_health
-                if region_health < 0.5:
-                    for comp in region.compartments.values():
-                        comp._evaluate_lifecycle()
-            self.global_health = np.mean(list(health_scores.values())) if health_scores else 0.0
-            return health_scores
+    async def health_check_all(self) -> Dict[str, float]:
+        async with self._get_structure_lock():
+            scores: Dict[str, float] = {}
+            for rid, r in self.regions.items():
+                h = r.health_check()
+                if h is not None:
+                    scores[rid] = h
+                for comp in r.compartments.values():
+                    comp._evaluate_lifecycle()
+            self.global_health = float(np.mean(list(scores.values()))) if scores else 0.5
+            return scores
 
-    async def cull_unhealthy(self):
-        async with self._structure_lock:
-            total_culled = 0
-            for region in self.regions.values():
-                removed = region.cull_unhealthy()
-                for comp_id in removed:
-                    self.compartment_to_region.pop(comp_id, None)
-                    self.compartments.pop(comp_id, None)
-                total_culled += len(removed)
-            return total_culled
+    async def cull_unhealthy(self) -> int:
+        async with self._get_structure_lock():
+            total = 0
+            for r in self.regions.values():
+                removed = r.cull_unhealthy()
+                for cid in removed:
+                    self.compartment_to_region.pop(cid, None)
+                    self.compartments.pop(cid, None)
+                total += len(removed)
+            return total
 
-    def spawn_if_needed(self):
-        expert_types = set()
-        for region in self.regions.values():
-            for comp in region.compartments.values():
-                expert_types.add(comp.expert_type)
-        for etype in expert_types:
+    async def spawn_if_needed(self) -> None:
+        expert_types = {c.expert_type for c in self.compartments.values()}
+        for et in expert_types:
             viable = sum(
-                1 for region in self.regions.values()
-                for comp in region.compartments.values()
-                if comp.expert_type == etype and comp.is_viable
+                1 for c in self.compartments.values()
+                if c.expert_type == et and c.is_viable
             )
             if viable < 2:
-                self._create_task(self.create_compartment(etype))
+                try:
+                    await self.create_compartment(et)
+                except Exception as e:
+                    logger.debug("Spawn failed", error=str(e))
 
-    # ----------------------------------------------------------------------
-    # Background loops
-    # ----------------------------------------------------------------------
-    async def _ecosystem_maintenance(self):
-        while True:
-            try:
-                total_tokens = sum(r.aggregated_tokens for r in self.regions.values())
-                adjustments = self.homeostatic_controller.compute_adjustment(self.global_health, total_tokens)
-                spawn_mod = adjustments['spawn_rate_modifier']
-                cull_mod = adjustments['cull_aggressiveness_modifier']
-                scale_mod = adjustments['resource_scale_modifier']
-                if spawn_mod > 1.05:
-                    self.spawn_if_needed()
-                if cull_mod > 1.05:
-                    await self.cull_unhealthy()
-                for comp in self.compartments.values():
-                    comp.resources.allocation_scaling *= scale_mod
-                await self.balance_load()
-                await self.health_check_all()
-                await asyncio.sleep(self.config.ecosystem_maintenance_interval_seconds)
-            except Exception as e:
-                logger.error(f"Ecosystem maintenance error: {e}")
-                await asyncio.sleep(60)
-
-    async def _trading_maintenance(self):
-        while True:
-            try:
-                for region in self.regions.values():
-                    matches = region.market.match_orders()
-                    for match in matches:
-                        seller_id = match['seller']
-                        buyer_id = match['buyer']
-                        amount = match['amount']
-                        if seller_id in self.compartments and buyer_id in self.compartments:
-                            seller = self.compartments[seller_id]
-                            buyer = self.compartments[buyer_id]
-                            if seller.spend_tokens(amount, "trade") and buyer.receive_tokens(amount, seller_id):
-                                logger.info(f"Trade executed: {seller_id} → {buyer_id} ({amount} tokens)")
-                await asyncio.sleep(self.config.trading_maintenance_interval_seconds)
-            except Exception as e:
-                logger.error(f"Trading maintenance error: {e}")
-                await asyncio.sleep(120)
-
-    async def _health_model_training(self):
-        while True:
-            try:
-                if len(self.central_health_model.history) >= self.config.health_model_min_samples:
-                    result = await self.central_health_model.train(force=True)
-                    if result['status'] == 'success':
-                        logger.info(f"Centralized health model retrained: {result['samples']} samples")
-                await asyncio.sleep(self.config.health_model_training_interval_seconds)
-            except Exception as e:
-                logger.error(f"Health model training error: {e}")
-                await asyncio.sleep(3600)
-
-    async def _evolution_maintenance(self):
-        while True:
-            try:
-                if self.config.enable_genetic_optimizer and len(self.compartments) >= 10:
-                    logger.info("Starting genetic optimization cycle...")
-                    result = await self.genetic_optimizer.evolve(generations=self.config.ga_generations)
-                    logger.info(f"Genetic optimization complete: best fitness {result['best_fitness']:.4f}, Pareto front size: {len(result.get('pareto_front', []))}")
-                await asyncio.sleep(self.config.ga_evolution_interval_hours * 3600)
-            except Exception as e:
-                logger.error(f"Evolution maintenance error: {e}")
-                await asyncio.sleep(3600)
-
-    async def _federated_loop(self):
-        while True:
-            await asyncio.sleep(300)  # 5 minutes
-            if self.federated:
-                await self.federated.send_update()
-
-    async def _chaos_loop(self):
-        while True:
-            await asyncio.sleep(60)
-            if self.chaos_injector:
-                await self.chaos_injector.maybe_inject_failure()
-
-    # ----------------------------------------------------------------------
-    # Public methods (with XAI where appropriate)
-    # ----------------------------------------------------------------------
-    async def find_best_compartment(self, expert_type, task_complexity=1.0):
-        candidates = []
-        for region in self.regions.values():
-            for comp in region.compartments.values():
-                if comp.expert_type == expert_type and comp.is_viable:
-                    health_score = comp.health_score
-                    if self.central_health_model.is_trained:
-                        try:
-                            pred = await self.central_health_model.predict_health(
-                                comp.compartment_id,
-                                {'health_score': health_score, 'success_rate': comp.success_rate,
-                                 'efficiency_score': comp.efficiency_score, 'token_balance': comp.token_balance,
-                                 'trust_gradient': comp.trust_gradient, 'task_load': len(comp.glycogen_queue) / 1000}
-                            )
-                            if pred.get('confidence', 0) > 0.5:
-                                health_score = health_score * 0.6 + pred.get('predicted_health', 0.5) * 0.4
-                        except Exception:
-                            pass
-                    weights = self._compartment_params['health_score_weights']
-                    score = (health_score * weights.get('success_rate', 0.4) +
-                             comp.efficiency_score * weights.get('efficiency_score', 0.3) +
-                             min(comp.token_balance / (task_complexity * 10), 1.0) * weights.get('trust_gradient', 0.3))
-                    candidates.append((comp, score))
+    # ---------------- selection & policy ----------------
+    @traced("compartment.select")
+    async def find_best_compartment(self, expert_type: str, task_complexity: float = 1.0) -> Optional[ChromatophoreCompartment]:
+        candidates = [
+            c for c in self.compartments.values()
+            if c.expert_type == expert_type and c.is_viable
+        ]
         if not candidates:
             return None
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        best = candidates[0][0]
-        if self.config.enable_xai:
-            explanation = self.explain_decision('select_compartment', best, candidates)
-            logger.info(f"Explanation: {explanation}")
-        return best
 
-    def explain_decision(self, decision_type, *args, **kwargs):
-        if decision_type == 'select_compartment':
-            best, candidates = args[0], args[1]
-            top = candidates[:3]
-            return f"Selected {best.compartment_id} because it has the highest score ({top[0][1]:.2f}) considering health, efficiency, and token balance."
-        elif decision_type == 'decommission':
-            comp = args[0]
-            return f"Decommissioned {comp.compartment_id} due to low health ({comp.health_score:.2f}) or non-viability."
-        else:
-            return "Decision made by rule-based system."
+        # Preferred path: adaptive cost + Pareto gating
+        if self.adaptive_cost is not None and self.pareto_gating is not None:
+            try:
+                cands = [
+                    {
+                        "expert_id": c.compartment_id,
+                        "quality_score": c.health_score,
+                        "carbon_g": 0.0,
+                        "latency_ms": 0.0,
+                        "energy_joules": 0.0,
+                        "compartment": c,
+                    }
+                    for c in candidates
+                ]
+                filtered = self.pareto_gating.filter(cands)
+                if filtered:
+                    cands = filtered
+                best = None
+                best_cost = math.inf
+                for entry in cands:
+                    try:
+                        cost = float(self.adaptive_cost.compute(
+                            quality=entry["quality_score"],
+                            carbon_g=entry["carbon_g"],
+                            latency_ms=entry["latency_ms"],
+                            energy_joules=entry["energy_joules"],
+                            health=entry["quality_score"],
+                            atp=0.5,
+                        ))
+                    except Exception:
+                        cost = math.inf
+                    if cost < best_cost:
+                        best_cost = cost
+                        best = entry["compartment"]
+                if best is not None:
+                    return best
+            except Exception:
+                pass
 
-    async def get_ecosystem_stats(self):
-        stats = {
-            'total_compartments': len(self.compartments),
-            'viable_compartments': sum(r.get_viable_count() for r in self.regions.values()),
-            'global_health': self.global_health,
-            'total_regions': len(self.regions),
-            'total_created': self.total_compartments_created,
-            'total_apoptosis': self.total_apoptosis_events,
-            'genetic_optimizer': {
-                'best_fitness': self.genetic_optimizer.best_fitness,
-                'pareto_front': [p.to_dict() for p in self.genetic_optimizer.pareto_front],
-            },
-            'causal_rl': self.rl_agent is not None,
-            'federated': self.federated is not None,
-            'safety_monitor': self.safety_monitor is not None,
-            'xai': self.config.enable_xai,
-            'precision_controller': self.precision_controller is not None,
-            'carbon_market': self.carbon_market is not None,
-            'chaos': self.chaos_injector is not None,
-            'human_approval': self.human_approval is not None,
-        }
-        return stats
+        # Fallback: weighted score
+        weights = self._compartment_params.get("health_score_weights", {})
+        scored: List[Tuple[ChromatophoreCompartment, float]] = []
+        for c in candidates:
+            score = (
+                c.health_score * weights.get("success_rate", 0.4)
+                + c.efficiency_score * weights.get("efficiency_score", 0.3)
+                + min(c.token_balance / max(task_complexity * 10.0, 1.0), 1.0)
+                * weights.get("trust_gradient", 0.3)
+            )
+            scored.append((c, score))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        if self.xai is not None:
+            logger.info("Select", text=self.xai.explain_select(scored[0][0], scored))
+        return scored[0][0]
 
     async def policy_probs(self, state: Dict[str, Any]) -> List[float]:
-        # Use RL agent if available
-        if self.rl_agent:
-            features = self._state_to_features(state)
-            return self.rl_agent.get_policy_probs(features)
-        # Fallback to uniform
-        if not self.compartments:
-            return [1.0]
-        viable = [c for c in self.compartments.values() if c.is_viable]
-        if not viable:
-            return [0.0] * len(self.compartments)
-        prob = 1.0 / len(viable)
-        return [prob if c in viable else 0.0 for c in self.compartments.keys()]
+        """
+        Fixed-length policy over {create, cull, balance}. Always valid.
+        """
+        try:
+            feats = self._state_to_features(state)
+            probs = self.rl_agent.get_policy_probs(feats)
+            arr = np.asarray(probs, dtype=float)
+            arr = np.clip(arr, 0.0, None)
+            total = float(arr.sum())
+            if total <= 0 or not np.isfinite(total):
+                return [1.0 / self.config.rl_action_dim] * self.config.rl_action_dim
+            return (arr / total).tolist()
+        except Exception:
+            return [1.0 / self.config.rl_action_dim] * self.config.rl_action_dim
 
-    def _state_to_features(self, state):
-        # Example: convert state dict to fixed-size vector
+    def _state_to_features(self, state: Dict[str, Any]) -> np.ndarray:
+        total_tokens = sum(c.token_balance for c in self.compartments.values())
+        avg_eff = (
+            float(np.mean([c.efficiency_score for c in self.compartments.values()]))
+            if self.compartments else 0.5
+        )
         return np.array([
-            state.get('global_health', 0.5),
-            state.get('total_tokens', 1000) / 2000,
-            state.get('total_compartments', 0) / 100,
-            state.get('demand', 0.5),
-            state.get('avg_efficiency', 0.5),
-            state.get('carbon', 0.0),
-            0.0, 0.0, 0.0, 0.0
+            float(state.get("global_health", self.global_health)),
+            min(total_tokens / 2000.0, 1.0),
+            min(len(self.compartments) / 100.0, 1.0),
+            float(state.get("demand", 0.5)),
+            avg_eff,
+            float(state.get("carbon", 0.0)),
+            float(state.get("region_count", len(self.regions)) / max(self.config.max_regions, 1)),
+            float(state.get("viable_fraction",
+                           sum(1 for c in self.compartments.values() if c.is_viable) / max(len(self.compartments), 1))),
+            float(state.get("avg_token", (total_tokens / max(len(self.compartments), 1)) / 1000.0)),
+            float(state.get("decommission_rate",
+                            self.total_apoptosis_events / max(self.total_compartments_created, 1))),
         ], dtype=float)
 
-    async def shutdown(self):
-        logger.info("Shutting down Hierarchical Compartment Manager")
-        for task in self._background_tasks:
-            task.cancel()
-        await asyncio.gather(*self._background_tasks, return_exceptions=True)
-        if self.persistence:
-            await self.save_state()
-        logger.info("Shutdown complete")
+    # ---------------- stats ----------------
+    async def get_ecosystem_stats(self) -> Dict[str, Any]:
+        return {
+            "total_compartments": len(self.compartments),
+            "viable_compartments": sum(r.get_viable_count() for r in self.regions.values()),
+            "global_health": self.global_health,
+            "total_regions": len(self.regions),
+            "total_created": self.total_compartments_created,
+            "total_apoptosis": self.total_apoptosis_events,
+            "q_table_size": self.rl_agent.size(),
+            "pareto_front_size": len(self.genetic_optimizer.pareto_front),
+            "genetic_best_fitness": self.genetic_optimizer.best_fitness,
+            "module_status": MODULE_STATUS,
+            "circuit_breaker": self.circuit_breaker.snapshot() if self.circuit_breaker else None,
+        }
+
+    async def health_report(self) -> Dict[str, Any]:
+        return {
+            "ready": await self.ready(),
+            "global_health": self.global_health,
+            "compartments": len(self.compartments),
+            "regions": len(self.regions),
+        }
 
 
-# ============================================================================
-# Persistence Manager (JSON instead of pickle)
-# ============================================================================
-class CompartmentPersistenceManager:
-    CURRENT_VERSION = "2.2"
-
-    def __init__(self, config: CompartmentConfig):
-        self.config = config
-        self.path = Path(config.persistence_path)
-        self._lock = asyncio.Lock()
-
-    async def save_state(self, manager: 'HierarchicalCompartmentManager') -> bool:
-        return await retry_async(
-            self._save_state_impl,
-            self.config.max_retries,
-            self.config.retry_base_delay_ms,
-            self.config.retry_max_delay_ms,
-            manager
-        )
-
-    async def _save_state_impl(self, manager: 'HierarchicalCompartmentManager') -> bool:
-        async with self._lock:
-            try:
-                state = {
-                    'version': self.CURRENT_VERSION,
-                    'config': manager.config.to_dict(),
-                    'regions': manager.regions,
-                    'compartment_to_region': manager.compartment_to_region,
-                    'compartments': manager.compartments,
-                    'global_health': manager.global_health,
-                    'total_compartments_created': manager.total_compartments_created,
-                    'total_apoptosis_events': manager.total_apoptosis_events,
-                    'knowledge_bank': manager.knowledge_bank,
-                    'central_health_model': {
-                        'history': manager.central_health_model.history,
-                        'is_trained': manager.central_health_model.is_trained,
-                        'predictions_cache': manager.central_health_model.predictions_cache,
-                    },
-                    'apoptosis_bank': {
-                        'knowledge_records': manager.apoptosis_bank.knowledge_records,
-                    },
-                    'genetic_optimizer': {
-                        'best_fitness': manager.genetic_optimizer.best_fitness,
-                        'best_individual': manager.genetic_optimizer.best_individual,
-                        'evolution_history': manager.genetic_optimizer.evolution_history,
-                        'pareto_front': [p.to_dict() for p in manager.genetic_optimizer.pareto_front],
-                    },
-                    'homeostatic_controller': {
-                        'integral_health': manager.homeostatic_controller.integral_health,
-                        'integral_token': manager.homeostatic_controller.integral_token,
-                        'prev_error_health': manager.homeostatic_controller.prev_error_health,
-                        'prev_error_token': manager.homeostatic_controller.prev_error_token,
-                    },
-                    '_compartment_params': manager._compartment_params,
-                }
-                # Convert dataclasses to dicts recursively
-                def serialize(obj):
-                    if isinstance(obj, dict):
-                        return {k: serialize(v) for k, v in obj.items()}
-                    elif isinstance(obj, list):
-                        return [serialize(v) for v in obj]
-                    elif hasattr(obj, 'to_dict'):
-                        return obj.to_dict()
-                    elif isinstance(obj, datetime):
-                        return obj.isoformat()
-                    elif isinstance(obj, Enum):
-                        return obj.value
-                    else:
-                        return obj
-                serializable = serialize(state)
-                with open(self.path, 'w') as f:
-                    json.dump(serializable, f, indent=2, default=str)
-                logger.info(f"Compartment state saved to {self.path}")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to save state: {e}")
-                return False
-
-    async def load_state(self, manager: 'HierarchicalCompartmentManager') -> bool:
-        return await retry_async(
-            self._load_state_impl,
-            self.config.max_retries,
-            self.config.retry_base_delay_ms,
-            self.config.retry_max_delay_ms,
-            manager
-        )
-
-    async def _load_state_impl(self, manager: 'HierarchicalCompartmentManager') -> bool:
-        async with self._lock:
-            if not self.path.exists():
-                logger.warning(f"Persistence file {self.path} not found")
-                return False
-            try:
-                with open(self.path, 'r') as f:
-                    state = json.load(f)
-                # Restore fields (simplified)
-                manager.config = CompartmentConfig.from_dict(state.get('config', {}))
-                manager.regions = state.get('regions', {})
-                manager.compartment_to_region = state.get('compartment_to_region', {})
-                manager.compartments = state.get('compartments', {})
-                manager.global_health = state.get('global_health', 0.7)
-                manager.total_compartments_created = state.get('total_compartments_created', 0)
-                manager.total_apoptosis_events = state.get('total_apoptosis_events', 0)
-                manager.knowledge_bank = state.get('knowledge_bank', {})
-                # Genetic optimizer
-                go_state = state.get('genetic_optimizer', {})
-                manager.genetic_optimizer.best_fitness = go_state.get('best_fitness', -float('inf'))
-                manager.genetic_optimizer.best_individual = go_state.get('best_individual', None)
-                manager.genetic_optimizer.evolution_history = go_state.get('evolution_history', [])
-                manager.genetic_optimizer.pareto_front = [MOPDPoint.from_dict(p) for p in go_state.get('pareto_front', [])]
-                # Homeostatic
-                hc = state.get('homeostatic_controller', {})
-                manager.homeostatic_controller.integral_health = hc.get('integral_health', 0.0)
-                manager.homeostatic_controller.integral_token = hc.get('integral_token', 0.0)
-                manager.homeostatic_controller.prev_error_health = hc.get('prev_error_health', 0.0)
-                manager.homeostatic_controller.prev_error_token = hc.get('prev_error_token', 0.0)
-                manager._compartment_params = state.get('_compartment_params', manager._compartment_params)
-                logger.info(f"Compartment state loaded from {self.path}")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to load state: {e}")
-                return False
-
-
-# ============================================================================
-# Legacy compatibility
-# ============================================================================
+# =============================================================================
+# SECTION 18. LEGACY COMPAT
+# =============================================================================
 class CompartmentManager(HierarchicalCompartmentManager):
-    def __init__(self, token_manager=None):
-        config = CompartmentConfig(max_regions=5, compartments_per_region=20)
-        super().__init__(config=config, token_manager=token_manager)
-        logger.info("Compartment Manager initialized (legacy compatibility mode)")
+    def __init__(self, token_manager: Optional[Any] = None):
+        super().__init__(
+            config=CompartmentConfig(max_regions=5, compartments_per_region=20),
+            token_manager=token_manager,
+        )
+
+
+# =============================================================================
+# SECTION 19. TESTS
+# =============================================================================
+class _Tests(unittest.TestCase):
+    def _cfg(self) -> CompartmentConfig:
+        import tempfile
+        td = tempfile.mkdtemp()
+        return CompartmentConfig(
+            max_regions=3,
+            compartments_per_region=5,
+            persistence_path=os.path.join(td, "state.json"),
+            circuit_breaker_db_path=os.path.join(td, "cb.db"),
+            ga_population_size=6,
+            ga_generations=2,
+            ecosystem_maintenance_interval_seconds=0.2,
+            trading_maintenance_interval_seconds=0.5,
+        )
+
+    def test_lifecycle(self):
+        async def go():
+            mgr = HierarchicalCompartmentManager(config=self._cfg())
+            self.assertFalse(await mgr.ready())
+            await mgr.start()
+            self.assertTrue(await mgr.ready())
+            await mgr.shutdown()
+            self.assertTrue(mgr._shutdown)
+            await mgr.shutdown()  # idempotent
+        asyncio.run(go())
+
+    def test_context_manager(self):
+        async def go():
+            async with HierarchicalCompartmentManager(config=self._cfg()) as mgr:
+                self.assertTrue(await mgr.ready())
+        asyncio.run(go())
+
+    def test_create_and_decommission(self):
+        async def go():
+            async with HierarchicalCompartmentManager(config=self._cfg()) as mgr:
+                c = await mgr.create_compartment("expert_a")
+                self.assertIsNotNone(c)
+                self.assertEqual(len(mgr.compartments), 1)
+                knowledge = await mgr.decommission_compartment(c.compartment_id)
+                self.assertIn("health_score", knowledge)
+                self.assertEqual(len(mgr.compartments), 0)
+        asyncio.run(go())
+
+    def test_max_compartments_invariant(self):
+        async def go():
+            cfg = self._cfg()
+            cfg.max_regions = 1
+            cfg.compartments_per_region = 3
+            async with HierarchicalCompartmentManager(config=cfg) as mgr:
+                for i in range(3):
+                    await mgr.create_compartment(f"expert_{i}")
+                with self.assertRaises(RuntimeError):
+                    await mgr.create_compartment("overflow")
+        asyncio.run(go())
+
+    def test_policy_probs_valid(self):
+        async def go():
+            async with HierarchicalCompartmentManager(config=self._cfg()) as mgr:
+                probs = await mgr.policy_probs({})
+                self.assertEqual(len(probs), mgr.config.rl_action_dim)
+                self.assertTrue(all(p >= 0 for p in probs))
+                self.assertAlmostEqual(sum(probs), 1.0, places=6)
+        asyncio.run(go())
+
+    def test_q_table_bounded(self):
+        rl = CausalRLAgentPlaceholder(state_dim=4, action_dim=3, max_q_table=10)
+        for _ in range(200):
+            s = np.random.rand(4)
+            a = rl.act(s)
+            rl.update(s, a, 1.0, s, False)
+        self.assertLessEqual(rl.size(), 10)
+
+    def test_knowledge_transfer(self):
+        kt = KnowledgeTransfer()
+        kt.add_knowledge("r1", {"score": 0.5})
+        kt.add_knowledge("r2", {"score": 0.7})
+        self.assertEqual(len(kt.latest(10)), 2)
+        d = kt.to_dict()
+        kt2 = KnowledgeTransfer.from_dict(d)
+        self.assertEqual(len(kt2.latest(10)), 2)
+
+    def test_region_roundtrip(self):
+        r = RegionAggregator("r1", max_compartments=5)
+        comp = ChromatophoreCompartment("c1", "expert_x")
+        r.add_compartment(comp)
+        r.knowledge_transfer.add_knowledge("r1", {"score": 0.5})
+        d = r.to_dict()
+        r2 = RegionAggregator.from_dict(d)
+        self.assertIn("c1", r2.compartments)
+        self.assertEqual(r2.compartments["c1"].expert_type, "expert_x")
+
+    def test_ga_fitness_genome_dependent(self):
+        async def go():
+            async with HierarchicalCompartmentManager(config=self._cfg()) as mgr:
+                for _ in range(5):
+                    await mgr.create_compartment("expert_x")
+                # Two individuals with very different weights should produce
+                # different fitness on the same compartments
+                ind_a = {"health_score_weights": {"success_rate": 0.9, "efficiency_score": 0.05, "trust_gradient": 0.05}}
+                ind_b = {"health_score_weights": {"success_rate": 0.05, "efficiency_score": 0.05, "trust_gradient": 0.9}}
+                oa = await mgr.genetic_optimizer._evaluate_individual(ind_a)
+                ob = await mgr.genetic_optimizer._evaluate_individual(ind_b)
+                self.assertNotAlmostEqual(oa["health"], ob["health"], places=4)
+        asyncio.run(go())
+
+    def test_persistence_roundtrip(self):
+        async def go():
+            cfg = self._cfg()
+            mgr = HierarchicalCompartmentManager(config=cfg)
+            async with mgr:
+                c = await mgr.create_compartment("expert_a")
+                await mgr.persistence.save_state(mgr)
+                self.assertTrue(os.path.exists(cfg.persistence_path))
+
+            mgr2 = HierarchicalCompartmentManager(config=cfg)
+            async with mgr2:
+                await mgr2.persistence.load_state(mgr2)
+                self.assertEqual(len(mgr2.compartments), 1)
+                # Compartment should still be a real object
+                cid = next(iter(mgr2.compartments))
+                self.assertIsInstance(mgr2.compartments[cid], ChromatophoreCompartment)
+        asyncio.run(go())
+
+    def test_circuit_breaker_transitions(self):
+        async def go():
+            import tempfile
+            td = tempfile.mkdtemp()
+            cb = CircuitBreaker("test", os.path.join(td, "cb.db"),
+                                failure_threshold=2, timeout_seconds=0.5)
+
+            async def ok():
+                return 1
+
+            async def fail():
+                raise RuntimeError("boom")
+
+            self.assertEqual(await cb.call(ok), 1)
+            for _ in range(2):
+                try:
+                    await cb.call(fail)
+                except RuntimeError:
+                    pass
+            self.assertEqual(cb.snapshot()["state"], "open")
+            with self.assertRaises(RuntimeError):
+                await cb.call(ok)
+            await asyncio.sleep(0.6)
+            self.assertEqual(await cb.call(ok), 1)
+            self.assertEqual(cb.snapshot()["state"], "closed")
+        asyncio.run(go())
+
+    def test_health_check_skips_empty(self):
+        async def go():
+            cfg = self._cfg()
+            cfg.max_regions = 3
+            async with HierarchicalCompartmentManager(config=cfg) as mgr:
+                # No compartments -> global health is neutral 0.5
+                scores = await mgr.health_check_all()
+                self.assertEqual(len(scores), 0)
+                self.assertAlmostEqual(mgr.global_health, 0.5, places=2)
+        asyncio.run(go())
+
+
+def run_tests() -> int:
+    suite = unittest.TestLoader().loadTestsFromTestCase(_Tests)
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
+# =============================================================================
+# SECTION 20. ENTRY POINT
+# =============================================================================
+async def _example() -> None:
+    async with HierarchicalCompartmentManager() as mgr:
+        await mgr.create_compartment("analyst")
+        await mgr.create_compartment("analyst")
+        await mgr.create_compartment("retriever")
+        await asyncio.sleep(0.5)
+        print("stats:", json.dumps(await mgr.get_ecosystem_stats(), indent=2, default=str))
+        print("probs:", await mgr.policy_probs({}))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Chromatophore Compartments v8.0.0")
+    parser.add_argument("--test", action="store_true", help="Run embedded tests")
+    parser.add_argument("--example", action="store_true", help="Run example usage")
+    parser.add_argument("--status", action="store_true", help="Print module statuses")
+    args = parser.parse_args()
+
+    if args.status:
+        for name, status in MODULE_STATUS.items():
+            print(f"{name:22s} {status}")
+        return
+
+    if args.test:
+        sys.exit(run_tests())
+
+    if args.example:
+        asyncio.run(_example())
+        return
+
+    print("Chromatophore Compartments v8.0.0 — no mode selected.")
+    print("Use --test, --example, or --status.")
+
+
+if __name__ == "__main__":
+    main()
