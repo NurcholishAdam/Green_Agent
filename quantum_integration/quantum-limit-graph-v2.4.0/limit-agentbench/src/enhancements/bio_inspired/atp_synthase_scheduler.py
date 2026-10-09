@@ -1,40 +1,90 @@
+#!/usr/bin/env python3
 # =============================================================================
-# Enhanced ATP Synthase Scheduler v10.0.0 – Full Implementation with All Enhancement Phases
+# Enhanced ATP Synthase Scheduler v11.0.0
 # =============================================================================
 """
-Enhanced ATP Synthase Scheduler v10.0.0
-Based on v9.2.0 with added:
-- Causal Reinforcement Learning agent (placeholder Q-learning).
-- Federated Green Learning coordinator (FedAvg).
-- Temporal Logic / Formal Verification (SafetyMonitor).
-- Explainable AI (XAI) for key decisions.
-- Adaptive Precision Switching (PrecisionController).
-- External Carbon Markets (CarbonMarketClient).
-- Resilience Engineering / Chaos Testing (ChaosInjector).
-- Human-in-the-Loop (HumanApprovalHandler).
-- Fixed MOPD async evaluation bug.
-- Circuit breakers actually used.
-- Other improvements.
+Enhanced ATP Synthase Scheduler v11.0.0
+========================================
+Rewritten from v10.0.0 with three goals:
+
+1. P0 correctness fixes (the previous file did not run):
+   - Removed `async with` from non-async methods.
+   - Removed `asyncio.run` calls from methods reachable from a running loop.
+   - Made all I/O-touching public methods async; sync helpers are pure.
+   - Made `get_scheduler_stats` async and awaited everywhere.
+   - CircuitBreaker: lazily bound asyncio.Lock, SQLite I/O moved to executor.
+   - policy_probs: always returns a valid probability vector (>=0, sum==1).
+   - Validated every call site for coroutine leaks.
+
+2. Honest module status (see MODULE_STATUS below):
+   - Advanced modules are DISABLED by default.
+   - Enabling one logs a clear warning about its maturity.
+   - "Placeholder" modules never pretend to work.
+
+3. P3 production readiness:
+   - Graceful shutdown with task drain and state flush.
+   - Structured module-status documentation.
+   - Embedded test suite: run `python3 atp_synthase_scheduler.py --test`.
+   - Sections clearly separated (acts as logical modules in one file).
+
+Module status legend
+--------------------
+  stable        Production-ready; covered by tests.
+  experimental  Works but not fully validated; disabled by default.
+  placeholder   Stub; safe no-op with clear logging; must not be relied on.
+
+MODULE_STATUS = {
+    "core_scheduler":        "stable",
+    "circuit_breaker":       "stable",
+    "task_manager":          "stable",
+    "enhanced_synthase":     "stable",
+    "demand_priority":       "stable",
+    "load_balancer":         "stable",
+    "ml_predictor":          "stable",
+    "gradient_forecaster":   "stable",
+    "mopd":                  "stable",
+    "xai":                   "experimental",
+    "safety_monitor":        "experimental",
+    "causal_rl":             "placeholder",
+    "federated":             "placeholder",
+    "precision_controller":  "placeholder",
+    "carbon_market":         "placeholder",
+    "chaos_injector":        "placeholder",
+    "human_approval":        "placeholder",
+}
+
+Every experimental/placeholder module:
+  - Is disabled by default in the config.
+  - Logs a `ModuleStatusWarning` at construction if enabled.
+  - Exposes `.available` (False for placeholders, True for experimental).
+  - Exposes `.status_reason` for the log.
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
+import json
 import logging
-import uuid
-import os
 import math
+import os
 import random
 import sqlite3
-from typing import Dict, Any, List, Optional, Tuple, Callable, Protocol, Union
-from dataclasses import dataclass, field, asdict
+import sys
+import time
+import unittest
+import uuid
+from collections import defaultdict, deque
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from collections import deque, defaultdict
-import numpy as np
-import json
-import hashlib
-import secrets
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
-# Try optional dependencies
+import numpy as np
+
+# -----------------------------------------------------------------------------
+# Optional dependencies
+# -----------------------------------------------------------------------------
 try:
     from pydantic import BaseModel, Field, validator
     PYDANTIC_AVAILABLE = True
@@ -42,7 +92,7 @@ except ImportError:
     PYDANTIC_AVAILABLE = False
 
 try:
-    from prometheus_client import Gauge, Counter, Histogram
+    from prometheus_client import Counter, Gauge, Histogram
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
@@ -56,7 +106,10 @@ except ImportError:
     SKLEARN_AVAILABLE = False
 
 try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+    from tenacity import (
+        retry, stop_after_attempt, wait_exponential,
+        retry_if_exception_type, before_sleep_log,
+    )
     TENACITY_AVAILABLE = True
 except ImportError:
     TENACITY_AVAILABLE = False
@@ -69,7 +122,7 @@ try:
             structlog.stdlib.add_log_level,
             structlog.stdlib.PositionalArgumentsFormatter(),
             TimeStamper(fmt="iso"),
-            JSONRenderer()
+            JSONRenderer(),
         ],
         context_class=dict,
         logger_factory=structlog.stdlib.LoggerFactory(),
@@ -79,16 +132,24 @@ try:
     logger = structlog.get_logger(__name__)
 except ImportError:
     logger = logging.getLogger(__name__)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 
-# Local imports (with fallback)
+# -----------------------------------------------------------------------------
+# Local optional imports
+# -----------------------------------------------------------------------------
 try:
     from .eco_atp_currency import EcoATPTokenManager, EcoATPConsumer, EcoATPSource
     TOKEN_AVAILABLE = True
 except ImportError:
     TOKEN_AVAILABLE = False
-    class EcoATPSource:
+
+    class EcoATPSource:  # type: ignore
         GRADIENT_CONVERSION = "gradient_conversion"
-    class EcoATPConsumer:
+
+    class EcoATPConsumer:  # type: ignore
         EXPERT_EXECUTION = "expert_execution"
 
 try:
@@ -97,77 +158,141 @@ try:
 except ImportError:
     GRADIENT_AVAILABLE = False
 
-# ============================================================================
-# Central Green Agent Component Imports
-# ============================================================================
+# -----------------------------------------------------------------------------
+# Central Green Agent components (optional)
+# -----------------------------------------------------------------------------
 try:
-    from ..config import config as central_config
-    from ..storage import Storage as CentralStorage
-    from ..scaling.message_queue import AsyncMessageQueue
-    from ..routing.pareto_gating import ParetoGating
-    from ..feedback.adaptive_cost import AdaptiveCostFunction
-    from ..safety.drift_detector import DriftDetector
-    from ..metrics import MetricsRegistry
-    from ..schemas.feedback_event import FeedbackEvent
-    from ..logger import logger as central_logger
+    from ..config import config as central_config  # type: ignore
+    from ..storage import Storage as CentralStorage  # type: ignore
+    from ..scaling.message_queue import AsyncMessageQueue  # type: ignore
+    from ..routing.pareto_gating import ParetoGating  # type: ignore
+    from ..feedback.adaptive_cost import AdaptiveCostFunction  # type: ignore
+    from ..safety.drift_detector import DriftDetector  # type: ignore
+    from ..metrics import MetricsRegistry  # type: ignore
+    from ..schemas.feedback_event import FeedbackEvent  # type: ignore
     CENTRAL_AVAILABLE = True
 except ImportError:
     CENTRAL_AVAILABLE = False
-    CentralStorage = None
-    AsyncMessageQueue = None
-    ParetoGating = None
-    AdaptiveCostFunction = None
-    DriftDetector = None
-    MetricsRegistry = None
-    FeedbackEvent = None
-    central_config = None
+    CentralStorage = None  # type: ignore
+    AsyncMessageQueue = None  # type: ignore
+    ParetoGating = None  # type: ignore
+    AdaptiveCostFunction = None  # type: ignore
+    DriftDetector = None  # type: ignore
+    MetricsRegistry = None  # type: ignore
+    FeedbackEvent = None  # type: ignore
+    central_config = None  # type: ignore
 
-# ============================================================================
-# Retry decorator
-# ============================================================================
+
+# =============================================================================
+# SECTION 0. MODULE STATUS REGISTRY
+# =============================================================================
+MODULE_STATUS: Dict[str, str] = {
+    "core_scheduler": "stable",
+    "circuit_breaker": "stable",
+    "task_manager": "stable",
+    "enhanced_synthase": "stable",
+    "demand_priority": "stable",
+    "load_balancer": "stable",
+    "ml_predictor": "stable",
+    "gradient_forecaster": "stable",
+    "mopd": "stable",
+    "xai": "experimental",
+    "safety_monitor": "experimental",
+    "causal_rl": "placeholder",
+    "federated": "placeholder",
+    "precision_controller": "placeholder",
+    "carbon_market": "placeholder",
+    "chaos_injector": "placeholder",
+    "human_approval": "placeholder",
+}
+
+
+class ModuleStatusWarning(UserWarning):
+    """Emitted when an experimental or placeholder module is enabled."""
+
+
+def _warn_module(module_name: str) -> str:
+    """Log a module-status warning and return the reason string."""
+    status = MODULE_STATUS.get(module_name, "unknown")
+    if status == "stable":
+        return "stable"
+    reason = (
+        f"Module '{module_name}' is '{status}' and enabled. "
+        f"{'Disabled by default; enable only after review.' if status == 'placeholder' else 'Validate before production use.'}"
+    )
+    logger.warning(reason)
+    return reason
+
+
+# =============================================================================
+# SECTION 1. RETRY DECORATOR
+# =============================================================================
 def retry_decorator(max_attempts: int = 3, min_delay: float = 0.1, max_delay: float = 10.0):
-    """Decorator to retry async functions with exponential backoff."""
+    """Retry decorator for async functions (tenacity if available, else manual)."""
     if TENACITY_AVAILABLE:
         def decorator(func):
             @retry(
                 stop=stop_after_attempt(max_attempts),
                 wait=wait_exponential(multiplier=min_delay, min=min_delay, max=max_delay),
                 retry=retry_if_exception_type(Exception),
-                before_sleep=before_sleep_log(logger, logging.WARNING)
+                before_sleep=before_sleep_log(logger, logging.WARNING),
             )
             async def wrapper(*args, **kwargs):
                 return await func(*args, **kwargs)
             return wrapper
         return decorator
-    else:
-        def decorator(func):
-            async def wrapper(*args, **kwargs):
-                for attempt in range(max_attempts):
-                    try:
-                        return await func(*args, **kwargs)
-                    except Exception as e:
-                        if attempt == max_attempts - 1:
-                            raise
-                        delay = min(min_delay * (2 ** attempt), max_delay)
-                        await asyncio.sleep(delay)
-            return wrapper
-        return decorator
 
-# ============================================================================
-# Persistent Circuit Breaker (SQLite)
-# ============================================================================
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception:
+                    if attempt == max_attempts - 1:
+                        raise
+                    delay = min(min_delay * (2 ** attempt), max_delay)
+                    await asyncio.sleep(delay)
+        return wrapper
+    return decorator
+
+
+# =============================================================================
+# SECTION 2. CIRCUIT BREAKER (STABLE)
+# =============================================================================
 class CircuitBreaker:
-    """Circuit breaker with SQLite persistence."""
-    def __init__(self, name: str, db_path: str, failure_threshold: int = 5, recovery_timeout: float = 60.0):
+    """
+    Circuit breaker with SQLite persistence.
+
+    P0 fix: the asyncio.Lock is lazily created on first use so it is bound to
+    the running loop. SQLite I/O is offloaded to a thread executor.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        db_path: str,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 60.0,
+    ):
         self.name = name
         self.db_path = db_path
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
-        self._init_db()
-        self._load_state()
-        self._lock = asyncio.Lock()
+        self.state = "closed"
+        self.failure_count = 0
+        self.last_failure_time: Optional[datetime] = None
+        self._lock: Optional[asyncio.Lock] = None  # lazy
+        self._sync_init_db()
+        self._sync_load_state()
 
-    def _init_db(self):
+    # --- lock ---
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    # --- persistence (sync, called only from threads or __init__) ---
+    def _sync_init_db(self) -> None:
         conn = sqlite3.connect(self.db_path)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS circuit_breaker (
@@ -180,348 +305,361 @@ class CircuitBreaker:
         conn.commit()
         conn.close()
 
-    def _load_state(self):
+    def _sync_load_state(self) -> None:
         conn = sqlite3.connect(self.db_path)
-        row = conn.execute("SELECT state, failures, last_failure FROM circuit_breaker WHERE name = ?", (self.name,)).fetchone()
+        row = conn.execute(
+            "SELECT state, failures, last_failure FROM circuit_breaker WHERE name = ?",
+            (self.name,),
+        ).fetchone()
         conn.close()
         if row:
             self.state = row[0]
             self.failure_count = row[1]
-            self.last_failure_time = datetime.fromisoformat(row[2]) if row[2] else None
-        else:
-            self.state = 'closed'
-            self.failure_count = 0
-            self.last_failure_time = None
+            self.last_failure_time = (
+                datetime.fromisoformat(row[2]) if row[2] else None
+            )
 
-    def _save_state(self):
+    def _sync_save_state(self) -> None:
         conn = sqlite3.connect(self.db_path)
         conn.execute("""
-            INSERT OR REPLACE INTO circuit_breaker (name, state, failures, last_failure)
+            INSERT OR REPLACE INTO circuit_breaker
+            (name, state, failures, last_failure)
             VALUES (?, ?, ?, ?)
-        """, (self.name, self.state, self.failure_count, self.last_failure_time.isoformat() if self.last_failure_time else None))
+        """, (
+            self.name, self.state, self.failure_count,
+            self.last_failure_time.isoformat() if self.last_failure_time else None,
+        ))
         conn.commit()
         conn.close()
 
+    async def _persist(self) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._sync_save_state)
+
+    # --- public API ---
     async def call(self, func: Callable, *args, **kwargs):
-        async with self._lock:
-            if self.state == 'open':
-                if self.last_failure_time and (datetime.now(timezone.utc) - self.last_failure_time).total_seconds() >= self.recovery_timeout:
-                    self.state = 'half_open'
-                    self._save_state()
-                    logger.info(f"Circuit breaker {self.name} transitioning to half_open")
+        lock = self._get_lock()
+        async with lock:
+            if self.state == "open":
+                if (
+                    self.last_failure_time
+                    and (datetime.now(timezone.utc) - self.last_failure_time).total_seconds()
+                    >= self.recovery_timeout
+                ):
+                    self.state = "half_open"
+                    logger.info("Circuit breaker half_open", name=self.name)
+                    await self._persist()
                 else:
-                    raise Exception(f"Circuit breaker {self.name} is OPEN")
+                    raise RuntimeError(f"Circuit breaker {self.name} is OPEN")
+
         try:
             result = await func(*args, **kwargs)
-            async with self._lock:
-                if self.state == 'half_open':
-                    self.state = 'closed'
-                    self.failure_count = 0
-                    self._save_state()
-                    logger.info(f"Circuit breaker {self.name} closed after success")
-                else:
-                    self.failure_count = 0
-                    self._save_state()
-            return result
-        except Exception as e:
-            async with self._lock:
+        except Exception:
+            async with lock:
                 self.failure_count += 1
                 self.last_failure_time = datetime.now(timezone.utc)
                 if self.failure_count >= self.failure_threshold:
-                    self.state = 'open'
-                    logger.warning(f"Circuit breaker {self.name} opened after {self.failure_count} failures")
-                self._save_state()
-            raise e
-
-# ============================================================================
-# NEW MODULES (Enhancement Phases)
-# ============================================================================
-
-# --- Causal RL Agent (Phase: Causal Reinforcement Learning) ---
-class CausalRLAgent:
-    """Simplified Q-learning agent with optional causal feature mask (placeholder)."""
-    def __init__(self, state_dim: int, action_dim: int, causal_mask: Optional[np.ndarray] = None):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.causal_mask = causal_mask  # binary mask indicating which state features influence actions
-        self.q_table = defaultdict(lambda: np.zeros(action_dim))
-        self.epsilon = 0.1
-        self.learning_rate = 0.1
-        self.gamma = 0.99
-        self.last_state = None
-        self.last_action = None
-
-    def act(self, state: np.ndarray, explore: bool = True) -> int:
-        """Epsilon-greedy action selection."""
-        if explore and random.random() < self.epsilon:
-            return random.randrange(self.action_dim)
-        state_key = tuple(state)
-        return int(np.argmax(self.q_table[state_key]))
-
-    def update(self, state, action, reward, next_state, done):
-        """Q-learning update."""
-        state_key = tuple(state)
-        next_key = tuple(next_state)
-        best_next = np.max(self.q_table[next_key]) if not done else 0.0
-        td_target = reward + self.gamma * best_next
-        self.q_table[state_key][action] += self.learning_rate * (td_target - self.q_table[state_key][action])
-
-    def get_policy_probs(self, state: np.ndarray, temperature: float = 1.0) -> List[float]:
-        """Convert Q-values to probabilities using softmax."""
-        state_key = tuple(state)
-        q_values = self.q_table[state_key]
-        if temperature <= 0:
-            # greedy
-            probs = np.zeros_like(q_values)
-            probs[np.argmax(q_values)] = 1.0
-            return probs.tolist()
-        exp_q = np.exp((q_values - np.max(q_values)) / temperature)
-        return (exp_q / exp_q.sum()).tolist()
-
-# --- Federated Learning Coordinator (Phase: Federated Green Learning) ---
-class FederatedCoordinator:
-    """Coordinates federated learning of model weights across scheduler instances."""
-    def __init__(self, scheduler, queue: Optional[AsyncMessageQueue], model_keys: List[str] = None):
-        self.scheduler = scheduler
-        self.queue = queue
-        self.model_keys = model_keys or ['mopd_weights', 'rl_q_table', 'ml_model']
-        self.last_global_model = None
-
-    async def send_update(self):
-        """Send local model update to central server."""
-        if not self.queue:
-            logger.warning("No message queue for federated update.")
-            return
-        local_model = self._get_local_model()
-        payload = json.dumps(local_model)
-        await self.queue.publish("federated_updates", payload)
-        logger.info("Federated update sent.")
-
-    async def receive_global_model(self, model_json: str):
-        """Apply global model received from central server."""
-        model = json.loads(model_json)
-        self.last_global_model = model
-        self._apply_global_model(model)
-        logger.info("Global model applied.")
-
-    def _get_local_model(self) -> Dict[str, Any]:
-        """Extract local model parameters."""
-        model = {}
-        if 'mopd_weights' in self.model_keys:
-            model['mopd_weights'] = self.scheduler.config.mopd.objective_weights
-        if 'rl_q_table' in self.model_keys:
-            # Serialize Q-table to dict with string keys
-            q_table = {}
-            for k, v in self.scheduler.rl_agent.q_table.items():
-                q_table[str(k)] = v.tolist()
-            model['rl_q_table'] = q_table
-        if 'ml_model' in self.model_keys and self.scheduler.ml_predictor and self.scheduler.ml_predictor.is_trained:
-            # Can't easily serialize sklearn model; we could send feature importances or just skip
-            # For simplicity, we'll send None and not aggregate
-            model['ml_model'] = None
-        return model
-
-    def _apply_global_model(self, model: Dict[str, Any]):
-        """Apply global model parameters to local scheduler."""
-        if 'mopd_weights' in model and model['mopd_weights']:
-            # Simple weighted average with local (FedAvg)
-            local_weights = self.scheduler.config.mopd.objective_weights
-            global_weights = model['mopd_weights']
-            alpha = 0.5  # local weight
-            for key in local_weights:
-                if key in global_weights:
-                    local_weights[key] = alpha * local_weights[key] + (1 - alpha) * global_weights[key]
-            # Normalize
-            total = sum(local_weights.values())
-            if total > 0:
-                for key in local_weights:
-                    local_weights[key] /= total
-        if 'rl_q_table' in model and model['rl_q_table']:
-            # Merge Q-tables (simple averaging for common states)
-            global_q = model['rl_q_table']
-            for state_key_str, q_values in global_q.items():
-                state_key = tuple(map(int, state_key_str.strip('()').split(', '))) if ',' in state_key_str else (int(state_key_str),)
-                if state_key in self.scheduler.rl_agent.q_table:
-                    # Average
-                    self.scheduler.rl_agent.q_table[state_key] = (
-                        0.5 * self.scheduler.rl_agent.q_table[state_key] + 0.5 * np.array(q_values)
+                    self.state = "open"
+                    logger.warning(
+                        "Circuit breaker opened",
+                        name=self.name,
+                        failures=self.failure_count,
                     )
-                else:
-                    self.scheduler.rl_agent.q_table[state_key] = np.array(q_values)
+                await self._persist()
+            raise
 
-# --- Safety Monitor (Phase: Temporal Logic / Formal Verification) ---
-class SafetyMonitor:
-    """Runtime monitor for safety invariants."""
-    def __init__(self):
-        self.invariants = []
+        async with lock:
+            if self.state == "half_open":
+                self.state = "closed"
+                self.failure_count = 0
+                await self._persist()
+                logger.info("Circuit breaker closed", name=self.name)
+            elif self.failure_count > 0:
+                self.failure_count = 0
+                await self._persist()
+        return result
 
-    def add_invariant(self, name: str, condition_fn: Callable[[Dict[str, Any]], bool], description: str):
-        self.invariants.append((name, condition_fn, description))
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "state": self.state,
+            "failure_count": self.failure_count,
+            "last_failure_time": self.last_failure_time.isoformat()
+            if self.last_failure_time else None,
+        }
 
-    def check(self, state: Dict[str, Any]) -> List[str]:
-        violations = []
-        for name, fn, desc in self.invariants:
-            if not fn(state):
-                violations.append(f"{name}: {desc}")
-        return violations
 
-# --- Precision Controller (Phase: Adaptive Precision Switching) ---
+# =============================================================================
+# SECTION 3. PLACEHOLDER / EXPERIMENTAL MODULES
+# =============================================================================
+#
+# Each module below is honest about what it does. Placeholders return safe
+# no-ops with clear logging. Experimental modules work but are disabled by
+# default and warn when enabled.
+#
+
+
 class PrecisionController:
-    """Decides numerical precision based on load and energy budget."""
-    def __init__(self, policy: str = "energy_aware"):
+    """
+    STATUS: placeholder.
+
+    Previous v10 returned "float16"/"float32" strings that nothing consumed.
+    This version is honest: `.available` is False and `.get_precision` is a
+    no-op returning "float32" with a single startup warning.
+    """
+
+    STATUS = "placeholder"
+
+    def __init__(self, policy: str = "energy_aware", enabled: bool = False):
         self.policy = policy
+        self.available = False
+        self.status_reason = "No consumer wired; returns float32 only."
+        if enabled:
+            _warn_module("precision_controller")
 
     def get_precision(self, load: float, energy_budget: float) -> str:
-        if self.policy == "energy_aware":
-            if load > 0.8 or energy_budget < 0.2:
-                return "float16"
-            else:
-                return "float32"
-        elif self.policy == "performance":
-            return "float32"
         return "float32"
 
-# --- Carbon Market Client (Phase: External Carbon Markets) ---
+
 class CarbonMarketClient:
-    """Placeholder for interacting with carbon credit markets."""
-    def __init__(self, provider_url: str = None, contract_address: str = None, private_key: str = None):
-        self.provider_url = provider_url
-        self.contract_address = contract_address
-        self.private_key = private_key
+    """
+    STATUS: placeholder.
+
+    No real trading. buy_credits / sell_credits return False and log once.
+    """
+
+    STATUS = "placeholder"
+
+    def __init__(
+        self,
+        provider_url: Optional[str] = None,
+        contract_address: Optional[str] = None,
+        private_key: Optional[str] = None,
+        enabled: bool = False,
+    ):
         self.available = False
-        if provider_url and contract_address and private_key:
-            try:
-                # Try to import web3
-                from web3 import Web3, Account
-                self.w3 = Web3(Web3.HTTPProvider(provider_url))
-                self.account = Account.from_key(private_key)
-                self.available = True
-            except ImportError:
-                logger.warning("web3 not installed; carbon market integration disabled.")
-        else:
-            logger.info("Carbon market client not configured.")
+        self.status_reason = "No live backend; trading methods are no-ops."
+        self._warned = False
+        if enabled:
+            _warn_module("carbon_market")
+
+    def _warn_once(self) -> None:
+        if not self._warned:
+            logger.info("Carbon market is a placeholder; no trades executed.")
+            self._warned = True
 
     def buy_credits(self, amount: float) -> bool:
-        if not self.available:
-            return False
-        # Implement actual smart contract call
-        logger.info(f"Simulating purchase of {amount} carbon credits.")
-        return True
+        self._warn_once()
+        return False
 
     def sell_credits(self, amount: float) -> bool:
-        if not self.available:
-            return False
-        logger.info(f"Simulating sale of {amount} carbon credits.")
-        return True
+        self._warn_once()
+        return False
 
-# --- Chaos Injector (Phase: Resilience Engineering) ---
-class ChaosInjector:
-    """Injects random failures to test system resilience."""
-    def __init__(self, scheduler, chaos_probability: float = 0.01):
-        self.scheduler = scheduler
-        self.chaos_probability = chaos_probability
 
-    async def maybe_inject_failure(self):
-        if random.random() < self.chaos_probability:
-            action = random.choice(['kill_task', 'delay', 'corrupt_state'])
-            logger.warning(f"Chaos injection: {action}")
-            if action == 'kill_task':
-                # Cancel a random background task
-                if self.scheduler._task_manager.tasks:
-                    task_name = random.choice(list(self.scheduler._task_manager.tasks.keys()))
-                    task = self.scheduler._task_manager.tasks[task_name]
-                    task.cancel()
-                    logger.warning(f"Chaos killed task: {task_name}")
-            elif action == 'delay':
-                await asyncio.sleep(random.uniform(0.5, 2.0))
-            elif action == 'corrupt_state':
-                # Flip a random bit in a config value (simulate)
-                if random.random() < 0.5:
-                    self.scheduler.config.driving_force_weights['carbon'] *= random.uniform(0.8, 1.2)
-                    logger.warning("Chaos corrupted driving_force_weights['carbon']")
-
-# --- Human Approval Handler (Phase: Human-in-the-Loop) ---
 class HumanApprovalHandler:
-    """Requests and tracks human approval for critical decisions."""
-    def __init__(self, queue: Optional[AsyncMessageQueue]):
+    """
+    STATUS: placeholder.
+
+    v10 auto-approved silently. This version:
+      - `.available` is False.
+      - `request_approval` returns False by default (deny) unless
+        `auto_approve_dev` is True, which logs a loud warning.
+    """
+
+    STATUS = "placeholder"
+
+    def __init__(
+        self,
+        queue: Optional[Any] = None,
+        enabled: bool = False,
+        auto_approve_dev: bool = False,
+    ):
         self.queue = queue
-        self.pending_requests = {}
+        self.available = False
+        self.auto_approve_dev = auto_approve_dev
+        self.status_reason = "No approval round-trip; denies by default."
+        if enabled:
+            _warn_module("human_approval")
+        if auto_approve_dev:
+            logger.warning(
+                "HumanApprovalHandler auto_approve_dev=True; every request will be approved. "
+                "Never enable in production."
+            )
 
     async def request_approval(self, decision: Dict[str, Any], timeout: float = 60.0) -> bool:
-        """Publish approval request and wait for response (simplified)."""
-        request_id = str(uuid.uuid4())
-        if not self.queue:
-            logger.warning("No queue for human approval; auto-approving.")
+        if self.auto_approve_dev:
             return True
-        event = FeedbackEvent.create_with_context(
-            task_id=request_id,
-            selected_action=decision.get('action', 'unknown'),
-            quality_score=0.0,
-            energy_joules=0.0,
-            carbon_g=0.0,
-            feedback_type="approval_request",
-            adaptive_cost_value=0.0,
-            state=decision,
-            candidates=[],
-            source="atp_synthase_scheduler",
-            environment=getattr(central_config, "ENVIRONMENT", "production") if central_config else "production",
-            tags=["approval"]
+        logger.info(
+            "Approval requested but HumanApprovalHandler is a placeholder; denying.",
+            decision=decision,
         )
-        await self.queue.publish("approval_requests", event.to_json())
-        # In a real system, we would wait for a callback. Here we auto-approve after timeout.
-        logger.info(f"Human approval requested for {decision.get('action')}, auto-approving after timeout.")
-        await asyncio.sleep(0)  # simulate async wait
-        return True  # For now, always approve
+        return False
 
-# ============================================================================
-# Protocols for dependency injection
-# ============================================================================
-class TokenServiceProtocol(Protocol):
-    def get_system_summary(self) -> Dict[str, Any]: ...
-    def generate_tokens(self, account_id: str, source: Any, **kwargs) -> List[Any]: ...
-    def reserve_tokens(self, account_id: str, amount: float, consumer: Any) -> Tuple[bool, List[str]]: ...
-    def consume_tokens(self, token_ids: List[str], consumer: Any, operation_success: bool) -> float: ...
-    def recover_tokens(self, token_ids: List[str], completion_percentage: float) -> float: ...
-    def create_account(self, account_id: str) -> Any: ...
-    def get_account_summary(self, account_id: str) -> Dict[str, Any]: ...
 
-class GradientServiceProtocol(Protocol):
-    def get_field_strengths(self) -> Dict[str, float]: ...
-    def discharge_field(self, field_id: str, amount: float) -> float: ...
-    def pump_field(self, field_id: str, amount: float, source: str) -> None: ...
-    def get_field_stats(self) -> Dict[str, Any]: ...
+class ChaosInjector:
+    """
+    STATUS: placeholder.
 
-class HarvesterProtocol(Protocol):
-    def get_harvesting_stats(self) -> Dict[str, Any]: ...
-    def set_mode(self, mode: Any) -> None: ...
+    v10 mutated live config with no rollback. This version:
+      - `.available` is False.
+      - `maybe_inject_failure` is a no-op.
+    """
 
-# ============================================================================
-# Configuration (Pydantic or dataclass) - unchanged from original, but included for completeness
-# ============================================================================
+    STATUS = "placeholder"
+
+    def __init__(self, scheduler: Any, chaos_probability: float = 0.0, enabled: bool = False):
+        self.scheduler = scheduler
+        self.chaos_probability = chaos_probability
+        self.available = False
+        self.status_reason = "No isolation or rollback; injection is a no-op."
+        if enabled:
+            _warn_module("chaos_injector")
+
+    async def maybe_inject_failure(self) -> None:
+        return None
+
+
+class CausalRLAgent:
+    """
+    STATUS: placeholder.
+
+    v10 was tabular Q-learning with an unused causal mask. This version keeps
+    the interface but never invents Q-values; it returns a uniform policy and
+    does not update.
+    """
+
+    STATUS = "placeholder"
+
+    def __init__(self, state_dim: int, action_dim: int, enabled: bool = False):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.available = False
+        self.status_reason = "No causal model; policy is uniform."
+        if enabled:
+            _warn_module("causal_rl")
+
+    def act(self, state: np.ndarray, explore: bool = True) -> int:
+        return random.randrange(self.action_dim)
+
+    def update(self, state, action, reward, next_state, done) -> None:
+        return None
+
+    def get_policy_probs(self, state: np.ndarray, temperature: float = 1.0) -> List[float]:
+        return [1.0 / self.action_dim] * self.action_dim
+
+
+class FederatedCoordinator:
+    """
+    STATUS: placeholder.
+
+    v10 sent/received full models with fragile key parsing. This version:
+      - `.available` is False.
+      - send_update is a no-op returning False.
+      - receive_global_model logs and does not mutate local state.
+    """
+
+    STATUS = "placeholder"
+
+    def __init__(self, scheduler: Any, queue: Optional[Any], enabled: bool = False):
+        self.scheduler = scheduler
+        self.queue = queue
+        self.available = False
+        self.status_reason = "No secure aggregation; send/receive are no-ops."
+        if enabled:
+            _warn_module("federated")
+
+    async def send_update(self) -> bool:
+        logger.info("Federated send_update called but module is a placeholder; no-op.")
+        return False
+
+    async def receive_global_model(self, model_json: str) -> bool:
+        logger.info("Federated receive_global_model called but module is a placeholder; no-op.")
+        return False
+
+
+class SafetyMonitor:
+    """
+    STATUS: experimental.
+
+    Real invariants evaluated against a caller-provided state dict. Simpler
+    than v10's version but honest: no placeholder values.
+    """
+
+    STATUS = "experimental"
+
+    def __init__(self, enabled: bool = True):
+        self.available = True
+        self.invariants: List[Tuple[str, Callable[[Dict[str, Any]], bool], str]] = []
+        self.status_reason = "Simple invariants; not a temporal-logic checker."
+        if enabled:
+            _warn_module("safety_monitor")
+
+    def add_invariant(self, name: str, fn: Callable[[Dict[str, Any]], bool], description: str) -> None:
+        self.invariants.append((name, fn, description))
+
+    def check(self, state: Dict[str, Any]) -> List[str]:
+        return [
+            f"{name}: {desc}"
+            for name, fn, desc in self.invariants
+            if not fn(state)
+        ]
+
+
+class XAIExplainer:
+    """
+    STATUS: experimental.
+
+    Templated explanations. Not a saliency/counterfactual engine.
+    """
+
+    STATUS = "experimental"
+
+    def __init__(self, enabled: bool = True):
+        self.available = True
+        self.status_reason = "Template-based text; no attribution or counterfactuals."
+        if enabled:
+            _warn_module("xai")
+
+    def explain_mopd(self, plan: Any, objective_weights: Dict[str, float]) -> str:
+        top = max(objective_weights, key=objective_weights.get) if objective_weights else "unknown"
+        return (
+            f"MOPD selected plan with emphasis on {top} "
+            f"(weight={objective_weights.get(top, 0.0):.2f})."
+        )
+
+    def explain_schedule(self, task: Any) -> str:
+        return (
+            f"Task {task.task_id} scheduled with priority "
+            f"{task.user_priority} and ATP {task.eco_atp_required:.2f}."
+        )
+
+
+# =============================================================================
+# SECTION 4. CONFIG
+# =============================================================================
 if PYDANTIC_AVAILABLE:
     class MOPDConfig(BaseModel):
         enabled: bool = True
         objective_weights: Dict[str, float] = Field(
             default_factory=lambda: {
-                'total_produced': 0.3,
-                'avg_efficiency': 0.3,
-                'demand_satisfaction': 0.2,
-                'token_balance': 0.2,
+                "total_produced": 0.3,
+                "avg_efficiency": 0.3,
+                "demand_satisfaction": 0.2,
+                "token_balance": 0.2,
             }
         )
         grid_resolution: int = 5
-        enable_cost_benefit: bool = True
-        enable_predictive: bool = True
 
-        @validator('objective_weights')
-        def check_weights(cls, v):
+        @validator("objective_weights")
+        def _check(cls, v):
             total = sum(v.values())
             if abs(total - 1.0) > 1e-6:
                 raise ValueError("objective_weights must sum to 1")
             return v
 
     class SynthaseSchedulerConfig(BaseModel):
-        # Core parameters
+        # Core
         protons_per_rotation: int = Field(12, ge=8, le=17)
         atp_per_rotation: int = Field(3, ge=1)
         max_rotation_speed_rpm: float = Field(6000, gt=0)
@@ -541,50 +679,51 @@ if PYDANTIC_AVAILABLE:
         quantum_efficiency_boost: float = Field(0.25, ge=0, le=1)
         quantum_tunneling_threshold: float = Field(0.7, ge=0, le=1)
         quantum_coherence_time: float = Field(10.0, ge=0)
+
         driving_force_weights: Dict[str, float] = Field(
             default_factory=lambda: {
-                'carbon': 0.25,
-                'helium': 0.15,
-                'trust': 0.20,
-                'opportunity': 0.25,
-                'eco_atp_reserve': 0.15
+                "carbon": 0.25, "helium": 0.15, "trust": 0.20,
+                "opportunity": 0.25, "eco_atp_reserve": 0.15,
             }
         )
         priority_defaults: Dict[str, Dict[str, float]] = Field(
             default_factory=lambda: {
-                'critical': {'weight': 2.0, 'min_balance': 10000, 'max_consumption': 0.9},
-                'high': {'weight': 1.5, 'min_balance': 5000, 'max_consumption': 0.7},
-                'normal': {'weight': 1.0, 'min_balance': 2000, 'max_consumption': 0.5},
-                'low': {'weight': 0.7, 'min_balance': 1000, 'max_consumption': 0.3},
-                'background': {'weight': 0.4, 'min_balance': 500, 'max_consumption': 0.1}
+                "critical": {"weight": 2.0, "min_balance": 10000, "max_consumption": 0.9},
+                "high": {"weight": 1.5, "min_balance": 5000, "max_consumption": 0.7},
+                "normal": {"weight": 1.0, "min_balance": 2000, "max_consumption": 0.5},
+                "low": {"weight": 0.7, "min_balance": 1000, "max_consumption": 0.3},
+                "background": {"weight": 0.4, "min_balance": 500, "max_consumption": 0.1},
             }
         )
-        default_priority: str = 'normal'
+        default_priority: str = "normal"
+
         ml_lookback: int = Field(50, ge=10)
-        ml_model_path: str = Field("./models/atp_demand_model.joblib")
-        ml_retrain_interval: int = Field(3600, ge=300)
+        ml_model_path: str = "./models/atp_demand_model.joblib"
         ml_min_samples: int = Field(100, ge=20)
+
         forecast_history_window: int = Field(50, ge=10)
         forecast_horizon: int = Field(20, ge=5)
         forecast_alpha: float = Field(0.3, ge=0, le=1)
         forecast_beta: float = Field(0.1, ge=0, le=1)
+
         load_balance_history_size: int = Field(100, ge=10)
         load_balance_weights: Dict[str, float] = Field(
             default_factory=lambda: {
-                'health': 0.3,
-                'efficiency': 0.3,
-                'quantum': 0.2,
-                'performance': 0.2
+                "health": 0.3, "efficiency": 0.3,
+                "quantum": 0.2, "performance": 0.2,
             }
         )
+
         adaptive_priority_enabled: bool = True
         adaptive_priority_learning_rate: float = Field(0.1, ge=0, le=1)
         priority_performance_window: int = Field(50, ge=10)
+
         synthesis_interval: float = Field(0.1, ge=0.01)
         regulation_interval: float = Field(30, ge=5)
         predictive_interval: float = Field(60, ge=10)
         forecast_interval: float = Field(60, ge=10)
         maintenance_interval: float = Field(60, ge=10)
+
         enable_multi_synthase: bool = True
         enable_quantum: bool = True
         enable_ml_prediction: bool = True
@@ -594,45 +733,38 @@ if PYDANTIC_AVAILABLE:
             default_factory=lambda: {5: 0.9, 4: 0.8, 3: 0.7, 2: 0.6, 1: 0.0}
         )
         shutdown_timeout_seconds: int = Field(30, ge=5)
-        circuit_breaker_db_path: str = Field("./circuit_breakers.db")
+        circuit_breaker_db_path: str = "./circuit_breakers.db"
         mopd: MOPDConfig = Field(default_factory=MOPDConfig)
-        # New config for enhancements
-        enable_causal_rl: bool = True
-        enable_federated_learning: bool = True
-        enable_safety_monitor: bool = True
-        enable_xai: bool = True
-        enable_precision_switching: bool = True
+
+        # --- Advanced modules: ALL DISABLED BY DEFAULT ---
+        enable_causal_rl: bool = False
+        enable_federated_learning: bool = False
+        enable_safety_monitor: bool = True     # experimental but harmless
+        enable_xai: bool = True                # experimental but harmless
+        enable_precision_switching: bool = False
         enable_carbon_market: bool = False
         carbon_market_config: Optional[Dict[str, str]] = None
         enable_chaos: bool = False
         chaos_probability: float = 0.0
-        enable_human_approval: bool = True
+        enable_human_approval: bool = False
+
+        # Development escape hatches; never enable in production
+        dev_auto_approve: bool = False
 
         class Config:
             env_prefix = "ATP_SCHEDULER_"
-
-    class DemandPriorityConfig(BaseModel):
-        priority_level: str
-        weight: float
-        min_balance: float
-        max_consumption: float
 else:
     @dataclass
     class MOPDConfig:
         enabled: bool = True
         objective_weights: Dict[str, float] = field(default_factory=lambda: {
-            'total_produced': 0.3,
-            'avg_efficiency': 0.3,
-            'demand_satisfaction': 0.2,
-            'token_balance': 0.2,
+            "total_produced": 0.3, "avg_efficiency": 0.3,
+            "demand_satisfaction": 0.2, "token_balance": 0.2,
         })
         grid_resolution: int = 5
-        enable_cost_benefit: bool = True
-        enable_predictive: bool = True
 
     @dataclass
     class SynthaseSchedulerConfig:
-        # Core parameters
         protons_per_rotation: int = 12
         atp_per_rotation: int = 3
         max_rotation_speed_rpm: float = 6000
@@ -653,23 +785,19 @@ else:
         quantum_tunneling_threshold: float = 0.7
         quantum_coherence_time: float = 10.0
         driving_force_weights: Dict[str, float] = field(default_factory=lambda: {
-            'carbon': 0.25,
-            'helium': 0.15,
-            'trust': 0.20,
-            'opportunity': 0.25,
-            'eco_atp_reserve': 0.15
+            "carbon": 0.25, "helium": 0.15, "trust": 0.20,
+            "opportunity": 0.25, "eco_atp_reserve": 0.15,
         })
         priority_defaults: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
-            'critical': {'weight': 2.0, 'min_balance': 10000, 'max_consumption': 0.9},
-            'high': {'weight': 1.5, 'min_balance': 5000, 'max_consumption': 0.7},
-            'normal': {'weight': 1.0, 'min_balance': 2000, 'max_consumption': 0.5},
-            'low': {'weight': 0.7, 'min_balance': 1000, 'max_consumption': 0.3},
-            'background': {'weight': 0.4, 'min_balance': 500, 'max_consumption': 0.1}
+            "critical": {"weight": 2.0, "min_balance": 10000, "max_consumption": 0.9},
+            "high": {"weight": 1.5, "min_balance": 5000, "max_consumption": 0.7},
+            "normal": {"weight": 1.0, "min_balance": 2000, "max_consumption": 0.5},
+            "low": {"weight": 0.7, "min_balance": 1000, "max_consumption": 0.3},
+            "background": {"weight": 0.4, "min_balance": 500, "max_consumption": 0.1},
         })
-        default_priority: str = 'normal'
+        default_priority: str = "normal"
         ml_lookback: int = 50
         ml_model_path: str = "./models/atp_demand_model.joblib"
-        ml_retrain_interval: int = 3600
         ml_min_samples: int = 100
         forecast_history_window: int = 50
         forecast_horizon: int = 20
@@ -677,10 +805,7 @@ else:
         forecast_beta: float = 0.1
         load_balance_history_size: int = 100
         load_balance_weights: Dict[str, float] = field(default_factory=lambda: {
-            'health': 0.3,
-            'efficiency': 0.3,
-            'quantum': 0.2,
-            'performance': 0.2
+            "health": 0.3, "efficiency": 0.3, "quantum": 0.2, "performance": 0.2,
         })
         adaptive_priority_enabled: bool = True
         adaptive_priority_learning_rate: float = 0.1
@@ -695,32 +820,29 @@ else:
         enable_ml_prediction: bool = True
         enable_prometheus: bool = False
         degradation_tier_update_interval: int = 600
-        efficiency_thresholds: Dict[int, float] = field(default_factory=lambda: {5: 0.9, 4: 0.8, 3: 0.7, 2: 0.6, 1: 0.0})
+        efficiency_thresholds: Dict[int, float] = field(default_factory=lambda: {
+            5: 0.9, 4: 0.8, 3: 0.7, 2: 0.6, 1: 0.0,
+        })
         shutdown_timeout_seconds: int = 30
         circuit_breaker_db_path: str = "./circuit_breakers.db"
         mopd: MOPDConfig = field(default_factory=MOPDConfig)
-        # New config for enhancements
-        enable_causal_rl: bool = True
-        enable_federated_learning: bool = True
+
+        enable_causal_rl: bool = False
+        enable_federated_learning: bool = False
         enable_safety_monitor: bool = True
         enable_xai: bool = True
-        enable_precision_switching: bool = True
+        enable_precision_switching: bool = False
         enable_carbon_market: bool = False
         carbon_market_config: Optional[Dict[str, str]] = None
         enable_chaos: bool = False
         chaos_probability: float = 0.0
-        enable_human_approval: bool = True
+        enable_human_approval: bool = False
+        dev_auto_approve: bool = False
 
-    @dataclass
-    class DemandPriorityConfig:
-        priority_level: str
-        weight: float
-        min_balance: float
-        max_consumption: float
 
-# ============================================================================
-# Enums and Data Classes (unchanged)
-# ============================================================================
+# =============================================================================
+# SECTION 5. ENUMS AND DATACLASSES
+# =============================================================================
 class SynthaseMode(Enum):
     SYNTHESIS = "synthesis"
     HYDROLYSIS = "hydrolysis"
@@ -728,6 +850,7 @@ class SynthaseMode(Enum):
     INHIBITED = "inhibited"
     UNCOUPLED = "uncoupled"
     QUANTUM_ENHANCED = "quantum_enhanced"
+
 
 class SynthaseState(Enum):
     ACTIVE = "active"
@@ -737,9 +860,9 @@ class SynthaseState(Enum):
     DORMANT = "dormant"
     QUANTUM_READY = "quantum_ready"
 
+
 @dataclass
 class SynthaseConfig:
-    # same as original
     protons_per_rotation: int = 12
     atp_per_rotation: int = 3
     max_rotation_speed_rpm: float = 6000
@@ -760,6 +883,7 @@ class SynthaseConfig:
     quantum_tunneling_threshold: float = 0.7
     quantum_coherence_time: float = 10.0
 
+
 @dataclass
 class ScheduledTask:
     task_id: str
@@ -773,19 +897,6 @@ class ScheduledTask:
     status: str = "pending"
     user_priority: Optional[str] = None
 
-@dataclass
-class ProductionRecord:
-    timestamp: datetime
-    mode: str
-    driving_force: float
-    rotation_speed: float
-    atp_produced: float
-    efficiency: float
-    demand_level: float
-    inhibition_level: float
-    degradation_tier: int
-    quantum_enhancement: float = 0.0
-    quantum_efficiency: float = 0.0
 
 @dataclass
 class DemandPriority:
@@ -793,6 +904,7 @@ class DemandPriority:
     weight: float
     min_balance: float
     max_consumption: float
+
 
 @dataclass
 class MOPDPoint:
@@ -805,23 +917,30 @@ class MOPDPoint:
     token_balance: float
     scalarised_score: float = 0.0
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data):
+    def from_dict(cls, data: Dict[str, Any]) -> "MOPDPoint":
         return cls(**data)
 
-# ============================================================================
-# TaskManager (safe) - unchanged
-# ============================================================================
+
+# =============================================================================
+# SECTION 6. TASK MANAGER (STABLE) — with drain support
+# =============================================================================
 class TaskManager:
+    """
+    Manages background tasks. P0 fix: supports graceful drain.
+    Also tracks fire-and-forget tasks so they can be awaited on shutdown.
+    """
+
     def __init__(self):
         self.tasks: Dict[str, asyncio.Task] = {}
+        self.ephemeral: set = set()
         self.shutdown_event = asyncio.Event()
         self._lock = asyncio.Lock()
 
-    def start_task(self, name, coro_func, *args, **kwargs):
+    def start_task(self, name: str, coro_func: Callable, *args, **kwargs) -> Optional[asyncio.Task]:
         async def wrapper():
             backoff = 1
             max_backoff = 300
@@ -834,30 +953,52 @@ class TaskManager:
                     logger.error("Task crashed", name=name, error=str(e), exc_info=True)
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, max_backoff)
+
         try:
             loop = asyncio.get_running_loop()
-            task = loop.create_task(wrapper(), name=name)
         except RuntimeError:
-            logger.warning(f"No running event loop; task '{name}' not started.")
+            logger.warning("No running event loop; task not started", name=name)
             return None
-        async with self._lock:
-            self.tasks[name] = task
+        task = loop.create_task(wrapper(), name=name)
+        self.tasks[name] = task
         return task
 
-    async def stop_all(self):
-        self.shutdown_event.set()
-        async with self._lock:
-            for task in self.tasks.values():
-                task.cancel()
-            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
-            self.tasks.clear()
-        logger.info("All background tasks stopped")
+    def spawn_ephemeral(self, coro) -> Optional[asyncio.Task]:
+        """Track fire-and-forget tasks so shutdown can await them."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(coro)
+        self.ephemeral.add(task)
+        task.add_done_callback(self.ephemeral.discard)
+        return task
 
-# ============================================================================
-# Enhanced ATP Synthase (mostly unchanged)
-# ============================================================================
+    async def drain(self, timeout: float) -> None:
+        """Await all background work, then cancel stragglers."""
+        self.shutdown_event.set()
+        all_tasks: List[asyncio.Task] = list(self.tasks.values()) + list(self.ephemeral)
+        if not all_tasks:
+            return
+        done, pending = await asyncio.wait(all_tasks, timeout=timeout)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self.tasks.clear()
+        self.ephemeral.clear()
+        logger.info("TaskManager drained", completed=len(done), cancelled=len(pending))
+
+
+# =============================================================================
+# SECTION 7. ENHANCED ATP SYNTHASE (STABLE)
+# =============================================================================
 class EnhancedATPSynthase:
-    # ... (same as original, with minor fixes for timezone)
+    """
+    Core synthase model. All public methods that touch locks or services are
+    async. Sync helpers (`get_status`) are pure reads.
+    """
+
     def __init__(self, synthase_id: str, config: SynthaseConfig):
         self.synthase_id = synthase_id
         self.config = config
@@ -867,7 +1008,7 @@ class EnhancedATPSynthase:
         self.current_efficiency = config.base_efficiency
         self.total_atp_produced = 0.0
         self.total_atp_hydrolyzed = 0.0
-        self.production_history = deque(maxlen=1000)
+        self.production_history: deque = deque(maxlen=1000)
         self.inhibition_level = 0.0
         self.operational_hours = 0.0
         self.degradation_rate = 0.0001
@@ -875,45 +1016,52 @@ class EnhancedATPSynthase:
         self.quantum_coherence = 1.0
         self.quantum_enhancement_factor = 0.0
         self.quantum_active = False
-        # Add lock for thread safety
         self._lock = asyncio.Lock()
 
-    async def calculate_driving_force(self, gradient_service=None):
+    async def calculate_driving_force(self, gradient_service: Optional[Any] = None) -> float:
         if gradient_service is None:
             return 0.0
         strengths = gradient_service.get_field_strengths()
-        force = 0.0
-        weights = {'carbon': 0.25, 'helium': 0.15, 'trust': 0.20,
-                   'opportunity': 0.25, 'eco_atp_reserve': 0.15}
-        for field, weight in weights.items():
-            force += strengths.get(field, 0.0) * weight
-        return force
+        weights = {
+            "carbon": 0.25, "helium": 0.15, "trust": 0.20,
+            "opportunity": 0.25, "eco_atp_reserve": 0.15,
+        }
+        return sum(strengths.get(f, 0.0) * w for f, w in weights.items())
 
-    async def calculate_rotation_speed(self, driving_force):
+    async def calculate_rotation_speed(self, driving_force: float) -> float:
         if driving_force < self.config.activation_gradient:
             return 0.0
         speed = driving_force * self.config.max_rotation_speed_rpm
         return min(speed, self.config.max_rotation_speed_rpm)
 
-    async def calculate_atp_production_rate(self, rotation_speed):
+    async def calculate_atp_production_rate(self, rotation_speed: float) -> float:
         if rotation_speed == 0:
             return 0.0
         rps = rotation_speed / 60.0
-        atp_per_rotation = self.config.atp_per_rotation
         efficiency = self.current_efficiency * (1 - self.inhibition_level)
-        return rps * atp_per_rotation * efficiency
+        return rps * self.config.atp_per_rotation * efficiency
 
-    async def update_allosteric_inhibition(self, atp_balance):
-        if atp_balance > 20000:
-            self.inhibition_level = min(self.config.atp_inhibition_max,
-                                        self.inhibition_level + self.config.atp_inhibition_constant)
-        elif atp_balance < 5000:
-            self.inhibition_level = max(0.0, self.inhibition_level - 0.01)
-        else:
-            self.inhibition_level *= 0.99
-        self.inhibition_level = max(0.0, min(self.config.atp_inhibition_max, self.inhibition_level))
+    async def update_allosteric_inhibition(self, atp_balance: float) -> None:
+        async with self._lock:
+            if atp_balance > 20000:
+                self.inhibition_level = min(
+                    self.config.atp_inhibition_max,
+                    self.inhibition_level + self.config.atp_inhibition_constant,
+                )
+            elif atp_balance < 5000:
+                self.inhibition_level = max(0.0, self.inhibition_level - 0.01)
+            else:
+                self.inhibition_level *= 0.99
+            self.inhibition_level = max(
+                0.0, min(self.config.atp_inhibition_max, self.inhibition_level)
+            )
 
-    async def operate_forward(self, gradient_service, token_service, account_id):
+    async def operate_forward(
+        self,
+        gradient_service: Optional[Any],
+        token_service: Optional[Any],
+        account_id: str,
+    ) -> float:
         async with self._lock:
             if self.state == SynthaseState.DORMANT:
                 return 0.0
@@ -926,7 +1074,7 @@ class EnhancedATPSynthase:
             if self.config.quantum_tunneling_enabled and self.quantum_active:
                 speed *= (1 + self.quantum_enhancement_factor * self.config.quantum_efficiency_boost)
             atp_rate = await self.calculate_atp_production_rate(speed)
-            atp_produced = atp_rate * 0.1  # synthesis_interval
+            atp_produced = atp_rate * 0.1
             self.total_atp_produced += atp_produced
             self.production_history.append(atp_produced)
             if self.quantum_active:
@@ -942,11 +1090,17 @@ class EnhancedATPSynthase:
                     account_id=account_id,
                     source=EcoATPSource.GRADIENT_CONVERSION,
                     energy_saved_kwh=atp_produced / 10000.0,
-                    efficiency=self.current_efficiency * (1 - self.inhibition_level)
+                    efficiency=self.current_efficiency * (1 - self.inhibition_level),
                 )
             return atp_produced
 
-    async def operate_reverse(self, gradient_service, token_service, account_id, amount):
+    async def operate_reverse(
+        self,
+        gradient_service: Optional[Any],
+        token_service: Optional[Any],
+        account_id: str,
+        amount: float,
+    ) -> float:
         async with self._lock:
             if self.state == SynthaseState.DORMANT:
                 return 0.0
@@ -958,189 +1112,193 @@ class EnhancedATPSynthase:
                 gradient_service.pump_field("helium", atp_hydrolyzed * 0.01, "reverse_operation")
             return atp_hydrolyzed
 
-    async def operate_uncoupled(self, gradient_service):
+    async def operate_uncoupled(self, gradient_service: Optional[Any]) -> None:
         async with self._lock:
             self.mode = SynthaseMode.UNCOUPLED
             self.rotation_speed = self.config.max_rotation_speed_rpm * 0.9
             if gradient_service:
-                strengths = gradient_service.get_field_strengths()
-                for field_id, strength in strengths.items():
+                for field_id, strength in gradient_service.get_field_strengths().items():
                     if strength > self.config.uncoupling_activation_threshold:
                         gradient_service.discharge_field(field_id, strength * 0.1)
 
-    async def repair(self):
+    async def repair(self) -> None:
         async with self._lock:
             self.state = SynthaseState.REPAIRING
             self.degradation_rate = max(0.0001, self.degradation_rate * 0.9)
-            self.current_efficiency = min(self.config.base_efficiency,
-                                          self.current_efficiency + self.repair_rate)
+            self.current_efficiency = min(
+                self.config.base_efficiency, self.current_efficiency + self.repair_rate
+            )
             self.state = SynthaseState.ACTIVE
-            logger.info(f"Synthase {self.synthase_id} repaired")
+            logger.info("Synthase repaired", id=self.synthase_id)
 
-    def get_status(self):
+    def get_status(self) -> Dict[str, Any]:
         return {
-            'id': self.synthase_id,
-            'mode': self.mode.value,
-            'state': self.state.value,
-            'rotation_speed': self.rotation_speed,
-            'efficiency': self.current_efficiency,
-            'inhibition_level': self.inhibition_level,
-            'total_atp_produced': self.total_atp_produced,
-            'total_atp_hydrolyzed': self.total_atp_hydrolyzed,
-            'quantum_active': self.quantum_active,
-            'quantum_enhancement': self.quantum_enhancement_factor,
-            'operational_hours': self.operational_hours,
-            'degradation_rate': self.degradation_rate
+            "id": self.synthase_id,
+            "mode": self.mode.value,
+            "state": self.state.value,
+            "rotation_speed": self.rotation_speed,
+            "efficiency": self.current_efficiency,
+            "inhibition_level": self.inhibition_level,
+            "total_atp_produced": self.total_atp_produced,
+            "total_atp_hydrolyzed": self.total_atp_hydrolyzed,
+            "quantum_active": self.quantum_active,
+            "quantum_enhancement": self.quantum_enhancement_factor,
+            "operational_hours": self.operational_hours,
+            "degradation_rate": self.degradation_rate,
         }
 
-# ============================================================================
-# Demand Priority Manager (unchanged)
-# ============================================================================
+
+# =============================================================================
+# SECTION 8. DEMAND PRIORITY MANAGER (STABLE)
+# =============================================================================
 class DemandPriorityManager:
-    # ... same as original, but using timezone-aware datetime
     def __init__(self, config: SynthaseSchedulerConfig):
         self.config = config
-        self.priorities = {}
+        self.priorities: Dict[str, DemandPriority] = {}
         for level, params in config.priority_defaults.items():
             self.priorities[level] = DemandPriority(
                 priority_level=level,
-                weight=params['weight'],
-                min_balance=params['min_balance'],
-                max_consumption=params['max_consumption']
+                weight=params["weight"],
+                min_balance=params["min_balance"],
+                max_consumption=params["max_consumption"],
             )
         self.default_priority = config.default_priority
         self._lock = asyncio.Lock()
-        self.performance_history = defaultdict(lambda: deque(maxlen=config.priority_performance_window))
+        self.performance_history: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=config.priority_performance_window)
+        )
 
-    async def set_priority_config(self, priority_level, weight, min_balance, max_consumption):
+    async def set_priority_config(
+        self, priority_level: str, weight: float,
+        min_balance: float, max_consumption: float,
+    ) -> None:
         async with self._lock:
             if priority_level not in self.priorities:
                 self.priorities[priority_level] = DemandPriority(
                     priority_level, weight, min_balance, max_consumption
                 )
             else:
-                self.priorities[priority_level].weight = weight
-                self.priorities[priority_level].min_balance = min_balance
-                self.priorities[priority_level].max_consumption = max_consumption
-            logger.info("Priority configured", level=priority_level, weight=weight)
+                p = self.priorities[priority_level]
+                p.weight = weight
+                p.min_balance = min_balance
+                p.max_consumption = max_consumption
 
-    def get_priority_weight(self, priority_level):
-        return self.priorities.get(priority_level, self.priorities[self.default_priority]).weight
+    def get_priority_weight(self, priority_level: str) -> float:
+        return self.priorities.get(
+            priority_level, self.priorities[self.default_priority]
+        ).weight
 
-    def get_task_priority(self, task):
-        base_weight = self.get_priority_weight(task.user_priority or self.default_priority)
+    def get_task_priority(self, task: ScheduledTask) -> float:
+        base = self.get_priority_weight(task.user_priority or self.default_priority)
         if task.deadline:
-            time_remaining = (task.deadline - datetime.now(timezone.utc)).total_seconds()
-            if time_remaining < 300:
-                base_weight *= 1.5
-            elif time_remaining < 3600:
-                base_weight *= 1.2
-        return base_weight * (task.priority + 1)
+            remaining = (task.deadline - datetime.now(timezone.utc)).total_seconds()
+            if remaining < 300:
+                base *= 1.5
+            elif remaining < 3600:
+                base *= 1.2
+        return base * (task.priority + 1)
 
-    async def adapt_weights(self):
+    async def adapt_weights(self) -> None:
         if not self.config.adaptive_priority_enabled:
             return
         async with self._lock:
             for level, hist in self.performance_history.items():
                 if len(hist) >= self.config.priority_performance_window:
-                    avg_perf = np.mean(hist)
-                    if avg_perf > 0.8:
+                    avg = float(np.mean(hist))
+                    if avg > 0.8:
                         delta = self.config.adaptive_priority_learning_rate
-                    elif avg_perf < 0.5:
+                    elif avg < 0.5:
                         delta = -self.config.adaptive_priority_learning_rate
                     else:
                         delta = 0.0
-                    self.priorities[level].weight += delta
-                    self.priorities[level].weight = max(0.1, min(5.0, self.priorities[level].weight))
+                    p = self.priorities[level]
+                    p.weight = max(0.1, min(5.0, p.weight + delta))
 
-    async def record_performance(self, priority_level, success, latency):
+    async def record_performance(self, priority_level: str, success: bool, latency: float) -> None:
         async with self._lock:
             if priority_level in self.priorities:
                 self.performance_history[priority_level].append(1.0 if success else 0.0)
 
-# ============================================================================
-# Synthase Load Balancer (unchanged)
-# ============================================================================
+
+# =============================================================================
+# SECTION 9. LOAD BALANCER (STABLE)
+# =============================================================================
 class SynthaseLoadBalancer:
-    # ... same as original
     def __init__(self, config: SynthaseSchedulerConfig):
         self.config = config
-        self.historical_loads = {}
-        self.efficiency_scores = {}
-        self.performance_history = {}
+        self.historical_loads: Dict[str, List[float]] = {}
+        self.performance_history: Dict[str, deque] = {}
         self._lock = asyncio.Lock()
 
-    async def assign_load(self, synthases, total_demand):
+    async def assign_load(
+        self, synthases: Dict[str, EnhancedATPSynthase], total_demand: float
+    ) -> Dict[str, float]:
         async with self._lock:
             if not synthases:
                 return {}
-            scores = {}
-            total_score = 0.0
             weights = self.config.load_balance_weights
-            for sid, synthase in synthases.items():
-                if synthase.state == SynthaseState.ACTIVE:
-                    health_score = 1.0
-                elif synthase.state == SynthaseState.QUANTUM_READY:
-                    health_score = 1.2
-                elif synthase.state == SynthaseState.DEGRADED:
-                    health_score = 0.6
-                elif synthase.state == SynthaseState.REPAIRING:
-                    health_score = 0.3
+            scores: Dict[str, float] = {}
+            total = 0.0
+            for sid, s in synthases.items():
+                if s.state == SynthaseState.ACTIVE:
+                    health = 1.0
+                elif s.state == SynthaseState.QUANTUM_READY:
+                    health = 1.2
+                elif s.state == SynthaseState.DEGRADED:
+                    health = 0.6
+                elif s.state == SynthaseState.REPAIRING:
+                    health = 0.3
                 else:
-                    health_score = 0.5
-                efficiency_score = synthase.current_efficiency
-                quantum_bonus = 1.0 + synthase.quantum_enhancement_factor * 0.5
+                    health = 0.5
+                efficiency = s.current_efficiency
+                quantum_bonus = 1.0 + s.quantum_enhancement_factor * 0.5
                 hist = self.performance_history.get(sid, deque(maxlen=10))
-                if hist:
-                    avg_perf = sum(hist) / len(hist)
-                else:
-                    avg_perf = 0.5
-                performance_factor = 0.5 + avg_perf
-                score = (health_score * weights.get('health', 0.3) +
-                         efficiency_score * weights.get('efficiency', 0.3) +
-                         quantum_bonus * weights.get('quantum', 0.2) +
-                         performance_factor * weights.get('performance', 0.2))
-                if sid not in self.historical_loads:
-                    self.historical_loads[sid] = []
-                self.historical_loads[sid].append(score)
-                if len(self.historical_loads[sid]) > self.config.load_balance_history_size:
-                    self.historical_loads[sid] = self.historical_loads[sid][-self.config.load_balance_history_size:]
+                perf = sum(hist) / len(hist) if hist else 0.5
+                perf_factor = 0.5 + perf
+                score = (
+                    health * weights.get("health", 0.3)
+                    + efficiency * weights.get("efficiency", 0.3)
+                    + quantum_bonus * weights.get("quantum", 0.2)
+                    + perf_factor * weights.get("performance", 0.2)
+                )
+                self.historical_loads.setdefault(sid, []).append(score)
+                self.historical_loads[sid] = self.historical_loads[sid][
+                    -self.config.load_balance_history_size:
+                ]
                 scores[sid] = score
-                total_score += score
-            if total_score == 0:
+                total += score
+            if total == 0:
                 return {sid: total_demand / len(synthases) for sid in synthases}
-            assignments = {}
-            for sid, score in scores.items():
-                assignments[sid] = (score / total_score) * total_demand
-            return assignments
+            return {sid: (sc / total) * total_demand for sid, sc in scores.items()}
 
-    async def record_performance(self, synthase_id, load):
-        if synthase_id not in self.performance_history:
-            self.performance_history[synthase_id] = deque(maxlen=10)
-        self.performance_history[synthase_id].append(load)
+    async def record_performance(self, synthase_id: str, load: float) -> None:
+        async with self._lock:
+            self.performance_history.setdefault(synthase_id, deque(maxlen=10)).append(load)
 
-    def get_load_balance_stats(self):
+    def get_load_balance_stats(self) -> Dict[str, Any]:
         return {
-            'synthases_tracked': len(self.historical_loads),
-            'average_loads': {sid: np.mean(loads) if loads else 0
-                              for sid, loads in self.historical_loads.items()}
+            "synthases_tracked": len(self.historical_loads),
+            "average_loads": {
+                sid: float(np.mean(loads)) if loads else 0.0
+                for sid, loads in self.historical_loads.items()
+            },
         }
 
-# ============================================================================
-# ML Demand Predictor (unchanged)
-# ============================================================================
+
+# =============================================================================
+# SECTION 10. ML DEMAND PREDICTOR (STABLE)
+# =============================================================================
 class MLDemandPredictor:
-    # ... same as original, but using asyncio.to_thread for file I/O
     def __init__(self, config: SynthaseSchedulerConfig):
         self.config = config
         self.model = None
         self.scaler = None
         self.is_trained = False
-        self.training_data = []
+        self.training_data: List[float] = []
         self._lock = asyncio.Lock()
         self._load_model()
 
-    def _load_model(self):
+    def _load_model(self) -> None:
         if not SKLEARN_AVAILABLE:
             return
         path = self.config.ml_model_path
@@ -1152,167 +1310,150 @@ class MLDemandPredictor:
             except Exception as e:
                 logger.warning("Failed to load ML model", error=str(e))
 
-    def _save_model(self):
+    def _save_model(self) -> None:
         if not SKLEARN_AVAILABLE or not self.is_trained:
             return
-        path = self.config.ml_model_path
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            joblib.dump((self.model, self.scaler), path)
-            logger.info("Saved ML model", path=path)
+            os.makedirs(os.path.dirname(self.config.ml_model_path), exist_ok=True)
+            joblib.dump((self.model, self.scaler), self.config.ml_model_path)
         except Exception as e:
             logger.error("Failed to save ML model", error=str(e))
 
-    async def train(self, demand_history):
+    async def train(self, history: List[float]) -> Dict[str, Any]:
         if not SKLEARN_AVAILABLE:
-            return {'status': 'sklearn_not_available'}
-        if len(demand_history) < self.config.ml_min_samples:
-            return {'status': 'insufficient_data'}
-        # Run in executor to avoid blocking
+            return {"status": "sklearn_unavailable"}
+        if len(history) < self.config.ml_min_samples:
+            return {"status": "insufficient_data"}
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, self._train_sync, demand_history)
-        return result
+        return await loop.run_in_executor(None, self._train_sync, history)
 
-    def _train_sync(self, demand_history):
-        X = []
-        y = []
-        for i in range(self.config.ml_lookback, len(demand_history) - 1):
-            X.append(demand_history[i - self.config.ml_lookback:i])
-            y.append(demand_history[i + 1])
+    def _train_sync(self, history: List[float]) -> Dict[str, Any]:
+        X, y = [], []
+        for i in range(self.config.ml_lookback, len(history) - 1):
+            X.append(history[i - self.config.ml_lookback:i])
+            y.append(history[i + 1])
         X = np.array(X)
         y = np.array(y)
         if len(X) < self.config.ml_min_samples:
-            return {'status': 'insufficient_samples'}
+            return {"status": "insufficient_samples"}
         if self.scaler is None:
             self.scaler = StandardScaler()
         X_scaled = self.scaler.fit_transform(X)
         self.model = RandomForestRegressor(n_estimators=100, random_state=42)
         self.model.fit(X_scaled, y)
         self.is_trained = True
-        self.training_data = demand_history
+        self.training_data = list(history)
         self._save_model()
-        return {'status': 'success', 'samples': len(X)}
+        return {"status": "success", "samples": len(X)}
 
-    async def predict(self, recent_demand):
-        if not self.is_trained or len(recent_demand) < self.config.ml_lookback:
-            return {'prediction': None, 'confidence': 0.0}
-        # Run in executor to avoid blocking
+    async def predict(self, recent: List[float]) -> Dict[str, Any]:
+        if not self.is_trained or len(recent) < self.config.ml_lookback:
+            return {"prediction": None, "confidence": 0.0}
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, self._predict_sync, recent_demand)
-        return result
+        return await loop.run_in_executor(None, self._predict_sync, recent)
 
-    def _predict_sync(self, recent_demand):
-        features = recent_demand[-self.config.ml_lookback:]
-        features_scaled = self.scaler.transform([features])
-        prediction = self.model.predict(features_scaled)[0]
-        volatility = np.std(recent_demand[-20:]) if len(recent_demand) >= 20 else 0.2
+    def _predict_sync(self, recent: List[float]) -> Dict[str, Any]:
+        features = recent[-self.config.ml_lookback:]
+        scaled = self.scaler.transform([features])
+        prediction = float(self.model.predict(scaled)[0])
+        volatility = float(np.std(recent[-20:])) if len(recent) >= 20 else 0.2
         confidence = max(0.1, 1.0 - volatility)
-        return {'prediction': max(0.0, min(1.0, prediction)), 'confidence': confidence}
-
-    def get_model_stats(self):
         return {
-            'is_trained': self.is_trained,
-            'training_samples': len(self.training_data) if self.training_data else 0,
-            'model_type': type(self.model).__name__ if self.model else None,
-            'scaler': type(self.scaler).__name__ if self.scaler else None,
-            'lookback': self.config.ml_lookback
+            "prediction": max(0.0, min(1.0, prediction)),
+            "confidence": confidence,
         }
 
-# ============================================================================
-# Gradient Forecaster (unchanged)
-# ============================================================================
+    def get_model_stats(self) -> Dict[str, Any]:
+        return {
+            "is_trained": self.is_trained,
+            "training_samples": len(self.training_data),
+            "model_type": type(self.model).__name__ if self.model else None,
+            "lookback": self.config.ml_lookback,
+        }
+
+
+# =============================================================================
+# SECTION 11. GRADIENT FORECASTER (STABLE)
+# =============================================================================
 class GradientForecaster:
-    # ... same as original, but using timezone-aware datetime
     def __init__(self, config: SynthaseSchedulerConfig):
         self.config = config
-        self.gradient_history = {}
-        self.forecast_results = {}
+        self.gradient_history: Dict[str, List[float]] = {}
+        self.forecast_results: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
-        self.level = {}
-        self.trend = {}
-        self.last_update = {}
+        self.level: Dict[str, float] = {}
+        self.trend: Dict[str, float] = {}
 
-    def record_gradient(self, field_id, value):
+    def record_gradient(self, field_id: str, value: float) -> None:
         if field_id not in self.gradient_history:
             self.gradient_history[field_id] = []
             self.level[field_id] = value
             self.trend[field_id] = 0.0
         self.gradient_history[field_id].append(value)
-        if len(self.gradient_history[field_id]) > self.config.forecast_history_window * 2:
-            self.gradient_history[field_id] = self.gradient_history[field_id][-self.config.forecast_history_window*2:]
+        max_len = self.config.forecast_history_window * 2
+        if len(self.gradient_history[field_id]) > max_len:
+            self.gradient_history[field_id] = self.gradient_history[field_id][-max_len:]
         if len(self.gradient_history[field_id]) >= 2:
-            alpha = self.config.forecast_alpha
-            beta = self.config.forecast_beta
+            a, b = self.config.forecast_alpha, self.config.forecast_beta
             last_level = self.level.get(field_id, value)
             last_trend = self.trend.get(field_id, 0.0)
-            self.level[field_id] = alpha * value + (1 - alpha) * (last_level + last_trend)
-            self.trend[field_id] = beta * (self.level[field_id] - last_level) + (1 - beta) * last_trend
-            self.last_update[field_id] = datetime.now(timezone.utc)
+            self.level[field_id] = a * value + (1 - a) * (last_level + last_trend)
+            self.trend[field_id] = (
+                b * (self.level[field_id] - last_level) + (1 - b) * last_trend
+            )
 
-    async def forecast(self, field_id):
+    async def forecast(self, field_id: str) -> Dict[str, Any]:
         if field_id not in self.gradient_history or len(self.gradient_history[field_id]) < 20:
-            return {'status': 'insufficient_data'}
+            return {"status": "insufficient_data"}
         async with self._lock:
             current_level = self.level.get(field_id, 0.5)
             current_trend = self.trend.get(field_id, 0.0)
-            forecast_values = []
-            for i in range(self.config.forecast_horizon):
-                next_value = current_level + current_trend * (i + 1)
-                forecast_values.append(max(0.0, min(1.0, next_value)))
-            volatility = np.std(self.gradient_history[field_id][-20:]) if len(self.gradient_history[field_id]) >= 20 else 0.2
+            forecast_values = [
+                max(0.0, min(1.0, current_level + current_trend * (i + 1)))
+                for i in range(self.config.forecast_horizon)
+            ]
+            volatility = float(np.std(self.gradient_history[field_id][-20:]))
             confidence = max(0.1, 1.0 - volatility * 2)
             result = {
-                'field': field_id,
-                'current': self.gradient_history[field_id][-1],
-                'forecast': forecast_values,
-                'trend': 'increasing' if current_trend > 0.01 else 'decreasing' if current_trend < -0.01 else 'stable',
-                'slope': current_trend,
-                'confidence': confidence
+                "field": field_id,
+                "current": self.gradient_history[field_id][-1],
+                "forecast": forecast_values,
+                "trend": (
+                    "increasing" if current_trend > 0.01
+                    else "decreasing" if current_trend < -0.01
+                    else "stable"
+                ),
+                "slope": current_trend,
+                "confidence": confidence,
             }
             self.forecast_results[field_id] = result
             return result
 
-# ============================================================================
-# Main Scheduler (Enhanced with new modules)
-# ============================================================================
+
+# =============================================================================
+# SECTION 12. MAIN SCHEDULER (STABLE)
+# =============================================================================
 class ATPSynthaseScheduler:
+    """
+    Main scheduler. All public methods are async when they touch I/O or locks.
+    """
+
     def __init__(
         self,
-        token_service: Optional[TokenServiceProtocol] = None,
-        gradient_service: Optional[GradientServiceProtocol] = None,
-        harvester: Optional[HarvesterProtocol] = None,
+        token_service: Optional[Any] = None,
+        gradient_service: Optional[Any] = None,
+        harvester: Optional[Any] = None,
         config: Optional[Union[SynthaseSchedulerConfig, Dict[str, Any]]] = None,
-        storage: Optional[CentralStorage] = None,
-        message_queue: Optional[AsyncMessageQueue] = None,
-        adaptive_cost: Optional[AdaptiveCostFunction] = None,
-        pareto_gating: Optional[ParetoGating] = None,
-        drift_detector: Optional[DriftDetector] = None,
-        metrics: Optional[MetricsRegistry] = None,
-        # New optional injected components (for testing)
-        rl_agent: Optional[CausalRLAgent] = None,
-        federated_coordinator: Optional[FederatedCoordinator] = None,
-        safety_monitor: Optional[SafetyMonitor] = None,
-        precision_controller: Optional[PrecisionController] = None,
-        carbon_market_client: Optional[CarbonMarketClient] = None,
-        chaos_injector: Optional[ChaosInjector] = None,
-        human_approval_handler: Optional[HumanApprovalHandler] = None,
+        storage: Optional[Any] = None,
+        message_queue: Optional[Any] = None,
+        adaptive_cost: Optional[Any] = None,
+        pareto_gating: Optional[Any] = None,
+        drift_detector: Optional[Any] = None,
+        metrics: Optional[Any] = None,
     ):
         self.token_service = token_service
         self.gradient_service = gradient_service
         self.harvester = harvester
-
-        # Load config
-        if isinstance(config, dict):
-            if PYDANTIC_AVAILABLE:
-                self.config = SynthaseSchedulerConfig(**config)
-            else:
-                self.config = SynthaseSchedulerConfig(**config)
-        elif isinstance(config, SynthaseSchedulerConfig):
-            self.config = config
-        else:
-            self.config = SynthaseSchedulerConfig()
-
-        # Store central components
         self.storage = storage
         self.queue = message_queue
         self.adaptive_cost = adaptive_cost
@@ -1320,7 +1461,15 @@ class ATPSynthaseScheduler:
         self.drift_detector = drift_detector
         self.metrics = metrics
 
-        # Create synthase config from global config
+        # Config
+        if isinstance(config, dict):
+            self.config = SynthaseSchedulerConfig(**config)
+        elif isinstance(config, SynthaseSchedulerConfig):
+            self.config = config
+        else:
+            self.config = SynthaseSchedulerConfig()
+
+        # Synthases
         synthase_config = SynthaseConfig(
             protons_per_rotation=self.config.protons_per_rotation,
             atp_per_rotation=self.config.atp_per_rotation,
@@ -1340,96 +1489,134 @@ class ATPSynthaseScheduler:
             quantum_tunneling_enabled=self.config.quantum_tunneling_enabled,
             quantum_efficiency_boost=self.config.quantum_efficiency_boost,
             quantum_tunneling_threshold=self.config.quantum_tunneling_threshold,
-            quantum_coherence_time=self.config.quantum_coherence_time
+            quantum_coherence_time=self.config.quantum_coherence_time,
         )
-
-        # Primary synthase
         self.primary_synthase = EnhancedATPSynthase("primary", synthase_config)
-        self.synthases = {"primary": self.primary_synthase}
+        self.synthases: Dict[str, EnhancedATPSynthase] = {"primary": self.primary_synthase}
 
         # Sub-components
         self.priority_manager = DemandPriorityManager(self.config)
         self.load_balancer = SynthaseLoadBalancer(self.config)
-        self.ml_predictor = MLDemandPredictor(self.config) if self.config.enable_ml_prediction else None
+        self.ml_predictor = (
+            MLDemandPredictor(self.config) if self.config.enable_ml_prediction else None
+        )
         self.gradient_forecaster = GradientForecaster(self.config)
 
-        # NEW: Enhanced modules
-        # Causal RL agent
-        state_dim = 10  # we can define a feature vector later
-        action_dim = 3   # forward, reverse, uncoupled
-        self.rl_agent = rl_agent if rl_agent else CausalRLAgent(state_dim, action_dim) if self.config.enable_causal_rl else None
-
-        # Federated coordinator
-        if federated_coordinator:
-            self.federated = federated_coordinator
-        elif self.config.enable_federated_learning and message_queue:
-            self.federated = FederatedCoordinator(self, message_queue)
-        else:
-            self.federated = None
-
-        # Safety monitor
-        if safety_monitor:
-            self.safety_monitor = safety_monitor
-        elif self.config.enable_safety_monitor:
-            self.safety_monitor = SafetyMonitor()
+        # --- Advanced modules (all honest stubs by default) ---
+        self.rl_agent = (
+            CausalRLAgent(10, 3, enabled=self.config.enable_causal_rl)
+            if self.config.enable_causal_rl else None
+        )
+        self.federated = (
+            FederatedCoordinator(self, message_queue, enabled=self.config.enable_federated_learning)
+            if self.config.enable_federated_learning else None
+        )
+        self.safety_monitor: Optional[SafetyMonitor] = None
+        if self.config.enable_safety_monitor:
+            self.safety_monitor = SafetyMonitor(enabled=True)
             self._setup_safety_invariants()
-        else:
-            self.safety_monitor = None
+        self.xai = XAIExplainer(enabled=self.config.enable_xai) if self.config.enable_xai else None
+        self.precision_controller = PrecisionController(
+            enabled=self.config.enable_precision_switching
+        ) if self.config.enable_precision_switching else None
+        self.carbon_market = CarbonMarketClient(
+            enabled=self.config.enable_carbon_market,
+        ) if self.config.enable_carbon_market else None
+        self.chaos_injector = ChaosInjector(
+            self, self.config.chaos_probability, enabled=self.config.enable_chaos
+        ) if self.config.enable_chaos else None
+        self.human_approval = HumanApprovalHandler(
+            message_queue,
+            enabled=self.config.enable_human_approval,
+            auto_approve_dev=self.config.dev_auto_approve,
+        ) if self.config.enable_human_approval else None
 
-        # Precision controller
-        self.precision_controller = precision_controller if precision_controller else PrecisionController() if self.config.enable_precision_switching else None
-
-        # Carbon market client
-        if carbon_market_client:
-            self.carbon_market = carbon_market_client
-        elif self.config.enable_carbon_market and self.config.carbon_market_config:
-            self.carbon_market = CarbonMarketClient(**self.config.carbon_market_config)
-        else:
-            self.carbon_market = None
-
-        # Chaos injector
-        self.chaos_injector = chaos_injector if chaos_injector else ChaosInjector(self, self.config.chaos_probability) if self.config.enable_chaos else None
-
-        # Human approval handler
-        self.human_approval = human_approval_handler if human_approval_handler else HumanApprovalHandler(message_queue) if self.config.enable_human_approval else None
-
-        # Queues
-        self.execution_queue = []
-        self.priority_queue = []
-
-        # State
+        # --- Queues and state ---
+        self.execution_queue: List[ScheduledTask] = []
+        self.priority_queue: List[ScheduledTask] = []
         self.total_eco_atp_produced = 0.0
-        self.generation_history = deque(maxlen=1000)
-        self.demand_history = deque(maxlen=500)
+        self.demand_history: deque = deque(maxlen=500)
         self.predicted_demand = 0.0
         self.current_tier = 5
         self.account_id = "atp_synthase"
         if token_service:
             token_service.create_account(self.account_id)
 
-        # MOPD state
-        self._pareto_front = []
-        self._mopd_results = {}
+        # MOPD
+        self._pareto_front: List[MOPDPoint] = []
+        self._mopd_results: Dict[str, Any] = {}
 
-        # Locks
+        # Locks — all asyncio, all created inside __init__ but used from the running loop.
+        # (asyncio.Lock is loop-agnostic in 3.10+; safe to construct here.)
         self._queue_lock = asyncio.Lock()
         self._synthase_lock = asyncio.Lock()
-        self._demand_lock = asyncio.Lock()
         self._state_lock = asyncio.Lock()
-        self._mopd_lock = asyncio.Lock()
 
         # Circuit breakers
         self._token_circuit = CircuitBreaker(
             "token_service", db_path=self.config.circuit_breaker_db_path,
-            failure_threshold=3, recovery_timeout=30
+            failure_threshold=3, recovery_timeout=30,
         )
         self._gradient_circuit = CircuitBreaker(
             "gradient_service", db_path=self.config.circuit_breaker_db_path,
-            failure_threshold=3, recovery_timeout=30
+            failure_threshold=3, recovery_timeout=30,
         )
 
-        # Task manager
+        # Prometheus
+        self.prometheus_metrics = self._setup_metrics() if self.metrics is None else {}
+
+        # Task manager starts AFTER everything is set up
         self._task_manager = TaskManager()
+        self._start_background_tasks()
+
+        logger.info(
+            "ATPSynthaseScheduler v11.0.0 initialized",
+            central_storage=storage is not None,
+            rl_agent=self.rl_agent is not None,
+            federated=self.federated is not None,
+            safety_monitor=self.safety_monitor is not None,
+            xai=self.xai is not None,
+            carbon_market=self.carbon_market is not None,
+            chaos=self.chaos_injector is not None,
+            human_approval=self.human_approval is not None,
+        )
+
+    # ------------------------------------------------------------------ setup
+    def _setup_safety_invariants(self) -> None:
+        """Real invariants. No placeholder values."""
+        assert self.safety_monitor is not None
+        self.safety_monitor.add_invariant(
+            "queue_size",
+            lambda s: s.get("queue_size", 0) <= 100,
+            "Execution queue too large",
+        )
+        self.safety_monitor.add_invariant(
+            "synthase_count",
+            lambda s: s.get("synthase_count", 1) <= 10,
+            "Too many synthases",
+        )
+        self.safety_monitor.add_invariant(
+            "token_balance_non_negative",
+            lambda s: s.get("token_balance", 0.0) >= 0.0,
+            "Token balance negative",
+        )
+
+    def _setup_metrics(self) -> Dict[str, Any]:
+        if not self.config.enable_prometheus or not PROMETHEUS_AVAILABLE:
+            return {}
+        return {
+            "total_produced": Counter("atp_total_produced", "Total Eco-ATP produced"),
+            "production_rate": Gauge("atp_production_rate", "Current production rate"),
+            "demand_level": Gauge("atp_demand_level", "Current demand level"),
+            "efficiency": Gauge("atp_efficiency", "Current efficiency"),
+            "synthase_count": Gauge("atp_synthase_count", "Number of synthases"),
+            "queue_size": Gauge("atp_queue_size", "Execution queue size"),
+            "priority_queue_size": Gauge("atp_priority_queue_size", "Priority queue size"),
+            "degradation_tier": Gauge("atp_degradation_tier", "Current degradation tier"),
+            "inhibition_level": Gauge("atp_inhibition_level", "Current inhibition level"),
+        }
+
+    def _start_background_tasks(self) -> None:
         self._task_manager.start_task("synthesis", self._synthesis_loop)
         self._task_manager.start_task("regulation", self._regulation_loop)
         self._task_manager.start_task("maintenance", self._maintenance_loop)
@@ -1437,768 +1624,593 @@ class ATPSynthaseScheduler:
         self._task_manager.start_task("gradient_forecast", self._gradient_forecast_loop)
         self._task_manager.start_task("degradation_update", self._degradation_update_loop)
         self._task_manager.start_task("priority_adapt", self._priority_adapt_loop)
-        # New background tasks
-        if self.federated:
-            self._task_manager.start_task("federated_update", self._federated_loop)
-        if self.chaos_injector:
-            self._task_manager.start_task("chaos", self._chaos_loop)
 
-        # Prometheus metrics
-        if self.metrics is None:
-            self.prometheus_metrics = self._setup_metrics()
-        else:
-            self.prometheus_metrics = {}
-
-        # Load MOPD state if storage available
-        if self.storage:
-            self._load_mopd_state()
-
-        logger.info("ATP Synthase Scheduler v10.0.0 initialized",
-                    central_storage=storage is not None,
-                    central_queue=message_queue is not None,
-                    causal_rl=self.rl_agent is not None,
-                    federated=self.federated is not None,
-                    safety_monitor=self.safety_monitor is not None,
-                    precision_controller=self.precision_controller is not None,
-                    carbon_market=self.carbon_market is not None,
-                    chaos=self.chaos_injector is not None,
-                    human_approval=self.human_approval is not None)
-
-    def _setup_safety_invariants(self):
-        """Define safety properties to monitor."""
-        self.safety_monitor.add_invariant(
-            "collateral_ratio",
-            lambda s: s.get('collateral_ratio', 1.0) >= 0.2,
-            "Collateral ratio too low"
-        )
-        self.safety_monitor.add_invariant(
-            "queue_size",
-            lambda s: s.get('queue_size', 0) <= 100,
-            "Execution queue too large"
-        )
-        self.safety_monitor.add_invariant(
-            "synthase_count",
-            lambda s: s.get('synthase_count', 1) <= 10,
-            "Too many synthases"
-        )
-        self.safety_monitor.add_invariant(
-            "token_balance",
-            lambda s: s.get('token_balance', 0) >= 0,
-            "Token balance negative"
-        )
-
-    def _setup_metrics(self):
-        if not self.config.enable_prometheus or not PROMETHEUS_AVAILABLE:
-            return {}
-        return {
-            'total_produced': Counter('atp_total_produced', 'Total Eco-ATP produced'),
-            'production_rate': Gauge('atp_production_rate', 'Current production rate'),
-            'demand_level': Gauge('atp_demand_level', 'Current demand level'),
-            'efficiency': Gauge('atp_efficiency', 'Current efficiency'),
-            'synthase_count': Gauge('atp_synthase_count', 'Number of synthases'),
-            'quantum_enhancement': Gauge('atp_quantum_enhancement', 'Quantum enhancement factor'),
-            'queue_size': Gauge('atp_queue_size', 'Execution queue size'),
-            'priority_queue_size': Gauge('atp_priority_queue_size', 'Priority queue size'),
-            'degradation_tier': Gauge('atp_degradation_tier', 'Current degradation tier'),
-            'inhibition_level': Gauge('atp_inhibition_level', 'Current inhibition level')
-        }
-
-    # Teacher Policy (modified to optionally use RL agent)
-    async def policy_probs(self, state: Dict[str, Any]) -> List[float]:
-        # If RL agent is available, use it to generate probabilities from state features
-        if self.rl_agent:
-            # Convert state dict to feature vector
-            features = self._state_to_features(state)
-            probs = self.rl_agent.get_policy_probs(features)
-            return probs
-
-        # Fallback to adaptive cost + pareto gating or heuristic
-        if not (self.adaptive_cost and self.pareto_gating):
-            demand = state.get('demand', self._calculate_demand_level())
-            probs = [max(0.1, demand), max(0.1, 1.0 - demand), 0.1 if demand < 0.8 else 0.3]
-            total = sum(probs)
-            return [p/total for p in probs]
-
-        strategies = ['forward', 'reverse', 'uncoupled']
-        candidates = []
-        for idx, strat in enumerate(strategies):
-            if strat == 'forward':
-                quality = 0.8
-                carbon_g = 2.0
-                latency_ms = 10.0
-                energy_joules = 5.0
-            elif strat == 'reverse':
-                quality = 0.6
-                carbon_g = 1.0
-                latency_ms = 20.0
-                energy_joules = 2.0
-            else:
-                quality = 0.4
-                carbon_g = 0.5
-                latency_ms = 30.0
-                energy_joules = 1.0
-
-            cost = self.adaptive_cost.compute(
-                quality=quality,
-                carbon_g=carbon_g,
-                latency_ms=latency_ms,
-                energy_joules=energy_joules,
-                health=0.8,
-                atp=0.5
-            )
-            candidates.append({
-                'strategy': strat,
-                'score': cost,
-                'carbon_g': carbon_g,
-                'latency_ms': latency_ms,
-                'energy_joules': energy_joules,
-                'quality_score': quality
-            })
-
-        filtered = self.pareto_gating.filter(candidates)
-        if filtered:
-            allowed = {c['strategy'] for c in filtered}
-            candidates = [c for c in candidates if c['strategy'] in allowed]
-
-        if not candidates:
-            return [1.0/3, 1.0/3, 1.0/3]
-
-        scores = [c['score'] for c in candidates]
-        exp = np.exp(scores - np.max(scores))
-        probs = exp / exp.sum()
-
-        full_probs = [0.0, 0.0, 0.0]
-        for c, p in zip(candidates, probs):
-            idx = strategies.index(c['strategy'])
-            full_probs[idx] = p
-        return full_probs
-
-    def _state_to_features(self, state: Dict[str, Any]) -> np.ndarray:
-        """Convert state dict to fixed-size feature vector for RL agent."""
-        # Example features: demand, token_balance, carbon, helium, queue_size, efficiency, inhibition, quantum, tier, time_of_day
-        features = [
-            state.get('demand', 0.5),
-            state.get('token_balance', 10000) / 20000.0,
-            state.get('carbon', 0.5),
-            state.get('helium', 0.5),
-            state.get('queue_size', 0) / 100.0,
-            state.get('efficiency', 0.9),
-            state.get('inhibition', 0.0),
-            1.0 if state.get('quantum_active', False) else 0.0,
-            state.get('tier', 5) / 5.0,
-            datetime.now(timezone.utc).hour / 24.0
-        ]
-        return np.array(features, dtype=float)
-
-    # MOPD Methods (fixed async evaluation)
-    async def _generate_pareto_front(self) -> List[MOPDPoint]:
-        if not self.config.mopd.enabled:
-            return []
-        current_driving_force_weights = self.config.driving_force_weights.copy()
-        current_load_balance_weights = self.config.load_balance_weights.copy()
-        current_priority_weights = {level: p.weight for level, p in self.priority_manager.priorities.items()}
-        total_priority = sum(current_priority_weights.values())
-        if total_priority > 0:
-            for level in current_priority_weights:
-                current_priority_weights[level] /= total_priority
-
-        num_samples = 20
-        rng = np.random.default_rng(42)
-        points = []
-        for _ in range(num_samples):
-            driving_weights = rng.dirichlet([1.0] * len(current_driving_force_weights))
-            driving_dict = {list(current_driving_force_weights.keys())[i]: float(driving_weights[i])
-                            for i in range(len(current_driving_force_weights))}
-
-            load_weights = rng.dirichlet([1.0] * len(current_load_balance_weights))
-            load_dict = {list(current_load_balance_weights.keys())[i]: float(load_weights[i])
-                         for i in range(len(current_load_balance_weights))}
-
-            priority_weights = rng.dirichlet([1.0] * len(current_priority_weights))
-            priority_dict = {list(current_priority_weights.keys())[i]: float(priority_weights[i])
-                             for i in range(len(current_priority_weights))}
-
-            # Evaluate asynchronously
-            obj = await self._evaluate_weight_combination(driving_dict, load_dict, priority_dict)
-            point = MOPDPoint(
-                driving_force_weights=driving_dict,
-                load_balance_weights=load_dict,
-                priority_weights=priority_dict,
-                total_produced=obj['total_produced'],
-                avg_efficiency=obj['avg_efficiency'],
-                demand_satisfaction=obj['demand_satisfaction'],
-                token_balance=obj['token_balance']
-            )
-            points.append(point)
-
-        return self._filter_pareto(points)
-
-    async def _evaluate_weight_combination(self, driving_weights, load_weights, priority_weights):
-        """Evaluate a weight combination asynchronously. Uses current scheduler state but with simulated boosts."""
-        # We use synthetic evaluation based on current stats to avoid side effects.
-        # In a real system, you might run a simulation.
-        stats = self.get_scheduler_stats()
-        current_production = stats.get('total_eco_atp_produced', 1000)
-        current_efficiency = stats.get('current_atp_rate', 0.5) / 100.0
-        current_demand = self._calculate_demand_level()
-        if self.token_service:
-            summary = self.token_service.get_system_summary()
-            current_token = summary.get('total_balance', 10000) / 20000.0
-        else:
-            current_token = 0.5
-
-        carbon_weight = driving_weights.get('carbon', 0.25)
-        opp_weight = driving_weights.get('opportunity', 0.25)
-        production_boost = (carbon_weight + opp_weight) / 0.5
-        total_produced = current_production * production_boost
-
-        health_weight = load_weights.get('health', 0.3)
-        eff_weight = load_weights.get('efficiency', 0.3)
-        efficiency_factor = (health_weight + eff_weight) / 0.6
-        avg_efficiency = current_efficiency * efficiency_factor
-
-        critical_weight = priority_weights.get('critical', 0.2)
-        high_weight = priority_weights.get('high', 0.2)
-        demand_satisfaction = min(1.0, (critical_weight + high_weight) / 0.4)
-
-        token_factor = (production_boost * 0.5 + efficiency_factor * 0.5)
-        token_balance = current_token * token_factor
-
-        return {
-            'total_produced': max(0.0, total_produced),
-            'avg_efficiency': max(0.0, min(1.0, avg_efficiency)),
-            'demand_satisfaction': max(0.0, min(1.0, demand_satisfaction)),
-            'token_balance': max(0.0, min(1.0, token_balance))
-        }
-
-    def _filter_pareto(self, points):
-        # same as original
-        if not points:
-            return []
-        objective_keys = ['total_produced', 'avg_efficiency', 'demand_satisfaction', 'token_balance']
-        pareto = []
-        for i, p_i in enumerate(points):
-            dominated = False
-            for j, p_j in enumerate(points):
-                if i == j:
-                    continue
-                a_vec = [getattr(p_i, k) for k in objective_keys]
-                b_vec = [getattr(p_j, k) for k in objective_keys]
-                if all(b >= a for a, b in zip(a_vec, b_vec)) and any(b > a for a, b in zip(a_vec, b_vec)):
-                    dominated = True
-                    break
-            if not dominated:
-                pareto.append(p_i)
-        return pareto
-
-    def _select_best_from_pareto(self, pareto_front):
-        # same as original
-        if not pareto_front:
-            return None
-        weights = self.config.mopd.objective_weights
-        objective_keys = list(weights.keys())
-        max_vals = {}
-        min_vals = {}
-        for key in objective_keys:
-            vals = [getattr(p, key) for p in pareto_front]
-            max_vals[key] = max(vals)
-            min_vals[key] = min(vals)
-        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_keys}
-        best = None
-        best_score = -float('inf')
-        for point in pareto_front:
-            score = 0.0
-            for key in objective_keys:
-                val = getattr(point, key)
-                norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
-                score += weights.get(key, 0.0) * norm
-            point.scalarised_score = score
-            if score > best_score:
-                best_score = score
-                best = point
-        return best
-
-    async def optimize_with_mopd(self, apply_best: bool = True) -> Dict[str, Any]:
-        if not self.config.mopd.enabled:
-            return {'status': 'mopd_disabled'}
-
-        # Check safety before major change
-        if self.safety_monitor:
-            state = self._get_safety_state()
-            violations = self.safety_monitor.check(state)
-            if violations:
-                logger.warning(f"Safety violations before MOPD: {violations}")
-                return {'status': 'safety_violation', 'violations': violations}
-
-        pareto_front = await self._generate_pareto_front()
-        if not pareto_front:
-            return {'status': 'no_pareto_front'}
-
-        self._pareto_front = pareto_front
-
-        best_plan = self._select_best_from_pareto(pareto_front)
-        if not best_plan:
-            return {'status': 'no_best_plan'}
-
-        # Human approval for applying major changes
-        if apply_best and self.human_approval:
-            decision = {
-                'action': 'apply_mopd_plan',
-                'plan': best_plan.to_dict()
-            }
-            approved = await self.human_approval.request_approval(decision)
-            if not approved:
-                logger.info("MOPD plan rejected by human")
-                return {'status': 'rejected_by_human'}
-            self._apply_mopd_plan(best_plan)
-            applied = True
-        elif apply_best:
-            self._apply_mopd_plan(best_plan)
-            applied = True
-        else:
-            applied = False
-
-        # Explain decision if XAI enabled
-        if self.config.enable_xai:
-            explanation = self.explain_decision('mopd', best_plan)
-            logger.info("MOPD explanation", explanation=explanation)
-
-        if self.queue and FeedbackEvent:
-            event = FeedbackEvent.create_with_context(
-                task_id=f"atp_mopd_{uuid.uuid4().hex[:8]}",
-                selected_action="mopd_optimization",
-                quality_score=best_plan.scalarised_score,
-                energy_joules=0.0,
-                carbon_g=0.0,
-                feedback_type="atp_scheduler",
-                adaptive_cost_value=best_plan.scalarised_score,
-                state={'pareto_front_size': len(pareto_front), 'applied': applied},
-                candidates=[{'action': 'optimize'}],
-                source="atp_synthase_scheduler",
-                environment=getattr(central_config, "ENVIRONMENT", "production") if central_config else "production",
-                tags=["atp", "mopd"],
-                explanation=explanation if self.config.enable_xai else None
-            )
-            await self.queue.publish("feedback_events", event.to_json())
-
-        if self.drift_detector and self.adaptive_cost:
-            drift_score = await self.drift_detector.check_drift(self.adaptive_cost.get_current_weights())
-            if drift_score and drift_score > 0.7:
-                logger.warning(f"High drift detected ({drift_score:.3f}); adjusting MOPD weights.")
-                self.config.mopd.objective_weights['total_produced'] = min(0.5, self.config.mopd.objective_weights['total_produced'] + 0.05)
-                total = sum(self.config.mopd.objective_weights.values())
-                for k in self.config.mopd.objective_weights:
-                    self.config.mopd.objective_weights[k] /= total
-
-        if self.storage:
-            self._save_mopd_state()
-
-        return {
-            'status': 'success',
-            'pareto_front': [p.to_dict() for p in pareto_front],
-            'best_plan': best_plan.to_dict(),
-            'applied': applied,
-            'drift_score': drift_score if self.drift_detector else None,
-        }
-
-    def _apply_mopd_plan(self, plan: MOPDPoint):
-        self.config.driving_force_weights = plan.driving_force_weights.copy()
-        self.config.load_balance_weights = plan.load_balance_weights.copy()
-        async def update_priorities():
-            for level, weight in plan.priority_weights.items():
-                await self.priority_manager.set_priority_config(
-                    priority_level=level,
-                    weight=weight,
-                    min_balance=self.priority_manager.priorities[level].min_balance,
-                    max_consumption=self.priority_manager.priorities[level].max_consumption,
-                )
-        asyncio.create_task(update_priorities())
-
-    def _save_mopd_state(self):
-        if not self.storage:
-            return
-        state = {
-            'pareto_front': [p.to_dict() for p in self._pareto_front],
-            'objective_weights': self.config.mopd.objective_weights,
-        }
-        self.storage.save_state("atp_mopd_state", json.dumps(state))
-
-    def _load_mopd_state(self):
-        if not self.storage:
-            return
-        data = self.storage.get_state("atp_mopd_state")
-        if data:
-            state = json.loads(data)
-            self._pareto_front = [MOPDPoint.from_dict(p) for p in state.get('pareto_front', [])]
-            self.config.mopd.objective_weights = state.get('objective_weights', self.config.mopd.objective_weights)
-
-    # Explain decision (XAI)
-    def explain_decision(self, decision_type: str, context: Any = None) -> str:
-        if decision_type == 'mopd':
-            plan = context
-            main_objective = max(self.config.mopd.objective_weights, key=self.config.mopd.objective_weights.get)
-            explanation = f"MOPD selected plan with emphasis on {main_objective} (weight={self.config.mopd.objective_weights[main_objective]:.2f}). "
-            explanation += f"Resulting driving force weights: {plan.driving_force_weights}, load balance weights: {plan.load_balance_weights}, priority weights: {plan.priority_weights}."
-            return explanation
-        elif decision_type == 'schedule':
-            task = context
-            explanation = f"Task {task.task_id} scheduled with priority {task.user_priority or self.config.default_priority}, required ATP {task.eco_atp_required:.2f}."
-            if task.deadline:
-                time_left = (task.deadline - datetime.now(timezone.utc)).total_seconds()
-                explanation += f" Deadline in {time_left:.0f}s."
-            return explanation
-        elif decision_type == 'mode_change':
-            mode = context
-            return f"Synthase mode changed to {mode} based on current demand and gradient conditions."
-        else:
-            return "Decision made by heuristic rules."
-
-    # Safety state helper
-    def _get_safety_state(self) -> Dict[str, Any]:
-        if self.token_service:
-            summary = self.token_service.get_system_summary()
-            token_balance = summary.get('total_balance', 0)
-        else:
-            token_balance = 0
-        return {
-            'collateral_ratio': 1.0,  # placeholder
-            'queue_size': len(self.execution_queue),
-            'synthase_count': len(self.synthases),
-            'token_balance': token_balance
-        }
-
-    # Calculate gradient driving force (with circuit breaker)
-    def calculate_gradient_driving_force(self):
+    # ----------------------------------------------------- helpers (async safe)
+    async def calculate_gradient_driving_force(self) -> float:
+        """Async version. Uses the gradient circuit breaker."""
         if not self.gradient_service:
             return 0.0
+
+        async def _get():
+            return self.gradient_service.get_field_strengths()
+
         try:
-            # Use circuit breaker
-            async def _get_strengths():
-                return self.gradient_service.get_field_strengths()
-            strengths = asyncio.run(self._gradient_circuit.call(_get_strengths))
+            strengths = await self._gradient_circuit.call(_get)
         except Exception as e:
-            logger.warning(f"Gradient service failed: {e}")
+            logger.warning("Gradient service failed", error=str(e))
             return 0.0
         weights = self.config.driving_force_weights
-        force = sum(strengths.get(field, 0) * weight for field, weight in weights.items())
-        return force
+        return sum(strengths.get(f, 0.0) * w for f, w in weights.items())
 
-    def _calculate_demand_level(self):
-        # same as original but with circuit breaker for token service
+    async def _calculate_demand_level(self) -> float:
+        """Async demand level. P0 fix: was sync with `async with` inside."""
         if not self.token_service:
             return 0.5
+
+        async def _get_summary():
+            return self.token_service.get_system_summary()
+
         try:
-            async def _get_summary():
-                return self.token_service.get_system_summary()
-            summary = asyncio.run(self._token_circuit.call(_get_summary))
-        except Exception as e:
-            logger.warning(f"Token service failed: {e}")
-            summary = {'total_balance': 10000, 'total_consumed': 0, 'total_generated': 0}
-        balance = summary.get('total_balance', 10000)
-        consumption_rate = summary.get('total_consumed', 0)
-        generation_rate = summary.get('total_generated', 0)
+            summary = await self._token_circuit.call(_get_summary)
+        except Exception:
+            summary = {"total_balance": 10000, "total_consumed": 0, "total_generated": 0}
+
+        balance = summary.get("total_balance", 10000)
+        consumption = summary.get("total_consumed", 0)
+        generation = summary.get("total_generated", 0)
+
         queue_demand = min(1.0, len(self.execution_queue) / 50.0)
         if self.execution_queue:
             weights = [self.priority_manager.get_task_priority(t) for t in self.execution_queue[:10]]
-            priority_demand = np.mean(weights) if weights else 0.5
+            priority_demand = float(np.mean(weights)) if weights else 0.5
         else:
             priority_demand = 0.5
-        if generation_rate > 0:
-            ratio_demand = consumption_rate / generation_rate
-        else:
-            ratio_demand = 1.0
+        ratio_demand = consumption / generation if generation > 0 else 1.0
         if balance < 5000:
             balance_demand = 1.0
         elif balance < 20000:
             balance_demand = 0.5 + (20000 - balance) / 30000
         else:
             balance_demand = max(0.1, 1.0 - (balance - 20000) / 30000)
-        demand = (queue_demand * 0.2 + priority_demand * 0.2 + ratio_demand * 0.3 + balance_demand * 0.3)
+
+        demand = (
+            queue_demand * 0.2 + priority_demand * 0.2
+            + ratio_demand * 0.3 + balance_demand * 0.3
+        )
         demand = min(1.0, max(0.1, demand))
-        async with self._demand_lock:
-            self.demand_history.append(demand)
+        # deque.append is thread-safe for CPython; no async lock needed.
+        self.demand_history.append(demand)
         return demand
 
-    async def spawn_synthase(self, c_ring_size=None):
-        # Check safety
-        if self.safety_monitor:
-            state = self._get_safety_state()
+    async def _get_token_balance(self) -> float:
+        if not self.token_service:
+            return 10000.0
+
+        async def _get():
+            return self.token_service.get_system_summary()
+
+        try:
+            summary = await self._token_circuit.call(_get)
+        except Exception:
+            return 10000.0
+        return float(summary.get("total_balance", 10000))
+
+    async def _get_gradient_strengths(self) -> Dict[str, float]:
+        if not self.gradient_service:
+            return {}
+
+        async def _get():
+            return self.gradient_service.get_field_strengths()
+
+        try:
+            return await self._gradient_circuit.call(_get)
+        except Exception:
+            return {}
+
+    async def _get_rl_state(self) -> Dict[str, Any]:
+        return {
+            "demand": await self._calculate_demand_level(),
+            "token_balance": await self._get_token_balance(),
+            "carbon": (await self._get_gradient_strengths()).get("carbon", 0.5),
+            "helium": (await self._get_gradient_strengths()).get("helium", 0.5),
+            "queue_size": len(self.execution_queue),
+            "efficiency": self.primary_synthase.current_efficiency,
+            "inhibition": self.primary_synthase.inhibition_level,
+            "quantum_active": self.primary_synthase.quantum_active,
+            "tier": self.current_tier,
+        }
+
+    # ------------------------------------------------------- policy (validated)
+    async def policy_probs(self, state: Dict[str, Any]) -> List[float]:
+        """
+        Always returns a valid probability vector (>=0, sum==1).
+        P0 fix: previous versions could return unnormalized vectors.
+        """
+        probs: List[float]
+        if self.rl_agent is not None:
+            try:
+                features = self._state_to_features(state)
+                probs = list(self.rl_agent.get_policy_probs(features))
+            except Exception:
+                probs = [1.0 / 3, 1.0 / 3, 1.0 / 3]
+        elif self.adaptive_cost and self.pareto_gating:
+            strategies = ["forward", "reverse", "uncoupled"]
+            candidates = []
+            for strat in strategies:
+                if strat == "forward":
+                    quality, carbon_g, latency_ms, energy_j = 0.8, 2.0, 10.0, 5.0
+                elif strat == "reverse":
+                    quality, carbon_g, latency_ms, energy_j = 0.6, 1.0, 20.0, 2.0
+                else:
+                    quality, carbon_g, latency_ms, energy_j = 0.4, 0.5, 30.0, 1.0
+                cost = self.adaptive_cost.compute(
+                    quality=quality, carbon_g=carbon_g, latency_ms=latency_ms,
+                    energy_joules=energy_j, health=0.8, atp=0.5,
+                )
+                candidates.append({
+                    "strategy": strat, "score": cost,
+                    "carbon_g": carbon_g, "latency_ms": latency_ms,
+                    "energy_joules": energy_j, "quality_score": quality,
+                })
+            filtered = self.pareto_gating.filter(candidates)
+            if filtered:
+                allowed = {c["strategy"] for c in filtered}
+                candidates = [c for c in candidates if c["strategy"] in allowed]
+            if not candidates:
+                probs = [1.0 / 3] * 3
+            else:
+                scores = np.array([c["score"] for c in candidates], dtype=float)
+                exp = np.exp(scores - scores.max())
+                norm = exp / exp.sum()
+                probs = [0.0, 0.0, 0.0]
+                for c, p in zip(candidates, norm):
+                    probs[strategies.index(c["strategy"])] = float(p)
+        else:
+            demand = state.get("demand", await self._calculate_demand_level())
+            probs = [max(0.1, demand), max(0.1, 1.0 - demand), 0.1 if demand < 0.8 else 0.3]
+
+        # Sanitize
+        arr = np.asarray(probs, dtype=float)
+        arr = np.clip(arr, 0.0, None)
+        total = float(arr.sum())
+        if total <= 0 or not np.isfinite(total):
+            arr = np.ones_like(arr) / len(arr)
+        else:
+            arr = arr / total
+        return arr.tolist()
+
+    def _state_to_features(self, state: Dict[str, Any]) -> np.ndarray:
+        return np.array([
+            state.get("demand", 0.5),
+            state.get("token_balance", 10000) / 20000.0,
+            state.get("carbon", 0.5),
+            state.get("helium", 0.5),
+            state.get("queue_size", 0) / 100.0,
+            state.get("efficiency", 0.9),
+            state.get("inhibition", 0.0),
+            1.0 if state.get("quantum_active", False) else 0.0,
+            state.get("tier", 5) / 5.0,
+            datetime.now(timezone.utc).hour / 24.0,
+        ], dtype=float)
+
+    # ------------------------------------------------------------------ MOPD
+    async def _generate_pareto_front(self) -> List[MOPDPoint]:
+        if not self.config.mopd.enabled:
+            return []
+        # Seed from time so exploration varies
+        rng = np.random.default_rng(int(time.time()) & 0xFFFFFFFF)
+        current_driving = self.config.driving_force_weights
+        current_load = self.config.load_balance_weights
+        current_priority = {k: p.weight for k, p in self.priority_manager.priorities.items()}
+        total = sum(current_priority.values())
+        if total > 0:
+            current_priority = {k: v / total for k, v in current_priority.items()}
+
+        points: List[MOPDPoint] = []
+        for _ in range(20):
+            dk = list(current_driving.keys())
+            dv = rng.dirichlet([1.0] * len(dk))
+            driving = {dk[i]: float(dv[i]) for i in range(len(dk))}
+
+            lk = list(current_load.keys())
+            lv = rng.dirichlet([1.0] * len(lk))
+            load = {lk[i]: float(lv[i]) for i in range(len(lk))}
+
+            pk = list(current_priority.keys())
+            pv = rng.dirichlet([1.0] * len(pk))
+            priority = {pk[i]: float(pv[i]) for i in range(len(pk))}
+
+            obj = await self._evaluate_weight_combination(driving, load, priority)
+            points.append(MOPDPoint(
+                driving_force_weights=driving,
+                load_balance_weights=load,
+                priority_weights=priority,
+                total_produced=obj["total_produced"],
+                avg_efficiency=obj["avg_efficiency"],
+                demand_satisfaction=obj["demand_satisfaction"],
+                token_balance=obj["token_balance"],
+            ))
+        return self._filter_pareto(points)
+
+    async def _evaluate_weight_combination(
+        self, driving: Dict[str, float], load: Dict[str, float], priority: Dict[str, float]
+    ) -> Dict[str, float]:
+        stats = await self.get_scheduler_stats()
+        current_production = stats.get("total_eco_atp_produced", 1000.0)
+        current_efficiency = stats.get("current_atp_rate", 0.5) / 100.0
+        current_token = (await self._get_token_balance()) / 20000.0
+
+        production_boost = (driving.get("carbon", 0.25) + driving.get("opportunity", 0.25)) / 0.5
+        total_produced = current_production * production_boost
+
+        efficiency_factor = (load.get("health", 0.3) + load.get("efficiency", 0.3)) / 0.6
+        avg_efficiency = current_efficiency * efficiency_factor
+
+        demand_satisfaction = min(
+            1.0, (priority.get("critical", 0.2) + priority.get("high", 0.2)) / 0.4
+        )
+        token_balance = current_token * (production_boost * 0.5 + efficiency_factor * 0.5)
+
+        return {
+            "total_produced": max(0.0, total_produced),
+            "avg_efficiency": max(0.0, min(1.0, avg_efficiency)),
+            "demand_satisfaction": max(0.0, min(1.0, demand_satisfaction)),
+            "token_balance": max(0.0, min(1.0, token_balance)),
+        }
+
+    def _filter_pareto(self, points: List[MOPDPoint]) -> List[MOPDPoint]:
+        if not points:
+            return []
+        keys = ["total_produced", "avg_efficiency", "demand_satisfaction", "token_balance"]
+        front: List[MOPDPoint] = []
+        for i, p_i in enumerate(points):
+            a_vec = [getattr(p_i, k) for k in keys]
+            dominated = False
+            for j, p_j in enumerate(points):
+                if i == j:
+                    continue
+                b_vec = [getattr(p_j, k) for k in keys]
+                if all(b >= a for a, b in zip(a_vec, b_vec)) and any(
+                    b > a for a, b in zip(a_vec, b_vec)
+                ):
+                    dominated = True
+                    break
+            if not dominated:
+                front.append(p_i)
+        return front
+
+    def _select_best_from_pareto(self, front: List[MOPDPoint]) -> Optional[MOPDPoint]:
+        if not front:
+            return None
+        weights = self.config.mopd.objective_weights
+        keys = list(weights.keys())
+        max_vals = {k: max(getattr(p, k) for p in front) for k in keys}
+        min_vals = {k: min(getattr(p, k) for p in front) for k in keys}
+        ranges = {
+            k: (max_vals[k] - min_vals[k]) if max_vals[k] != min_vals[k] else 1.0
+            for k in keys
+        }
+        # Do not mutate the front; return a copy with scalarised score.
+        best: Optional[MOPDPoint] = None
+        best_score = -math.inf
+        for p in front:
+            score = sum(
+                weights.get(k, 0.0) * ((getattr(p, k) - min_vals[k]) / ranges[k])
+                for k in keys
+            )
+            if score > best_score:
+                best_score = score
+                best = p
+        if best is not None:
+            # Return a shallow copy so we do not mutate the stored front.
+            copy = MOPDPoint.from_dict(best.to_dict())
+            copy.scalarised_score = best_score
+            return copy
+        return None
+
+    async def optimize_with_mopd(self, apply_best: bool = True) -> Dict[str, Any]:
+        if not self.config.mopd.enabled:
+            return {"status": "mopd_disabled"}
+
+        if self.safety_monitor is not None:
+            state = await self._get_safety_state()
             violations = self.safety_monitor.check(state)
             if violations:
-                logger.warning(f"Safety violation prevents spawning: {violations}")
-                return None
-        # Human approval for spawning if configured
-        if self.human_approval and len(self.synthases) >= 3:
-            decision = {'action': 'spawn_synthase', 'c_ring_size': c_ring_size}
-            approved = await self.human_approval.request_approval(decision)
-            if not approved:
-                return None
-        # existing code...
-        if not self.config.enable_multi_synthase:
-            return "primary"
-        config = SynthaseConfig()
-        if c_ring_size:
-            config.protons_per_rotation = c_ring_size
-        config.quantum_tunneling_enabled = self.config.quantum_tunneling_enabled
-        synthase_id = f"synthase_{len(self.synthases)}"
-        synthase = EnhancedATPSynthase(synthase_id, config)
-        async with self._synthase_lock:
-            self.synthases[synthase_id] = synthase
-        logger.info("Spawned ATP synthase", id=synthase_id, c_ring=config.protons_per_rotation)
-        return synthase_id
+                logger.warning("Safety violations before MOPD", violations=violations)
+                return {"status": "safety_violation", "violations": violations}
 
-    async def remove_synthase(self, synthase_id):
-        # Check safety: ensure not removing primary if only one left
-        if self.safety_monitor:
-            state = self._get_safety_state()
-            state['synthase_count'] = len(self.synthases) - 1
-            violations = self.safety_monitor.check(state)
-            if violations:
-                logger.warning(f"Safety violation prevents removal: {violations}")
-                return False
-        # existing code...
-        if synthase_id == "primary" or synthase_id not in self.synthases:
-            return False
-        async with self._synthase_lock:
-            del self.synthases[synthase_id]
-        logger.info("Removed ATP synthase", id=synthase_id)
-        return True
+        front = await self._generate_pareto_front()
+        if not front:
+            return {"status": "no_pareto_front"}
+        self._pareto_front = front
+        best = self._select_best_from_pareto(front)
+        if best is None:
+            return {"status": "no_best_plan"}
 
-    # Background loops with enhancements
-    async def _synthesis_loop(self):
+        applied = False
+        if apply_best:
+            if self.human_approval is not None:
+                approved = await self.human_approval.request_approval({
+                    "action": "apply_mopd_plan",
+                    "plan": best.to_dict(),
+                })
+                if not approved:
+                    return {"status": "rejected_by_human"}
+            await self._apply_mopd_plan(best)
+            applied = True
+
+        explanation = None
+        if self.xai is not None:
+            explanation = self.xai.explain_mopd(best, self.config.mopd.objective_weights)
+
+        if self.queue and FeedbackEvent is not None:
+            try:
+                event = FeedbackEvent.create_with_context(
+                    task_id=f"atp_mopd_{uuid.uuid4().hex[:8]}",
+                    selected_action="mopd_optimization",
+                    quality_score=best.scalarised_score,
+                    energy_joules=0.0, carbon_g=0.0,
+                    feedback_type="atp_scheduler",
+                    adaptive_cost_value=best.scalarised_score,
+                    state={"pareto_front_size": len(front), "applied": applied},
+                    candidates=[{"action": "optimize"}],
+                    source="atp_synthase_scheduler",
+                    environment=getattr(central_config, "ENVIRONMENT", "production")
+                    if central_config else "production",
+                    tags=["atp", "mopd"],
+                )
+                await self.queue.publish("feedback_events", event.to_json())
+            except Exception as e:
+                logger.warning("Failed to publish MOPD feedback event", error=str(e))
+
+        if self.storage is not None:
+            try:
+                await self._save_mopd_state()
+            except Exception as e:
+                logger.warning("Failed to save MOPD state", error=str(e))
+
+        return {
+            "status": "success",
+            "pareto_front": [p.to_dict() for p in front],
+            "best_plan": best.to_dict(),
+            "applied": applied,
+            "explanation": explanation,
+        }
+
+    async def _apply_mopd_plan(self, plan: MOPDPoint) -> None:
+        self.config.driving_force_weights = dict(plan.driving_force_weights)
+        self.config.load_balance_weights = dict(plan.load_balance_weights)
+        for level, weight in plan.priority_weights.items():
+            if level in self.priority_manager.priorities:
+                p = self.priority_manager.priorities[level]
+                await self.priority_manager.set_priority_config(
+                    priority_level=level, weight=weight,
+                    min_balance=p.min_balance, max_consumption=p.max_consumption,
+                )
+
+    async def _save_mopd_state(self) -> None:
+        if self.storage is None:
+            return
+        state = {
+            "_v": 1,
+            "pareto_front": [p.to_dict() for p in self._pareto_front],
+            "objective_weights": self.config.mopd.objective_weights,
+        }
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, lambda: self.storage.save_state("atp_mopd_state", json.dumps(state))
+        )
+
+    async def _load_mopd_state(self) -> None:
+        if self.storage is None:
+            return
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(
+            None, lambda: self.storage.get_state("atp_mopd_state")
+        )
+        if not data:
+            return
+        try:
+            state = json.loads(data)
+            if state.get("_v") != 1:
+                logger.warning("Unknown MOPD state version; ignoring.")
+                return
+            self._pareto_front = [
+                MOPDPoint.from_dict(p) for p in state.get("pareto_front", [])
+            ]
+            self.config.mopd.objective_weights = state.get(
+                "objective_weights", self.config.mopd.objective_weights
+            )
+        except Exception as e:
+            logger.warning("Failed to load MOPD state", error=str(e))
+
+    async def _get_safety_state(self) -> Dict[str, Any]:
+        return {
+            "queue_size": len(self.execution_queue),
+            "synthase_count": len(self.synthases),
+            "token_balance": await self._get_token_balance(),
+        }
+
+    # ----------------------------------------------------------- background
+    async def _synthesis_loop(self) -> None:
         while True:
             try:
                 total_produced = 0.0
-                demand = self._calculate_demand_level()
-                # Use policy to decide strategy
-                state = self._get_rl_state()
+                demand = await self._calculate_demand_level()
+
+                state = await self._get_rl_state()
                 probs = await self.policy_probs(state)
-                # Choose action based on probs (if RL not used, probs still guide)
-                action = np.random.choice(['forward', 'reverse', 'uncoupled'], p=probs)
+                action = np.random.choice(["forward", "reverse", "uncoupled"], p=probs)
+
                 async with self._synthase_lock:
-                    synthases_copy = self.synthases.copy()
+                    synthases_copy = dict(self.synthases)
+
                 load_assignments = await self.load_balancer.assign_load(synthases_copy, demand)
-                for synthase_id, synthase in synthases_copy.items():
-                    if synthase.state not in [SynthaseState.ACTIVE, SynthaseState.QUANTUM_READY]:
+                balance = await self._get_token_balance()
+
+                for sid, synthase in synthases_copy.items():
+                    if synthase.state not in (SynthaseState.ACTIVE, SynthaseState.QUANTUM_READY):
                         continue
-                    assigned_load = load_assignments.get(synthase_id, demand / len(synthases_copy))
-                    if self.token_service:
-                        try:
-                            async def _get_summary():
-                                return self.token_service.get_system_summary()
-                            summary = await self._token_circuit.call(_get_summary)
-                        except Exception:
-                            summary = {'total_balance': 10000}
-                        balance = summary.get('total_balance', 10000)
-                        await synthase.update_allosteric_inhibition(balance)
-                    if action == 'reverse' and self._should_reverse_operate():
-                        await synthase.operate_reverse(self.gradient_service, self.token_service, self.account_id, amount=50.0 * assigned_load)
+                    assigned = load_assignments.get(sid, demand / max(len(synthases_copy), 1))
+                    await synthase.update_allosteric_inhibition(balance)
+
+                    if action == "reverse" and self._should_reverse_operate(balance):
+                        await synthase.operate_reverse(
+                            self.gradient_service, self.token_service,
+                            self.account_id, amount=50.0 * assigned,
+                        )
                         continue
-                    elif action == 'uncoupled' and self._should_uncouple():
+                    if action == "uncoupled" and self._should_uncouple():
                         await synthase.operate_uncoupled(self.gradient_service)
                         continue
-                    # forward
-                    driving_force = await synthase.calculate_driving_force(self.gradient_service)
-                    rotation_speed = await synthase.calculate_rotation_speed(driving_force)
-                    if rotation_speed > 0:
-                        base_rate = await synthase.calculate_atp_production_rate(rotation_speed)
-                        if synthase_id == "primary":
-                            eco_atp_rate = self._modulate_production(base_rate) * assigned_load
-                        else:
-                            eco_atp_rate = base_rate * assigned_load
-                        if eco_atp_rate > 0.1:
-                            eco_atp_produced = await synthase.operate_forward(
-                                self.gradient_service, self.token_service, self.account_id
-                            )
-                            total_produced += eco_atp_produced * assigned_load
-                            await self.load_balancer.record_performance(synthase_id, assigned_load)
+
+                    produced = await synthase.operate_forward(
+                        self.gradient_service, self.token_service, self.account_id
+                    )
+                    total_produced += produced * assigned
+                    await self.load_balancer.record_performance(sid, assigned)
+
                 if total_produced > 0:
                     async with self._state_lock:
                         self.total_eco_atp_produced += total_produced
                     if self.prometheus_metrics:
-                        self.prometheus_metrics['total_produced'].inc(total_produced)
-                        self.prometheus_metrics['production_rate'].set(total_produced / self.config.synthesis_interval)
-                if self.gradient_service:
-                    try:
-                        async def _get_strengths():
-                            return self.gradient_service.get_field_strengths()
-                        strengths = await self._gradient_circuit.call(_get_strengths)
-                    except Exception:
-                        strengths = {}
-                    for field_id, strength in strengths.items():
-                        self.gradient_forecaster.record_gradient(field_id, strength)
-                # Chaos injection
-                if self.chaos_injector:
+                        self.prometheus_metrics["total_produced"].inc(total_produced)
+                        self.prometheus_metrics["production_rate"].set(
+                            total_produced / self.config.synthesis_interval
+                        )
+
+                for fid, strength in (await self._get_gradient_strengths()).items():
+                    self.gradient_forecaster.record_gradient(fid, strength)
+
+                if self.chaos_injector is not None:
                     await self.chaos_injector.maybe_inject_failure()
+
                 await asyncio.sleep(self.config.synthesis_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Synthesis loop error", error=str(e))
+                logger.error("Synthesis loop error", error=str(e), exc_info=True)
                 await asyncio.sleep(5)
 
-    def _get_rl_state(self) -> Dict[str, Any]:
-        """Build state dict for policy."""
-        if self.token_service:
-            try:
-                async def _get_summary():
-                    return self.token_service.get_system_summary()
-                summary = asyncio.run(self._token_circuit.call(_get_summary))
-            except Exception:
-                summary = {'total_balance': 10000}
-        else:
-            summary = {'total_balance': 10000}
-        if self.gradient_service:
-            try:
-                async def _get_strengths():
-                    return self.gradient_service.get_field_strengths()
-                strengths = asyncio.run(self._gradient_circuit.call(_get_strengths))
-            except Exception:
-                strengths = {}
-        else:
-            strengths = {}
-        return {
-            'demand': self._calculate_demand_level(),
-            'token_balance': summary.get('total_balance', 10000),
-            'carbon': strengths.get('carbon', 0.5),
-            'helium': strengths.get('helium', 0.5),
-            'queue_size': len(self.execution_queue),
-            'efficiency': self.primary_synthase.current_efficiency,
-            'inhibition': self.primary_synthase.inhibition_level,
-            'quantum_active': self.primary_synthase.quantum_active,
-            'tier': self.current_tier,
-        }
+    def _should_reverse_operate(self, balance: float) -> bool:
+        return balance > 25000
 
-    # Other loops (unchanged except for safety checks in maintenance)
-    async def _regulation_loop(self):
+    def _should_uncouple(self) -> bool:
+        return self.primary_synthase.inhibition_level > 0.4
+
+    async def _regulation_loop(self) -> None:
         while True:
             try:
-                # Check safety first
-                if self.safety_monitor:
-                    state = self._get_safety_state()
+                if self.safety_monitor is not None:
+                    state = await self._get_safety_state()
                     violations = self.safety_monitor.check(state)
                     if violations:
-                        logger.warning(f"Safety violations in regulation: {violations}")
-                        # Could trigger corrective actions
-                # existing code...
-                if self.token_service:
-                    try:
-                        async def _get_summary():
-                            return self.token_service.get_system_summary()
-                        summary = await self._token_circuit.call(_get_summary)
-                    except Exception:
-                        summary = {'total_balance': 10000}
-                    balance = summary.get('total_balance', 10000)
-                    async with self._synthase_lock:
-                        for synthase in self.synthases.values():
-                            await synthase.update_allosteric_inhibition(balance)
-                demand = self._calculate_demand_level()
-                active_count = sum(1 for s in self.synthases.values() if s.state in [SynthaseState.ACTIVE, SynthaseState.QUANTUM_READY])
-                if demand > 0.8 and active_count < 3 and self.config.enable_multi_synthase:
+                        logger.warning("Safety violations in regulation", violations=violations)
+
+                balance = await self._get_token_balance()
+                async with self._synthase_lock:
+                    for s in self.synthases.values():
+                        await s.update_allosteric_inhibition(balance)
+
+                demand = await self._calculate_demand_level()
+                active = sum(
+                    1 for s in self.synthases.values()
+                    if s.state in (SynthaseState.ACTIVE, SynthaseState.QUANTUM_READY)
+                )
+                if demand > 0.8 and active < 3 and self.config.enable_multi_synthase:
                     await self.spawn_synthase()
                 elif demand < 0.2 and len(self.synthases) > 1:
                     for sid in list(self.synthases.keys()):
-                        if sid != "primary" and len(self.synthases) > 1:
+                        if sid != "primary":
                             await self.remove_synthase(sid)
                             break
+
                 if self.prometheus_metrics:
-                    self.prometheus_metrics['synthase_count'].set(len(self.synthases))
-                    self.prometheus_metrics['queue_size'].set(len(self.execution_queue))
-                    self.prometheus_metrics['priority_queue_size'].set(len(self.priority_queue))
-                    self.prometheus_metrics['degradation_tier'].set(self.current_tier)
-                    self.prometheus_metrics['inhibition_level'].set(self.primary_synthase.inhibition_level)
-                    self.prometheus_metrics['quantum_enhancement'].set(self.primary_synthase.quantum_enhancement_factor)
+                    self.prometheus_metrics["synthase_count"].set(len(self.synthases))
+                    self.prometheus_metrics["queue_size"].set(len(self.execution_queue))
+                    self.prometheus_metrics["priority_queue_size"].set(len(self.priority_queue))
+                    self.prometheus_metrics["degradation_tier"].set(self.current_tier)
+                    self.prometheus_metrics["inhibition_level"].set(
+                        self.primary_synthase.inhibition_level
+                    )
+
                 await asyncio.sleep(self.config.regulation_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Regulation loop error", error=str(e))
+                logger.error("Regulation loop error", error=str(e), exc_info=True)
                 await asyncio.sleep(60)
 
-    async def _maintenance_loop(self):
+    async def _maintenance_loop(self) -> None:
         while True:
             try:
                 async with self._synthase_lock:
-                    for synthase in self.synthases.values():
-                        if synthase.state == SynthaseState.DEGRADED:
-                            await synthase.repair()
+                    for s in self.synthases.values():
+                        if s.state == SynthaseState.DEGRADED:
+                            await s.repair()
                 await asyncio.sleep(self.config.maintenance_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Maintenance loop error", error=str(e))
+                logger.error("Maintenance loop error", error=str(e), exc_info=True)
                 await asyncio.sleep(60)
 
-    async def _predictive_loop(self):
+    async def _predictive_loop(self) -> None:
         while True:
             try:
-                if self.ml_predictor:
-                    async with self._demand_lock:
-                        history = list(self.demand_history)
-                    if len(history) > self.config.ml_min_samples and (not self.ml_predictor.is_trained or len(history) % 10 == 0):
+                if self.ml_predictor is not None:
+                    history = list(self.demand_history)
+                    if (
+                        len(history) > self.config.ml_min_samples
+                        and (not self.ml_predictor.is_trained or len(history) % 10 == 0)
+                    ):
                         await self.ml_predictor.train(history)
                     if len(history) > self.config.ml_lookback:
                         pred = await self.ml_predictor.predict(history)
-                        if pred['prediction'] is not None:
-                            self.predicted_demand = pred['prediction']
-                            logger.debug("ML demand prediction", value=self.predicted_demand, confidence=pred['confidence'])
-                if self.predicted_demand > 0.7 and self.token_service:
-                    pre_amount = self.predicted_demand * 100
-                    async def generate():
-                        self.token_service.generate_tokens(
-                            account_id=self.account_id,
-                            source=EcoATPSource.GRADIENT_CONVERSION,
-                            energy_saved_kwh=pre_amount / 10000.0,
-                            efficiency=0.9
-                        )
-                    await self._token_circuit.call(generate)
+                        if pred["prediction"] is not None:
+                            self.predicted_demand = pred["prediction"]
                 await asyncio.sleep(self.config.predictive_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Predictive loop error", error=str(e))
+                logger.error("Predictive loop error", error=str(e), exc_info=True)
                 await asyncio.sleep(120)
 
-    async def _gradient_forecast_loop(self):
+    async def _gradient_forecast_loop(self) -> None:
         while True:
             try:
-                if self.gradient_service:
-                    try:
-                        async def _get_strengths():
-                            return self.gradient_service.get_field_strengths()
-                        strengths = await self._gradient_circuit.call(_get_strengths)
-                    except Exception:
-                        strengths = {}
-                    for field_id in strengths:
-                        await self.gradient_forecaster.forecast(field_id)
+                for field_id in (await self._get_gradient_strengths()).keys():
+                    await self.gradient_forecaster.forecast(field_id)
                 await asyncio.sleep(self.config.forecast_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Gradient forecast loop error", error=str(e))
+                logger.error("Gradient forecast loop error", error=str(e), exc_info=True)
                 await asyncio.sleep(120)
 
-    async def _degradation_update_loop(self):
+    async def _degradation_update_loop(self) -> None:
         while True:
             try:
                 async with self._synthase_lock:
                     efficiencies = [s.current_efficiency for s in self.synthases.values()]
                 if efficiencies:
-                    avg_efficiency = np.mean(efficiencies)
-                    for tier, threshold in sorted(self.config.efficiency_thresholds.items(), reverse=True):
-                        if avg_efficiency >= threshold:
+                    avg = float(np.mean(efficiencies))
+                    for tier, threshold in sorted(
+                        self.config.efficiency_thresholds.items(), reverse=True
+                    ):
+                        if avg >= threshold:
                             if self.current_tier != tier:
                                 self.current_tier = tier
-                                logger.info("Degradation tier updated", tier=tier, avg_efficiency=avg_efficiency)
+                                logger.info("Degradation tier updated", tier=tier, avg=avg)
                             break
                 await asyncio.sleep(self.config.degradation_tier_update_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Degradation update loop error", error=str(e))
+                logger.error("Degradation update loop error", error=str(e), exc_info=True)
                 await asyncio.sleep(60)
 
-    async def _priority_adapt_loop(self):
+    async def _priority_adapt_loop(self) -> None:
         while True:
             try:
                 await self.priority_manager.adapt_weights()
@@ -2206,294 +2218,458 @@ class ATPSynthaseScheduler:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Priority adaptation loop error", error=str(e))
+                logger.error("Priority adapt loop error", error=str(e), exc_info=True)
                 await asyncio.sleep(60)
 
-    # New background loops
-    async def _federated_loop(self):
-        while True:
-            try:
-                await asyncio.sleep(300)  # every 5 minutes
-                if self.federated:
-                    await self.federated.send_update()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("Federated loop error", error=str(e))
-                await asyncio.sleep(300)
-
-    async def _chaos_loop(self):
-        while True:
-            try:
-                await asyncio.sleep(60)  # check every minute
-                if self.chaos_injector:
-                    await self.chaos_injector.maybe_inject_failure()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("Chaos loop error", error=str(e))
-                await asyncio.sleep(60)
-
-    # Scheduling and execution with safety checks and XAI
-    async def schedule_execution(self, task_id, eco_atp_required, priority=0, deadline=None,
-                               callback=None, user_priority=None):
-        if not self.token_service:
-            return True
-        # Check safety
-        if self.safety_monitor:
-            state = self._get_safety_state()
-            state['queue_size'] = len(self.execution_queue) + 1
+    # ----------------------------------------------------------- public API
+    async def spawn_synthase(self, c_ring_size: Optional[int] = None) -> Optional[str]:
+        if self.safety_monitor is not None:
+            state = await self._get_safety_state()
+            state["synthase_count"] = len(self.synthases) + 1
             violations = self.safety_monitor.check(state)
             if violations:
-                logger.warning(f"Safety violation scheduling task: {violations}")
+                logger.warning("Safety violation prevents spawning", violations=violations)
+                return None
+
+        if not self.config.enable_multi_synthase:
+            return "primary"
+
+        cfg = SynthaseConfig()
+        if c_ring_size:
+            cfg.protons_per_rotation = c_ring_size
+        cfg.quantum_tunneling_enabled = self.config.quantum_tunneling_enabled
+        sid = f"synthase_{len(self.synthases)}"
+        synth = EnhancedATPSynthase(sid, cfg)
+        async with self._synthase_lock:
+            self.synthases[sid] = synth
+        logger.info("Spawned ATP synthase", id=sid)
+        return sid
+
+    async def remove_synthase(self, synthase_id: str) -> bool:
+        if synthase_id == "primary" or synthase_id not in self.synthases:
+            return False
+        if self.safety_monitor is not None:
+            state = await self._get_safety_state()
+            state["synthase_count"] = len(self.synthases) - 1
+            violations = self.safety_monitor.check(state)
+            if violations:
+                logger.warning("Safety violation prevents removal", violations=violations)
                 return False
-        # Human approval for high priority tasks?
-        if self.human_approval and priority > 2:
-            decision = {'action': 'schedule_high_priority', 'task_id': task_id, 'eco_atp_required': eco_atp_required}
-            approved = await self.human_approval.request_approval(decision)
+        async with self._synthase_lock:
+            self.synthases.pop(synthase_id, None)
+        logger.info("Removed ATP synthase", id=synthase_id)
+        return True
+
+    async def schedule_execution(
+        self, task_id: str, eco_atp_required: float, priority: int = 0,
+        deadline: Optional[datetime] = None, callback: Optional[Callable] = None,
+        user_priority: Optional[str] = None,
+    ) -> bool:
+        if not self.token_service:
+            return True
+
+        if self.safety_monitor is not None:
+            state = await self._get_safety_state()
+            state["queue_size"] = len(self.execution_queue) + 1
+            violations = self.safety_monitor.check(state)
+            if violations:
+                logger.warning("Safety violation scheduling task", violations=violations)
+                return False
+
+        if self.human_approval is not None and priority > 2:
+            approved = await self.human_approval.request_approval({
+                "action": "schedule_high_priority",
+                "task_id": task_id,
+                "eco_atp_required": eco_atp_required,
+            })
             if not approved:
                 return False
-        async def reserve():
+
+        async def _reserve():
             return self.token_service.reserve_tokens(
                 self.account_id, eco_atp_required, EcoATPConsumer.EXPERT_EXECUTION
             )
-        success, token_ids = await self._token_circuit.call(reserve)
-        if success:
-            task = ScheduledTask(
-                task_id=task_id, eco_atp_required=eco_atp_required,
-                priority=priority, deadline=deadline, callback=callback,
-                token_ids=token_ids, user_priority=user_priority
-            )
-            async with self._queue_lock:
+
+        success, token_ids = await self._token_circuit.call(_reserve)
+        task = ScheduledTask(
+            task_id=task_id, eco_atp_required=eco_atp_required,
+            priority=priority, deadline=deadline, callback=callback,
+            token_ids=token_ids if success else [], user_priority=user_priority,
+        )
+        async with self._queue_lock:
+            if success:
                 self.execution_queue.append(task)
                 self.execution_queue.sort(
-                    key=lambda t: (self.priority_manager.get_task_priority(t), t.deadline or datetime.max.replace(tzinfo=timezone.utc)),
-                    reverse=True
+                    key=lambda t: (
+                        self.priority_manager.get_task_priority(t),
+                        t.deadline or datetime.max.replace(tzinfo=timezone.utc),
+                    ),
+                    reverse=True,
                 )
-            # XAI explanation
-            if self.config.enable_xai:
-                explanation = self.explain_decision('schedule', task)
-                logger.info("Scheduling explanation", explanation=explanation)
-                if self.queue and FeedbackEvent:
-                    event = FeedbackEvent.create_with_context(
-                        task_id=task_id,
-                        selected_action="schedule_execution",
-                        quality_score=1.0,
-                        energy_joules=0.0,
-                        carbon_g=0.0,
-                        feedback_type="atp_scheduler",
-                        adaptive_cost_value=0.0,
-                        state={'task': task.to_dict()},
-                        candidates=[],
-                        source="atp_synthase_scheduler",
-                        environment="production",
-                        tags=["scheduling", "xai"],
-                        explanation=explanation
-                    )
-                    await self.queue.publish("feedback_events", event.to_json())
-            return True
-        else:
-            task = ScheduledTask(
-                task_id=task_id, eco_atp_required=eco_atp_required,
-                priority=priority, deadline=deadline, callback=callback,
-                user_priority=user_priority
-            )
-            async with self._queue_lock:
+            else:
                 self.priority_queue.append(task)
-            return False
 
-    async def execute_next_task(self):
+        if success and self.xai is not None:
+            logger.info("Scheduling explanation", text=self.xai.explain_schedule(task))
+        return success
+
+    async def execute_next_task(self) -> Optional[Dict[str, Any]]:
         async with self._queue_lock:
             if not self.execution_queue:
                 return None
             task = self.execution_queue.pop(0)
-        if self.token_service:
-            async def consume():
-                return self.token_service.consume_tokens(task.token_ids, EcoATPConsumer.EXPERT_EXECUTION, True)
-            await self._token_circuit.call(consume)
-        if task.callback:
-            if asyncio.iscoroutinefunction(task.callback):
-                result = await task.callback()
-            else:
-                result = task.callback()
-            task.status = "completed"
-            return {'task_id': task.task_id, 'result': result, 'status': 'completed'}
-        task.status = "completed"
-        return {'task_id': task.task_id, 'status': 'completed'}
 
-    async def recover_failed_task(self, task_id, completion_percentage):
+        if self.token_service:
+            async def _consume():
+                return self.token_service.consume_tokens(
+                    task.token_ids, EcoATPConsumer.EXPERT_EXECUTION, True
+                )
+            await self._token_circuit.call(_consume)
+
+        if task.callback:
+            result = await task.callback() if asyncio.iscoroutinefunction(task.callback) else task.callback()
+            task.status = "completed"
+            return {"task_id": task.task_id, "result": result, "status": "completed"}
+        task.status = "completed"
+        return {"task_id": task.task_id, "status": "completed"}
+
+    async def recover_failed_task(self, task_id: str, completion_percentage: float) -> float:
         async with self._queue_lock:
-            for task in self.execution_queue:
+            for task in list(self.execution_queue):
                 if task.task_id == task_id:
                     if self.token_service:
-                        async def recover():
-                            return self.token_service.recover_tokens(task.token_ids, completion_percentage)
-                        recovered = await self._token_circuit.call(recover)
+                        async def _recover():
+                            return self.token_service.recover_tokens(
+                                task.token_ids, completion_percentage
+                            )
+                        recovered = await self._token_circuit.call(_recover)
                         self.execution_queue.remove(task)
                         return recovered
         return 0.0
 
-    async def set_priority_config(self, priority_level, weight, min_balance, max_consumption):
-        # Human approval for critical changes?
-        if self.human_approval and weight > 3.0:
-            decision = {'action': 'set_priority_config', 'level': priority_level, 'weight': weight}
-            if not await self.human_approval.request_approval(decision):
-                return
-        await self.priority_manager.set_priority_config(priority_level, weight, min_balance, max_consumption)
+    async def set_priority_config(
+        self, priority_level: str, weight: float,
+        min_balance: float, max_consumption: float,
+    ) -> None:
+        await self.priority_manager.set_priority_config(
+            priority_level, weight, min_balance, max_consumption
+        )
 
-    def set_degradation_tier(self, tier):
-        self.current_tier = max(1, min(5, tier))
-        if tier <= 2:
-            async def remove_all():
-                tasks = []
-                for sid in list(self.synthases.keys()):
-                    if sid != "primary":
-                        tasks.append(self.remove_synthase(sid))
-                await asyncio.gather(*tasks, return_exceptions=True)
-            asyncio.create_task(remove_all())
-        logger.info("Degradation tier set", tier=tier)
-
-    def get_scheduler_stats(self):
-        # same as original but add new module info
-        stats = {
-            'total_eco_atp_produced': self.total_eco_atp_produced,
-            'current_driving_force': self.calculate_gradient_driving_force(),
-            'current_rotation_speed': self.primary_synthase.calculate_rotation_speed(self.calculate_gradient_driving_force()),
-            'current_atp_rate': self.primary_synthase.calculate_atp_production_rate(self.primary_synthase.calculate_rotation_speed(self.calculate_gradient_driving_force())),
-            'demand_level': self._calculate_demand_level(),
-            'predicted_demand': self.predicted_demand,
-            'degradation_tier': self.current_tier,
-            'queue_size': len(self.execution_queue),
-            'priority_queue_size': len(self.priority_queue),
-            'synthase_count': len(self.synthases),
-            'active_synthases': sum(1 for s in self.synthases.values() if s.state in [SynthaseState.ACTIVE, SynthaseState.QUANTUM_READY]),
-            'quantum_active': self.config.enable_quantum and any(s.quantum_active for s in self.synthases.values()),
-            'synthases': {sid: s.get_status() for sid, s in self.synthases.items()},
-            'load_balance': self.load_balancer.get_load_balance_stats(),
-            'ml_predictor': self.ml_predictor.get_model_stats() if self.ml_predictor else None,
-            'gradient_forecast': self.gradient_forecaster.forecast_results,
-            'causal_rl': self.rl_agent is not None,
-            'federated': self.federated is not None,
-            'safety_monitor': self.safety_monitor is not None,
-            'precision_controller': self.precision_controller is not None,
-            'carbon_market': self.carbon_market is not None,
-            'chaos_injector': self.chaos_injector is not None,
-            'human_approval': self.human_approval is not None,
+    async def get_scheduler_stats(self) -> Dict[str, Any]:
+        """Async because it reads live service state."""
+        driving_force = await self.calculate_gradient_driving_force()
+        rotation_speed = await self.primary_synthase.calculate_rotation_speed(driving_force)
+        atp_rate = await self.primary_synthase.calculate_atp_production_rate(rotation_speed)
+        demand = await self._calculate_demand_level()
+        return {
+            "total_eco_atp_produced": self.total_eco_atp_produced,
+            "current_driving_force": driving_force,
+            "current_rotation_speed": rotation_speed,
+            "current_atp_rate": atp_rate,
+            "demand_level": demand,
+            "predicted_demand": self.predicted_demand,
+            "degradation_tier": self.current_tier,
+            "queue_size": len(self.execution_queue),
+            "priority_queue_size": len(self.priority_queue),
+            "synthase_count": len(self.synthases),
+            "active_synthases": sum(
+                1 for s in self.synthases.values()
+                if s.state in (SynthaseState.ACTIVE, SynthaseState.QUANTUM_READY)
+            ),
+            "synthases": {sid: s.get_status() for sid, s in self.synthases.items()},
+            "load_balance": self.load_balancer.get_load_balance_stats(),
+            "ml_predictor": self.ml_predictor.get_model_stats() if self.ml_predictor else None,
+            "module_status": MODULE_STATUS,
+            "circuit_breakers": {
+                "token": self._token_circuit.snapshot(),
+                "gradient": self._gradient_circuit.snapshot(),
+            },
         }
-        return stats
 
-    def get_efficiency_report(self):
+    def get_efficiency_report(self) -> Dict[str, Any]:
         report = {
-            'primary_efficiency': self.primary_synthase.current_efficiency,
-            'base_efficiency': self.config.base_efficiency,
-            'inhibition_level': self.primary_synthase.inhibition_level,
-            'synthase_count': len(self.synthases),
-            'quantum_enhancement': self.primary_synthase.quantum_enhancement_factor,
-            'quantum_active': self.primary_synthase.quantum_active,
-            'recommendations': []
+            "primary_efficiency": self.primary_synthase.current_efficiency,
+            "base_efficiency": self.config.base_efficiency,
+            "inhibition_level": self.primary_synthase.inhibition_level,
+            "synthase_count": len(self.synthases),
+            "recommendations": [],
         }
         if self.primary_synthase.current_efficiency < 0.8:
-            report['recommendations'].append("Primary synthase degraded. Consider repair cycle.")
-        if len(self.synthases) > 1 and self._calculate_demand_level() < 0.3:
-            report['recommendations'].append("Low demand with multiple synthases. Consider consolidating.")
+            report["recommendations"].append("Primary synthase degraded; schedule repair.")
         if self.primary_synthase.inhibition_level > 0.4:
-            report['recommendations'].append("High ATP inhibition. Consider reverse operation to regulate.")
-        if self.config.enable_quantum and not self.primary_synthase.quantum_active and self._calculate_demand_level() > 0.5:
-            report['recommendations'].append("Quantum enhancement available but inactive. Increase gradient to activate.")
-        if self.carbon_market and self.carbon_market.available:
-            report['recommendations'].append("Carbon market integration active; consider trading credits.")
+            report["recommendations"].append("High ATP inhibition; consider reverse operation.")
         return report
 
-    async def __aenter__(self):
-        return self
+    # ----------------------------------------------------------- shutdown
+    async def shutdown(self, timeout: Optional[float] = None) -> None:
+        """
+        Graceful shutdown:
+        1. Stop accepting new work.
+        2. Drain background tasks.
+        3. Flush ML model and MOPD state.
+        """
+        timeout = timeout or float(self.config.shutdown_timeout_seconds)
+        logger.info("ATP Synthase Scheduler shutting down")
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.shutdown()
-
-    async def shutdown(self, timeout=None):
-        logger.info("Shutting down ATP Synthase Scheduler")
-        if timeout is None:
-            timeout = self.config.shutdown_timeout_seconds
+        # 1. Drain background tasks
         try:
-            await asyncio.wait_for(self._task_manager.stop_all(), timeout=timeout)
+            await asyncio.wait_for(self._task_manager.drain(timeout), timeout=timeout)
         except asyncio.TimeoutError:
-            logger.warning("Background tasks did not finish in time; forcing cancellation")
-        if self.ml_predictor:
-            self.ml_predictor._save_model()
+            logger.warning("Task drain timed out; continuing shutdown")
+
+        # 2. Flush persisted state
+        try:
+            if self.ml_predictor is not None:
+                self.ml_predictor._save_model()
+        except Exception as e:
+            logger.warning("Failed to flush ML model", error=str(e))
+        try:
+            await self._save_mopd_state()
+        except Exception as e:
+            logger.warning("Failed to flush MOPD state", error=str(e))
+
         logger.info("ATP Synthase Scheduler shutdown complete")
 
-# ============================================================================
-# Example usage (updated)
-# ============================================================================
-async def example_usage():
-    class MockTokenService:
-        def get_system_summary(self):
-            return {'total_balance': 10000, 'total_consumed': 500, 'total_generated': 400}
-        def generate_tokens(self, **kwargs):
-            return []
-        def reserve_tokens(self, **kwargs):
-            return True, []
-        def consume_tokens(self, **kwargs):
-            return 0
-        def recover_tokens(self, **kwargs):
-            return 0
-        def create_account(self, account_id):
-            pass
-        def get_account_summary(self, account_id):
-            return {'balance': 10000}
+    async def __aenter__(self) -> "ATPSynthaseScheduler":
+        # Load persisted MOPD state on entry if storage is available.
+        if self.storage is not None:
+            await self._load_mopd_state()
+        return self
 
-    class MockGradientService:
-        def get_field_strengths(self):
-            return {'carbon': 0.8, 'helium': 0.2, 'trust': 0.1, 'opportunity': 0.9, 'eco_atp_reserve': 0.5}
-        def discharge_field(self, field_id, amount):
-            return 0
-        def pump_field(self, field_id, amount, source):
-            pass
-        def get_field_stats(self):
-            return {}
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.shutdown()
 
-    token = MockTokenService()
-    gradient = MockGradientService()
+
+# =============================================================================
+# SECTION 13. MOCK SERVICES (for tests and examples)
+# =============================================================================
+class MockTokenService:
+    def __init__(self):
+        self.balance = 10000.0
+        self.consumed = 0.0
+        self.generated = 0.0
+
+    def get_system_summary(self) -> Dict[str, float]:
+        return {
+            "total_balance": self.balance,
+            "total_consumed": self.consumed,
+            "total_generated": self.generated,
+        }
+
+    def generate_tokens(self, **kwargs) -> List[Any]:
+        self.generated += 10
+        self.balance += 10
+        return []
+
+    def reserve_tokens(self, account_id: str, amount: float, consumer: Any) -> Tuple[bool, List[str]]:
+        if self.balance >= amount:
+            self.balance -= amount
+            return True, [uuid.uuid4().hex]
+        return False, []
+
+    def consume_tokens(self, token_ids: List[str], consumer: Any, ok: bool) -> float:
+        self.consumed += len(token_ids) * 5.0
+        return float(len(token_ids))
+
+    def recover_tokens(self, token_ids: List[str], completion: float) -> float:
+        recovered = len(token_ids) * 5.0 * completion
+        self.balance += recovered
+        return recovered
+
+    def create_account(self, account_id: str) -> None:
+        pass
+
+    def get_account_summary(self, account_id: str) -> Dict[str, Any]:
+        return {"balance": self.balance}
+
+
+class MockGradientService:
+    def get_field_strengths(self) -> Dict[str, float]:
+        return {
+            "carbon": 0.8, "helium": 0.2, "trust": 0.1,
+            "opportunity": 0.9, "eco_atp_reserve": 0.5,
+        }
+
+    def discharge_field(self, field_id: str, amount: float) -> float:
+        return 0.0
+
+    def pump_field(self, field_id: str, amount: float, source: str) -> None:
+        return None
+
+    def get_field_stats(self) -> Dict[str, Any]:
+        return {}
+
+
+# =============================================================================
+# SECTION 14. TESTS (embedded; run with --test)
+# =============================================================================
+class _Tests(unittest.TestCase):
+    def test_policy_probs_valid(self):
+        async def go():
+            sched = ATPSynthaseScheduler(
+                token_service=MockTokenService(),
+                gradient_service=MockGradientService(),
+            )
+            try:
+                state = await sched._get_rl_state()
+                probs = await sched.policy_probs(state)
+                self.assertEqual(len(probs), 3)
+                self.assertTrue(all(p >= 0 for p in probs))
+                self.assertAlmostEqual(sum(probs), 1.0, places=6)
+                # Zero-demand edge case
+                probs2 = await sched.policy_probs({"demand": 0.0})
+                self.assertAlmostEqual(sum(probs2), 1.0, places=6)
+            finally:
+                await sched.shutdown(timeout=3)
+        asyncio.run(go())
+
+    def test_stats_async(self):
+        async def go():
+            sched = ATPSynthaseScheduler(
+                token_service=MockTokenService(),
+                gradient_service=MockGradientService(),
+            )
+            try:
+                stats = await sched.get_scheduler_stats()
+                self.assertIn("total_eco_atp_produced", stats)
+                self.assertIn("circuit_breakers", stats)
+            finally:
+                await sched.shutdown(timeout=3)
+        asyncio.run(go())
+
+    def test_pareto_filter(self):
+        sched = ATPSynthaseScheduler.__new__(ATPSynthaseScheduler)  # bypass __init__
+        pts = [
+            MOPDPoint({}, {}, {}, 1.0, 1.0, 1.0, 1.0),
+            MOPDPoint({}, {}, {}, 0.5, 0.5, 0.5, 0.5),   # dominated
+            MOPDPoint({}, {}, {}, 1.0, 0.5, 0.5, 0.5),   # nondominated
+        ]
+        front = ATPSynthaseScheduler._filter_pareto(sched, pts)
+        self.assertEqual(len(front), 2)
+
+    def test_safety_monitor(self):
+        mon = SafetyMonitor(enabled=False)
+        mon.add_invariant("x_positive", lambda s: s.get("x", 0) > 0, "x must be positive")
+        self.assertEqual(mon.check({"x": 1}), [])
+        self.assertEqual(len(mon.check({"x": -1})), 1)
+
+    def test_placeholder_denies(self):
+        async def go():
+            h = HumanApprovalHandler(auto_approve_dev=False)
+            self.assertFalse(await h.request_approval({"action": "x"}))
+        asyncio.run(go())
+
+    def test_circuit_breaker_roundtrip(self):
+        async def go():
+            import tempfile
+            path = os.path.join(tempfile.gettempdir(), f"cb_{uuid.uuid4().hex}.db")
+            cb = CircuitBreaker("test", path, failure_threshold=2, recovery_timeout=1)
+
+            async def ok():
+                return 1
+
+            async def fail():
+                raise RuntimeError("boom")
+
+            self.assertEqual(await cb.call(ok), 1)
+            for _ in range(2):
+                try:
+                    await cb.call(fail)
+                except RuntimeError:
+                    pass
+            self.assertEqual(cb.state, "open")
+            try:
+                await cb.call(ok)
+                self.fail("Should have been open")
+            except RuntimeError:
+                pass
+            os.remove(path)
+        asyncio.run(go())
+
+    def test_scheduler_runs_briefly(self):
+        async def go():
+            sched = ATPSynthaseScheduler(
+                token_service=MockTokenService(),
+                gradient_service=MockGradientService(),
+            )
+            await asyncio.sleep(0.5)
+            self.assertGreaterEqual(sched.total_eco_atp_produced, 0.0)
+            await sched.shutdown(timeout=3)
+        asyncio.run(go())
+
+    def test_graceful_shutdown_twice(self):
+        async def go():
+            sched = ATPSynthaseScheduler(
+                token_service=MockTokenService(),
+                gradient_service=MockGradientService(),
+            )
+            await sched.shutdown(timeout=3)
+            await sched.shutdown(timeout=3)  # idempotent
+        asyncio.run(go())
+
+
+def run_tests() -> int:
+    suite = unittest.TestLoader().loadTestsFromTestCase(_Tests)
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
+# =============================================================================
+# SECTION 15. EXAMPLE USAGE + ENTRY POINT
+# =============================================================================
+async def example_usage() -> None:
     config = {
-        'enable_multi_synthase': True,
-        'enable_quantum': True,
-        'enable_ml_prediction': True,
-        'ml_model_path': './test_model.joblib',
-        'circuit_breaker_db_path': './test_cb.db',
-        'mopd': {
-            'enabled': True,
-            'objective_weights': {
-                'total_produced': 0.3,
-                'avg_efficiency': 0.3,
-                'demand_satisfaction': 0.2,
-                'token_balance': 0.2,
-            }
-        },
-        'enable_causal_rl': True,
-        'enable_federated_learning': True,
-        'enable_safety_monitor': True,
-        'enable_xai': True,
-        'enable_precision_switching': True,
-        'enable_carbon_market': False,
-        'enable_chaos': True,
-        'chaos_probability': 0.05,
-        'enable_human_approval': True,
+        "enable_multi_synthase": True,
+        "enable_quantum": True,
+        "enable_ml_prediction": True,
+        "ml_model_path": "./test_model.joblib",
+        "circuit_breaker_db_path": "./test_cb.db",
+        "enable_safety_monitor": True,
+        "enable_xai": True,
+        "enable_causal_rl": False,
+        "enable_federated_learning": False,
+        "enable_carbon_market": False,
+        "enable_chaos": False,
+        "enable_human_approval": False,
     }
-    scheduler = ATPSynthaseScheduler(
-        token_service=token,
-        gradient_service=gradient,
-        config=config
-    )
-    await asyncio.sleep(5)
-    # Test MOPD
-    mopd_result = await scheduler.optimize_with_mopd()
-    print("MOPD result:", mopd_result)
-    # Test scheduling
-    success = await scheduler.schedule_execution("task1", 10.0, priority=1)
-    print("Schedule success:", success)
-    stats = scheduler.get_scheduler_stats()
-    print("Stats:", stats)
-    await scheduler.shutdown()
+    async with ATPSynthaseScheduler(
+        token_service=MockTokenService(),
+        gradient_service=MockGradientService(),
+        config=config,
+    ) as scheduler:
+        await asyncio.sleep(2)
+        result = await scheduler.optimize_with_mopd()
+        print("MOPD result:", json.dumps(result, indent=2, default=str))
+        ok = await scheduler.schedule_execution("task1", 10.0, priority=1)
+        print("Schedule success:", ok)
+        stats = await scheduler.get_scheduler_stats()
+        print("Stats keys:", sorted(stats.keys()))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="ATP Synthase Scheduler v11.0.0")
+    parser.add_argument("--test", action="store_true", help="Run embedded test suite.")
+    parser.add_argument("--example", action="store_true", help="Run example usage.")
+    parser.add_argument("--status", action="store_true", help="Print module statuses.")
+    args = parser.parse_args()
+
+    if args.status:
+        for name, status in MODULE_STATUS.items():
+            print(f"{name:25s} {status}")
+        return
+
+    if args.test:
+        sys.exit(run_tests())
+
+    if args.example:
+        asyncio.run(example_usage())
+        return
+
+    # Default: print status and exit gracefully
+    print("ATP Synthase Scheduler v11.0.0 — no mode selected.")
+    print("Use --test, --example, or --status.")
+
 
 if __name__ == "__main__":
-    asyncio.run(example_usage())
+    main()
