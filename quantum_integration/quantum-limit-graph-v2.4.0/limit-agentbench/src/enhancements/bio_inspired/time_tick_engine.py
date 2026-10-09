@@ -1,221 +1,328 @@
+#!/usr/bin/env python3
+# =============================================================================
+# TimeTickEngine v4.0.0 — Patched Single-File Edition
+# =============================================================================
 """
-TimeTickEngine v3.4 – Enhanced simulation driver with evolutionary MOPD support and integrated enhancement modules.
+TimeTickEngine v4.0.0
+=====================
+Patched single-file version of the v3.4 source.
 
-Supports:
-- CSV data loading with validation and configurable date column.
-- Live data feed integration (via callback or async generator).
-- Interpolation methods: linear, quadratic, spline, time‑based.
-- Checkpoint saving/loading to resume simulations.
-- Metrics collection (total harvested, average efficiency, etc.).
-- Graceful stop via stop() method.
-- Async context manager.
-- **Multi‑policy simulation** for Pareto front generation.
-- **Evolutionary optimization** of policies using NSGA‑II.
-- **Dynamic objective weighting** based on system state.
-- **Persistence of Pareto fronts** in checkpoints.
-- **Parallel policy evaluation** for speed.
-- **NEW**: Quantum‑Distillation, Causal RL, Federated Learning, Safety Monitor,
-  XAI, Adaptive Precision, Carbon Markets, Chaos Testing, Human‑in‑the‑Loop.
+P0 fixes
+--------
+- Background tasks moved to `async start()`; no tasks in `__init__`.
+- `evaluate_policy` snapshot/restore + lock; policy evaluation is serialized
+  and no longer corrupts shared engine state.
+- `NSGAIIOptimizer._tournament_selection` uses an explicit key→rank map,
+  so selection actually reflects front rank and crowding.
+- `_select_best_from_pareto` returns a copy; stored Pareto front is never
+  mutated.
+- `_maybe_trade_carbon` handles sync and async carbon market clients.
+- `Lifecycle`: `async start()`, `async shutdown()`, `async ready()`,
+  `__aenter__` / `__aexit__`.
+- Config is pure dataclasses. No Pydantic v1/v2 branch.
+- Checkpoints use JSON, not pickle.
+
+P1 — correctness
+----------------
+- timezone-aware timestamps throughout.
+- Bounded `MetricsCollector` lists (via deques).
+- `_current_index` and other state mutated under an asyncio.Lock.
+- `evaluate_policy` restores `_current_index`, `_running`, `_stop_event`.
+- Chaos injector no longer mutates `_current_index` from a background task.
+- Guard against re-entering `run_simulation`.
+- `fillna(method=...)` replaced with `.ffill().bfill()`.
+- `get_pareto_front` returns deep copies.
+- Translator failures are logged at debug level.
+
+P2 — honesty
+------------
+- MODULE_STATUS documents every module.
+- Placeholders (disabled by default, warn when enabled):
+    quantum_distillation, causal_rl, federated, precision, carbon_market,
+    chaos, human_approval.
+- Experimental (warn when enabled):
+    mopd_filtering, nsga2_optimizer, safety_monitor, xai, checkpointing,
+    live_data_feed.
+
+P3 — production readiness
+-------------------------
+- Embedded test suite: python3 time_tick_engine.py --test.
+- --status prints module maturity.
+- Prometheus + OpenTelemetry hooks (optional).
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
-import logging
-from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, Callable, Union, List, Protocol, Awaitable, Tuple
-from dataclasses import dataclass, field, asdict
-import json
-import os
-import pickle
-import glob
-from pathlib import Path
-import math
-import hashlib
-import random
 import copy
-from collections import defaultdict
+import functools
+import hashlib
+import inspect
+import json
+import logging
+import math
+import os
+import random
+import sys
+import unittest
+from collections import defaultdict, deque
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from pathlib import Path
+from typing import (
+    Any, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple, Union,
+)
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-logger = logging.getLogger(__name__)
-
-# ============================================================================
-# Try importing optional dependencies
-# ============================================================================
-try:
-    from pydantic import BaseModel, Field, validator, root_validator
-    PYDANTIC_AVAILABLE = True
-except ImportError:
-    PYDANTIC_AVAILABLE = False
-
+# -----------------------------------------------------------------------------
+# Optional dependencies
+# -----------------------------------------------------------------------------
 try:
     from tqdm import tqdm
     TQDM_AVAILABLE = True
 except ImportError:
     TQDM_AVAILABLE = False
 
-# ============================================================================
-# Configuration (Pydantic or dataclass) – Enhanced with MOPD and new flags
-# ============================================================================
-if PYDANTIC_AVAILABLE:
-    class MOPDConfig(BaseModel):
-        """Configuration for Multi‑Objective Pareto Decision."""
-        enabled: bool = Field(True, description="Enable MOPD‑aware multi‑policy simulation")
-        objective_weights: Dict[str, float] = Field(
-            default_factory=lambda: {
-                'total_harvested': 0.3,
-                'avg_efficiency': 0.3,
-                'carbon_saved': 0.2,
-                'helium_saved': 0.2,
-            },
-            description="Weights for scalarising Pareto front (must sum to 1)"
-        )
-        grid_resolution: int = Field(5, description="Number of discrete points for sampling (unused for now)")
-        population_size: int = Field(20, ge=4)
-        generations: int = Field(5, ge=1)
-        mutation_rate: float = Field(0.2, ge=0.0, le=1.0)
-        crossover_rate: float = Field(0.8, ge=0.0, le=1.0)
-        tournament_size: int = Field(3, ge=2)
-        dynamic_weights: bool = Field(True, description="Enable dynamic weighting based on system state")
+try:
+    from prometheus_client import Counter, Gauge
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
 
-        @validator('objective_weights')
-        def check_weights(cls, v):
-            total = sum(v.values())
-            if abs(total - 1.0) > 1e-6:
-                raise ValueError("objective_weights must sum to 1")
-            return v
+try:
+    from opentelemetry import trace
+    _TRACER = trace.get_tracer("time_tick_engine")
+    OTEL_AVAILABLE = True
+except ImportError:
+    _TRACER = None
+    OTEL_AVAILABLE = False
 
-    class TimeTickConfig(BaseModel):
-        """Configuration for TimeTickEngine."""
-        data_source: str = Field(..., description="Path to CSV or 'live' for real‑time.")
-        csv_path: Optional[str] = Field(None, description="Path to CSV file (if data_source='csv').")
-        date_column: str = Field("date", description="Name of the date column in CSV.")
-        date_format: Optional[str] = Field(None, description="Date format for parsing (e.g., '%Y-%m-%d').")
-        value_columns: List[str] = Field(default_factory=lambda: ["helium_supply", "helium_demand"],
-                                         description="Columns to interpolate.")
-        start_date: Optional[str] = Field(None, description="Start date for simulation (YYYY-MM-DD).")
-        end_date: Optional[str] = Field(None, description="End date for simulation (YYYY-MM-DD).")
-        interpolation_method: str = Field("linear", description="Interpolation method: linear, quadratic, spline, time.")
-        tick_interval_seconds: float = Field(0.1, ge=0.001, description="Delay between ticks.")
-        checkpoint_dir: str = Field("./checkpoints", description="Directory for checkpoint files.")
-        enable_checkpointing: bool = True
-        checkpoint_interval: int = Field(100, ge=1, description="Save checkpoint every N ticks.")
-        metrics_enabled: bool = True
-        max_checkpoints: int = Field(5, ge=1, description="Maximum number of checkpoint files to keep.")
-        # Live data settings
-        live_fetch_interval: float = Field(1.0, ge=0.1, description="Interval (seconds) to fetch live data.")
-        live_data_callback: Optional[Callable[[], Awaitable[Dict[str, float]]]] = Field(
-            None, description="Async callback to fetch live data."
-        )
-        # Custom metrics storage limit
-        max_custom_metrics_entries: int = Field(1000, ge=1, description="Maximum number of custom metric entries to keep.")
-        # MOPD configuration
-        mopd: MOPDConfig = Field(default_factory=MOPDConfig, description="MOPD sub‑configuration")
+try:
+    import structlog
+    from structlog.processors import JSONRenderer, TimeStamper
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            TimeStamper(fmt="iso"),
+            JSONRenderer(),
+        ],
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+    logger = structlog.get_logger(__name__)
+except ImportError:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    logger = logging.getLogger(__name__)
 
-        # ======== NEW ENHANCEMENT FIELDS ========
-        enable_quantum_distillation: bool = False
-        enable_causal_rl: bool = False
-        enable_federated: bool = False
-        enable_safety_monitor: bool = True
-        enable_xai: bool = True
-        enable_precision: bool = False
-        enable_carbon_market: bool = False
-        carbon_market_config: Optional[Dict[str, str]] = None
-        enable_chaos: bool = False
-        chaos_probability: float = 0.0
-        enable_human_approval: bool = False
-        human_approval_timeout: float = 60.0
 
-        @validator('interpolation_method')
-        def validate_interpolation(cls, v):
-            allowed = {'linear', 'quadratic', 'spline', 'time'}
-            if v not in allowed:
-                raise ValueError(f'interpolation_method must be one of {allowed}')
-            return v
+# =============================================================================
+# SECTION 1. MODULE STATUS
+# =============================================================================
+MODULE_STATUS: Dict[str, str] = {
+    "time_tick_core":        "stable",
+    "csv_loading":           "stable",
+    "metrics":               "stable",
+    "event_bus":             "stable",
+    "task_manager":          "stable",
+    "live_data_feed":        "experimental",
+    "checkpointing":         "experimental",
+    "mopd_filtering":        "experimental",
+    "nsga2_optimizer":       "experimental",
+    "safety_monitor":        "experimental",
+    "xai":                   "experimental",
+    "quantum_distillation":  "placeholder",
+    "causal_rl":             "placeholder",
+    "federated":             "placeholder",
+    "precision":             "placeholder",
+    "carbon_market":         "placeholder",
+    "chaos":                 "placeholder",
+    "human_approval":        "placeholder",
+}
 
-        @validator('data_source')
-        def validate_data_source(cls, v):
-            if v not in ['csv', 'live']:
-                raise ValueError('data_source must be "csv" or "live"')
-            return v
 
-        @root_validator
-        def validate_live_source(cls, values):
-            if values.get('data_source') == 'live' and not values.get('live_data_callback'):
-                raise ValueError('live_data_callback is required when data_source="live"')
-            return values
-else:
-    @dataclass
-    class MOPDConfig:
-        enabled: bool = True
-        objective_weights: Dict[str, float] = field(default_factory=lambda: {
-            'total_harvested': 0.3,
-            'avg_efficiency': 0.3,
-            'carbon_saved': 0.2,
-            'helium_saved': 0.2,
-        })
-        grid_resolution: int = 5
-        population_size: int = 20
-        generations: int = 5
-        mutation_rate: float = 0.2
-        crossover_rate: float = 0.8
-        tournament_size: int = 3
-        dynamic_weights: bool = True
+def _warn_module(name: str) -> None:
+    status = MODULE_STATUS.get(name, "unknown")
+    if status == "stable":
+        return
+    if status == "placeholder":
+        logger.warning("Module is a placeholder; enabling it has no effect",
+                       module=name)
+    elif status == "experimental":
+        logger.warning("Module is experimental; validate before production use",
+                       module=name)
 
-    @dataclass
-    class TimeTickConfig:
-        data_source: str = "csv"
-        csv_path: Optional[str] = None
-        date_column: str = "date"
-        date_format: Optional[str] = None
-        value_columns: List[str] = field(default_factory=lambda: ["helium_supply", "helium_demand"])
-        start_date: Optional[str] = None
-        end_date: Optional[str] = None
-        interpolation_method: str = "linear"
-        tick_interval_seconds: float = 0.1
-        checkpoint_dir: str = "./checkpoints"
-        enable_checkpointing: bool = True
-        checkpoint_interval: int = 100
-        metrics_enabled: bool = True
-        max_checkpoints: int = 5
-        live_fetch_interval: float = 1.0
-        live_data_callback: Optional[Callable] = None
-        max_custom_metrics_entries: int = 1000
-        mopd: MOPDConfig = field(default_factory=MOPDConfig)
 
-        # New enhancement flags
-        enable_quantum_distillation: bool = False
-        enable_causal_rl: bool = False
-        enable_federated: bool = False
-        enable_safety_monitor: bool = True
-        enable_xai: bool = True
-        enable_precision: bool = False
-        enable_carbon_market: bool = False
-        carbon_market_config: Optional[Dict[str, str]] = None
-        enable_chaos: bool = False
-        chaos_probability: float = 0.0
-        enable_human_approval: bool = False
-        human_approval_timeout: float = 60.0
+# =============================================================================
+# SECTION 2. TRACING HELPERS
+# =============================================================================
+def traced(span_name: str):
+    def decorator(fn: Callable):
+        if not OTEL_AVAILABLE:
+            return fn
 
-# ============================================================================
-# Protocols for loose coupling
-# ============================================================================
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            with _TRACER.start_as_current_span(span_name):
+                return await fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def _is_awaitable(x: Any) -> bool:
+    return inspect.isawaitable(x)
+
+
+# =============================================================================
+# SECTION 3. ENUMS
+# =============================================================================
+class HarvestingMode(Enum):
+    FULL = "full"
+    ADAPTIVE = "adaptive"
+    MODULATED = "modulated"
+    CONSERVATIVE = "conservative"
+    MINIMAL = "minimal"
+    SURVIVAL = "survival"
+    STANDARD = "standard"
+    AGGRESSIVE = "aggressive"
+
+
+# =============================================================================
+# SECTION 4. CONFIGURATION (pure dataclasses)
+# =============================================================================
+@dataclass
+class MOPDConfig:
+    enabled: bool = True
+    objective_weights: Dict[str, float] = field(default_factory=lambda: {
+        "total_harvested": 0.3,
+        "avg_efficiency": 0.3,
+        "carbon_saved": 0.2,
+        "helium_saved": 0.2,
+    })
+    grid_resolution: int = 5
+    population_size: int = 20
+    generations: int = 5
+    mutation_rate: float = 0.2
+    crossover_rate: float = 0.8
+    tournament_size: int = 3
+    dynamic_weights: bool = True
+
+    def validate(self) -> List[str]:
+        issues: List[str] = []
+        total = sum(self.objective_weights.values())
+        if abs(total - 1.0) > 1e-6:
+            issues.append("mopd.objective_weights must sum to 1")
+        if self.population_size < 4:
+            issues.append("mopd.population_size must be >= 4")
+        if self.generations < 1:
+            issues.append("mopd.generations must be >= 1")
+        return issues
+
+
+@dataclass
+class TimeTickConfig:
+    data_source: str = "csv"
+    csv_path: Optional[str] = None
+    date_column: str = "date"
+    date_format: Optional[str] = None
+    value_columns: List[str] = field(
+        default_factory=lambda: ["helium_supply", "helium_demand"]
+    )
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    interpolation_method: str = "linear"
+    tick_interval_seconds: float = 0.1
+    checkpoint_dir: str = "./checkpoints"
+    enable_checkpointing: bool = True
+    checkpoint_interval: int = 100
+    metrics_enabled: bool = True
+    max_checkpoints: int = 5
+    live_fetch_interval: float = 1.0
+    live_data_callback: Optional[Callable] = None
+    max_custom_metrics_entries: int = 1000
+    max_metric_history: int = 10000
+    shutdown_timeout_seconds: int = 15
+    mopd: MOPDConfig = field(default_factory=MOPDConfig)
+
+    # Placeholders — disabled by default
+    enable_quantum_distillation: bool = False
+    enable_causal_rl: bool = False
+    enable_federated: bool = False
+    enable_precision: bool = False
+    enable_carbon_market: bool = False
+    carbon_market_config: Optional[Dict[str, str]] = None
+    enable_chaos: bool = False
+    chaos_probability: float = 0.0
+    enable_human_approval: bool = False
+    human_approval_timeout: float = 60.0
+
+    # Experimental — on where harmless
+    enable_safety_monitor: bool = True
+    enable_xai: bool = True
+
+    def validate(self) -> List[str]:
+        issues: List[str] = []
+        if self.data_source not in ("csv", "live"):
+            issues.append("data_source must be 'csv' or 'live'")
+        if self.data_source == "live" and self.live_data_callback is None:
+            issues.append("live_data_callback required when data_source='live'")
+        if self.interpolation_method not in ("linear", "quadratic", "spline", "time"):
+            issues.append("interpolation_method must be linear|quadratic|spline|time")
+        if not (0.0 <= self.chaos_probability <= 1.0):
+            issues.append("chaos_probability must be in [0, 1]")
+        if self.checkpoint_interval < 1:
+            issues.append("checkpoint_interval must be >= 1")
+        issues.extend(self.mopd.validate())
+        return issues
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["live_data_callback"] = None  # not serializable
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TimeTickConfig":
+        data = dict(data or {})
+        mopd_data = data.pop("mopd", None)
+        fields = cls.__dataclass_fields__
+        kwargs = {k: v for k, v in data.items() if k in fields}
+        cfg = cls(**kwargs)
+        if isinstance(mopd_data, dict):
+            cfg.mopd = MOPDConfig(**{
+                k: v for k, v in mopd_data.items()
+                if k in MOPDConfig.__dataclass_fields__
+            })
+        return cfg
+
+
+# =============================================================================
+# SECTION 5. PROTOCOLS
+# =============================================================================
 class HarvesterProtocol(Protocol):
-    """Protocol for the Photosynthetic Harvester."""
     async def harvest_cycle(self, environmental_data: Dict[str, float]) -> Dict[str, Any]: ...
     def set_mode(self, mode: Any) -> None: ...
     async def get_harvesting_stats(self) -> Dict[str, Any]: ...
     def restore_state(self, state: Dict[str, Any]) -> None: ...
     def set_parameters(self, params: Dict[str, Any]) -> None: ...
 
+
 class TranslatorProtocol(Protocol):
-    """Protocol for translating CSV rows to harvester input."""
     @staticmethod
     def translate_row(row: pd.Series) -> Dict[str, float]: ...
 
-# ============================================================================
-# Simulation State for checkpointing (extended)
-# ============================================================================
+
+# =============================================================================
+# SECTION 6. DATA STRUCTURES
+# =============================================================================
 @dataclass
 class SimulationState:
     current_index: int
@@ -226,30 +333,38 @@ class SimulationState:
     metrics_data: Dict[str, Any]
     harvester_state: Optional[Dict[str, Any]] = None
     data_hash: Optional[str] = None
-    timestamp: str
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     pareto_front: Optional[List[Dict[str, Any]]] = None
     current_policy_id: Optional[str] = None
 
-# ============================================================================
-# MOPD Data Classes
-# ============================================================================
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SimulationState":
+        return cls(**{k: v for k, v in (data or {}).items()
+                      if k in cls.__dataclass_fields__})
+
+
 @dataclass
 class MOPDPoint:
     policy_id: str
     harvester_mode: str
     parameters: Dict[str, Any] = field(default_factory=dict)
-    total_harvested: float
-    avg_efficiency: float
-    carbon_saved: float
-    helium_saved: float
+    total_harvested: float = 0.0
+    avg_efficiency: float = 0.0
+    carbon_saved: float = 0.0
+    helium_saved: float = 0.0
     scalarised_score: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPoint':
-        return cls(**data)
+    def from_dict(cls, data: Dict[str, Any]) -> "MOPDPoint":
+        return cls(**{k: v for k, v in (data or {}).items()
+                      if k in cls.__dataclass_fields__})
+
 
 @dataclass
 class Policy:
@@ -257,257 +372,423 @@ class Policy:
     harvester_mode: str
     parameters: Dict[str, Any] = field(default_factory=dict)
 
-# ============================================================================
-# New Enhancement Modules
-# ============================================================================
-class QuantumDistillationModule:
-    """Placeholder for quantum‑distillation integration."""
-    def __init__(self, config):
-        self.config = config
+
+@dataclass
+class CoreEvent:
+    event_type: str
+    source: str
+    payload: Dict[str, Any]
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    correlation_id: Optional[str] = None
+
+
+# =============================================================================
+# SECTION 7. TASK MANAGER + EVENT BUS
+# =============================================================================
+class TaskManager:
+    def __init__(self):
+        self.tasks: Dict[str, asyncio.Task] = {}
+        self.shutdown_event = asyncio.Event()
+        self._drained = False
+
+    def start_task(self, name: str, coro_func: Callable,
+                   *args, **kwargs) -> Optional[asyncio.Task]:
+        async def wrapper():
+            backoff = 1.0
+            max_backoff = 60.0
+            while not self.shutdown_event.is_set():
+                try:
+                    await coro_func(*args, **kwargs)
+                    if self.shutdown_event.is_set():
+                        break
+                    await asyncio.sleep(0.1)
+                    backoff = 1.0
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error("Task crashed", name=name, error=str(e))
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("No running loop; task not started", name=name)
+            return None
+        task = loop.create_task(wrapper(), name=name)
+        self.tasks[name] = task
+        return task
+
+    async def drain(self, timeout: float) -> None:
+        if self._drained:
+            return
+        self._drained = True
+        self.shutdown_event.set()
+        all_tasks = list(self.tasks.values())
+        if not all_tasks:
+            return
+        done, pending = await asyncio.wait(all_tasks, timeout=timeout)
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self.tasks.clear()
+        logger.info("TaskManager drained", completed=len(done),
+                    cancelled=len(pending))
+
+
+class EventBus:
+    def __init__(self, max_workers: int = 4):
+        self.subscribers: Dict[str, List[Callable]] = defaultdict(list)
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.workers: List[asyncio.Task] = []
+        self.running = False
+        self.max_workers = max_workers
+        self.stats = {"published": 0, "processed": 0, "errors": 0}
+        self._lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def start(self) -> None:
+        if self.running:
+            return
+        self.running = True
+        for _ in range(self.max_workers):
+            self.workers.append(asyncio.create_task(self._worker()))
+
+    async def stop(self) -> None:
+        if not self.running:
+            return
+        self.running = False
+        for _ in self.workers:
+            await self.queue.put(None)
+        if self.workers:
+            await asyncio.gather(*self.workers, return_exceptions=True)
+        self.workers.clear()
+
+    def subscribe(self, event_type: str, callback: Callable) -> None:
+        self.subscribers[event_type].append(callback)
+
+    async def publish(self, event: CoreEvent) -> None:
+        if not self.running:
+            return
+        await self.queue.put(event)
+        async with self._get_lock():
+            self.stats["published"] += 1
+
+    async def _worker(self) -> None:
+        while True:
+            try:
+                event = await self.queue.get()
+            except asyncio.CancelledError:
+                return
+            try:
+                if event is None:
+                    self.queue.task_done()
+                    return
+                for cb in list(self.subscribers.get(event.event_type, [])):
+                    try:
+                        r = cb(event)
+                        if _is_awaitable(r):
+                            await r
+                    except Exception as e:
+                        async with self._get_lock():
+                            self.stats["errors"] += 1
+                        logger.error("Event handler error", error=str(e))
+                async with self._get_lock():
+                    self.stats["processed"] += 1
+            finally:
+                self.queue.task_done()
+
+
+# =============================================================================
+# SECTION 8. PLACEHOLDERS
+# =============================================================================
+class QuantumDistillationModulePlaceholder:
+    STATUS = "placeholder"
+
+    def __init__(self, enabled: bool = False):
+        if enabled:
+            _warn_module("quantum_distillation")
         self.available = False
 
     async def optimize(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
-        logger.info("Quantum distillation optimization requested (placeholder).")
-        for key in parameters:
-            if isinstance(parameters[key], (int, float)):
-                parameters[key] += random.uniform(-0.01, 0.01)
-        return parameters
+        return dict(parameters)
 
     def is_available(self) -> bool:
-        return self.available
+        return False
 
 
-class CausalRLAgent:
-    """Simplified causal RL agent using Q‑learning with a causal feature mask."""
-    def __init__(self, state_dim: int, action_dim: int, causal_mask: Optional[np.ndarray] = None):
+class CausalRLAgentPlaceholder:
+    STATUS = "placeholder"
+
+    def __init__(self, state_dim: int = 10, action_dim: int = 3,
+                 max_q_table: int = 5000, enabled: bool = False):
+        if enabled:
+            _warn_module("causal_rl")
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.causal_mask = causal_mask
-        self.q_table = defaultdict(lambda: np.zeros(action_dim))
+        self.max_q_table = max_q_table
+        self.q_table: Dict[Tuple[int, ...], np.ndarray] = {}
+        self._order: "deque[Tuple[int, ...]]" = deque()
         self.epsilon = 0.1
         self.learning_rate = 0.1
         self.gamma = 0.99
+        self.available = False
+
+    def _discretize(self, state: np.ndarray) -> Tuple[int, ...]:
+        arr = np.asarray(state, dtype=float)[: self.state_dim]
+        if arr.shape[0] < self.state_dim:
+            arr = np.pad(arr, (0, self.state_dim - arr.shape[0]))
+        buckets = np.clip((arr * 5).astype(int), 0, 4)
+        return tuple(int(b) for b in buckets.tolist())
+
+    def _get_or_create(self, key: Tuple[int, ...]) -> np.ndarray:
+        if key in self.q_table:
+            return self.q_table[key]
+        if len(self.q_table) >= self.max_q_table:
+            old = self._order.popleft()
+            self.q_table.pop(old, None)
+        self.q_table[key] = np.zeros(self.action_dim)
+        self._order.append(key)
+        return self.q_table[key]
 
     def act(self, state: np.ndarray, explore: bool = True) -> int:
         if explore and random.random() < self.epsilon:
             return random.randrange(self.action_dim)
-        state_key = tuple(state)
-        return int(np.argmax(self.q_table[state_key]))
+        return int(np.argmax(self._get_or_create(self._discretize(state))))
 
-    def update(self, state, action, reward, next_state, done):
-        state_key = tuple(state)
-        next_key = tuple(next_state)
-        best_next = np.max(self.q_table[next_key]) if not done else 0.0
+    def update(self, state, action, reward, next_state, done) -> None:
+        key = self._discretize(state)
+        next_key = self._discretize(next_state)
+        cur = self._get_or_create(key)
+        nxt = self._get_or_create(next_key)
+        best_next = 0.0 if done else float(np.max(nxt))
         td_target = reward + self.gamma * best_next
-        self.q_table[state_key][action] += self.learning_rate * (td_target - self.q_table[state_key][action])
+        cur[action] += self.learning_rate * (td_target - cur[action])
 
-    def get_policy_probs(self, state: np.ndarray, temperature: float = 1.0) -> List[float]:
-        state_key = tuple(state)
-        q_values = self.q_table[state_key]
-        if temperature <= 0:
-            probs = np.zeros_like(q_values)
-            probs[np.argmax(q_values)] = 1.0
-            return probs.tolist()
-        exp_q = np.exp((q_values - np.max(q_values)) / temperature)
-        return (exp_q / exp_q.sum()).tolist()
+    def size(self) -> int:
+        return len(self.q_table)
 
 
-class FederatedCoordinator:
-    """Coordinates federated learning of evolved policies across deployments."""
-    def __init__(self, engine: 'TimeTickEngine', queue: Optional[Any] = None):
+class FederatedCoordinatorPlaceholder:
+    STATUS = "placeholder"
+
+    def __init__(self, engine: Any, queue: Optional[Any] = None,
+                 enabled: bool = False):
+        if enabled:
+            _warn_module("federated")
         self.engine = engine
         self.queue = queue
-        self.last_global_model = None
+        self.available = False
 
-    async def send_update(self):
-        if not self.queue:
-            logger.warning("No message queue for federated update.")
-            return
-        if self.engine._pareto_front:
-            model = {
-                'pareto_front': [p.to_dict() for p in self.engine._pareto_front],
-                'objective_weights': self.engine.config.mopd.objective_weights,
-            }
-            await self.queue.publish("federated_updates", json.dumps(model))
-            logger.info("Federated update sent.")
+    async def send_update(self) -> bool:
+        return False
 
-    async def receive_global_model(self, model_json: str):
-        model = json.loads(model_json)
-        self.last_global_model = model
-        if 'objective_weights' in model:
-            local_weights = self.engine.config.mopd.objective_weights
-            global_weights = model['objective_weights']
-            for key in local_weights:
-                if key in global_weights:
-                    local_weights[key] = 0.5 * local_weights[key] + 0.5 * global_weights[key]
-            total = sum(local_weights.values())
-            if total > 0:
-                for key in local_weights:
-                    local_weights[key] /= total
-        if 'pareto_front' in model:
-            self.engine._pareto_front = [MOPDPoint.from_dict(p) for p in model['pareto_front']]
-        logger.info("Federated global model applied.")
+    async def receive_global_model(self, model_json: str) -> bool:
+        return False
 
 
-class SafetyMonitor:
-    """Runtime monitor for safety invariants on policies and simulation outcomes."""
-    def __init__(self):
-        self.invariants = []
+class PrecisionControllerPlaceholder:
+    STATUS = "placeholder"
 
-    def add_invariant(self, name: str, condition_fn: Callable[[Dict[str, Any]], bool], description: str):
-        self.invariants.append((name, condition_fn, description))
-
-    def check(self, state: Dict[str, Any]) -> List[str]:
-        violations = []
-        for name, fn, desc in self.invariants:
-            if not fn(state):
-                violations.append(f"{name}: {desc}")
-        return violations
-
-
-class PrecisionController:
-    """Decides numerical precision for calculations based on load and energy budget."""
-    def __init__(self, policy: str = "energy_aware"):
+    def __init__(self, policy: str = "energy_aware",
+                 enabled: bool = False):
+        if enabled:
+            _warn_module("precision")
         self.policy = policy
+        self.available = False
 
     def get_precision(self, load: float, energy_budget: float) -> str:
-        if self.policy == "energy_aware":
-            if load > 0.8 or energy_budget < 0.2:
-                return "float16"
-            else:
-                return "float32"
         return "float32"
 
 
-class CarbonMarketClient:
-    """Placeholder for carbon market integration."""
-    def __init__(self, provider_url: str = None, contract_address: str = None, private_key: str = None):
+class CarbonMarketClientPlaceholder:
+    STATUS = "placeholder"
+
+    def __init__(self, enabled: bool = False, **kwargs: Any):
+        if enabled:
+            _warn_module("carbon_market")
         self.available = False
-        if provider_url and contract_address and private_key:
-            self.available = True
 
     def buy_credits(self, amount: float) -> bool:
-        if not self.available:
-            return False
-        logger.info(f"Simulating purchase of {amount} carbon credits.")
-        return True
+        return False
 
     def sell_credits(self, amount: float) -> bool:
-        if not self.available:
-            return False
-        logger.info(f"Simulating sale of {amount} carbon credits.")
-        return True
+        return False
 
 
-class ChaosInjector:
-    """Injects random failures into the simulation to test resilience."""
-    def __init__(self, engine: 'TimeTickEngine', chaos_probability: float = 0.01):
+class ChaosInjectorPlaceholder:
+    STATUS = "placeholder"
+
+    def __init__(self, engine: Any, chaos_probability: float = 0.0,
+                 enabled: bool = False):
+        if enabled:
+            _warn_module("chaos")
         self.engine = engine
         self.chaos_probability = chaos_probability
+        self.available = False
 
-    async def maybe_inject_failure(self):
-        if random.random() < self.chaos_probability:
-            action = random.choice(['delay', 'corrupt_data', 'skip_tick'])
-            logger.warning(f"Chaos injection: {action}")
-            if action == 'delay':
-                await asyncio.sleep(random.uniform(0.5, 2.0))
-            elif action == 'corrupt_data':
-                if self.engine.metrics.custom_metrics:
-                    key = random.choice(list(self.engine.metrics.custom_metrics.keys()))
-                    if self.engine.metrics.custom_metrics[key]:
-                        self.engine.metrics.custom_metrics[key][-1] = random.uniform(0, 100)
-            elif action == 'skip_tick':
-                if self.engine.config.data_source == 'csv':
-                    self.engine._current_index += 1
+    async def maybe_inject_failure(self) -> None:
+        return None
 
 
-class HumanApprovalHandler:
-    """Requests human approval for critical decisions."""
-    def __init__(self, queue: Optional[Any] = None):
+class HumanApprovalHandlerPlaceholder:
+    STATUS = "placeholder"
+
+    def __init__(self, queue: Optional[Any] = None, enabled: bool = False,
+                 auto_approve_dev: bool = False):
+        if enabled:
+            _warn_module("human_approval")
         self.queue = queue
+        self.available = False
+        self.auto_approve_dev = auto_approve_dev
+        if auto_approve_dev:
+            logger.warning(
+                "HumanApproval auto_approve_dev=True; do not use in production."
+            )
 
-    async def request_approval(self, decision: Dict[str, Any], timeout: float = 60.0) -> bool:
-        if not self.queue:
-            logger.warning("No queue for human approval; auto-approving.")
+    async def request_approval(self, decision: Dict[str, Any],
+                                timeout: float = 60.0) -> bool:
+        if self.auto_approve_dev:
             return True
-        logger.info(f"Human approval requested for {decision.get('action')}, auto-approving.")
-        await asyncio.sleep(0)
-        return True
+        return False
 
 
-# ============================================================================
-# Metrics Collector (extensible with capped storage)
-# ============================================================================
+# =============================================================================
+# SECTION 9. EXPERIMENTAL MODULES
+# =============================================================================
+class SafetyMonitor:
+    STATUS = "experimental"
+
+    def __init__(self, enabled: bool = True):
+        if enabled:
+            _warn_module("safety_monitor")
+        self.invariants: List[
+            Tuple[str, Callable[[Dict[str, Any]], bool], str]
+        ] = []
+        self.available = True
+
+    def add_invariant(self, name: str,
+                      fn: Callable[[Dict[str, Any]], bool],
+                      description: str) -> None:
+        self.invariants.append((name, fn, description))
+
+    def check(self, state: Dict[str, Any]) -> List[str]:
+        return [f"{n}: {d}" for n, fn, d in self.invariants if not fn(state)]
+
+
+class XAIExplainer:
+    STATUS = "experimental"
+
+    def __init__(self, enabled: bool = True):
+        if enabled:
+            _warn_module("xai")
+        self.available = True
+
+    def explain_policy(self, point: MOPDPoint) -> str:
+        return (
+            f"Policy {point.policy_id} selected: mode={point.harvester_mode}, "
+            f"total_harvested={point.total_harvested:.2f}, "
+            f"avg_efficiency={point.avg_efficiency:.2f}, "
+            f"carbon_saved={point.carbon_saved:.2f}, "
+            f"helium_saved={point.helium_saved:.2f}."
+        )
+
+
+# =============================================================================
+# SECTION 10. METRICS COLLECTOR (bounded)
+# =============================================================================
 class MetricsCollector:
-    """Collect and aggregate simulation metrics with capped storage for custom metrics."""
-    def __init__(self, max_custom_entries: int = 1000):
+    def __init__(self, max_custom_entries: int = 1000,
+                 max_history: int = 10000):
         self.total_harvested = 0.0
         self.harvest_cycles = 0
-        self.efficiencies: List[float] = []
-        self.modes: List[str] = []
-        self.timestamps: List[datetime] = []
-        self.custom_metrics: Dict[str, List[Any]] = {}
-        self._max_custom_entries = max_custom_entries
+        self._max_custom = max_custom_entries
+        self._max_history = max_history
+        self.efficiencies: "deque[float]" = deque(maxlen=max_history)
+        self.modes: "deque[str]" = deque(maxlen=max_history)
+        self.timestamps: "deque[datetime]" = deque(maxlen=max_history)
+        self.custom_metrics: Dict[str, deque] = {}
 
-    def record(self, result: Dict[str, Any]):
-        self.total_harvested += result.get('eco_atp_generated', 0)
+    def record(self, result: Dict[str, Any]) -> None:
+        self.total_harvested += float(result.get("eco_atp_generated", 0.0))
         self.harvest_cycles += 1
-        self.efficiencies.append(result.get('efficiency', 0))
-        self.modes.append(result.get('mode', 'unknown'))
-        self.timestamps.append(datetime.now())
+        self.efficiencies.append(float(result.get("efficiency", 0.0)))
+        self.modes.append(str(result.get("mode", "unknown")))
+        self.timestamps.append(datetime.now(timezone.utc))
 
         for key, value in result.items():
-            if key not in ['eco_atp_generated', 'efficiency', 'mode']:
-                if key not in self.custom_metrics:
-                    self.custom_metrics[key] = []
-                self.custom_metrics[key].append(value)
-                if len(self.custom_metrics[key]) > self._max_custom_entries:
-                    self.custom_metrics[key] = self.custom_metrics[key][-self._max_custom_entries:]
+            if key in ("eco_atp_generated", "efficiency", "mode"):
+                continue
+            if key not in self.custom_metrics:
+                self.custom_metrics[key] = deque(maxlen=self._max_custom)
+            self.custom_metrics[key].append(value)
 
     def get_summary(self) -> Dict[str, Any]:
-        summary = {
-            'total_harvested': self.total_harvested,
-            'harvest_cycles': self.harvest_cycles,
-            'avg_efficiency': np.mean(self.efficiencies) if self.efficiencies else 0,
-            'max_efficiency': max(self.efficiencies) if self.efficiencies else 0,
-            'mode_counts': {mode: self.modes.count(mode) for mode in set(self.modes)},
-            'duration_hours': (self.timestamps[-1] - self.timestamps[0]).total_seconds() / 3600 if self.timestamps else 0
+        effs = list(self.efficiencies)
+        tss = list(self.timestamps)
+        summary: Dict[str, Any] = {
+            "total_harvested": self.total_harvested,
+            "harvest_cycles": self.harvest_cycles,
+            "avg_efficiency": float(np.mean(effs)) if effs else 0.0,
+            "max_efficiency": max(effs) if effs else 0.0,
+            "mode_counts": {m: list(self.modes).count(m)
+                            for m in set(self.modes)},
+            "duration_hours": (
+                (tss[-1] - tss[0]).total_seconds() / 3600.0
+                if len(tss) >= 2 else 0.0
+            ),
         }
         for key, values in self.custom_metrics.items():
-            if values:
-                recent = values[-self._max_custom_entries:]
-                summary[f'avg_{key}'] = np.mean(recent)
-                summary[f'min_{key}'] = np.min(recent)
-                summary[f'max_{key}'] = np.max(recent)
+            vals = list(values)
+            if vals:
+                try:
+                    summary[f"avg_{key}"] = float(np.mean(vals))
+                    summary[f"min_{key}"] = float(np.min(vals))
+                    summary[f"max_{key}"] = float(np.max(vals))
+                except Exception:
+                    pass
         return summary
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            'total_harvested': self.total_harvested,
-            'harvest_cycles': self.harvest_cycles,
-            'efficiencies': self.efficiencies,
-            'modes': self.modes,
-            'timestamps': [ts.isoformat() for ts in self.timestamps],
-            'custom_metrics': self.custom_metrics,
-            'max_custom_entries': self._max_custom_entries,
+            "total_harvested": self.total_harvested,
+            "harvest_cycles": self.harvest_cycles,
+            "efficiencies": list(self.efficiencies),
+            "modes": list(self.modes),
+            "timestamps": [ts.isoformat() for ts in self.timestamps],
+            "custom_metrics": {k: list(v) for k, v in self.custom_metrics.items()},
+            "max_custom_entries": self._max_custom,
+            "max_history": self._max_history,
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'MetricsCollector':
-        collector = cls(max_custom_entries=data.get('max_custom_entries', 1000))
-        collector.total_harvested = data.get('total_harvested', 0.0)
-        collector.harvest_cycles = data.get('harvest_cycles', 0)
-        collector.efficiencies = data.get('efficiencies', [])
-        collector.modes = data.get('modes', [])
-        collector.timestamps = [datetime.fromisoformat(ts) for ts in data.get('timestamps', [])]
-        collector.custom_metrics = data.get('custom_metrics', {})
-        return collector
+    def from_dict(cls, data: Dict[str, Any]) -> "MetricsCollector":
+        c = cls(
+            max_custom_entries=int(data.get("max_custom_entries", 1000)),
+            max_history=int(data.get("max_history", 10000)),
+        )
+        c.total_harvested = float(data.get("total_harvested", 0.0))
+        c.harvest_cycles = int(data.get("harvest_cycles", 0))
+        c.efficiencies = deque(data.get("efficiencies", []),
+                                maxlen=c._max_history)
+        c.modes = deque(data.get("modes", []), maxlen=c._max_history)
+        c.timestamps = deque(
+            [datetime.fromisoformat(ts) for ts in data.get("timestamps", [])],
+            maxlen=c._max_history,
+        )
+        for k, v in (data.get("custom_metrics") or {}).items():
+            c.custom_metrics[k] = deque(v, maxlen=c._max_custom)
+        return c
 
-# ============================================================================
-# Live Data Feed
-# ============================================================================
+
+# =============================================================================
+# SECTION 11. LIVE DATA FEED
+# =============================================================================
 class LiveDataFeed:
-    """Handles fetching live data via a callback or async generator."""
     def __init__(self, config: TimeTickConfig):
         self.config = config
         self._callback = config.live_data_callback
@@ -516,359 +797,437 @@ class LiveDataFeed:
         self._backoff = 0.5
 
     async def fetch(self) -> Dict[str, float]:
-        if self._callback:
+        if self._callback is not None:
             try:
-                data = await self._callback()
+                data = self._callback()
+                if _is_awaitable(data):
+                    data = await data
                 if data is not None:
-                    self._last_data = data
+                    self._last_data = dict(data)
                     self._backoff = 0.5
-                    return data
+                    return dict(data)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error("Live data callback failed: %s", e)
+                logger.error("Live callback failed", error=str(e))
                 self._backoff = min(self._backoff * 2, 30.0)
                 await asyncio.sleep(self._backoff)
         if self._last_data is None:
             return {col: 0.5 for col in self.config.value_columns}
-        return self._last_data
+        return dict(self._last_data)
 
-    async def run(self):
-        self._running = True
-        while self._running:
-            try:
-                await self.fetch()
-                await asyncio.sleep(self.config.live_fetch_interval)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("Live feed run error: %s", e)
-                await asyncio.sleep(self._backoff)
-        self._running = False
-        logger.info("Live data feed stopped.")
-
-    def stop(self):
+    def stop(self) -> None:
         self._running = False
 
-# ============================================================================
-# Enhanced TimeTickEngine
-# ============================================================================
+
+# =============================================================================
+# SECTION 12. TIME TICK ENGINE
+# =============================================================================
 class TimeTickEngine:
-    def __init__(self,
-                 harvester: HarvesterProtocol,
-                 translator: Union[TranslatorProtocol, Callable],
-                 config: Optional[Union[TimeTickConfig, Dict[str, Any]]] = None,
-                 message_queue: Optional[Any] = None):
+    """
+    Lifecycle:
+        engine = TimeTickEngine(harvester, translator, config)
+        await engine.start()
+        ...
+        await engine.shutdown()
+    """
+
+    def __init__(
+        self,
+        harvester: HarvesterProtocol,
+        translator: Union[TranslatorProtocol, Callable],
+        config: Optional[Union[TimeTickConfig, Dict[str, Any]]] = None,
+        message_queue: Optional[Any] = None,
+    ):
         self.harvester = harvester
         self.translator = translator
         self.message_queue = message_queue
 
         if isinstance(config, dict):
-            if PYDANTIC_AVAILABLE:
-                self.config = TimeTickConfig(**config)
-            else:
-                self.config = TimeTickConfig(**config)
+            self.config = TimeTickConfig.from_dict(config)
         elif isinstance(config, TimeTickConfig):
             self.config = config
         else:
-            self.config = TimeTickConfig(data_source="csv", csv_path="helium_data.csv")
+            self.config = TimeTickConfig()
 
+        issues = self.config.validate()
+        if issues:
+            raise ValueError(f"Invalid config: {issues}")
+
+        # Data
+        self.df_monthly: Optional[pd.DataFrame] = None
         self.daily_df: Optional[pd.DataFrame] = None
-        self.metrics = MetricsCollector(max_custom_entries=self.config.max_custom_metrics_entries)
+        self._data_hash: Optional[str] = None
+
+        # State
+        self.metrics = MetricsCollector(
+            max_custom_entries=self.config.max_custom_metrics_entries,
+            max_history=self.config.max_metric_history,
+        )
         self._running = False
         self._stop_event = asyncio.Event()
         self._current_index = 0
-        self._checkpoint_path = None
         self._live_feed: Optional[LiveDataFeed] = None
-        self._data_hash: Optional[str] = None
 
+        # MOPD
         self._mopd_results: Dict[str, Dict[str, Any]] = {}
         self._pareto_front: List[MOPDPoint] = []
-        self._policy_cache: Dict[Tuple[str, frozenset], MOPDPoint] = {}
+        self._policy_cache: Dict[Tuple, MOPDPoint] = {}
 
-        # Enhanced modules
-        self.quantum_distillation = QuantumDistillationModule(self.config) if self.config.enable_quantum_distillation else None
+        # Concurrency
+        self._state_lock: Optional[asyncio.Lock] = None
+        self._policy_eval_lock: Optional[asyncio.Lock] = None
 
-        if self.config.enable_causal_rl:
-            self.causal_rl_agent = CausalRLAgent(state_dim=10, action_dim=3)
-        else:
-            self.causal_rl_agent = None
+        # Placeholders
+        self.quantum_distillation = (
+            QuantumDistillationModulePlaceholder(enabled=True)
+            if self.config.enable_quantum_distillation else None
+        )
+        self.causal_rl_agent = (
+            CausalRLAgentPlaceholder(enabled=True)
+            if self.config.enable_causal_rl else None
+        )
+        self.federated_coordinator = (
+            FederatedCoordinatorPlaceholder(self, self.message_queue,
+                                             enabled=True)
+            if self.config.enable_federated else None
+        )
+        self.precision_controller = (
+            PrecisionControllerPlaceholder(enabled=True)
+            if self.config.enable_precision else None
+        )
+        self.carbon_market = (
+            CarbonMarketClientPlaceholder(
+                enabled=True, **(self.config.carbon_market_config or {})
+            )
+            if self.config.enable_carbon_market else None
+        )
+        self.chaos_injector = (
+            ChaosInjectorPlaceholder(self, self.config.chaos_probability,
+                                      enabled=True)
+            if self.config.enable_chaos else None
+        )
+        self.human_approval = (
+            HumanApprovalHandlerPlaceholder(self.message_queue, enabled=True)
+            if self.config.enable_human_approval else None
+        )
 
-        self.federated_coordinator = FederatedCoordinator(self, self.message_queue) if self.config.enable_federated else None
-
-        self.safety_monitor = SafetyMonitor() if self.config.enable_safety_monitor else None
-        if self.safety_monitor:
+        # Experimental
+        self.safety_monitor: Optional[SafetyMonitor] = None
+        if self.config.enable_safety_monitor:
+            self.safety_monitor = SafetyMonitor(enabled=True)
             self._setup_safety_invariants()
+        self.xai = XAIExplainer(enabled=self.config.enable_xai)
 
-        self.precision_controller = PrecisionController() if self.config.enable_precision else None
+        # Subsystems
+        self.event_bus = EventBus()
+        self._task_manager = TaskManager()
 
-        self.carbon_market = None
-        if self.config.enable_carbon_market and self.config.carbon_market_config:
-            self.carbon_market = CarbonMarketClient(**self.config.carbon_market_config)
-
-        self.chaos_injector = ChaosInjector(self, self.config.chaos_probability) if self.config.enable_chaos else None
-
-        self.human_approval = HumanApprovalHandler(self.message_queue) if self.config.enable_human_approval else None
-
-        # Start background tasks for federated updates and chaos
-        if self.federated_coordinator:
-            self._federated_task = asyncio.create_task(self._federated_loop())
-        if self.chaos_injector:
-            self._chaos_task = asyncio.create_task(self._chaos_loop())
+        # Lifecycle
+        self._started = False
+        self._shutdown = False
 
         if self.config.enable_checkpointing:
             Path(self.config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
-        logger.info("TimeTickEngine initialized with enhanced modules.")
+        logger.info("TimeTickEngine created (not started)")
 
-    def _setup_safety_invariants(self):
+    # ---------------- locks ----------------
+    def _get_state_lock(self) -> asyncio.Lock:
+        if self._state_lock is None:
+            self._state_lock = asyncio.Lock()
+        return self._state_lock
+
+    def _get_policy_eval_lock(self) -> asyncio.Lock:
+        if self._policy_eval_lock is None:
+            self._policy_eval_lock = asyncio.Lock()
+        return self._policy_eval_lock
+
+    # ---------------- safety ----------------
+    def _setup_safety_invariants(self) -> None:
+        assert self.safety_monitor is not None
         self.safety_monitor.add_invariant(
-            "efficiency_positive",
-            lambda state: state.get('efficiency', 0) >= 0,
-            "Efficiency must be non-negative"
+            "efficiency_non_negative",
+            lambda s: s.get("efficiency", 0.0) >= 0.0,
+            "Efficiency must be non-negative",
         )
         self.safety_monitor.add_invariant(
             "harvest_non_negative",
-            lambda state: state.get('total_harvested', 0) >= 0,
-            "Total harvested must be non-negative"
+            lambda s: s.get("total_harvested", 0.0) >= 0.0,
+            "Total harvested must be non-negative",
         )
 
-    async def _federated_loop(self):
-        while True:
-            await asyncio.sleep(300)  # 5 minutes
-            if self.federated_coordinator:
-                await self.federated_coordinator.send_update()
-
-    async def _chaos_loop(self):
-        while True:
-            await asyncio.sleep(60)
-            if self.chaos_injector:
-                await self.chaos_injector.maybe_inject_failure()
-
     def _check_safety(self, state: Dict[str, Any]) -> List[str]:
-        if not self.safety_monitor:
+        if self.safety_monitor is None:
             return []
         return self.safety_monitor.check(state)
 
-    def _explain_decision(self, point: MOPDPoint) -> str:
-        explanation = (
-            f"Policy {point.policy_id} selected: mode={point.harvester_mode}, "
-            f"total_harvested={point.total_harvested:.2f}, "
-            f"avg_efficiency={point.avg_efficiency:.2f}, "
-            f"carbon_saved={point.carbon_saved:.2f}, helium_saved={point.helium_saved:.2f}."
-        )
-        return explanation
+    # ---------------- lifecycle ----------------
+    async def start(self) -> None:
+        if self._started:
+            return
+        await self.event_bus.start()
 
-    async def _maybe_trade_carbon(self, carbon_saved: float):
-        if self.carbon_market and self.carbon_market.available and carbon_saved > 0:
-            await self.carbon_market.sell_credits(carbon_saved * 0.1)
+        if self.federated_coordinator is not None:
+            self._task_manager.start_task("federated_loop",
+                                           self._federated_loop)
+        if self.chaos_injector is not None:
+            self._task_manager.start_task("chaos_loop", self._chaos_loop)
 
-    async def _maybe_request_approval(self, action: str, details: Dict[str, Any]) -> bool:
-        if self.human_approval:
-            return await self.human_approval.request_approval({'action': action, 'details': details})
-        return True
+        self._started = True
+        logger.info("TimeTickEngine started")
 
-    # ============================================================================
-    # Data Loading
-    # ============================================================================
-    async def load_data(self, csv_path: Optional[str] = None):
-        if self.config.data_source == 'live':
+    async def ready(self) -> bool:
+        return self._started and not self._shutdown
+
+    async def shutdown(self, timeout: Optional[float] = None) -> None:
+        if self._shutdown:
+            return
+        self._shutdown = True
+        timeout = timeout or float(self.config.shutdown_timeout_seconds)
+        logger.info("TimeTickEngine shutting down")
+
+        self.stop()
+        try:
+            await asyncio.wait_for(self._task_manager.drain(timeout),
+                                    timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Task drain timed out")
+
+        try:
+            await asyncio.wait_for(self.event_bus.stop(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("Event bus stop timed out")
+
+        if (self.config.enable_checkpointing
+                and self._current_index > 0
+                and self.config.data_source == "csv"):
+            try:
+                await self._save_checkpoint(self._current_index)
+            except Exception as e:
+                logger.warning("Final checkpoint failed", error=str(e))
+
+        logger.info("TimeTickEngine shutdown complete")
+
+    async def __aenter__(self) -> "TimeTickEngine":
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.shutdown()
+
+    # ---------------- background loops ----------------
+    async def _federated_loop(self) -> None:
+        while not self._task_manager.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(300)
+                if self.federated_coordinator is not None:
+                    await self.federated_coordinator.send_update()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("Federated loop error", error=str(e))
+
+    async def _chaos_loop(self) -> None:
+        while not self._task_manager.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(60)
+                if self.chaos_injector is not None:
+                    await self.chaos_injector.maybe_inject_failure()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("Chaos loop error", error=str(e))
+
+    # ---------------- data loading ----------------
+    async def load_data(self, csv_path: Optional[str] = None) -> None:
+        if self.config.data_source == "live":
             self._live_feed = LiveDataFeed(self.config)
-            logger.info("Live data feed initialized.")
+            logger.info("Live data feed initialized")
             return
 
         path = csv_path or self.config.csv_path
         if not path:
-            raise ValueError("CSV path not provided.")
+            raise ValueError("CSV path not provided")
 
-        logger.info("Loading CSV from %s", path)
         try:
-            with open(path, 'rb') as f:
+            with open(path, "rb") as f:
                 self._data_hash = hashlib.md5(f.read()).hexdigest()
         except Exception as e:
-            logger.warning("Could not compute data hash for checkpoint validation: %s", e)
+            logger.warning("Data hash computation failed", error=str(e))
             self._data_hash = None
 
         try:
             df = pd.read_csv(path)
         except Exception as e:
-            logger.error("Failed to read CSV: %s", e)
+            logger.error("Failed to read CSV", error=str(e))
             raise
 
         required = [self.config.date_column] + self.config.value_columns
-        missing = [col for col in required if col not in df.columns]
+        missing = [c for c in required if c not in df.columns]
         if missing:
             raise ValueError(f"Missing columns in CSV: {missing}")
 
         try:
             if self.config.date_format:
-                df[self.config.date_column] = pd.to_datetime(df[self.config.date_column],
-                                                            format=self.config.date_format)
+                df[self.config.date_column] = pd.to_datetime(
+                    df[self.config.date_column], format=self.config.date_format
+                )
             else:
                 df[self.config.date_column] = pd.to_datetime(df[self.config.date_column])
         except Exception as e:
-            raise ValueError(f"Failed to parse date column '{self.config.date_column}': {e}")
+            raise ValueError(f"Date parsing failed: {e}")
 
         df = df.sort_values(self.config.date_column)
 
         if self.config.start_date:
-            start = pd.to_datetime(self.config.start_date)
-            df = df[df[self.config.date_column] >= start]
+            df = df[df[self.config.date_column] >= pd.to_datetime(self.config.start_date)]
         if self.config.end_date:
-            end = pd.to_datetime(self.config.end_date)
-            df = df[df[self.config.date_column] <= end]
+            df = df[df[self.config.date_column] <= pd.to_datetime(self.config.end_date)]
 
         self.df_monthly = df
         self._interpolate_daily()
-        logger.info("Loaded %d monthly rows, interpolated to %d daily ticks.",
-                    len(self.df_monthly), len(self.daily_df))
+        logger.info("CSV loaded", rows_monthly=len(self.df_monthly),
+                    rows_daily=len(self.daily_df))
 
-    def _interpolate_daily(self):
-        if self.df_monthly.empty:
-            logger.warning("No data after filtering; daily DataFrame will be empty.")
-            self.daily_df = pd.DataFrame(columns=['date'] + self.config.value_columns)
+    def _interpolate_daily(self) -> None:
+        if self.df_monthly is None or self.df_monthly.empty:
+            self.daily_df = pd.DataFrame(
+                columns=["date"] + self.config.value_columns
+            )
             return
-
-        df_monthly = self.df_monthly.set_index(self.config.date_column)
-        daily_index = pd.date_range(
-            start=df_monthly.index.min(),
-            end=df_monthly.index.max(),
-            freq='D'
-        )
-        numeric_cols = [col for col in self.config.value_columns if col in df_monthly.columns]
+        df_m = self.df_monthly.set_index(self.config.date_column)
+        daily_index = pd.date_range(start=df_m.index.min(),
+                                    end=df_m.index.max(), freq="D")
+        numeric_cols = [c for c in self.config.value_columns if c in df_m.columns]
         try:
-            if self.config.interpolation_method == 'linear':
-                self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='linear')
-            elif self.config.interpolation_method == 'quadratic':
-                self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='quadratic')
-            elif self.config.interpolation_method == 'spline':
+            method = self.config.interpolation_method
+            if method == "spline":
                 try:
-                    self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='spline')
+                    self.daily_df = (df_m[numeric_cols].reindex(daily_index)
+                                     .interpolate(method="spline", order=3))
                 except Exception as e:
-                    logger.warning("Spline interpolation failed (%s), falling back to linear.", e)
-                    self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='linear')
-            elif self.config.interpolation_method == 'time':
-                self.daily_df = df_monthly[numeric_cols].reindex(daily_index).interpolate(method='time')
+                    logger.warning("Spline failed; falling back to linear",
+                                   error=str(e))
+                    self.daily_df = (df_m[numeric_cols].reindex(daily_index)
+                                     .interpolate(method="linear"))
             else:
-                raise ValueError(f"Unsupported interpolation method: {self.config.interpolation_method}")
+                self.daily_df = (df_m[numeric_cols].reindex(daily_index)
+                                 .interpolate(method=method))
         except Exception as e:
-            logger.error("Interpolation failed: %s", e)
+            logger.error("Interpolation failed", error=str(e))
             raise
-
         self.daily_df = self.daily_df.reset_index()
-        self.daily_df.rename(columns={'index': 'date'}, inplace=True)
-        self.daily_df = self.daily_df.fillna(method='ffill').fillna(method='bfill')
+        # pandas >= 2.x: use ffill/bfill directly
+        self.daily_df = self.daily_df.ffill().bfill()
 
-    # ============================================================================
-    # Simulation
-    # ============================================================================
-    async def run_simulation(self,
-                             start_index: Optional[int] = None,
-                             post_tick_callback: Optional[Callable[[int, pd.Series, Dict[str, Any]], Awaitable[None]]] = None):
-        if self.config.data_source == 'csv' and self.daily_df is None:
-            raise RuntimeError("Data not loaded. Call load_data() first.")
+    # ---------------- simulation ----------------
+    @traced("time_tick_engine.run_simulation")
+    async def run_simulation(
+        self,
+        start_index: Optional[int] = None,
+        post_tick_callback: Optional[
+            Callable[[int, pd.Series, Dict[str, Any]], Awaitable[None]]
+        ] = None,
+    ) -> None:
+        if self._running:
+            raise RuntimeError("Simulation already running on this engine")
+
+        if self.config.data_source == "csv" and self.daily_df is None:
+            raise RuntimeError("Data not loaded. Call load_data() first")
 
         if start_index is not None:
             self._current_index = start_index
-        else:
-            if self.config.enable_checkpointing:
-                self._load_checkpoint()
+        elif self.config.enable_checkpointing:
+            self._load_checkpoint()
 
         self._stop_event.clear()
         self._running = True
 
-        if self.config.data_source == 'live' and self._live_feed:
-            live_task = asyncio.create_task(self._live_feed.run())
-        else:
-            live_task = None
+        total_ticks = (
+            len(self.daily_df) if self.config.data_source == "csv" else None
+        )
 
-        total_ticks = len(self.daily_df) if self.config.data_source == 'csv' else None
-
-        logger.info("Starting simulation from index %d", self._current_index)
         pbar = None
-        if TQDM_AVAILABLE and self.config.data_source == 'csv' and total_ticks:
-            pbar = tqdm(total=total_ticks, initial=self._current_index, desc="Simulating")
+        if TQDM_AVAILABLE and total_ticks:
+            pbar = tqdm(total=total_ticks, initial=self._current_index,
+                        desc="Simulating")
 
         try:
             while self._running and not self._stop_event.is_set():
-                if self.config.data_source == 'csv':
-                    if self._current_index >= total_ticks:
-                        logger.info("Reached end of data.")
+                if self.config.data_source == "csv":
+                    if total_ticks is not None and self._current_index >= total_ticks:
+                        logger.info("Reached end of data")
                         break
                     row = self.daily_df.iloc[self._current_index]
                     if pbar:
                         pbar.update(1)
                 else:
-                    if self._live_feed:
-                        data = await self._live_feed.fetch()
-                        row = pd.Series({'date': datetime.now()})
-                        for k, v in data.items():
-                            row[k] = v
-                    else:
-                        logger.error("No live data feed available.")
+                    if self._live_feed is None:
+                        logger.error("No live data feed available")
                         break
+                    data = await self._live_feed.fetch()
+                    row = pd.Series({"date": datetime.now(timezone.utc)})
+                    for k, v in data.items():
+                        row[k] = v
 
                 env_data = self._translate_row(row)
                 if env_data is None:
-                    if self.config.data_source == 'csv':
+                    if self.config.data_source == "csv":
                         self._current_index += 1
                     continue
 
                 result = await self.harvester.harvest_cycle(env_data)
 
-                # Safety check
-                if self.safety_monitor:
+                if self.safety_monitor is not None:
                     state = {
-                        'efficiency': result.get('efficiency', 0),
-                        'total_harvested': self.metrics.total_harvested + result.get('eco_atp_generated', 0),
+                        "efficiency": result.get("efficiency", 0.0),
+                        "total_harvested": (
+                            self.metrics.total_harvested
+                            + result.get("eco_atp_generated", 0.0)
+                        ),
                     }
                     violations = self._check_safety(state)
                     if violations:
-                        logger.warning("Safety violations detected: %s", violations)
+                        logger.warning("Safety violations", violations=violations)
 
-                # Carbon trading
-                if 'carbon_saved' in result and self.carbon_market:
-                    await self._maybe_trade_carbon(result['carbon_saved'])
+                if result.get("carbon_saved", 0.0) > 0 and self.carbon_market:
+                    await self._maybe_trade_carbon(result["carbon_saved"])
 
                 if self.config.metrics_enabled:
                     self.metrics.record(result)
 
-                if post_tick_callback:
+                if post_tick_callback is not None:
                     try:
-                        if asyncio.iscoroutinefunction(post_tick_callback):
-                            await post_tick_callback(self._current_index, row, result)
-                        else:
-                            post_tick_callback(self._current_index, row, result)
+                        r = post_tick_callback(self._current_index, row, result)
+                        if _is_awaitable(r):
+                            await r
                     except Exception as e:
-                        logger.error("Post-tick callback failed: %s", e)
+                        logger.error("Post-tick callback failed", error=str(e))
 
                 if self.config.enable_xai and self._current_index % 100 == 0:
-                    logger.info("XAI: Tick %d, harvested %.2f, mode %s",
-                                self._current_index, result.get('eco_atp_generated', 0), result.get('mode', 'unknown'))
+                    logger.info("XAI tick", tick=self._current_index,
+                                harvested=result.get("eco_atp_generated", 0.0))
 
-                if self.config.data_source == 'csv' and self._current_index % 30 == 0:
-                    logger.info("Day %d: harvested %.2f Eco‑ATP",
-                                self._current_index, result.get('eco_atp_generated', 0))
-
-                if self.config.enable_checkpointing and self.config.data_source == 'csv':
-                    if self._current_index % self.config.checkpoint_interval == 0:
-                        await self._save_checkpoint(self._current_index)
+                if (self.config.enable_checkpointing
+                        and self.config.data_source == "csv"
+                        and self._current_index % self.config.checkpoint_interval == 0):
+                    await self._save_checkpoint(self._current_index)
 
                 await asyncio.sleep(self.config.tick_interval_seconds)
-
-                if self.config.data_source == 'csv':
+                if self.config.data_source == "csv":
                     self._current_index += 1
 
         except asyncio.CancelledError:
-            logger.info("Simulation cancelled.")
-            self._running = False
-            if self.config.enable_checkpointing and self.config.data_source == 'csv':
+            logger.info("Simulation cancelled")
+            if (self.config.enable_checkpointing
+                    and self.config.data_source == "csv"):
                 await self._save_checkpoint(self._current_index)
             raise
 
         except Exception as e:
-            logger.error("Simulation failed at index %d: %s", self._current_index, e)
-            self._running = False
+            logger.error("Simulation failed", index=self._current_index,
+                         error=str(e))
             raise
 
         finally:
@@ -876,164 +1235,176 @@ class TimeTickEngine:
                 pbar.close()
             self._running = False
             self._stop_event.set()
-            if live_task:
-                live_task.cancel()
-                await asyncio.gather(live_task, return_exceptions=True)
-            if self._live_feed:
+            if self._live_feed is not None:
                 self._live_feed.stop()
-            logger.info("Simulation finished. Total harvested: %.2f", self.metrics.total_harvested)
+            logger.info("Simulation finished",
+                        total_harvested=self.metrics.total_harvested)
 
-    def stop(self):
+    def stop(self) -> None:
         self._stop_event.set()
         self._running = False
-        logger.info("Stop requested.")
+        logger.info("Stop requested")
 
     def _translate_row(self, row: pd.Series) -> Optional[Dict[str, float]]:
         try:
             if callable(self.translator):
                 return self.translator(row)
-            elif hasattr(self.translator, 'translate_row'):
+            if hasattr(self.translator, "translate_row"):
                 return self.translator.translate_row(row)
-            else:
-                raise TypeError("translator is not a callable nor has translate_row method")
+            raise TypeError("translator is not callable nor has translate_row")
         except Exception as e:
-            logger.error("Row translation failed: %s", e)
+            logger.debug("Row translation failed", error=str(e))
             return None
 
-    # ============================================================================
-    # Policy Evaluation and Evolutionary Optimization
-    # ============================================================================
+    # ---------------- policy evaluation ----------------
+    def _policy_key(self, policy: Policy) -> Tuple:
+        params = tuple(sorted(policy.parameters.items()))
+        return (policy.harvester_mode, params)
+
+    @traced("time_tick_engine.evaluate_policy")
     async def evaluate_policy(self, policy: Policy) -> MOPDPoint:
-        params_key = (policy.harvester_mode, frozenset(policy.parameters.items()))
-        if params_key in self._policy_cache:
-            return self._policy_cache[params_key]
+        # Serialize policy evaluation: it mutates the harvester's mode and
+        # parameters, the metrics collector, and _current_index, all of which
+        # are shared across the engine.
+        async with self._get_policy_eval_lock():
+            key = self._policy_key(policy)
+            if key in self._policy_cache:
+                return self._policy_cache[key]
 
-        original_mode = getattr(self.harvester, 'mode', None)
-        original_params = {}
-        if hasattr(self.harvester, 'get_parameters'):
+            # Snapshot engine + harvester state
+            original_index = self._current_index
+            original_running = self._running
+            original_stop_was_set = self._stop_event.is_set()
+            original_metrics = self.metrics
+            original_mode = getattr(self.harvester, "mode", None)
+            original_params = None
+            if hasattr(self.harvester, "get_parameters"):
+                try:
+                    original_params = self.harvester.get_parameters()
+                except Exception:
+                    original_params = None
+
             try:
-                original_params = self.harvester.get_parameters()
-            except:
-                pass
+                if hasattr(self.harvester, "set_mode"):
+                    self.harvester.set_mode(policy.harvester_mode)
+                if (policy.parameters
+                        and hasattr(self.harvester, "set_parameters")):
+                    self.harvester.set_parameters(policy.parameters)
 
-        try:
-            # Apply policy
-            if hasattr(self.harvester, 'set_mode'):
-                self.harvester.set_mode(policy.harvester_mode)
-            if policy.parameters and hasattr(self.harvester, 'set_parameters'):
-                self.harvester.set_parameters(policy.parameters)
+                self.metrics = MetricsCollector(
+                    max_custom_entries=self.config.max_custom_metrics_entries,
+                    max_history=self.config.max_metric_history,
+                )
 
-            # Reset metrics for this policy
-            self.metrics = MetricsCollector(max_custom_entries=self.config.max_custom_metrics_entries)
+                await self.run_simulation(start_index=0)
 
-            # Run simulation from start
-            await self.run_simulation(start_index=0)
+                summary = self.metrics.get_summary()
+                point = MOPDPoint(
+                    policy_id=policy.policy_id,
+                    harvester_mode=policy.harvester_mode,
+                    parameters=dict(policy.parameters),
+                    total_harvested=float(summary["total_harvested"]),
+                    avg_efficiency=float(summary["avg_efficiency"]),
+                    carbon_saved=float(summary.get("avg_carbon_impact", 0.0)),
+                    helium_saved=float(summary.get("avg_helium_usage", 0.0)),
+                )
 
-            summary = self.metrics.get_summary()
-            carbon_saved = summary.get('avg_carbon_impact', 0.0)
-            helium_saved = summary.get('avg_helium_usage', 0.0)
+                if self.safety_monitor is not None:
+                    state = {
+                        "total_harvested": point.total_harvested,
+                        "efficiency": point.avg_efficiency,
+                    }
+                    violations = self._check_safety(state)
+                    if violations:
+                        logger.warning("Policy violates safety invariants",
+                                       policy=policy.policy_id,
+                                       violations=violations)
+                        point.total_harvested = 0.0
+                        point.avg_efficiency = 0.0
+                        point.carbon_saved = 0.0
+                        point.helium_saved = 0.0
 
-            point = MOPDPoint(
-                policy_id=policy.policy_id,
-                harvester_mode=policy.harvester_mode,
-                parameters=policy.parameters,
-                total_harvested=summary['total_harvested'],
-                avg_efficiency=summary['avg_efficiency'],
-                carbon_saved=carbon_saved,
-                helium_saved=helium_saved,
-            )
+                if self.config.enable_xai:
+                    logger.info("XAI", text=self.xai.explain_policy(point))
 
-            # Safety check
-            if self.safety_monitor:
-                state = {
-                    'total_harvested': point.total_harvested,
-                    'efficiency': point.avg_efficiency,
-                }
-                violations = self._check_safety(state)
-                if violations:
-                    logger.warning("Policy %s violates safety invariants: %s", policy.policy_id, violations)
-                    point.total_harvested = 0
-                    point.avg_efficiency = 0
-                    point.carbon_saved = 0
-                    point.helium_saved = 0
+                self._policy_cache[key] = point
+                return point
 
-            # XAI explanation
-            if self.config.enable_xai:
-                logger.info("XAI: %s", self._explain_decision(point))
-
-            self._policy_cache[params_key] = point
-            return point
-
-        except Exception as e:
-            logger.error("Policy %s evaluation failed: %s", policy.policy_id, e)
-            raise
-        finally:
-            # Restore original state
-            if hasattr(self.harvester, 'set_mode') and original_mode is not None:
-                self.harvester.set_mode(original_mode)
-            if original_params and hasattr(self.harvester, 'set_parameters'):
-                self.harvester.set_parameters(original_params)
+            finally:
+                # Restore engine state
+                self._current_index = original_index
+                self._running = original_running
+                if original_stop_was_set:
+                    self._stop_event.set()
+                else:
+                    self._stop_event.clear()
+                self.metrics = original_metrics
+                if (original_mode is not None
+                        and hasattr(self.harvester, "set_mode")):
+                    try:
+                        self.harvester.set_mode(original_mode)
+                    except Exception:
+                        pass
+                if (original_params is not None
+                        and hasattr(self.harvester, "set_parameters")):
+                    try:
+                        self.harvester.set_parameters(original_params)
+                    except Exception:
+                        pass
 
     async def run_multi_policy_simulation(
         self,
         policies: List[Policy],
-        post_policy_callback: Optional[Callable[[Policy, Dict[str, Any]], Awaitable[None]]] = None
+        post_policy_callback: Optional[
+            Callable[[Policy, Dict[str, Any]], Awaitable[None]]
+        ] = None,
     ) -> List[MOPDPoint]:
         if not self.config.mopd.enabled:
-            logger.warning("MOPD is disabled; no Pareto front will be generated.")
+            logger.warning("MOPD disabled; no Pareto front will be generated")
             return []
-
-        if self.config.data_source == 'csv' and self.daily_df is None:
-            raise RuntimeError("Data not loaded. Call load_data() first.")
+        if self.config.data_source == "csv" and self.daily_df is None:
+            raise RuntimeError("Data not loaded. Call load_data() first")
 
         self._mopd_results = {}
         self._pareto_front = []
 
-        logger.info("Evaluating %d policies...", len(policies))
-        points = []
-        eval_tasks = [self.evaluate_policy(p) for p in policies]
-        results = await asyncio.gather(*eval_tasks, return_exceptions=True)
-        for p, res in zip(policies, results):
-            if isinstance(res, Exception):
-                logger.error("Policy %s failed: %s", p.policy_id, res)
-                continue
-            points.append(res)
-
-        for point in points:
-            self._mopd_results[point.policy_id] = {
-                'metrics': self.metrics.get_summary(),
-                'point': point,
-            }
+        logger.info("Evaluating policies", count=len(policies))
+        points: List[MOPDPoint] = []
+        for p in policies:
+            try:
+                point = await self.evaluate_policy(p)
+                points.append(point)
+                if post_policy_callback is not None:
+                    r = post_policy_callback(p, point.to_dict())
+                    if _is_awaitable(r):
+                        await r
+            except Exception as e:
+                logger.error("Policy evaluation failed",
+                             policy=p.policy_id, error=str(e))
 
         self._pareto_front = self._filter_pareto(points)
-        best_plan = self._select_best_from_pareto(self._pareto_front)
-        if best_plan:
-            logger.info("Best policy: %s with scalarised score %.3f",
-                        best_plan.policy_id, best_plan.scalarised_score)
+        best = self._select_best_from_pareto(self._pareto_front)
+        if best is not None:
+            logger.info("Best policy selected",
+                        policy=best.policy_id,
+                        score=best.scalarised_score)
             if self.config.enable_xai:
-                logger.info("XAI: %s", self._explain_decision(best_plan))
-            if self.carbon_market:
-                await self._maybe_trade_carbon(best_plan.carbon_saved)
+                logger.info("XAI", text=self.xai.explain_policy(best))
+            if self.carbon_market is not None and best.carbon_saved > 0:
+                await self._maybe_trade_carbon(best.carbon_saved)
 
         if self.config.enable_checkpointing:
-            await self._save_checkpoint(self._current_index, pareto_front=self._pareto_front)
-
-        if self.config.metrics_enabled:
-            logger.info("MOPD generation: %d policies, Pareto front size: %d",
-                        len(policies), len(self._pareto_front))
-
-        if self.federated_coordinator:
-            await self.federated_coordinator.send_update()
-
+            await self._save_checkpoint(self._current_index,
+                                         pareto_front=self._pareto_front)
         return self._pareto_front
 
-    async def run_evolution(self, policy_space: Dict[str, Any] = None):
+    async def run_evolution(self, policy_space: Optional[Dict[str, Any]] = None
+                             ) -> List[MOPDPoint]:
         if not self.config.mopd.enabled:
-            logger.warning("MOPD is disabled; cannot run evolution.")
+            logger.warning("MOPD disabled; cannot run evolution")
             return []
-
-        if self.config.data_source == 'csv' and self.daily_df is None:
-            raise RuntimeError("Data not loaded. Call load_data() first.")
+        if self.config.data_source == "csv" and self.daily_df is None:
+            raise RuntimeError("Data not loaded. Call load_data() first")
 
         optimizer = NSGAIIOptimizer(
             engine=self,
@@ -1050,204 +1421,240 @@ class TimeTickEngine:
         self._pareto_front = pareto
 
         if self.config.enable_checkpointing:
-            await self._save_checkpoint(self._current_index, pareto_front=self._pareto_front)
-
+            await self._save_checkpoint(self._current_index,
+                                         pareto_front=self._pareto_front)
         if self.config.enable_xai and pareto:
             best = self._select_best_from_pareto(pareto)
-            if best:
-                logger.info("XAI (evolution): %s", self._explain_decision(best))
-
-        if self.federated_coordinator:
-            await self.federated_coordinator.send_update()
-
+            if best is not None:
+                logger.info("XAI", text=self.xai.explain_policy(best))
         return pareto
 
+    # ---------------- MOPD helpers ----------------
     def _filter_pareto(self, points: List[MOPDPoint]) -> List[MOPDPoint]:
         if not points:
             return []
-        pareto = []
-        objective_keys = ['total_harvested', 'avg_efficiency', 'carbon_saved', 'helium_saved']
-        for i, p_i in enumerate(points):
+        keys = ["total_harvested", "avg_efficiency",
+                "carbon_saved", "helium_saved"]
+        pareto: List[MOPDPoint] = []
+        for i, p in enumerate(points):
             dominated = False
-            for j, p_j in enumerate(points):
+            for j, q in enumerate(points):
                 if i == j:
                     continue
-                a_vec = [getattr(p_i, k) for k in objective_keys]
-                b_vec = [getattr(p_j, k) for k in objective_keys]
-                if all(b >= a for a, b in zip(a_vec, b_vec)) and any(b > a for a, b in zip(a_vec, b_vec)):
+                a = [getattr(p, k) for k in keys]
+                b = [getattr(q, k) for k in keys]
+                if all(bb >= aa for aa, bb in zip(a, b)) and any(
+                    bb > aa for aa, bb in zip(a, b)
+                ):
                     dominated = True
                     break
             if not dominated:
-                pareto.append(p_i)
+                pareto.append(p)
         return pareto
 
-    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint]) -> Optional[MOPDPoint]:
-        if not pareto_front:
+    def _select_best_from_pareto(self, front: List[MOPDPoint]
+                                   ) -> Optional[MOPDPoint]:
+        if not front:
             return None
         weights = self.config.mopd.objective_weights
-        objective_keys = list(weights.keys())
-        max_vals = {k: max(getattr(p, k) for p in pareto_front) for k in objective_keys}
-        min_vals = {k: min(getattr(p, k) for p in pareto_front) for k in objective_keys}
-        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_keys}
-        best = None
-        best_score = -float('inf')
-        for point in pareto_front:
-            score = 0.0
-            for key in objective_keys:
-                val = getattr(point, key)
-                norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
-                score += weights.get(key, 0.0) * norm
-            point.scalarised_score = score
+        keys = list(weights.keys())
+        max_vals = {k: max(getattr(p, k) for p in front) for k in keys}
+        min_vals = {k: min(getattr(p, k) for p in front) for k in keys}
+        ranges = {k: (max_vals[k] - min_vals[k])
+                  if max_vals[k] != min_vals[k] else 1.0 for k in keys}
+        best: Optional[MOPDPoint] = None
+        best_score = -math.inf
+        for p in front:
+            score = sum(
+                weights[k] * ((getattr(p, k) - min_vals[k]) / ranges[k])
+                for k in keys
+            )
             if score > best_score:
                 best_score = score
-                best = point
-        return best
+                best = p
+        if best is None:
+            return None
+        copy_point = MOPDPoint.from_dict(best.to_dict())
+        copy_point.scalarised_score = best_score
+        return copy_point
 
-    # ============================================================================
-    # Checkpointing
-    # ============================================================================
-    async def _save_checkpoint(self, current_index: int, pareto_front: Optional[List[MOPDPoint]] = None):
-        harvester_state = None
+    # ---------------- carbon market helper ----------------
+    async def _maybe_trade_carbon(self, carbon_saved: float) -> None:
+        if (self.carbon_market is None
+                or not getattr(self.carbon_market, "available", False)
+                or carbon_saved <= 0):
+            return
         try:
-            if hasattr(self.harvester, 'get_harvesting_stats'):
-                stats = await self.harvester.get_harvesting_stats()
-                harvester_state = stats
+            r = self.carbon_market.sell_credits(carbon_saved * 0.1)
+            if _is_awaitable(r):
+                await r
         except Exception as e:
-            logger.warning("Could not retrieve harvester state for checkpoint: %s", e)
+            logger.warning("Carbon trade failed", error=str(e))
 
-        if self.config.data_source == 'csv' and self.daily_df is not None and current_index < len(self.daily_df):
-            current_date_str = self.daily_df.iloc[current_index]['date'].isoformat()
+    # ---------------- checkpointing (JSON) ----------------
+    def _checkpoint_path(self) -> Optional[Path]:
+        if not self.config.enable_checkpointing:
+            return None
+        pattern = f"simulation_{self.harvester.__class__.__name__}_*.json"
+        return Path(self.config.checkpoint_dir) / pattern
+
+    def _cleanup_old_checkpoints(self) -> None:
+        pat = self._checkpoint_path()
+        if pat is None:
+            return
+        files = sorted(Path(pat.parent).glob(pat.name),
+                       key=lambda p: p.stat().st_mtime)
+        if len(files) > self.config.max_checkpoints:
+            for f in files[:-self.config.max_checkpoints]:
+                try:
+                    f.unlink()
+                except Exception as e:
+                    logger.warning("Failed to remove old checkpoint",
+                                   path=str(f), error=str(e))
+
+    async def _save_checkpoint(self, current_index: int,
+                                pareto_front: Optional[List[MOPDPoint]] = None
+                                ) -> None:
+        if not self.config.enable_checkpointing:
+            return
+
+        harvester_state: Optional[Dict[str, Any]] = None
+        if hasattr(self.harvester, "get_harvesting_stats"):
+            try:
+                r = self.harvester.get_harvesting_stats()
+                if _is_awaitable(r):
+                    r = await r
+                harvester_state = r
+            except Exception as e:
+                logger.warning("Harvester state fetch failed", error=str(e))
+
+        if (self.config.data_source == "csv"
+                and self.daily_df is not None
+                and current_index < len(self.daily_df)):
+            d = self.daily_df.iloc[current_index]["date"]
+            current_date_str = d.isoformat() if hasattr(d, "isoformat") else str(d)
         else:
-            current_date_str = datetime.now().isoformat()
+            current_date_str = datetime.now(timezone.utc).isoformat()
 
-        metrics_summary = self.metrics.get_summary()
-        metrics_data = self.metrics.to_dict()
-
-        pareto_front_dict = None
-        if pareto_front is not None:
-            pareto_front_dict = [p.to_dict() for p in pareto_front]
-        elif self._pareto_front:
-            pareto_front_dict = [p.to_dict() for p in self._pareto_front]
-
+        pareto = pareto_front if pareto_front is not None else self._pareto_front
         state = SimulationState(
             current_index=current_index,
             current_date=current_date_str,
             total_harvested=self.metrics.total_harvested,
             harvest_cycles=self.metrics.harvest_cycles,
-            metrics=metrics_summary,
-            metrics_data=metrics_data,
+            metrics=self.metrics.get_summary(),
+            metrics_data=self.metrics.to_dict(),
             harvester_state=harvester_state,
             data_hash=self._data_hash,
-            timestamp=datetime.now().isoformat(),
-            pareto_front=pareto_front_dict,
-            current_policy_id=None
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            pareto_front=[p.to_dict() for p in pareto] if pareto else None,
+            current_policy_id=None,
         )
 
-        filename = f"simulation_{self.harvester.__class__.__name__}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl"
-        checkpoint_path = Path(self.config.checkpoint_dir) / filename
+        filename = (
+            f"simulation_{self.harvester.__class__.__name__}_"
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        path = Path(self.config.checkpoint_dir) / filename
         try:
-            with open(checkpoint_path, 'wb') as f:
-                pickle.dump(state, f)
-            logger.debug("Checkpoint saved at index %d to %s", current_index, checkpoint_path)
+            with open(path, "w") as f:
+                json.dump(state.to_dict(), f, default=str, indent=2)
             self._cleanup_old_checkpoints()
+            logger.debug("Checkpoint saved", index=current_index, path=str(path))
         except Exception as e:
-            logger.warning("Failed to save checkpoint: %s", e)
-
-    def _cleanup_old_checkpoints(self):
-        pattern = f"simulation_{self.harvester.__class__.__name__}_*.pkl"
-        checkpoint_files = sorted(Path(self.config.checkpoint_dir).glob(pattern), key=lambda p: p.stat().st_mtime)
-        if len(checkpoint_files) > self.config.max_checkpoints:
-            for old_file in checkpoint_files[:-self.config.max_checkpoints]:
-                try:
-                    old_file.unlink()
-                    logger.debug("Removed old checkpoint: %s", old_file)
-                except Exception as e:
-                    logger.warning("Failed to remove old checkpoint %s: %s", old_file, e)
+            logger.warning("Checkpoint save failed", error=str(e))
 
     def _load_checkpoint(self) -> bool:
-        pattern = f"simulation_{self.harvester.__class__.__name__}_*.pkl"
-        checkpoint_files = sorted(Path(self.config.checkpoint_dir).glob(pattern), key=lambda p: p.stat().st_mtime)
-        if not checkpoint_files:
+        if not self.config.enable_checkpointing:
             return False
-
-        latest = checkpoint_files[-1]
+        pat = self._checkpoint_path()
+        if pat is None:
+            return False
+        files = sorted(Path(pat.parent).glob(pat.name),
+                       key=lambda p: p.stat().st_mtime)
+        if not files:
+            return False
+        latest = files[-1]
         try:
-            with open(latest, 'rb') as f:
-                state = pickle.load(f)
+            with open(latest, "r") as f:
+                data = json.load(f)
+            state = SimulationState.from_dict(data)
 
-            if self._data_hash is not None and state.data_hash is not None:
-                if state.data_hash != self._data_hash:
-                    logger.warning("Data hash mismatch: checkpoint may be incompatible. Resuming from start.")
-                    return False
+            if (self._data_hash is not None
+                    and state.data_hash is not None
+                    and state.data_hash != self._data_hash):
+                logger.warning("Data hash mismatch; ignoring checkpoint")
+                return False
 
-            self._current_index = state.current_index
+            self._current_index = int(state.current_index)
             if state.metrics_data:
                 self.metrics = MetricsCollector.from_dict(state.metrics_data)
             else:
-                self.metrics.total_harvested = state.total_harvested
-                self.metrics.harvest_cycles = state.harvest_cycles
+                self.metrics.total_harvested = float(state.total_harvested)
+                self.metrics.harvest_cycles = int(state.harvest_cycles)
 
-            if state.harvester_state and hasattr(self.harvester, 'restore_state'):
+            if (state.harvester_state is not None
+                    and hasattr(self.harvester, "restore_state")):
                 try:
-                    self.harvester.restore_state(state.harvester_state)
-                    logger.info("Restored harvester state from checkpoint.")
+                    r = self.harvester.restore_state(state.harvester_state)
+                    if _is_awaitable(r):
+                        # cannot await from sync method; spawn best-effort
+                        try:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(r)
+                        except RuntimeError:
+                            pass
                 except Exception as e:
-                    logger.warning("Failed to restore harvester state: %s", e)
+                    logger.warning("Harvester restore failed", error=str(e))
 
             if state.pareto_front:
-                self._pareto_front = [MOPDPoint.from_dict(p) for p in state.pareto_front]
-                logger.info("Restored Pareto front with %d points.", len(self._pareto_front))
+                self._pareto_front = [
+                    MOPDPoint.from_dict(p) for p in state.pareto_front
+                ]
+                logger.info("Pareto front restored",
+                            size=len(self._pareto_front))
 
-            logger.info("Resumed from checkpoint: index %d, date %s, file %s",
-                        state.current_index, state.current_date, latest)
+            logger.info("Checkpoint loaded", index=state.current_index,
+                        date=state.current_date, path=str(latest))
             return True
         except Exception as e:
-            logger.warning("Failed to load checkpoint: %s", e)
+            logger.warning("Checkpoint load failed", error=str(e))
             return False
 
+    # ---------------- reporting ----------------
     def get_pareto_front(self) -> List[MOPDPoint]:
-        return self._pareto_front.copy()
+        return [MOPDPoint.from_dict(p.to_dict()) for p in self._pareto_front]
 
     def get_mopd_summary(self) -> Dict[str, Any]:
         if not self.config.mopd.enabled:
             return {"enabled": False}
         return {
             "enabled": True,
-            "objective_weights": self.config.mopd.objective_weights,
+            "objective_weights": dict(self.config.mopd.objective_weights),
             "grid_resolution": self.config.mopd.grid_resolution,
             "pareto_front_size": len(self._pareto_front),
             "num_policies_evaluated": len(self._mopd_results),
+            "module_status": MODULE_STATUS,
         }
 
     def get_metrics(self) -> Dict[str, Any]:
         return self.metrics.get_summary()
 
-    async def shutdown(self):
-        if self._running:
-            self.stop()
-            await asyncio.sleep(0.1)
-        if self.config.enable_checkpointing and self._current_index > 0 and self.config.data_source == 'csv':
-            await self._save_checkpoint(self._current_index)
-        # Cancel background tasks
-        for task in [getattr(self, '_federated_task', None), getattr(self, '_chaos_task', None)]:
-            if task and not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-        logger.info("TimeTickEngine shutdown.")
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.shutdown()
-
-
-# ============================================================================
-# NSGA-II Optimizer for Policy Space
-# ============================================================================
+# =============================================================================
+# SECTION 13. NSGA-II OPTIMIZER (key-based selection)
+# =============================================================================
 class NSGAIIOptimizer:
-    def __init__(self,
-                 engine: TimeTickEngine,
+    """
+    NSGA-II over policies. Selection is by (front_rank, crowding_distance);
+    dominance is maximization across the four objectives.
+    """
+    STATUS = "experimental"
+
+    OBJECTIVE_KEYS = ("total_harvested", "avg_efficiency",
+                      "carbon_saved", "helium_saved")
+
+    def __init__(self, engine: TimeTickEngine,
                  policy_space: Optional[Dict[str, Any]] = None,
                  population_size: int = 20,
                  generations: int = 5,
@@ -1255,7 +1662,10 @@ class NSGAIIOptimizer:
                  crossover_rate: float = 0.8,
                  tournament_size: int = 3,
                  dynamic_weights: bool = True,
-                 objective_weights: Optional[Dict[str, float]] = None):
+                 objective_weights: Optional[Dict[str, float]] = None,
+                 enabled: bool = True):
+        if enabled:
+            _warn_module("nsga2_optimizer")
         self.engine = engine
         self.policy_space = policy_space if policy_space else self._default_policy_space()
         self.population_size = population_size
@@ -1265,84 +1675,88 @@ class NSGAIIOptimizer:
         self.tournament_size = tournament_size
         self.dynamic_weights = dynamic_weights
         self.objective_weights = objective_weights or engine.config.mopd.objective_weights
-        self.best_individual = None
-        self.best_fitness = -float('inf')
-        self.evolution_history = []
+        self.best_individual: Optional[Dict[str, Any]] = None
+        self.best_fitness = -math.inf
+        self.evolution_history: List[Dict[str, Any]] = []
         self.pareto_front: List[MOPDPoint] = []
         self._eval_cache: Dict[Tuple, MOPDPoint] = {}
+        self.available = True
 
         self.param_names = list(self.policy_space.keys())
-        self.discrete_params = {k: v for k, v in self.policy_space.items() if isinstance(v, (list, tuple)) and not isinstance(v[0], (int, float))}
-        self.continuous_params = {k: v for k, v in self.policy_space.items() if isinstance(v, (list, tuple)) and isinstance(v[0], (int, float)) and len(v) == 2}
-
+        self.discrete_params: Dict[str, List] = {}
+        self.continuous_params: Dict[str, Tuple[float, float]] = {}
         for k, v in self.policy_space.items():
-            if isinstance(v, list) and not isinstance(v[0], (list, tuple)):
-                self.discrete_params[k] = v
-            elif isinstance(v, tuple) and len(v) == 2 and all(isinstance(x, (int, float)) for x in v):
-                self.continuous_params[k] = v
+            if isinstance(v, (list, tuple)) and len(v) == 2 and all(
+                isinstance(x, (int, float)) for x in v
+            ) and not isinstance(v[0], bool):
+                self.continuous_params[k] = (float(v[0]), float(v[1]))
+            else:
+                self.discrete_params[k] = list(v)
 
     def _default_policy_space(self) -> Dict[str, Any]:
         return {
-            'harvester_mode': ['standard', 'aggressive', 'conservative'],
-            'conversion_factor': (0.5, 1.5),
-            'repair_rate': (0.001, 0.02),
-            'sensitivity_multiplier': (0.5, 2.0),
+            "harvester_mode": ["standard", "aggressive", "conservative"],
+            "conversion_factor": (0.5, 1.5),
+            "repair_rate": (0.001, 0.02),
+            "sensitivity_multiplier": (0.5, 2.0),
         }
 
+    def _individual_key(self, ind: Dict[str, Any]) -> Tuple:
+        return tuple(sorted((k, float(v)) if isinstance(v, (int, float))
+                            else (k, str(v)) for k, v in ind.items()))
+
     def _random_individual(self) -> Dict[str, Any]:
-        ind = {}
+        ind: Dict[str, Any] = {}
         for name in self.param_names:
             if name in self.discrete_params:
                 ind[name] = random.choice(self.discrete_params[name])
             elif name in self.continuous_params:
-                low, high = self.continuous_params[name]
-                ind[name] = random.uniform(low, high)
+                lo, hi = self.continuous_params[name]
+                ind[name] = random.uniform(lo, hi)
         return ind
 
-    def _crossover(self, parent1: Dict, parent2: Dict) -> Dict:
-        child = {}
+    def _crossover(self, p1: Dict[str, Any],
+                   p2: Dict[str, Any]) -> Dict[str, Any]:
+        child: Dict[str, Any] = {}
         for name in self.param_names:
             if name in self.discrete_params:
-                child[name] = random.choice([parent1[name], parent2[name]])
+                child[name] = random.choice([p1[name], p2[name]])
             else:
-                low, high = self.continuous_params[name]
+                lo, hi = self.continuous_params[name]
                 if random.random() < 0.5:
                     u = random.random()
-                    if u <= 0.5:
-                        beta = (2 * u) ** (1 / (20 + 1))
-                    else:
-                        beta = (1 / (2 * (1 - u))) ** (1 / (20 + 1))
-                    val = 0.5 * ((1 + beta) * parent1[name] + (1 - beta) * parent2[name])
-                    child[name] = max(low, min(high, val))
+                    beta = ((2 * u) ** (1.0 / 21.0) if u <= 0.5
+                            else (1.0 / (2 * (1 - u))) ** (1.0 / 21.0))
+                    val = 0.5 * ((1 + beta) * p1[name] + (1 - beta) * p2[name])
+                    child[name] = max(lo, min(hi, val))
                 else:
-                    child[name] = parent1[name] if random.random() < 0.5 else parent2[name]
+                    child[name] = p1[name] if random.random() < 0.5 else p2[name]
         return child
 
-    def _mutate(self, individual: Dict) -> Dict:
-        mutant = copy.deepcopy(individual)
+    def _mutate(self, ind: Dict[str, Any]) -> Dict[str, Any]:
+        m = dict(ind)
         for name in self.param_names:
             if random.random() < self.mutation_rate:
                 if name in self.discrete_params:
-                    mutant[name] = random.choice(self.discrete_params[name])
+                    m[name] = random.choice(self.discrete_params[name])
                 else:
-                    low, high = self.continuous_params[name]
+                    lo, hi = self.continuous_params[name]
                     u = random.random()
-                    if u < 0.5:
-                        delta = (2 * u) ** (1 / (20 + 1)) - 1
-                    else:
-                        delta = 1 - (2 * (1 - u)) ** (1 / (20 + 1))
-                    mutant[name] = individual[name] + delta * (high - low)
-                    mutant[name] = max(low, min(high, mutant[name]))
-        return mutant
+                    delta = ((2 * u) ** (1.0 / 21.0) - 1 if u < 0.5
+                             else 1 - (2 * (1 - u)) ** (1.0 / 21.0))
+                    m[name] = max(lo, min(hi, ind[name] + delta * (hi - lo)))
+        return m
 
-    def _individual_to_policy(self, ind: Dict) -> Policy:
-        policy_id = "evolved_" + hashlib.md5(str(ind).encode()).hexdigest()[:8]
-        mode = ind.get('harvester_mode', 'standard')
-        params = {k: v for k, v in ind.items() if k != 'harvester_mode'}
-        return Policy(policy_id=policy_id, harvester_mode=mode, parameters=params)
+    def _individual_to_policy(self, ind: Dict[str, Any]) -> Policy:
+        pid = "evolved_" + hashlib.md5(
+            json.dumps(ind, sort_keys=True, default=str).encode()
+        ).hexdigest()[:8]
+        mode = str(ind.get("harvester_mode", "standard"))
+        params = {k: v for k, v in ind.items() if k != "harvester_mode"}
+        return Policy(policy_id=pid, harvester_mode=mode, parameters=params)
 
-    async def _evaluate_individual(self, ind: Dict) -> MOPDPoint:
-        key = tuple(sorted(ind.items()))
+    async def _evaluate_individual(self, ind: Dict[str, Any]) -> MOPDPoint:
+        key = self._individual_key(ind)
         if key in self._eval_cache:
             return self._eval_cache[key]
         policy = self._individual_to_policy(ind)
@@ -1350,315 +1764,590 @@ class NSGAIIOptimizer:
         self._eval_cache[key] = point
         return point
 
-    def _fast_non_dominated_sort(self, points: List[MOPDPoint]) -> List[List[MOPDPoint]]:
-        fronts = []
-        domination_count = {id(p): 0 for p in points}
-        dominated_solutions = {id(p): [] for p in points}
-        objective_keys = ['total_harvested', 'avg_efficiency', 'carbon_saved', 'helium_saved']
+    @staticmethod
+    def _dominates(a: MOPDPoint, b: MOPDPoint) -> bool:
+        keys = NSGAIIOptimizer.OBJECTIVE_KEYS
+        av = [getattr(a, k) for k in keys]
+        bv = [getattr(b, k) for k in keys]
+        return all(x >= y for x, y in zip(av, bv)) and any(
+            x > y for x, y in zip(av, bv)
+        )
 
-        for i, p in enumerate(points):
-            for j, q in enumerate(points):
+    def _fast_non_dominated_sort(
+        self, points: List[MOPDPoint]
+    ) -> List[List[int]]:
+        n = len(points)
+        dominated: List[List[int]] = [[] for _ in range(n)]
+        dom_count = [0] * n
+        fronts: List[List[int]] = [[]]
+
+        for i in range(n):
+            for j in range(n):
                 if i == j:
                     continue
-                p_obj = [getattr(p, k) for k in objective_keys]
-                q_obj = [getattr(q, k) for k in objective_keys]
-                if all(p >= q for p, q in zip(p_obj, q_obj)) and any(p > q for p, q in zip(p_obj, q_obj)):
-                    dominated_solutions[id(p)].append(q)
-                elif all(q >= p for p, q in zip(p_obj, q_obj)) and any(q > p for p, q in zip(p_obj, q_obj)):
-                    domination_count[id(p)] += 1
+                if self._dominates(points[i], points[j]):
+                    dominated[i].append(j)
+                elif self._dominates(points[j], points[i]):
+                    dom_count[i] += 1
+            if dom_count[i] == 0:
+                fronts[0].append(i)
 
-            if domination_count[id(p)] == 0:
-                if not fronts:
-                    fronts.append([])
-                fronts[0].append(p)
+        k = 0
+        while fronts[k]:
+            nxt: List[int] = []
+            for i in fronts[k]:
+                for j in dominated[i]:
+                    dom_count[j] -= 1
+                    if dom_count[j] == 0:
+                        nxt.append(j)
+            k += 1
+            fronts.append(nxt)
+        return [f for f in fronts if f]
 
-        i = 0
-        while i < len(fronts):
-            next_front = []
-            for p in fronts[i]:
-                for q in dominated_solutions[id(p)]:
-                    domination_count[id(q)] -= 1
-                    if domination_count[id(q)] == 0:
-                        next_front.append(q)
-            if next_front:
-                fronts.append(next_front)
-            i += 1
-        return fronts
-
-    def _crowding_distance(self, front: List[MOPDPoint]) -> Dict[int, float]:
+    def _crowding_distance(self, front: List[int],
+                            points: List[MOPDPoint]) -> Dict[int, float]:
         if not front:
             return {}
-        distances = {id(p): 0.0 for p in front}
-        objective_keys = ['total_harvested', 'avg_efficiency', 'carbon_saved', 'helium_saved']
-        for obj in objective_keys:
-            sorted_front = sorted(front, key=lambda x: getattr(x, obj))
-            distances[id(sorted_front[0])] = float('inf')
-            distances[id(sorted_front[-1])] = float('inf')
-            obj_min = getattr(sorted_front[0], obj)
-            obj_max = getattr(sorted_front[-1], obj)
-            if obj_max == obj_min:
+        if len(front) <= 2:
+            return {i: float("inf") for i in front}
+        d: Dict[int, float] = {i: 0.0 for i in front}
+        for key in self.OBJECTIVE_KEYS:
+            sf = sorted(front, key=lambda i: getattr(points[i], key))
+            d[sf[0]] = float("inf")
+            d[sf[-1]] = float("inf")
+            span = getattr(points[sf[-1]], key) - getattr(points[sf[0]], key)
+            if span <= 0:
                 continue
-            for i in range(1, len(sorted_front) - 1):
-                distances[id(sorted_front[i])] += (getattr(sorted_front[i+1], obj) - getattr(sorted_front[i-1], obj)) / (obj_max - obj_min)
-        return distances
+            for idx in range(1, len(sf) - 1):
+                d[sf[idx]] += (
+                    getattr(points[sf[idx + 1]], key)
+                    - getattr(points[sf[idx - 1]], key)
+                ) / span
+        return d
 
-    def _tournament_selection(self, population: List[Dict], fronts: List[List[MOPDPoint]], crowding: Dict[int, float]) -> Dict:
-        point_to_ind = {}
-        for ind, point in self._eval_cache.items():
-            point_to_ind[id(point)] = ind
-
-        candidates = random.sample(population, self.tournament_size)
+    def _tournament_selection(
+        self, keys: List[Tuple], key_to_rank: Dict[Tuple, int],
+        key_to_crowd: Dict[Tuple, float],
+    ) -> Tuple:
+        if len(keys) < self.tournament_size:
+            cand = random.choice(keys)
+            return cand
+        candidates = random.sample(keys, self.tournament_size)
         best = candidates[0]
-        best_rank = float('inf')
-        best_crowding = -float('inf')
-        for cand in candidates:
-            rank = None
-            for fi, front in enumerate(fronts):
-                for p in front:
-                    if point_to_ind.get(id(p)) == cand:
-                        rank = fi
-                        break
-                if rank is not None:
-                    break
-            if rank is None:
-                rank = len(fronts)
-            cd = crowding.get(id(self._eval_cache.get(tuple(sorted(cand.items())))), 0) if tuple(sorted(cand.items())) in self._eval_cache else 0
-            if rank < best_rank or (rank == best_rank and cd > best_crowding):
+        best_rank = key_to_rank.get(best, len(keys))
+        best_crowd = key_to_crowd.get(best, 0.0)
+        for cand in candidates[1:]:
+            r = key_to_rank.get(cand, len(keys))
+            c = key_to_crowd.get(cand, 0.0)
+            if r < best_rank or (r == best_rank and c > best_crowd):
                 best = cand
-                best_rank = rank
-                best_crowding = cd
+                best_rank = r
+                best_crowd = c
         return best
 
     def _compute_dynamic_weights(self) -> Dict[str, float]:
-        weights = self.objective_weights.copy()
-        if not self.dynamic_weights:
+        weights = dict(self.objective_weights)
+        if not self.dynamic_weights or not self.pareto_front:
             return weights
-        if self.pareto_front:
-            avg_harvest = np.mean([p.total_harvested for p in self.pareto_front])
-            max_harvest = max([p.total_harvested for p in self.pareto_front])
-            if max_harvest > 0 and avg_harvest < 0.5 * max_harvest:
-                weights['total_harvested'] = min(0.5, weights.get('total_harvested', 0.3) * 1.5)
-                total = sum(weights.values())
-                weights = {k: v / total for k, v in weights.items()}
+        avg_h = float(np.mean([p.total_harvested for p in self.pareto_front]))
+        max_h = max(p.total_harvested for p in self.pareto_front)
+        if max_h > 0 and avg_h < 0.5 * max_h:
+            weights["total_harvested"] = min(
+                0.5, weights.get("total_harvested", 0.3) * 1.5
+            )
+            total = sum(weights.values()) or 1.0
+            weights = {k: v / total for k, v in weights.items()}
         return weights
 
+    @traced("nsga2.evolve")
     async def evolve(self) -> List[MOPDPoint]:
-        population = [self._random_individual() for _ in range(self.population_size)]
-        points = []
+        # Build initial population
+        population: List[Dict[str, Any]] = [
+            self._random_individual() for _ in range(self.population_size)
+        ]
+        points: List[MOPDPoint] = []
         for ind in population:
-            p = await self._evaluate_individual(ind)
-            points.append(p)
-
-        point_to_ind = {id(p): ind for ind, p in zip(population, points)}
+            points.append(await self._evaluate_individual(ind))
 
         for gen in range(self.generations):
-            offspring = []
-            pairs = list(zip(population, points))
-            fronts = self._fast_non_dominated_sort(points)
-            crowding = {}
-            for front in fronts:
-                front_crowding = self._crowding_distance(front)
-                crowding.update(front_crowding)
+            keys = [self._individual_key(ind) for ind in population]
+            key_to_ind: Dict[Tuple, Dict[str, Any]] = dict(zip(keys, population))
 
+            fronts = self._fast_non_dominated_sort(points)
+            key_to_rank: Dict[Tuple, int] = {}
+            key_to_crowd: Dict[Tuple, float] = {}
+            for rank, front in enumerate(fronts):
+                cd = self._crowding_distance(front, points)
+                for idx in front:
+                    k = keys[idx]
+                    key_to_rank[k] = rank
+                    key_to_crowd[k] = cd.get(idx, 0.0)
+
+            # Produce offspring
+            offspring: List[Dict[str, Any]] = []
             while len(offspring) < self.population_size:
-                parent1 = self._tournament_selection([p[0] for p in pairs], fronts, crowding)
-                parent2 = self._tournament_selection([p[0] for p in pairs], fronts, crowding)
+                pk1 = self._tournament_selection(keys, key_to_rank, key_to_crowd)
+                pk2 = self._tournament_selection(keys, key_to_rank, key_to_crowd)
+                p1 = key_to_ind[pk1]
+                p2 = key_to_ind[pk2]
                 if random.random() < self.crossover_rate:
-                    child = self._crossover(parent1, parent2)
+                    child = self._crossover(p1, p2)
                 else:
-                    child = copy.deepcopy(parent1)
+                    child = dict(p1)
                 child = self._mutate(child)
                 offspring.append(child)
 
-            child_points = []
+            off_points: List[MOPDPoint] = []
             for ind in offspring:
-                p = await self._evaluate_individual(ind)
-                child_points.append(p)
+                off_points.append(await self._evaluate_individual(ind))
 
+            # Combine and dedupe by key
             combined_inds = population + offspring
-            combined_points = points + child_points
-            unique_pairs = {}
-            for ind, p in zip(combined_inds, combined_points):
-                key = tuple(sorted(ind.items()))
-                unique_pairs[key] = (ind, p)
-            population = [v[0] for v in unique_pairs.values()]
-            points = [v[1] for v in unique_pairs.values()]
+            combined_points = points + off_points
+            seen: Dict[Tuple, int] = {}
+            dedup_inds: List[Dict[str, Any]] = []
+            dedup_points: List[MOPDPoint] = []
+            for ind, pt in zip(combined_inds, combined_points):
+                k = self._individual_key(ind)
+                if k in seen:
+                    continue
+                seen[k] = len(dedup_inds)
+                dedup_inds.append(ind)
+                dedup_points.append(pt)
 
-            fronts = self._fast_non_dominated_sort(points)
-            new_population = []
-            new_points = []
+            # Select next generation
+            fronts = self._fast_non_dominated_sort(dedup_points)
+            new_inds: List[Dict[str, Any]] = []
+            new_points: List[MOPDPoint] = []
             for front in fronts:
-                if len(new_population) + len(front) <= self.population_size:
-                    for p in front:
-                        for ind, p2 in zip(population, points):
-                            if p2 is p:
-                                new_population.append(ind)
-                                new_points.append(p)
-                                break
+                if len(new_inds) + len(front) <= self.population_size:
+                    for idx in front:
+                        new_inds.append(dedup_inds[idx])
+                        new_points.append(dedup_points[idx])
                 else:
-                    crowding = self._crowding_distance(front)
-                    sorted_front = sorted(front, key=lambda x: crowding.get(id(x), 0), reverse=True)
-                    for p in sorted_front:
-                        if len(new_population) >= self.population_size:
-                            break
-                        for ind, p2 in zip(population, points):
-                            if p2 is p:
-                                new_population.append(ind)
-                                new_points.append(p)
-                                break
-            population = new_population[:self.population_size]
-            points = new_points[:self.population_size]
+                    cd = self._crowding_distance(front, dedup_points)
+                    sf = sorted(front, key=lambda i: cd.get(i, 0.0),
+                                 reverse=True)
+                    remaining = self.population_size - len(new_inds)
+                    for idx in sf[:remaining]:
+                        new_inds.append(dedup_inds[idx])
+                        new_points.append(dedup_points[idx])
+                    break
+            population, points = new_inds, new_points
 
+            # Update Pareto front for this generation
             fronts = self._fast_non_dominated_sort(points)
             if fronts:
-                self.pareto_front = fronts[0]
-            logger.info(f"Generation {gen+1}/{self.generations}: population={len(population)}, Pareto front size={len(self.pareto_front)}")
+                self.pareto_front = [points[i] for i in fronts[0]]
+            logger.info("Generation done", gen=gen + 1,
+                        population=len(population),
+                        pareto_size=len(self.pareto_front))
 
         weights = self._compute_dynamic_weights()
-        best_point = self._select_best_from_pareto(self.pareto_front, weights)
-        if best_point:
-            for ind, p in zip(population, points):
-                if p is best_point:
+        # Copy so we don't mutate the stored points
+        best = self._select_best_from_pareto(self.pareto_front, weights)
+        if best is not None:
+            self.best_fitness = best.scalarised_score
+            for ind in population:
+                pol = self._individual_to_policy(ind)
+                if pol.policy_id == best.policy_id:
                     self.best_individual = ind
-                    self.best_fitness = best_point.scalarised_score
                     break
-        return self.pareto_front
+        return [MOPDPoint.from_dict(p.to_dict()) for p in self.pareto_front]
 
-    def _select_best_from_pareto(self, pareto_front: List[MOPDPoint], weights: Optional[Dict[str, float]] = None) -> Optional[MOPDPoint]:
-        if not pareto_front:
+    def _select_best_from_pareto(
+        self, front: List[MOPDPoint],
+        weights: Optional[Dict[str, float]] = None,
+    ) -> Optional[MOPDPoint]:
+        if not front:
             return None
-        if weights is None:
-            weights = self.objective_weights
-        objective_keys = list(weights.keys())
-        max_vals = {k: max(getattr(p, k) for p in pareto_front) for k in objective_keys}
-        min_vals = {k: min(getattr(p, k) for p in pareto_front) for k in objective_keys}
-        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_keys}
-
-        best = None
-        best_score = -float('inf')
-        for point in pareto_front:
-            score = 0.0
-            for key in objective_keys:
-                val = getattr(point, key)
-                norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
-                score += weights.get(key, 0.0) * norm
-            point.scalarised_score = score
+        weights = weights or self.objective_weights
+        keys = list(weights.keys())
+        max_vals = {k: max(getattr(p, k) for p in front) for k in keys}
+        min_vals = {k: min(getattr(p, k) for p in front) for k in keys}
+        ranges = {k: (max_vals[k] - min_vals[k]) if max_vals[k] != min_vals[k] else 1.0
+                  for k in keys}
+        best: Optional[MOPDPoint] = None
+        best_score = -math.inf
+        for p in front:
+            score = sum(
+                weights[k] * ((getattr(p, k) - min_vals[k]) / ranges[k])
+                for k in keys
+            )
             if score > best_score:
                 best_score = score
-                best = point
-        return best
+                best = p
+        if best is None:
+            return None
+        copy_point = MOPDPoint.from_dict(best.to_dict())
+        copy_point.scalarised_score = best_score
+        return copy_point
 
 
-# ============================================================================
-# Example usage
-# ============================================================================
-if __name__ == "__main__":
-    class MockHarvester:
-        def __init__(self):
-            self.mode = "standard"
-            self.parameters = {}
+# =============================================================================
+# SECTION 14. TESTS
+# =============================================================================
+class _MockHarvester:
+    def __init__(self):
+        self.mode = "standard"
+        self.parameters: Dict[str, Any] = {}
+        self.mode_calls: List[Any] = []
+        self.param_calls: List[Dict[str, Any]] = []
 
-        async def harvest_cycle(self, env_data):
-            base = env_data.get('helium_supply', 0.5) * 10
-            factor = 1.0
-            if self.mode == "aggressive":
-                factor = 1.5
-            elif self.mode == "conservative":
-                factor = 0.8
-            if 'conversion_factor' in self.parameters:
-                factor *= self.parameters['conversion_factor']
-            if 'sensitivity_multiplier' in self.parameters:
-                factor *= self.parameters['sensitivity_multiplier']
-            repair_rate = self.parameters.get('repair_rate', 0.01)
-            efficiency = 0.85 * factor * (1 - repair_rate * 10)
-            return {
-                'eco_atp_generated': base * factor,
-                'account_balance': 1000,
-                'efficiency': efficiency,
-                'mode': self.mode,
-                'carbon_impact': 0.1 * factor,
-                'helium_usage': env_data.get('helium_demand', 0.5) * factor
-            }
+    async def harvest_cycle(self, env_data: Dict[str, float]) -> Dict[str, Any]:
+        base = float(env_data.get("helium_supply", 0.5)) * 10.0
+        factor = 1.0
+        if self.mode == "aggressive":
+            factor = 1.5
+        elif self.mode == "conservative":
+            factor = 0.8
+        factor *= float(self.parameters.get("conversion_factor", 1.0))
+        factor *= float(self.parameters.get("sensitivity_multiplier", 1.0))
+        repair = float(self.parameters.get("repair_rate", 0.01))
+        efficiency = 0.85 * factor * (1.0 - repair * 10.0)
+        return {
+            "eco_atp_generated": base * factor,
+            "efficiency": efficiency,
+            "mode": self.mode,
+            "carbon_impact": 0.1 * factor,
+            "helium_usage": float(env_data.get("helium_demand", 0.5)) * factor,
+        }
 
-        async def get_harvesting_stats(self):
-            return {'harvester_id': 'mock', 'mode': self.mode}
+    async def get_harvesting_stats(self) -> Dict[str, Any]:
+        return {"harvester_id": "mock", "mode": self.mode}
 
-        def restore_state(self, state):
-            pass
+    def restore_state(self, state: Dict[str, Any]) -> None:
+        pass
 
-        def set_mode(self, mode):
-            self.mode = mode
+    def set_mode(self, mode: Any) -> None:
+        self.mode = mode
+        self.mode_calls.append(mode)
 
-        def set_parameters(self, params):
-            self.parameters = params
+    def set_parameters(self, params: Dict[str, Any]) -> None:
+        self.parameters = dict(params)
+        self.param_calls.append(dict(params))
 
-        def get_parameters(self):
-            return self.parameters
+    def get_parameters(self) -> Dict[str, Any]:
+        return dict(self.parameters)
 
-    class MockTranslator:
-        @staticmethod
-        def translate_row(row):
-            return {
-                'renewable_availability': 0.8,
-                'carbon_intensity': 200,
-                'waste_heat': 0.3,
-                'edge_availability': 0.6,
-                'system_overload': 0.1,
-                'helium_supply': row.get('helium_supply', 0.5),
-                'helium_demand': row.get('helium_demand', 0.5)
-            }
 
-    config = {
-        'data_source': 'csv',
-        'csv_path': 'helium_data.csv',
-        'value_columns': ['helium_supply', 'helium_demand'],
-        'interpolation_method': 'linear',
-        'tick_interval_seconds': 0.01,
-        'enable_checkpointing': False,
-        'metrics_enabled': True,
-        'mopd': {
-            'enabled': True,
-            'population_size': 8,
-            'generations': 3,
-            'objective_weights': {
-                'total_harvested': 0.3,
-                'avg_efficiency': 0.3,
-                'carbon_saved': 0.2,
-                'helium_saved': 0.2,
-            },
-            'dynamic_weights': True
-        },
-        'enable_quantum_distillation': True,
-        'enable_causal_rl': True,
-        'enable_federated': True,
-        'enable_safety_monitor': True,
-        'enable_xai': True,
-        'enable_precision': True,
-        'enable_carbon_market': True,
-        'carbon_market_config': {'provider_url': 'http://localhost:8545', 'contract_address': '0xabc', 'private_key': '0x123'},
-        'enable_chaos': True,
-        'chaos_probability': 0.1,
-        'enable_human_approval': True,
-    }
+class _MockTranslator:
+    @staticmethod
+    def translate_row(row: pd.Series) -> Dict[str, float]:
+        return {
+            "renewable_availability": 0.8,
+            "carbon_intensity": 200.0,
+            "waste_heat": 0.3,
+            "edge_availability": 0.6,
+            "system_overload": 0.1,
+            "helium_supply": float(row.get("helium_supply", 0.5)),
+            "helium_demand": float(row.get("helium_demand", 0.5)),
+        }
 
-    async def main():
-        harvester = MockHarvester()
-        translator = MockTranslator()
-        engine = TimeTickEngine(harvester, translator, config)
 
-        try:
-            await engine.load_data()
-            policy_space = {
-                'harvester_mode': ['standard', 'aggressive', 'conservative'],
-                'conversion_factor': (0.5, 1.5),
-                'repair_rate': (0.001, 0.02),
-                'sensitivity_multiplier': (0.5, 2.0),
-            }
-            pareto = await engine.run_evolution(policy_space)
-            print("Evolved Pareto front size:", len(pareto))
-            for p in pareto[:5]:
-                print(f"Policy {p.policy_id}: mode={p.harvester_mode}, harvested={p.total_harvested:.2f}, eff={p.avg_efficiency:.2f}")
-        finally:
+def _build_daily_df(days: int = 20) -> pd.DataFrame:
+    dates = pd.date_range("2024-01-01", periods=days, freq="D")
+    return pd.DataFrame({
+        "date": dates,
+        "helium_supply": np.linspace(0.3, 0.8, days),
+        "helium_demand": np.linspace(0.5, 0.4, days),
+    })
+
+
+class _Tests(unittest.TestCase):
+    def _cfg(self, **overrides) -> TimeTickConfig:
+        cfg = TimeTickConfig(
+            data_source="csv",
+            csv_path="unused.csv",
+            value_columns=["helium_supply", "helium_demand"],
+            tick_interval_seconds=0.0,
+            enable_checkpointing=False,
+            metrics_enabled=True,
+            enable_safety_monitor=True,
+            enable_xai=False,
+            mopd=MOPDConfig(enabled=True, population_size=4, generations=1),
+        )
+        for k, v in overrides.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+        return cfg
+
+    def _engine(self, **overrides) -> TimeTickEngine:
+        engine = TimeTickEngine(
+            harvester=_MockHarvester(),
+            translator=_MockTranslator(),
+            config=self._cfg(**overrides),
+        )
+        engine.daily_df = _build_daily_df()
+        return engine
+
+    def test_lifecycle(self):
+        async def go():
+            engine = self._engine()
+            self.assertFalse(await engine.ready())
+            await engine.start()
+            self.assertTrue(await engine.ready())
             await engine.shutdown()
+            self.assertTrue(engine._shutdown)
+            await engine.shutdown()  # idempotent
+        asyncio.run(go())
 
-    asyncio.run(main())
+    def test_context_manager(self):
+        async def go():
+            engine = self._engine()
+            async with engine:
+                self.assertTrue(await engine.ready())
+        asyncio.run(go())
+
+    def test_run_simulation_advances(self):
+        async def go():
+            async with self._engine() as engine:
+                await engine.run_simulation(start_index=0)
+                self.assertEqual(engine.metrics.harvest_cycles,
+                                 len(engine.daily_df))
+                self.assertGreater(engine.metrics.total_harvested, 0.0)
+        asyncio.run(go())
+
+    def test_evaluate_policy_restores_state(self):
+        async def go():
+            async with self._engine() as engine:
+                engine._current_index = 7
+                engine.metrics.total_harvested = 123.45
+                before_index = engine._current_index
+                before_metrics = engine.metrics.total_harvested
+                before_mode = engine.harvester.mode
+
+                policy = Policy(
+                    policy_id="p1",
+                    harvester_mode="aggressive",
+                    parameters={"conversion_factor": 1.2},
+                )
+                point = await engine.evaluate_policy(policy)
+                self.assertGreater(point.total_harvested, 0.0)
+                self.assertEqual(engine._current_index, before_index)
+                self.assertAlmostEqual(engine.metrics.total_harvested,
+                                        before_metrics)
+                self.assertEqual(engine.harvester.mode, before_mode)
+        asyncio.run(go())
+
+    def test_parallel_policy_evaluation_is_serialized(self):
+        async def go():
+            async with self._engine() as engine:
+                policies = [
+                    Policy(policy_id=f"p{i}",
+                            harvester_mode="standard",
+                            parameters={"conversion_factor": 1.0 + i * 0.1})
+                    for i in range(4)
+                ]
+                # Serialize the evaluations via gather (they will still queue
+                # on the internal lock, but gather proves no crash / no
+                # cross-contamination).
+                points = await asyncio.gather(
+                    *[engine.evaluate_policy(p) for p in policies]
+                )
+                self.assertEqual(len(points), len(policies))
+                # Each has its own policy id
+                self.assertEqual({p.policy_id for p in points},
+                                 {p.policy_id for p in policies})
+        asyncio.run(go())
+
+    def test_tournament_uses_rank(self):
+        async def go():
+            async with self._engine() as engine:
+                opt = NSGAIIOptimizer(
+                    engine=engine,
+                    population_size=6,
+                    generations=1,
+                    objective_weights={
+                        "total_harvested": 0.5,
+                        "avg_efficiency": 0.5,
+                        "carbon_saved": 0.0,
+                        "helium_saved": 0.0,
+                    },
+                )
+                # Build fake keys and ranks; verify tournament prefers low rank
+                keys = [("a",), ("b",), ("c",)]
+                ranks = {("a",): 2, ("b",): 0, ("c",): 1}
+                crowd = {("a",): 5.0, ("b",): 0.1, ("c",): 0.1}
+                # Force size so sampling includes all three
+                opt.tournament_size = 3
+                winner = opt._tournament_selection(keys, ranks, crowd)
+                self.assertEqual(winner, ("b",))
+        asyncio.run(go())
+
+    def test_select_best_does_not_mutate_front(self):
+        engine = self._engine()
+        front = [
+            MOPDPoint("a", "standard", {}, 10.0, 0.5, 0.1, 0.2),
+            MOPDPoint("b", "standard", {}, 5.0, 0.9, 0.2, 0.1),
+        ]
+        before = [p.scalarised_score for p in front]
+        best = engine._select_best_from_pareto(front)
+        self.assertIsNotNone(best)
+        self.assertEqual([p.scalarised_score for p in front], before)
+        self.assertNotEqual(best.scalarised_score, 0.0)
+
+    def test_carbon_trade_does_not_crash(self):
+        async def go():
+            async with self._engine(enable_carbon_market=True,
+                                     carbon_market_config={
+                                         "provider_url": "http://x",
+                                         "contract_address": "0x1",
+                                         "private_key": "0x2",
+                                     }) as engine:
+                # Placeholder available=False, so this is a no-op path
+                await engine._maybe_trade_carbon(1.0)
+        asyncio.run(go())
+
+    def test_checkpoint_json_roundtrip(self):
+        async def go():
+            import tempfile
+            td = tempfile.mkdtemp()
+            cfg = self._cfg(enable_checkpointing=True,
+                             checkpoint_dir=td,
+                             checkpoint_interval=5)
+            engine = TimeTickEngine(
+                harvester=_MockHarvester(),
+                translator=_MockTranslator(),
+                config=cfg,
+            )
+            engine.daily_df = _build_daily_df()
+            engine._data_hash = "deadbeef"
+            async with engine:
+                await engine.run_simulation(start_index=0)
+                await engine._save_checkpoint(engine._current_index)
+            # There should be at least one checkpoint file
+            files = list(Path(td).glob("*.json"))
+            self.assertGreater(len(files), 0)
+        asyncio.run(go())
+
+    def test_reentrance_guard(self):
+        async def go():
+            async with self._engine() as engine:
+                engine._running = True
+                with self.assertRaises(RuntimeError):
+                    await engine.run_simulation(start_index=0)
+                engine._running = False
+        asyncio.run(go())
+
+    def test_metrics_bounded(self):
+        m = MetricsCollector(max_history=5)
+        for i in range(20):
+            m.record({"eco_atp_generated": 1.0, "efficiency": 0.5,
+                       "mode": "standard"})
+        self.assertLessEqual(len(m.efficiencies), 5)
+        self.assertLessEqual(len(m.modes), 5)
+        self.assertLessEqual(len(m.timestamps), 5)
+
+    def test_placeholders_honest(self):
+        qd = QuantumDistillationModulePlaceholder()
+        self.assertFalse(qd.available)
+        rl = CausalRLAgentPlaceholder()
+        self.assertFalse(rl.available)
+        fed = FederatedCoordinatorPlaceholder(None)
+        self.assertFalse(fed.available)
+        pc = PrecisionControllerPlaceholder()
+        self.assertFalse(pc.available)
+        cm = CarbonMarketClientPlaceholder()
+        self.assertFalse(cm.available)
+        self.assertFalse(cm.buy_credits(1.0))
+        self.assertFalse(cm.sell_credits(1.0))
+        ci = ChaosInjectorPlaceholder(None)
+        self.assertFalse(ci.available)
+
+        async def go():
+            ha = HumanApprovalHandlerPlaceholder()
+            self.assertFalse(ha.available)
+            self.assertFalse(await ha.request_approval({"action": "x"}))
+        asyncio.run(go())
+
+    def test_q_table_bounded(self):
+        rl = CausalRLAgentPlaceholder(state_dim=4, action_dim=3,
+                                        max_q_table=5)
+        for _ in range(100):
+            s = np.random.rand(4)
+            a = rl.act(s)
+            rl.update(s, a, 1.0, s, False)
+        self.assertLessEqual(rl.size(), 5)
+
+    def test_run_evolution_smoke(self):
+        async def go():
+            async with self._engine() as engine:
+                pareto = await engine.run_evolution()
+                self.assertIsInstance(pareto, list)
+        asyncio.run(go())
+
+    def test_module_status_is_documented(self):
+        self.assertEqual(MODULE_STATUS["time_tick_core"], "stable")
+        self.assertEqual(MODULE_STATUS["causal_rl"], "placeholder")
+        self.assertEqual(MODULE_STATUS["nsga2_optimizer"], "experimental")
+
+    def test_config_roundtrip(self):
+        cfg = self._cfg()
+        d = cfg.to_dict()
+        cfg2 = TimeTickConfig.from_dict(d)
+        self.assertEqual(cfg.interpolation_method, cfg2.interpolation_method)
+        self.assertEqual(cfg.mopd.enabled, cfg2.mopd.enabled)
+        self.assertAlmostEqual(cfg.mopd.objective_weights["total_harvested"],
+                                cfg2.mopd.objective_weights["total_harvested"])
+
+
+def run_tests() -> int:
+    suite = unittest.TestLoader().loadTestsFromTestCase(_Tests)
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
+# =============================================================================
+# SECTION 15. ENTRY POINT
+# =============================================================================
+async def _example() -> None:
+    cfg = TimeTickConfig(
+        data_source="csv",
+        csv_path="unused.csv",
+        tick_interval_seconds=0.0,
+        enable_checkpointing=False,
+        mopd=MOPDConfig(enabled=True, population_size=6, generations=2),
+    )
+    engine = TimeTickEngine(
+        harvester=_MockHarvester(),
+        translator=_MockTranslator(),
+        config=cfg,
+    )
+    engine.daily_df = _build_daily_df()
+    async with engine:
+        pareto = await engine.run_evolution()
+        print(f"Pareto front size: {len(pareto)}")
+        for p in pareto[:5]:
+            print(f"  {p.policy_id}: mode={p.harvester_mode}, "
+                  f"harvested={p.total_harvested:.2f}, "
+                  f"efficiency={p.avg_efficiency:.2f}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="TimeTickEngine v4.0.0")
+    parser.add_argument("--test", action="store_true",
+                        help="Run embedded tests")
+    parser.add_argument("--example", action="store_true",
+                        help="Run example usage")
+    parser.add_argument("--status", action="store_true",
+                        help="Print module statuses")
+    args = parser.parse_args()
+
+    if args.status:
+        for name, status in MODULE_STATUS.items():
+            print(f"{name:24s} {status}")
+        return
+    if args.test:
+        sys.exit(run_tests())
+    if args.example:
+        asyncio.run(_example())
+        return
+
+    print("TimeTickEngine v4.0.0 — no mode selected.")
+    print("Use --test, --example, or --status.")
+
+
+if __name__ == "__main__":
+    main()
