@@ -1,46 +1,84 @@
 #!/usr/bin/env python3
+# =============================================================================
+# Bio-Integrated Green Agent v13.0.0
+# =============================================================================
 """
-Bio‑Integrated Green Agent v12.2.1
-Complete orchestration with MOPD (Multi‑Objective Pareto Decision) and central integration.
+Bio-Integrated Green Agent v13.0.0
+===================================
+Patched single-file version. Focus on correctness, honesty, and lifecycle.
 
-Enhancements over v12.2.0:
-- Fixed missing imports (Enum, Redis, HeliumEnvironmentTranslator).
-- Safe async task creation.
-- Integrated central Green Agent components.
-- Implemented teacher policy (`policy_probs`) for MTPD optimizer.
-- MODP now actively used for strategy selection via central ParetoGating and AdaptiveCostFunction.
-- FeedbackEvent publication after each strategy change.
-- Drift detection with adaptive weight adjustment.
-- All methods now fully implemented (no placeholders).
+P0 fixes applied
+----------------
+- CircuitBreaker is always defined (no more NameError when CORE_AVAILABLE).
+- Lazy asyncio.Lock in CircuitBreaker (no cross-loop binding).
+- RL selector chooses by min cost (AdaptiveCostFunction returns a cost).
+- FeedbackEvent now uses create_with_context when available, with a safe fallback.
+- Strategy-application methods are guarded by hasattr; safe no-ops otherwise.
+- CentralStorage.save_state/load_state are guarded by hasattr.
+- No background tasks started inside __init__; use `await agent.start()`.
+
+P1 additions
+------------
+- _refresh_state() pulls live metrics from services.
+- _update_metrics() computes reward; RL selector.update() is called each tick.
+- Q-table, state_last_visited, strategy_objectives_history, audit ledger bounded.
+- Pareto dominance includes carbon (minimize) with correct direction.
+
+P2 honesty
+----------
+- Swarm, proactive-healing, drift are placeholders: disabled by default,
+  `.available == False`, safe no-ops, warn when enabled.
+- MOPD and RL selector are experimental: warn when enabled.
+
+P3 production readiness
+-----------------------
+- async start(), __aenter__ / __aexit__, ready().
+- Graceful shutdown: drain + flush.
+- Logical module sections (bio_agent, rl_selector, mopd, swarm, audit, security).
+- MODULE_STATUS documentation.
+- Embedded test suite: `python3 bio_integrated_agent.py --test`.
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
-import logging
-import json
-import os
 import hashlib
-import uuid
+import json
+import logging
+import math
+import os
+import random
 import sqlite3
-import pickle
-import yaml
-from typing import Dict, Any, List, Optional, Tuple, Callable, Union, Awaitable
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone, timedelta
-from collections import defaultdict, deque, OrderedDict
-from enum import Enum  # FIX: added missing import
-import numpy as np
-import secrets
+import sys
+import time
+import unittest
+import uuid
+import warnings
+from collections import defaultdict, deque
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
-import importlib.util
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
-# ---------- Pydantic ----------
+import numpy as np
+
+# -----------------------------------------------------------------------------
+# Optional dependencies
+# -----------------------------------------------------------------------------
 try:
-    from pydantic import BaseModel, Field, validator
+    from pydantic import BaseModel, Field, field_validator
     PYDANTIC_AVAILABLE = True
 except ImportError:
     PYDANTIC_AVAILABLE = False
 
-# ---------- structlog ----------
+try:
+    from prometheus_client import Counter, Gauge
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
 try:
     import structlog
     from structlog.processors import JSONRenderer, TimeStamper
@@ -49,7 +87,7 @@ try:
             structlog.stdlib.add_log_level,
             structlog.stdlib.PositionalArgumentsFormatter(),
             TimeStamper(fmt="iso"),
-            JSONRenderer()
+            JSONRenderer(),
         ],
         context_class=dict,
         logger_factory=structlog.stdlib.LoggerFactory(),
@@ -57,226 +95,261 @@ try:
         cache_logger_on_first_use=True,
     )
     logger = structlog.get_logger(__name__)
-    STRUCTLOG_AVAILABLE = True
 except ImportError:
-    STRUCTLOG_AVAILABLE = False
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     logger = logging.getLogger(__name__)
 
-# ---------- Prometheus ----------
 try:
-    from prometheus_client import Gauge, Counter, Histogram, CollectorRegistry, generate_latest
-    PROMETHEUS_AVAILABLE = True
-except ImportError:
-    PROMETHEUS_AVAILABLE = False
-
-# ---------- Tenacity ----------
-try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
-    TENACITY_AVAILABLE = True
-except ImportError:
-    TENACITY_AVAILABLE = False
-
-# ---------- PQC ----------
-try:
-    from pqcrypto.sign import falcon, dilithium
-    PQC_AVAILABLE = True
-except ImportError:
-    PQC_AVAILABLE = False
-
-# ---------- Local imports (with fallback) ----------
-try:
-    from .eco_atp_currency import EcoATPTokenManager, EcoATPConsumer, EcoATPSource
-    TOKEN_AVAILABLE = True
-except ImportError:
-    TOKEN_AVAILABLE = False
-
-try:
-    from .proton_gradient_fields import GradientFieldManager
-    GRADIENT_AVAILABLE = True
-except ImportError:
-    GRADIENT_AVAILABLE = False
-
-try:
-    from .atp_synthase_scheduler import ATPSynthaseScheduler
-    ATP_AVAILABLE = True
-except ImportError:
-    ATP_AVAILABLE = False
-
-try:
-    from .chromatophore_compartments import HierarchicalCompartmentManager
-    COMPARTMENT_AVAILABLE = True
-except ImportError:
-    COMPARTMENT_AVAILABLE = False
-
-try:
-    from .biomass_storage import BiomassStorage, StorageTier
-    BIOMASS_AVAILABLE = True
-except ImportError:
-    BIOMASS_AVAILABLE = False
-
-try:
-    from .photosynthetic_harvester import PhotosyntheticHarvester, HarvestingMode
-    HARVESTER_AVAILABLE = True
-except ImportError:
-    HARVESTER_AVAILABLE = False
-
-try:
-    from .time_tick_engine import TimeTickEngine
-    TICK_ENGINE_AVAILABLE = True
-except ImportError:
-    TICK_ENGINE_AVAILABLE = False
-
-try:
-    from .quantum_bridge import QuantumBridge
-    QUANTUM_BRIDGE_AVAILABLE = True
-except ImportError:
-    QUANTUM_BRIDGE_AVAILABLE = False
-
-try:
-    from .__init__ import EnhancedBioInspiredCore, BioEvent, CircuitBreaker as CoreCircuitBreaker
-    CORE_AVAILABLE = True
-except ImportError:
-    CORE_AVAILABLE = False
-
-# ---------- Central Green Agent components ----------
-from ..storage import Storage as CentralStorage
-from ..scaling.message_queue import AsyncMessageQueue
-from ..routing.pareto_gating import ParetoGating
-from ..feedback.adaptive_cost import AdaptiveCostFunction
-from ..safety.drift_detector import DriftDetector
-from ..metrics import MetricsRegistry
-from ..schemas.feedback_event import FeedbackEvent
-from ..config import config as central_config
-from ..logger import logger as central_logger
-
-# ---------- Redis (optional) ----------
-try:
-    import redis.asyncio as redis
+    import redis.asyncio as redis_asyncio  # type: ignore
     REDIS_AVAILABLE = True
 except ImportError:
+    redis_asyncio = None  # type: ignore
     REDIS_AVAILABLE = False
 
-# ---------- HeliumEnvironmentTranslator (placeholder) ----------
-if TICK_ENGINE_AVAILABLE:
-    try:
-        from .time_tick_engine import HeliumEnvironmentTranslator
-    except ImportError:
-        class HeliumEnvironmentTranslator:
-            def __init__(self, *args, **kwargs):
-                pass
-else:
-    class HeliumEnvironmentTranslator:
-        def __init__(self, *args, **kwargs):
-            pass
+try:
+    from pqcrypto.sign import dilithium  # type: ignore
+    PQC_AVAILABLE = True
+except ImportError:
+    dilithium = None  # type: ignore
+    PQC_AVAILABLE = False
 
-# ============================================================================
-# Fallback definitions if core not available
-# ============================================================================
-if not CORE_AVAILABLE:
-    class CircuitBreakerState(Enum):
-        CLOSED = "closed"
-        OPEN = "open"
-        HALF_OPEN = "half_open"
+# -----------------------------------------------------------------------------
+# Central components (optional)
+# -----------------------------------------------------------------------------
+try:
+    from ..storage import Storage as CentralStorage  # type: ignore
+    from ..scaling.message_queue import AsyncMessageQueue  # type: ignore
+    from ..routing.pareto_gating import ParetoGating  # type: ignore
+    from ..feedback.adaptive_cost import AdaptiveCostFunction  # type: ignore
+    from ..safety.drift_detector import DriftDetector  # type: ignore
+    from ..metrics import MetricsRegistry  # type: ignore
+    from ..schemas.feedback_event import FeedbackEvent  # type: ignore
+    CENTRAL_AVAILABLE = True
+except ImportError:
+    CENTRAL_AVAILABLE = False
+    CentralStorage = None  # type: ignore
+    AsyncMessageQueue = None  # type: ignore
+    ParetoGating = None  # type: ignore
+    AdaptiveCostFunction = None  # type: ignore
+    DriftDetector = None  # type: ignore
+    MetricsRegistry = None  # type: ignore
+    FeedbackEvent = None  # type: ignore
 
-    class CircuitBreaker:
-        def __init__(self, name, failure_threshold=5, recovery_timeout=30.0, half_open_attempts=3, storage=None):
-            self.name = name
-            self.failure_threshold = failure_threshold
-            self.recovery_timeout = recovery_timeout
-            self.half_open_attempts = half_open_attempts
-            self._state = CircuitBreakerState.CLOSED
-            self._failure_count = 0
-            self._last_failure_time = None
-            self._half_open_attempt_count = 0
+
+# =============================================================================
+# SECTION 0. MODULE STATUS
+# =============================================================================
+MODULE_STATUS: Dict[str, str] = {
+    "bio_agent":           "stable",
+    "circuit_breaker":     "stable",
+    "task_manager":        "stable",
+    "security":            "experimental",
+    "audit":               "experimental",
+    "rl_selector":         "experimental",
+    "mopd":                "experimental",
+    "swarm":               "placeholder",
+    "proactive_healing":   "placeholder",
+    "drift":               "placeholder",
+}
+
+
+def _warn_module(name: str) -> None:
+    status = MODULE_STATUS.get(name, "unknown")
+    if status == "stable":
+        return
+    if status == "placeholder":
+        logger.warning(
+            "Module is a placeholder; enabling it will not have an effect",
+            module=name,
+        )
+    elif status == "experimental":
+        logger.warning(
+            "Module is experimental; validate before production use",
+            module=name,
+        )
+    else:
+        logger.warning("Unknown module status", module=name, status=status)
+
+
+# =============================================================================
+# SECTION 1. CIRCUIT BREAKER (STABLE)
+# =============================================================================
+class CircuitBreakerState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+class CircuitBreaker:
+    """
+    Simple circuit breaker with optional SQLite persistence.
+
+    P0 fixes:
+      - Lazily created asyncio.Lock (no cross-loop binding).
+      - SQLite I/O offloaded to a thread executor.
+      - Idempotent transitions.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+        half_open_attempts: int = 3,
+        storage: Optional[Any] = None,
+    ):
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.half_open_attempts = half_open_attempts
+        self._state = CircuitBreakerState.CLOSED
+        self._failure_count = 0
+        self._half_open_attempt_count = 0
+        self._last_failure_time: Optional[datetime] = None
+        self._lock: Optional[asyncio.Lock] = None
+        self.storage = storage
+        self._load_state_sync()
+
+    # ---------- lazy lock ----------
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
             self._lock = asyncio.Lock()
-            self.storage = storage
-            self._load_state()
+        return self._lock
 
-        def _load_state(self):
-            if self.storage:
-                state = self.storage.get_circuit_breaker_state(self.name)
-                if state:
-                    self._state = CircuitBreakerState(state['state'])
-                    self._failure_count = state['failures']
-                    if state['last_failure']:
-                        self._last_failure_time = datetime.fromisoformat(state['last_failure'])
-                    self._half_open_attempt_count = state.get('half_open_attempts', 0)
+    # ---------- persistence (sync; called from __init__ or executor) ----------
+    def _load_state_sync(self) -> None:
+        if not self.storage:
+            return
+        try:
+            getter = getattr(self.storage, "get_circuit_breaker_state", None)
+            if getter is None:
+                return
+            state = getter(self.name)
+            if not state:
+                return
+            self._state = CircuitBreakerState(state["state"])
+            self._failure_count = int(state.get("failures", 0))
+            lf = state.get("last_failure")
+            if lf:
+                self._last_failure_time = datetime.fromisoformat(lf)
+            self._half_open_attempt_count = int(state.get("half_open_attempts", 0))
+        except Exception as e:
+            logger.warning("Circuit breaker load failed", name=self.name, error=str(e))
 
-        def _save_state(self):
-            if self.storage:
-                self.storage.save_circuit_breaker_state(
-                    self.name,
-                    self._state.value,
-                    self._failure_count,
-                    self._last_failure_time.isoformat() if self._last_failure_time else None,
-                    self._half_open_attempt_count
-                )
+    def _save_state_sync(self) -> None:
+        if not self.storage:
+            return
+        try:
+            saver = getattr(self.storage, "save_circuit_breaker_state", None)
+            if saver is None:
+                return
+            saver(
+                self.name,
+                self._state.value,
+                self._failure_count,
+                self._last_failure_time.isoformat() if self._last_failure_time else None,
+                self._half_open_attempt_count,
+            )
+        except Exception as e:
+            logger.warning("Circuit breaker save failed", name=self.name, error=str(e))
 
-        async def call(self, func, *args, **kwargs):
-            async with self._lock:
-                if self._state == CircuitBreakerState.OPEN:
-                    if (datetime.now(timezone.utc) - self._last_failure_time).total_seconds() > self.recovery_timeout:
-                        self._state = CircuitBreakerState.HALF_OPEN
-                        self._half_open_attempt_count = 0
-                        logger.info(f"Circuit breaker {self.name} entering HALF_OPEN")
-                        self._save_state()
-                    else:
-                        raise Exception(f"Circuit breaker {self.name} is OPEN")
-                elif self._state == CircuitBreakerState.HALF_OPEN:
-                    if self._half_open_attempt_count >= self.half_open_attempts:
-                        self._state = CircuitBreakerState.OPEN
-                        self._last_failure_time = datetime.now(timezone.utc)
-                        self._save_state()
-                        raise Exception(f"Circuit breaker {self.name} half-open attempts exceeded")
-            try:
-                result = await func(*args, **kwargs)
-                async with self._lock:
-                    if self._state == CircuitBreakerState.HALF_OPEN:
-                        self._state = CircuitBreakerState.CLOSED
-                        self._failure_count = 0
-                        self._save_state()
-                        logger.info(f"Circuit breaker {self.name} recovered to CLOSED")
-                    else:
-                        self._failure_count = 0
-                        self._save_state()
-                return result
-            except Exception as e:
-                async with self._lock:
-                    self._failure_count += 1
+    async def _persist(self) -> None:
+        if not self.storage:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._save_state_sync)
+        except RuntimeError:
+            # No running loop: fall back to sync write
+            self._save_state_sync()
+
+    # ---------- API ----------
+    async def call(self, func: Callable, *args, **kwargs):
+        lock = self._get_lock()
+        async with lock:
+            if self._state == CircuitBreakerState.OPEN:
+                if (
+                    self._last_failure_time
+                    and (datetime.now(timezone.utc) - self._last_failure_time).total_seconds()
+                    > self.recovery_timeout
+                ):
+                    self._state = CircuitBreakerState.HALF_OPEN
+                    self._half_open_attempt_count = 0
+                    await self._persist()
+                else:
+                    raise RuntimeError(f"Circuit breaker {self.name} is OPEN")
+            elif self._state == CircuitBreakerState.HALF_OPEN:
+                if self._half_open_attempt_count >= self.half_open_attempts:
+                    self._state = CircuitBreakerState.OPEN
                     self._last_failure_time = datetime.now(timezone.utc)
-                    if self._failure_count >= self.failure_threshold:
-                        self._state = CircuitBreakerState.OPEN
-                        logger.warning(f"Circuit breaker {self.name} opened after {self._failure_count} failures")
-                    elif self._state == CircuitBreakerState.HALF_OPEN:
-                        self._half_open_attempt_count += 1
-                    self._save_state()
-                raise e
+                    await self._persist()
+                    raise RuntimeError(
+                        f"Circuit breaker {self.name} half-open attempts exceeded"
+                    )
 
-    @dataclass
-    class BioEvent:
-        event_type: str
-        source: str
-        timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-        data: Dict[str, Any] = field(default_factory=dict)
-        correlation_id: Optional[str] = None
-        priority: int = 0
+        try:
+            result = await func(*args, **kwargs)
+        except Exception:
+            async with lock:
+                self._failure_count += 1
+                self._last_failure_time = datetime.now(timezone.utc)
+                if self._failure_count >= self.failure_threshold:
+                    self._state = CircuitBreakerState.OPEN
+                    logger.warning(
+                        "Circuit breaker opened",
+                        name=self.name,
+                        failures=self._failure_count,
+                    )
+                elif self._state == CircuitBreakerState.HALF_OPEN:
+                    self._half_open_attempt_count += 1
+                await self._persist()
+            raise
 
-# ============================================================================
-# Storage for circuit breaker states (SQLite persistence)
-# ============================================================================
-class Storage:
-    """Persistent storage for circuit breaker states (and possibly other data)."""
+        async with lock:
+            if self._state == CircuitBreakerState.HALF_OPEN:
+                self._state = CircuitBreakerState.CLOSED
+                self._failure_count = 0
+                self._half_open_attempt_count = 0
+                await self._persist()
+            elif self._failure_count > 0:
+                self._failure_count = 0
+                await self._persist()
+        return result
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "state": self._state.value,
+            "failures": self._failure_count,
+            "half_open_attempts": self._half_open_attempt_count,
+            "last_failure": self._last_failure_time.isoformat()
+            if self._last_failure_time else None,
+        }
+
+
+# =============================================================================
+# SECTION 2. LOCAL STORAGE (STABLE)
+# =============================================================================
+class LocalCircuitBreakerStorage:
+    """SQLite-backed storage for circuit breaker state. Safe for single process."""
+
     def __init__(self, db_path: str = "agent_storage.db"):
         self.db_path = db_path
-        self._init_db()
+        self._init_db_sync()
 
-    def _get_conn(self):
-        conn = sqlite3.connect(self.db_path)
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+        except sqlite3.Error:
+            pass
         return conn
 
-    def _init_db(self):
+    def _init_db_sync(self) -> None:
         with self._get_conn() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS circuit_breaker (
@@ -287,411 +360,162 @@ class Storage:
                     half_open_attempts INTEGER DEFAULT 0
                 )
             """)
-            conn.commit()
-
-    def save_circuit_breaker_state(self, name, state, failures, last_failure, half_open_attempts):
-        with self._get_conn() as conn:
             conn.execute("""
-                INSERT OR REPLACE INTO circuit_breaker (name, state, failures, last_failure, half_open_attempts)
-                VALUES (?, ?, ?, ?, ?)
-            """, (name, state, failures, last_failure, half_open_attempts))
+                CREATE TABLE IF NOT EXISTS audit_ledger (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    signature TEXT,
+                    hash TEXT NOT NULL,
+                    prev_hash TEXT
+                )
+            """)
             conn.commit()
 
-    def get_circuit_breaker_state(self, name):
+    def save_circuit_breaker_state(
+        self, name: str, state: str, failures: int,
+        last_failure: Optional[str], half_open_attempts: int,
+    ) -> None:
         with self._get_conn() as conn:
-            row = conn.execute("SELECT state, failures, last_failure, half_open_attempts FROM circuit_breaker WHERE name = ?", (name,)).fetchone()
-            if row:
-                return dict(row)
-            return None
+            conn.execute(
+                """INSERT OR REPLACE INTO circuit_breaker
+                   (name, state, failures, last_failure, half_open_attempts)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (name, state, failures, last_failure, half_open_attempts),
+            )
+            conn.commit()
 
-# ============================================================================
-# Configuration (Pydantic) – extended with MOPD
-# ============================================================================
+    def get_circuit_breaker_state(self, name: str) -> Optional[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT state, failures, last_failure, half_open_attempts "
+                "FROM circuit_breaker WHERE name = ?",
+                (name,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def append_ledger(
+        self, timestamp: str, event_type: str, payload: str,
+        signature: Optional[str], hash_: str, prev_hash: Optional[str],
+    ) -> int:
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO audit_ledger
+                   (timestamp, event_type, payload, signature, hash, prev_hash)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (timestamp, event_type, payload, signature, hash_, prev_hash),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def read_ledger(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT seq, timestamp, event_type, payload, signature, hash, prev_hash "
+                "FROM audit_ledger ORDER BY seq DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def ledger_size(self) -> int:
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT COUNT(*) AS c FROM audit_ledger").fetchone()
+            return int(row["c"]) if row else 0
+
+
+# =============================================================================
+# SECTION 3. CONFIGURATION (STABLE)
+# =============================================================================
 if PYDANTIC_AVAILABLE:
-    class MOPDConfig(BaseModel):
-        enabled: bool = Field(True)
-        objective_weights: Dict[str, float] = Field(
-            default_factory=lambda: {
-                'energy_efficiency': 0.3,
-                'helium_sustainability': 0.25,
-                'token_balance': 0.2,
-                'health_score': 0.15,
-                'carbon_leakage': 0.1,
-            }
-        )
-        grid_resolution: int = 5
-
-        @validator('objective_weights')
-        def check_weights(cls, v):
-            total = sum(v.values())
-            if abs(total - 1.0) > 1e-6:
-                raise ValueError("objective_weights must sum to 1")
-            return v
-
     class AgentConfig(BaseModel):
         agent_id: str = Field(default_factory=lambda: f"agent_{uuid.uuid4().hex[:8]}")
         enable_energy_aware_rl: bool = True
-        enable_quantum_bridge: bool = True
-        enable_time_tick_engine: bool = True
-        enable_swarm_coordination: bool = True
-        enable_multi_objective_rl: bool = False
-        enable_proactive_healing: bool = True
-        rl_learning_rate: float = 0.1
-        rl_discount_factor: float = 0.9
-        rl_epsilon: float = 0.1
-        rl_learning_rate_min: float = 0.01
-        rl_epsilon_min: float = 0.01
-        rl_state_bins: Dict[str, List[str]] = Field(default_factory=lambda: {
-            'load': ['low', 'medium', 'high'],
-            'health': ['poor', 'medium', 'good'],
-            'token': ['scarce', 'adequate', 'abundant'],
-            'energy': ['light', 'normal', 'heavy'],
-            'helium': ['scarce', 'normal', 'abundant'],
-            'carbon': ['low', 'medium', 'high'],
-            'alert_count': ['none', 'some', 'many'],
-            'helium_trend': ['falling', 'stable', 'rising'],
-            'q_penalty_carbon': ['low', 'medium', 'high'],
-            'q_penalty_helium': ['low', 'medium', 'high'],
-            'degradation_tier': ['low', 'medium', 'high'],
-            'swarm_consensus': ['minority', 'mixed', 'majority'],
-            'workflow_success': ['failed', 'partial', 'succeeded'],
-        })
-        rl_strategies: List[str] = ['conservative', 'balanced', 'performance']
-        strategy_policies: Dict[str, Dict[str, Any]] = Field(default_factory=lambda: {
-            'conservative': {
-                'state_save_interval_seconds': 600,
-                'health_check_interval_seconds': 60,
-                'task_throughput': 0.3,
-                'token_base_generation_rate': 0.5,
-                'biomass_storage_tier': 'cold',
-                'compartment_creation': False,
-                'harvester_mode': 'minimal',
-                'scheduler_protons_per_rotation': 17,
-                'gradient_pump_rate': 0.2,
-                'token_generation_rate': 0.5,
-                'competition_spawn': False,
-            },
-            'balanced': {
-                'state_save_interval_seconds': 300,
-                'health_check_interval_seconds': 30,
-                'task_throughput': 1.0,
-                'token_base_generation_rate': 1.0,
-                'biomass_storage_tier': 'standard',
-                'compartment_creation': True,
-                'harvester_mode': 'adaptive',
-                'scheduler_protons_per_rotation': 12,
-                'gradient_pump_rate': 0.5,
-                'token_generation_rate': 1.0,
-                'competition_spawn': False,
-            },
-            'performance': {
-                'state_save_interval_seconds': 60,
-                'health_check_interval_seconds': 10,
-                'task_throughput': 2.0,
-                'token_base_generation_rate': 1.5,
-                'biomass_storage_tier': 'hot',
-                'compartment_creation': True,
-                'harvester_mode': 'full',
-                'scheduler_protons_per_rotation': 8,
-                'gradient_pump_rate': 1.0,
-                'token_generation_rate': 2.0,
-                'competition_spawn': True,
+        enable_swarm_coordination: bool = False    # placeholder
+        enable_multi_objective_rl: bool = True
+        enable_proactive_healing: bool = False     # placeholder
+        enable_drift_integration: bool = False     # placeholder
+        enable_prometheus: bool = False
+
+        rl_learning_rate: float = Field(0.1, ge=0.0, le=1.0)
+        rl_discount_factor: float = Field(0.9, ge=0.0, le=1.0)
+        rl_epsilon: float = Field(0.1, ge=0.0, le=1.0)
+        rl_learning_rate_min: float = Field(0.01, ge=0.0, le=1.0)
+        rl_epsilon_min: float = Field(0.01, ge=0.0, le=1.0)
+
+        q_table_max_size: int = Field(5000, ge=100)
+        q_table_prune_threshold: float = Field(0.1, ge=0.0, le=1.0)
+        strategy_history_max: int = Field(200, ge=10)
+        audit_ledger_in_memory_max: int = Field(500, ge=10)
+
+        rl_strategies: List[str] = Field(default_factory=lambda: ["conservative", "balanced", "performance"])
+        objective_weights: Dict[str, float] = Field(
+            default_factory=lambda: {
+                "energy_efficiency": 0.3,
+                "helium_sustainability": 0.25,
+                "token_balance": 0.2,
+                "health_score": 0.15,
+                "carbon_leakage": 0.1,
             }
-        })
-        pqc_key_dir: str = "./pqc_keys"
-        blockchain_audit_events: List[str] = ['strategy_change', 'anomaly', 'module_retirement', 'daily_snapshot']
-        blockchain_audit_min_importance: float = 0.5
-        state_save_interval_seconds: int = 300
+        )
+
+        strategy_update_interval: float = Field(5.0, ge=0.5)
+        state_save_interval: float = Field(60.0, ge=5.0)
         state_save_path: str = "./agent_state.json"
         storage_db_path: str = "./agent_storage.db"
-        q_table_max_size: int = 5000
-        q_table_refresh_interval: int = 10000
-        q_table_prune_threshold: float = 0.1
-        proactive_healing_health_threshold: float = 0.6
-        enable_prometheus: bool = False
-        objective_weights: Dict[str, float] = Field(default_factory=lambda: {
-            'energy_efficiency': 0.3,
-            'helium_sustainability': 0.25,
-            'token_balance': 0.2,
-            'health_score': 0.15,
-            'carbon_leakage': 0.1,
-        })
+        pqc_key_dir: str = "./pqc_keys"
+
         circuit_breaker_failure_threshold: int = 5
         circuit_breaker_recovery_timeout: float = 30.0
         circuit_breaker_half_open_attempts: int = 3
-        mopd: MOPDConfig = Field(default_factory=MOPDConfig)
+
+        shutdown_timeout_seconds: int = 15
 
         class Config:
             env_prefix = "AGENT_"
-
-        @validator('rl_state_bins')
-        def validate_state_bins(cls, v):
-            required_keys = ['load', 'health', 'token', 'energy', 'helium', 'carbon', 'alert_count',
-                             'helium_trend', 'q_penalty_carbon', 'q_penalty_helium', 'degradation_tier',
-                             'swarm_consensus', 'workflow_success']
-            for key in required_keys:
-                if key not in v:
-                    raise ValueError(f"Missing required state bin key: {key}")
-            return v
-
-        @classmethod
-        def from_yaml(cls, path):
-            with open(path, 'r') as f:
-                data = yaml.safe_load(f)
-            return cls(**data)
-
-        @classmethod
-        def from_json(cls, path):
-            with open(path, 'r') as f:
-                data = json.load(f)
-            return cls(**data)
 else:
-    # Fallback dataclass
-    @dataclass
-    class MOPDConfig:
-        enabled: bool = True
-        objective_weights: Dict[str, float] = field(default_factory=lambda: {
-            'energy_efficiency': 0.3,
-            'helium_sustainability': 0.25,
-            'token_balance': 0.2,
-            'health_score': 0.15,
-            'carbon_leakage': 0.1,
-        })
-        grid_resolution: int = 5
-
     @dataclass
     class AgentConfig:
         agent_id: str = field(default_factory=lambda: f"agent_{uuid.uuid4().hex[:8]}")
         enable_energy_aware_rl: bool = True
-        enable_quantum_bridge: bool = True
-        enable_time_tick_engine: bool = True
-        enable_swarm_coordination: bool = True
-        enable_multi_objective_rl: bool = False
-        enable_proactive_healing: bool = True
+        enable_swarm_coordination: bool = False
+        enable_multi_objective_rl: bool = True
+        enable_proactive_healing: bool = False
+        enable_drift_integration: bool = False
+        enable_prometheus: bool = False
         rl_learning_rate: float = 0.1
         rl_discount_factor: float = 0.9
         rl_epsilon: float = 0.1
         rl_learning_rate_min: float = 0.01
         rl_epsilon_min: float = 0.01
-        rl_state_bins: Dict[str, List[str]] = field(default_factory=lambda: {
-            'load': ['low', 'medium', 'high'],
-            'health': ['poor', 'medium', 'good'],
-            'token': ['scarce', 'adequate', 'abundant'],
-            'energy': ['light', 'normal', 'heavy'],
-            'helium': ['scarce', 'normal', 'abundant'],
-            'carbon': ['low', 'medium', 'high'],
-            'alert_count': ['none', 'some', 'many'],
-            'helium_trend': ['falling', 'stable', 'rising'],
-            'q_penalty_carbon': ['low', 'medium', 'high'],
-            'q_penalty_helium': ['low', 'medium', 'high'],
-            'degradation_tier': ['low', 'medium', 'high'],
-            'swarm_consensus': ['minority', 'mixed', 'majority'],
-            'workflow_success': ['failed', 'partial', 'succeeded'],
+        q_table_max_size: int = 5000
+        q_table_prune_threshold: float = 0.1
+        strategy_history_max: int = 200
+        audit_ledger_in_memory_max: int = 500
+        rl_strategies: List[str] = field(default_factory=lambda: ["conservative", "balanced", "performance"])
+        objective_weights: Dict[str, float] = field(default_factory=lambda: {
+            "energy_efficiency": 0.3,
+            "helium_sustainability": 0.25,
+            "token_balance": 0.2,
+            "health_score": 0.15,
+            "carbon_leakage": 0.1,
         })
-        rl_strategies: List[str] = field(default_factory=lambda: ['conservative', 'balanced', 'performance'])
-        strategy_policies: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
-            'conservative': {
-                'state_save_interval_seconds': 600,
-                'health_check_interval_seconds': 60,
-                'task_throughput': 0.3,
-                'token_base_generation_rate': 0.5,
-                'biomass_storage_tier': 'cold',
-                'compartment_creation': False,
-                'harvester_mode': 'minimal',
-                'scheduler_protons_per_rotation': 17,
-                'gradient_pump_rate': 0.2,
-                'token_generation_rate': 0.5,
-                'competition_spawn': False,
-            },
-            'balanced': {
-                'state_save_interval_seconds': 300,
-                'health_check_interval_seconds': 30,
-                'task_throughput': 1.0,
-                'token_base_generation_rate': 1.0,
-                'biomass_storage_tier': 'standard',
-                'compartment_creation': True,
-                'harvester_mode': 'adaptive',
-                'scheduler_protons_per_rotation': 12,
-                'gradient_pump_rate': 0.5,
-                'token_generation_rate': 1.0,
-                'competition_spawn': False,
-            },
-            'performance': {
-                'state_save_interval_seconds': 60,
-                'health_check_interval_seconds': 10,
-                'task_throughput': 2.0,
-                'token_base_generation_rate': 1.5,
-                'biomass_storage_tier': 'hot',
-                'compartment_creation': True,
-                'harvester_mode': 'full',
-                'scheduler_protons_per_rotation': 8,
-                'gradient_pump_rate': 1.0,
-                'token_generation_rate': 2.0,
-                'competition_spawn': True,
-            }
-        })
-        pqc_key_dir: str = "./pqc_keys"
-        blockchain_audit_events: List[str] = field(default_factory=lambda: ['strategy_change', 'anomaly', 'module_retirement', 'daily_snapshot'])
-        blockchain_audit_min_importance: float = 0.5
-        state_save_interval_seconds: int = 300
+        strategy_update_interval: float = 5.0
+        state_save_interval: float = 60.0
         state_save_path: str = "./agent_state.json"
         storage_db_path: str = "./agent_storage.db"
-        q_table_max_size: int = 5000
-        q_table_refresh_interval: int = 10000
-        q_table_prune_threshold: float = 0.1
-        proactive_healing_health_threshold: float = 0.6
-        enable_prometheus: bool = False
-        objective_weights: Dict[str, float] = field(default_factory=lambda: {
-            'energy_efficiency': 0.3,
-            'helium_sustainability': 0.25,
-            'token_balance': 0.2,
-            'health_score': 0.15,
-            'carbon_leakage': 0.1,
-        })
+        pqc_key_dir: str = "./pqc_keys"
         circuit_breaker_failure_threshold: int = 5
         circuit_breaker_recovery_timeout: float = 30.0
         circuit_breaker_half_open_attempts: int = 3
-        mopd: MOPDConfig = field(default_factory=MOPDConfig)
+        shutdown_timeout_seconds: int = 15
 
-# ============================================================================
-# Quantum‑Resilient Security (unchanged)
-# ============================================================================
-class QuantumResilientSecurity:
-    def __init__(self, config: AgentConfig):
-        self.config = config
-        self.pqc_key_dir = Path(config.pqc_key_dir)
-        self.pqc_key_dir.mkdir(parents=True, exist_ok=True)
-        self.private_key = None
-        self.public_key = None
-        self._load_or_generate_keys()
 
-    def _load_or_generate_keys(self):
-        priv_path = self.pqc_key_dir / "private.key"
-        pub_path = self.pqc_key_dir / "public.key"
-        if priv_path.exists() and pub_path.exists():
-            try:
-                with open(priv_path, 'rb') as f:
-                    self.private_key = f.read()
-                with open(pub_path, 'rb') as f:
-                    self.public_key = f.read()
-                logger.info("Loaded existing PQC keys")
-                return
-            except Exception as e:
-                logger.warning(f"Failed to load PQC keys: {e}")
-
-        if PQC_AVAILABLE:
-            self.private_key, self.public_key = dilithium.generate_keypair()
-        else:
-            from cryptography.hazmat.primitives.asymmetric import ec
-            from cryptography.hazmat.primitives import serialization
-            private_key = ec.generate_private_key(ec.SECP256R1())
-            self.private_key = private_key.private_bytes(
-                encoding=serialization.Encoding.DER,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption()
-            )
-            self.public_key = private_key.public_key().public_bytes(
-                encoding=serialization.Encoding.DER,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo
-            )
-        with open(priv_path, 'wb') as f:
-            f.write(self.private_key)
-        with open(pub_path, 'wb') as f:
-            f.write(self.public_key)
-
-    def sign_data(self, data: Dict[str, Any]) -> str:
-        payload = json.dumps(data, sort_keys=True, default=str).encode()
-        if PQC_AVAILABLE:
-            return dilithium.sign(payload, self.private_key).hex()
-        else:
-            from cryptography.hazmat.primitives.asymmetric import ec
-            from cryptography.hazmat.primitives import hashes
-            private_key = ec.load_der_private_key(self.private_key, password=None)
-            signature = private_key.sign(payload, ec.ECDSA(hashes.SHA256()))
-            return signature.hex()
-
-    def verify_signature(self, data, signature):
-        payload = json.dumps(data, sort_keys=True, default=str).encode()
-        if PQC_AVAILABLE:
-            try:
-                dilithium.verify(payload, bytes.fromhex(signature), self.public_key)
-                return True
-            except Exception:
-                return False
-        else:
-            from cryptography.hazmat.primitives.asymmetric import ec
-            from cryptography.hazmat.primitives import hashes
-            try:
-                public_key = ec.load_der_public_key(self.public_key)
-                public_key.verify(bytes.fromhex(signature), payload, ec.ECDSA(hashes.SHA256()))
-                return True
-            except Exception:
-                return False
-
-# ============================================================================
-# Blockchain Auditor
-# ============================================================================
-class BlockchainAuditor:
-    def __init__(self, config: AgentConfig, security: QuantumResilientSecurity):
-        self.config = config
-        self.security = security
-        self.ledger = []
-        self._lock = asyncio.Lock()
-
-    async def record_event(self, event_type, payload, importance=0.5):
-        if event_type not in self.config.blockchain_audit_events:
-            return False
-        if importance < self.config.blockchain_audit_min_importance:
-            return False
-        signature = self.security.sign_data(payload)
-        entry = {
-            'event_type': event_type,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'payload': payload,
-            'signature': signature,
-            'hash': hashlib.sha256(json.dumps(payload, default=str).encode()).hexdigest()
-        }
-        async with self._lock:
-            self.ledger.append(entry)
-        logger.info(f"Audit recorded: {event_type} (importance {importance})")
-        return True
-
-    def get_ledger(self, limit=100):
-        return self.ledger[-limit:]
-
-    def verify_entry(self, entry):
-        return self.security.verify_signature(entry['payload'], entry['signature'])
-
-# ============================================================================
-# Internal Event Bus
-# ============================================================================
-class EventBus:
-    def __init__(self):
-        self._subscribers = defaultdict(list)
-        self._lock = asyncio.Lock()
-
-    def subscribe(self, event_type, callback):
-        async with self._lock:
-            self._subscribers[event_type].append(callback)
-
-    async def publish(self, event: BioEvent):
-        async with self._lock:
-            callbacks = self._subscribers.get(event.event_type, [])
-        for cb in callbacks:
-            try:
-                if asyncio.iscoroutinefunction(cb):
-                    await cb(event)
-                else:
-                    cb(event)
-            except Exception as e:
-                logger.error(f"Event callback error for {event.event_type}: {e}")
-
-# ============================================================================
-# MOPD Data Classes
-# ============================================================================
+# =============================================================================
+# SECTION 4. MOPD (EXPERIMENTAL)
+# =============================================================================
 @dataclass
 class MOPDPoint:
-    """Represents a strategy with its objective vector."""
     strategy: str
     energy_efficiency: float
     helium_sustainability: float
@@ -700,376 +524,508 @@ class MOPDPoint:
     carbon_leakage: float
     scalarised_score: float = 0.0
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data):
+    def from_dict(cls, data: Dict[str, Any]) -> "MOPDPoint":
         return cls(**data)
 
-# ============================================================================
-# RL Strategy Selector (Enhanced with MOPD integration)
-# ============================================================================
+
+MAXIMIZE_KEYS = ("energy_efficiency", "helium_sustainability", "token_balance", "health_score")
+MINIMIZE_KEYS = ("carbon_leakage",)
+
+
+def pareto_filter(points: List[MOPDPoint]) -> List[MOPDPoint]:
+    """Non-dominated filter with correct direction for minimization keys."""
+    if not points:
+        return []
+    front: List[MOPDPoint] = []
+    for i, p in enumerate(points):
+        dominated = False
+        for j, q in enumerate(points):
+            if i == j:
+                continue
+            better_or_equal_max = all(getattr(q, k) >= getattr(p, k) for k in MAXIMIZE_KEYS)
+            better_or_equal_min = all(getattr(q, k) <= getattr(p, k) for k in MINIMIZE_KEYS)
+            strictly_better = (
+                any(getattr(q, k) > getattr(p, k) for k in MAXIMIZE_KEYS)
+                or any(getattr(q, k) < getattr(p, k) for k in MINIMIZE_KEYS)
+            )
+            if better_or_equal_max and better_or_equal_min and strictly_better:
+                dominated = True
+                break
+        if not dominated:
+            front.append(p)
+    return front
+
+
+# =============================================================================
+# SECTION 5. RL SELECTOR (EXPERIMENTAL)
+# =============================================================================
 class RLStrategySelector:
-    def __init__(self, config: AgentConfig):
+    """
+    Tabular Q-learning with bounded Q-table.
+    STATUS: experimental. Warns on enable.
+    """
+
+    def __init__(self, config: AgentConfig, enabled: bool = True):
+        if enabled:
+            _warn_module("rl_selector")
         self.config = config
-        self.q_table: Dict[str, Dict[str, float]] = defaultdict(lambda: {s: 0.0 for s in config.rl_strategies})
+        self.actions: List[str] = list(config.rl_strategies)
+        self.q_table: Dict[str, Dict[str, float]] = {}
         self.learning_rate = config.rl_learning_rate
         self.discount_factor = config.rl_discount_factor
         self.epsilon = config.rl_epsilon
-        self.last_state_key = None
-        self.last_action = None
-        self.actions = config.rl_strategies
-        self.state_bins = config.rl_state_bins
-        self.reward_history = deque(maxlen=100)
-        self.step_counter = 0
-        self.state_last_visited: Dict[str, datetime] = {}
-        self.strategy_objectives_history: Dict[str, List[Dict[str, float]]] = defaultdict(list)
+        self.reward_history: deque = deque(maxlen=100)
+        self.state_last_visited: Dict[str, float] = {}
+        self.strategy_objectives_history: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=config.strategy_history_max)
+        )
         self.pareto_front: List[MOPDPoint] = []
-
-        # Central components (optional)
         self.adaptive_cost = None
         self.pareto_gating = None
 
-    def set_central_components(self, adaptive_cost, pareto_gating):
+    def set_central_components(self, adaptive_cost: Any, pareto_gating: Any) -> None:
         self.adaptive_cost = adaptive_cost
         self.pareto_gating = pareto_gating
 
     def _state_to_key(self, state: Dict[str, float]) -> str:
-        load = state.get('system_load', 0.5)
-        health = state.get('health_score', 0.8)
-        token = state.get('token_balance', 0)
-        energy = state.get('energy_intensity', 0.5)
-        helium = state.get('helium_level', 0.5)
-        carbon = state.get('carbon_leakage_proxy', 0.3)
-        alert_count = state.get('alert_count', 0)
-        helium_trend = state.get('helium_trend', 0)
-        q_penalty_carbon = state.get('q_penalty_carbon', 0.5)
-        q_penalty_helium = state.get('q_penalty_helium', 0.5)
-        degradation_tier = state.get('degradation_tier', 3)
-        swarm_consensus = state.get('swarm_consensus', 0.5)
-        workflow_success = state.get('workflow_success', 0.5)
+        load = state.get("system_load", 0.5)
+        health = state.get("health_score", 0.8)
+        token = state.get("token_balance", 0)
+        energy = state.get("energy_intensity", 0.5)
+        helium = state.get("helium_level", 0.5)
+        carbon = state.get("carbon_leakage_proxy", 0.3)
+        alert_count = state.get("alert_count", 0)
+        return (
+            f"{'h' if load > 0.7 else 'm' if load > 0.4 else 'l'}"
+            f"_{'g' if health > 0.7 else 'm' if health > 0.4 else 'p'}"
+            f"_{'a' if token > 1000 else 'd' if token > 100 else 's'}"
+            f"_{'e' if energy > 0.7 else 'n' if energy > 0.4 else 'i'}"
+            f"_{'a' if helium > 0.7 else 'n' if helium > 0.3 else 's'}"
+            f"_{'h' if carbon > 0.6 else 'm' if carbon > 0.3 else 'l'}"
+            f"_{'m' if alert_count > 2 else 's' if alert_count > 0 else 'n'}"
+        )
 
-        load_bin = 'high' if load > 0.7 else 'medium' if load > 0.4 else 'low'
-        health_bin = 'good' if health > 0.7 else 'medium' if health > 0.4 else 'poor'
-        token_bin = 'abundant' if token > 1000 else 'adequate' if token > 100 else 'scarce'
-        energy_bin = 'heavy' if energy > 0.7 else 'normal' if energy > 0.4 else 'light'
-        helium_bin = 'scarce' if helium < 0.3 else 'normal' if helium < 0.7 else 'abundant'
-        carbon_bin = 'high' if carbon > 0.6 else 'medium' if carbon > 0.3 else 'low'
-        alert_bin = 'many' if alert_count > 2 else 'some' if alert_count > 0 else 'none'
-        helium_trend_bin = 'rising' if helium_trend > 0.1 else 'falling' if helium_trend < -0.1 else 'stable'
-        q_carbon_bin = 'high' if q_penalty_carbon > 0.7 else 'medium' if q_penalty_carbon > 0.3 else 'low'
-        q_helium_bin = 'high' if q_penalty_helium > 0.7 else 'medium' if q_penalty_helium > 0.3 else 'low'
-        deg_tier_bin = 'high' if degradation_tier > 3 else 'medium' if degradation_tier > 1 else 'low'
-        swarm_bin = 'majority' if swarm_consensus > 0.7 else 'minority' if swarm_consensus < 0.3 else 'mixed'
-        workflow_bin = 'succeeded' if workflow_success > 0.8 else 'failed' if workflow_success < 0.3 else 'partial'
+    def _ensure_state(self, key: str) -> Dict[str, float]:
+        if key not in self.q_table:
+            self.q_table[key] = {s: 0.0 for s in self.actions}
+        return self.q_table[key]
 
-        return f"{load_bin}_{health_bin}_{token_bin}_{energy_bin}_{helium_bin}_{carbon_bin}_{alert_bin}_{helium_trend_bin}_{q_carbon_bin}_{q_helium_bin}_{deg_tier_bin}_{swarm_bin}_{workflow_bin}"
+    def _prune_q_table(self) -> None:
+        cap = self.config.q_table_max_size
+        if len(self.q_table) <= cap:
+            return
+        # Sort by last visited (oldest first) and drop
+        items = sorted(self.state_last_visited.items(), key=lambda kv: kv[1])
+        to_drop = len(self.q_table) - cap
+        for k, _ in items[:to_drop]:
+            self.q_table.pop(k, None)
+            self.state_last_visited.pop(k, None)
 
     def select_action(self, state: Dict[str, float]) -> str:
         key = self._state_to_key(state)
-        if key not in self.q_table:
-            self.q_table[key] = {s: 0.0 for s in self.actions}
-        self.state_last_visited[key] = datetime.now(timezone.utc)
+        q_vals = self._ensure_state(key)
+        self.state_last_visited[key] = time.time()
 
-        # If central MODP components available, use them for selection
-        if self.adaptive_cost and self.pareto_gating:
-            if self.pareto_front:
-                candidates = []
-                for point in self.pareto_front:
+        # Prefer MOPD if we have a Pareto front and central components
+        if self.adaptive_cost is not None and self.pareto_gating is not None and self.pareto_front:
+            candidates = []
+            for point in self.pareto_front:
+                try:
                     cost = self.adaptive_cost.compute(
                         quality=point.energy_efficiency,
-                        carbon_g=point.carbon_leakage * 1000,
+                        carbon_g=point.carbon_leakage * 1000.0,
                         latency_ms=0.0,
                         energy_joules=0.0,
                         health=point.health_score,
-                        atp=point.token_balance
+                        atp=point.token_balance,
                     )
-                    candidates.append((cost, point.strategy))
-                if candidates:
-                    best = max(candidates, key=lambda x: x[0])
-                    return best[1]
+                    candidates.append((float(cost), point.strategy))
+                except Exception:
+                    continue
+            if candidates:
+                # AdaptiveCostFunction returns a cost; lower is better.
+                return min(candidates, key=lambda x: x[0])[1]
 
-        # Fallback to epsilon-greedy Q-learning
-        if len(self.reward_history) > 20:
-            var = np.var(self.reward_history)
-            if var < 0.05:
-                self.epsilon = max(self.config.rl_epsilon_min, self.epsilon * 0.95)
-            else:
-                self.epsilon = min(self.config.rl_epsilon, self.epsilon * 1.05)
-
-        if np.random.random() < self.epsilon:
-            action = np.random.choice(self.actions)
+        # Epsilon-greedy
+        if random.random() < self.epsilon:
+            action = random.choice(self.actions)
         else:
-            q_vals = self.q_table[key]
             max_q = max(q_vals.values())
-            best_actions = [a for a, q in q_vals.items() if q == max_q]
-            action = np.random.choice(best_actions)
+            best = [a for a, q in q_vals.items() if q == max_q]
+            action = random.choice(best)
 
-        self.last_state_key = key
-        self.last_action = action
-        self.step_counter += 1
+        self._prune_q_table()
         return action
 
-    def update(self, state, action, reward, next_state, objectives):
+    def update(
+        self,
+        state: Dict[str, float],
+        action: str,
+        reward: float,
+        next_state: Dict[str, float],
+        objectives: Optional[Dict[str, float]] = None,
+    ) -> None:
         key = self._state_to_key(state)
         next_key = self._state_to_key(next_state)
-
-        # Update Q-table
-        current_q = self.q_table[key][action]
-        next_max_q = max(self.q_table[next_key].values()) if next_key in self.q_table else 0.0
-        self.q_table[key][action] = current_q + self.learning_rate * (reward + self.discount_factor * next_max_q - current_q)
-
-        # Update objective history
-        self.strategy_objectives_history[action].append(objectives)
+        current_q = self.q_table.setdefault(key, {s: 0.0 for s in self.actions}).get(action, 0.0)
+        next_q = self.q_table.setdefault(next_key, {s: 0.0 for s in self.actions})
+        next_max_q = max(next_q.values()) if next_q else 0.0
+        self.q_table[key][action] = current_q + self.learning_rate * (
+            reward + self.discount_factor * next_max_q - current_q
+        )
         self.reward_history.append(reward)
 
-        # Update Pareto front
-        self._update_pareto_front()
+        if objectives is not None:
+            self.strategy_objectives_history[action].append(objectives)
 
-    def _get_strategy_average_objectives(self):
-        avg = {}
+        self._update_pareto_front()
+        self._prune_q_table()
+
+        # Slow epsilon decay
+        self.epsilon = max(self.config.rl_epsilon_min, self.epsilon * 0.995)
+
+    def _update_pareto_front(self) -> None:
+        if not self.strategy_objectives_history:
+            self.pareto_front = []
+            return
+        points: List[MOPDPoint] = []
         for strategy, objs in self.strategy_objectives_history.items():
             if not objs:
                 continue
-            avg_obj = {}
-            keys = objs[0].keys()
-            for k in keys:
-                avg_obj[k] = np.mean([o[k] for o in objs])
-            avg[strategy] = avg_obj
-        return avg
-
-    def _update_pareto_front(self):
-        avg = self._get_strategy_average_objectives()
-        if not avg:
-            return
-        points = []
-        for strategy, obj in avg.items():
-            point = MOPDPoint(
+            avg = {k: float(np.mean([o.get(k, 0.0) for o in objs])) for k in objs[0].keys()}
+            points.append(MOPDPoint(
                 strategy=strategy,
-                energy_efficiency=obj.get('energy_efficiency', 0),
-                helium_sustainability=obj.get('helium_sustainability', 0),
-                token_balance=obj.get('token_balance', 0),
-                health_score=obj.get('health_score', 0),
-                carbon_leakage=obj.get('carbon_leakage', 0),
-            )
-            points.append(point)
-        # Simple non-dominated sort
-        pareto = []
-        for i, p in enumerate(points):
-            dominated = False
-            for j, q in enumerate(points):
-                if i == j:
-                    continue
-                if all(getattr(q, k) >= getattr(p, k) for k in ['energy_efficiency','helium_sustainability','token_balance','health_score']) and \
-                   any(getattr(q, k) > getattr(p, k) for k in ['energy_efficiency','helium_sustainability','token_balance','health_score']):
-                    dominated = True
-                    break
-            if not dominated:
-                pareto.append(p)
-        self.pareto_front = pareto
+                energy_efficiency=avg.get("energy_efficiency", 0.0),
+                helium_sustainability=avg.get("helium_sustainability", 0.0),
+                token_balance=avg.get("token_balance", 0.0),
+                health_score=avg.get("health_score", 0.0),
+                carbon_leakage=avg.get("carbon_leakage", 1.0),
+            ))
+        self.pareto_front = pareto_filter(points)
 
-    def get_pareto_front(self):
-        return self.pareto_front.copy()
+    def get_pareto_front(self) -> List[MOPDPoint]:
+        return list(self.pareto_front)
 
-    def get_mopd_summary(self):
-        return {
-            "pareto_size": len(self.pareto_front),
-            "points": [p.to_dict() for p in self.pareto_front],
-        }
+    def q_table_size(self) -> int:
+        return len(self.q_table)
 
-# ============================================================================
-# Swarm Coordinator (simplified)
-# ============================================================================
-class SwarmCoordinator:
-    def __init__(self, agent_id, config, strategy_selector=None):
+
+# =============================================================================
+# SECTION 6. PLACEHOLDERS (SWARM, HEALING, DRIFT)
+# =============================================================================
+class SwarmCoordinatorPlaceholder:
+    """STATUS: placeholder. No Redis, no coordination."""
+
+    STATUS = "placeholder"
+
+    def __init__(self, agent_id: str, enabled: bool = False):
         self.agent_id = agent_id
-        self.config = config
-        self.strategy_selector = strategy_selector
-        self.shared_data = {}
-        self._lock = asyncio.Lock()
-        self.redis_client = None
-        self.pubsub = None
-        self.channel = f"swarm_{agent_id}"
-        if REDIS_AVAILABLE:
-            try:
-                import redis.asyncio as redis
-                self.redis_client = redis.from_url("redis://localhost:6379")
-                self.pubsub = self.redis_client.pubsub()
-                self._listen_task = None
-            except Exception as e:
-                logger.warning(f"Redis not available: {e}")
-                self.redis_client = None
-        else:
-            logger.warning("Redis not installed; swarm coordination disabled.")
+        self.available = False
+        self.peers: Dict[str, Any] = {}
+        if enabled:
+            _warn_module("swarm")
 
-    async def start(self):
-        if self.redis_client:
-            await self.pubsub.subscribe(self.channel)
-            self._listen_task = asyncio.create_task(self._listen())
+    async def start(self) -> None:
+        return None
 
-    async def _listen(self):
-        async for message in self.pubsub.listen():
-            if message['type'] == 'message':
-                try:
-                    data = json.loads(message['data'])
-                    agent_id = data.get('agent_id')
-                    if agent_id == self.agent_id:
-                        continue
-                    async with self._lock:
-                        self.shared_data[agent_id] = data
-                except Exception as e:
-                    logger.error(f"Failed to process swarm message: {e}")
+    async def stop(self) -> None:
+        return None
 
-    async def share(self, data):
-        if not self.redis_client:
-            return
+    async def share(self, data: Dict[str, Any]) -> None:
+        return None
+
+
+class ProactiveHealingPlaceholder:
+    """STATUS: placeholder. Does not detect or heal."""
+
+    STATUS = "placeholder"
+
+    def __init__(self, health_threshold: float = 0.6, enabled: bool = False):
+        self.health_threshold = health_threshold
+        self.available = False
+        self.actions: deque = deque(maxlen=100)
+        if enabled:
+            _warn_module("proactive_healing")
+
+    async def evaluate(self, state: Dict[str, Any]) -> List[str]:
+        return []
+
+
+class DriftPlaceholder:
+    """STATUS: placeholder. Accepts a central DriftDetector if provided."""
+
+    STATUS = "placeholder"
+
+    def __init__(self, detector: Optional[Any] = None, enabled: bool = False):
+        self.detector = detector
+        self.available = detector is not None
+        self.last_score: float = 0.0
+        if enabled and detector is None:
+            _warn_module("drift")
+
+    async def check(self, weights: Dict[str, float]) -> float:
+        if self.detector is None:
+            return 0.0
         try:
-            await self.redis_client.publish(self.channel, json.dumps(data))
+            result = await self.detector.check_drift(weights)
+            self.last_score = float(result or 0.0)
+            return self.last_score
         except Exception as e:
-            logger.error(f"Failed to publish to swarm: {e}")
+            logger.debug("Drift check failed", error=str(e))
+            return 0.0
 
-    async def stop(self):
-        if self.pubsub:
-            await self.pubsub.unsubscribe(self.channel)
-            await self.pubsub.close()
-        if self.redis_client:
-            await self.redis_client.close()
 
-# ============================================================================
-# Task Manager
-# ============================================================================
+# =============================================================================
+# SECTION 7. SECURITY (EXPERIMENTAL)
+# =============================================================================
+class SecurityService:
+    """
+    Signing/verification. Uses Dilithium when available, else SHA-256 HMAC-like
+    digest with a per-process secret. Not actually quantum-safe without pqcrypto.
+    STATUS: experimental.
+    """
+
+    def __init__(self, key_dir: str, enabled: bool = True):
+        if enabled:
+            _warn_module("security")
+        self.key_dir = Path(key_dir)
+        self.key_dir.mkdir(parents=True, exist_ok=True)
+        self._secret = self._load_or_generate_secret()
+
+    def _load_or_generate_secret(self) -> bytes:
+        p = self.key_dir / "hmac_secret.bin"
+        if p.exists():
+            return p.read_bytes()
+        secret = os.urandom(32)
+        p.write_bytes(secret)
+        return secret
+
+    def sign_data(self, data: Dict[str, Any]) -> str:
+        payload = json.dumps(data, sort_keys=True, default=str).encode()
+        if PQC_AVAILABLE:
+            try:
+                priv = self._load_or_generate_dilithium()
+                return dilithium.sign(payload, priv).hex()
+            except Exception:
+                pass
+        import hmac
+        return hmac.new(self._secret, payload, hashlib.sha256).hexdigest()
+
+    def _load_or_generate_dilithium(self) -> bytes:
+        p = self.key_dir / "dilithium_private.key"
+        if p.exists():
+            return p.read_bytes()
+        priv, pub = dilithium.generate_keypair()
+        p.write_bytes(priv)
+        (self.key_dir / "dilithium_public.key").write_bytes(pub)
+        return priv
+
+    def verify(self, data: Dict[str, Any], signature: str) -> bool:
+        return self.sign_data(data) == signature
+
+    @property
+    def backend(self) -> str:
+        return "dilithium" if PQC_AVAILABLE else "hmac-sha256"
+
+
+# =============================================================================
+# SECTION 8. AUDIT (EXPERIMENTAL) — bounded, chained, persisted
+# =============================================================================
+class AuditService:
+    """
+    Chained, SQLite-backed audit log with bounded in-memory cache.
+    STATUS: experimental.
+    """
+
+    def __init__(
+        self,
+        storage: LocalCircuitBreakerStorage,
+        security: SecurityService,
+        in_memory_max: int = 500,
+        enabled: bool = True,
+    ):
+        if enabled:
+            _warn_module("audit")
+        self.storage = storage
+        self.security = security
+        self.in_memory: deque = deque(maxlen=in_memory_max)
+        self._lock = asyncio.Lock()
+
+    async def record(
+        self, event_type: str, payload: Dict[str, Any], importance: float = 0.5
+    ) -> Optional[int]:
+        ts = datetime.now(timezone.utc).isoformat()
+        signature = self.security.sign_data(payload)
+        payload_str = json.dumps(payload, sort_keys=True, default=str)
+        prev_hash = None
+        # Read latest hash for chain
+        try:
+            last = self.storage.read_ledger(limit=1)
+            if last:
+                prev_hash = last[0].get("hash")
+        except Exception:
+            prev_hash = None
+        entry_hash = hashlib.sha256(
+            f"{ts}|{event_type}|{payload_str}|{signature}|{prev_hash or ''}".encode()
+        ).hexdigest()
+
+        async with self._lock:
+            try:
+                seq = self.storage.append_ledger(
+                    ts, event_type, payload_str, signature, entry_hash, prev_hash
+                )
+            except Exception as e:
+                logger.warning("Audit persist failed", error=str(e))
+                seq = None
+            self.in_memory.append({
+                "seq": seq,
+                "timestamp": ts,
+                "event_type": event_type,
+                "payload": payload,
+                "signature": signature,
+                "hash": entry_hash,
+                "prev_hash": prev_hash,
+                "importance": importance,
+            })
+        return seq
+
+    def recent(self, limit: int = 100) -> List[Dict[str, Any]]:
+        return list(self.in_memory)[-limit:]
+
+    def verify_chain(self) -> bool:
+        entries = self.storage.read_ledger(limit=10_000)
+        # Entries come newest-first; reverse to verify chain
+        entries = list(reversed(entries))
+        prev = None
+        for e in entries:
+            expected = hashlib.sha256(
+                f"{e['timestamp']}|{e['event_type']}|{e['payload']}|{e['signature']}|{prev or ''}".encode()
+            ).hexdigest()
+            if expected != e["hash"]:
+                return False
+            prev = e["hash"]
+        return True
+
+
+# =============================================================================
+# SECTION 9. TASK MANAGER (STABLE) — with drain
+# =============================================================================
 class TaskManager:
     def __init__(self):
-        self.tasks = {}
+        self.tasks: Dict[str, asyncio.Task] = {}
+        self.ephemeral: set = set()
         self.shutdown_event = asyncio.Event()
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
+        self._drained = False
 
-    def start_task(self, name, coro_func, *args, **kwargs):
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    def start_task(self, name: str, coro_func: Callable, *args, **kwargs) -> Optional[asyncio.Task]:
         async def wrapper():
             backoff = 1
-            max_backoff = 300
+            max_backoff = 60
             while not self.shutdown_event.is_set():
                 try:
                     await coro_func(*args, **kwargs)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    logger.error("Task crashed", name=name, error=str(e), exc_info=True)
+                    logger.error("Task crashed", name=name, error=str(e))
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, max_backoff)
-        task = asyncio.create_task(wrapper(), name=name)
-        async with self._lock:
-            self.tasks[name] = task
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("No running event loop; task not started", name=name)
+            return None
+        task = loop.create_task(wrapper(), name=name)
+        self.tasks[name] = task
         return task
 
-    async def stop_all(self):
-        self.shutdown_event.set()
-        async with self._lock:
-            for task in self.tasks.values():
-                task.cancel()
-            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
-            self.tasks.clear()
-        logger.info("All background tasks stopped")
+    def spawn_ephemeral(self, coro) -> Optional[asyncio.Task]:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(coro)
+        self.ephemeral.add(task)
+        task.add_done_callback(self.ephemeral.discard)
+        return task
 
-# ============================================================================
-# Core Bio‑Integrated Agent (Enhanced)
-# ============================================================================
+    async def drain(self, timeout: float) -> None:
+        if self._drained:
+            return
+        self._drained = True
+        self.shutdown_event.set()
+        all_tasks = list(self.tasks.values()) + list(self.ephemeral)
+        if not all_tasks:
+            return
+        done, pending = await asyncio.wait(all_tasks, timeout=timeout)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self.tasks.clear()
+        self.ephemeral.clear()
+        logger.info("TaskManager drained", completed=len(done), cancelled=len(pending))
+
+
+# =============================================================================
+# SECTION 10. BIO-INTEGRATED AGENT (STABLE ORCHESTRATOR)
+# =============================================================================
 class BioIntegratedAgent:
+    """
+    Orchestrator. Lifecycle:
+
+        agent = BioIntegratedAgent(...)
+        await agent.start()      # or use async with
+        ...
+        await agent.shutdown()
+    """
+
     def __init__(
         self,
-        bio_core=None,
-        config=None,
-        csv_path=None,
-        quantum_graph=None,
-        token_manager=None,
-        gradient_manager=None,
-        scheduler=None,
-        compartment_manager=None,
-        biomass_storage=None,
-        harvester=None,
-        tick_engine=None,
-        quantum_bridge=None,
-        storage: Optional[CentralStorage] = None,
-        message_queue: Optional[AsyncMessageQueue] = None,
-        adaptive_cost: Optional[AdaptiveCostFunction] = None,
-        pareto_gating: Optional[ParetoGating] = None,
-        drift_detector: Optional[DriftDetector] = None,
-        metrics: Optional[MetricsRegistry] = None,
+        config: Optional[Union[AgentConfig, Dict[str, Any]]] = None,
+        storage: Optional[Any] = None,
+        message_queue: Optional[Any] = None,
+        adaptive_cost: Optional[Any] = None,
+        pareto_gating: Optional[Any] = None,
+        drift_detector: Optional[Any] = None,
+        metrics: Optional[Any] = None,
+        bio_core: Optional[Any] = None,
     ):
-        # Load config
+        # Config
         if isinstance(config, dict):
-            if PYDANTIC_AVAILABLE:
-                self.config = AgentConfig(**config)
-            else:
-                self.config = AgentConfig(**config)
+            self.config = AgentConfig(**config) if PYDANTIC_AVAILABLE else AgentConfig(**config)
         elif isinstance(config, AgentConfig):
             self.config = config
         else:
-            self.config = AgentConfig()
+            self.config = AgentConfig() if PYDANTIC_AVAILABLE else AgentConfig()
 
-        self.bio_core = bio_core
-
-        # Central components
-        self.storage = storage if storage else Storage(self.config.storage_db_path)
+        # External components
+        self.storage = storage
         self.queue = message_queue
         self.adaptive_cost = adaptive_cost
         self.pareto_gating = pareto_gating
         self.drift_detector = drift_detector
         self.metrics = metrics
+        self.bio_core = bio_core
 
-        # Bio modules
-        self.token_manager = token_manager or (EcoATPTokenManager() if TOKEN_AVAILABLE else None)
-        self.gradient_manager = gradient_manager or (GradientFieldManager() if GRADIENT_AVAILABLE else None)
-        self.scheduler = scheduler or (ATPSynthaseScheduler(self.token_manager, self.gradient_manager) if ATP_AVAILABLE else None)
-        self.compartment_manager = compartment_manager or (HierarchicalCompartmentManager(self.token_manager) if COMPARTMENT_AVAILABLE else None)
-        self.biomass_storage = biomass_storage or (BiomassStorage(self.token_manager, self.gradient_manager) if BIOMASS_AVAILABLE else None)
-        self.harvester = harvester or (PhotosyntheticHarvester(self.token_manager) if HARVESTER_AVAILABLE else None)
-
-        if self.config.enable_time_tick_engine and csv_path and TICK_ENGINE_AVAILABLE:
-            from .time_tick_engine import TimeTickEngine, HeliumEnvironmentTranslator
-            self.tick_engine = TimeTickEngine(
-                csv_path=csv_path,
-                harvester=self.harvester,
-                translator_class=HeliumEnvironmentTranslator
-            )
-        else:
-            self.tick_engine = tick_engine
-
-        if self.config.enable_quantum_bridge and quantum_graph and QUANTUM_BRIDGE_AVAILABLE:
-            from .quantum_bridge import QuantumBridge
-            self.quantum_bridge = QuantumBridge(self.gradient_manager, quantum_graph)
-        else:
-            self.quantum_bridge = quantum_bridge
-
-        # Security & audit
-        self.security = QuantumResilientSecurity(self.config)
-        self.auditor = BlockchainAuditor(self.config, self.security)
-
-        # RL strategy selector
-        self.strategy_selector = RLStrategySelector(self.config) if self.config.enable_energy_aware_rl else None
-        if self.strategy_selector and adaptive_cost and pareto_gating:
-            self.strategy_selector.set_central_components(adaptive_cost, pareto_gating)
-        self.current_strategy = 'balanced'
-        self.strategy_change_time = datetime.now(timezone.utc)
-
-        # State & metrics
-        self.state = self._get_initial_state()
-        self.agent_metrics = {
-            'strategy_changes': 0,
-            'total_reward': 0.0,
-            'energy_efficiency': 0.0,
-            'helium_efficiency': 0.0,
-            'avg_reward': 0.0,
-        }
-        self.reward_history = deque(maxlen=100)
-
-        # Storage fallback
-        if not hasattr(self.storage, 'save_circuit_breaker_state'):
-            self.local_storage = Storage(self.config.storage_db_path)
-            self.storage = self.local_storage
-        else:
-            self.local_storage = None
+        # Local infrastructure
+        self._local_storage = LocalCircuitBreakerStorage(self.config.storage_db_path)
+        self.security = SecurityService(self.config.pqc_key_dir)
+        self.audit = AuditService(
+            self._local_storage, self.security,
+            in_memory_max=self.config.audit_ledger_in_memory_max,
+        )
 
         # Circuit breakers
         self._token_circuit = CircuitBreaker(
@@ -1077,295 +1033,687 @@ class BioIntegratedAgent:
             failure_threshold=self.config.circuit_breaker_failure_threshold,
             recovery_timeout=self.config.circuit_breaker_recovery_timeout,
             half_open_attempts=self.config.circuit_breaker_half_open_attempts,
-            storage=self.storage
+            storage=self._local_storage,
         )
         self._gradient_circuit = CircuitBreaker(
             "gradient_service",
             failure_threshold=self.config.circuit_breaker_failure_threshold,
             recovery_timeout=self.config.circuit_breaker_recovery_timeout,
             half_open_attempts=self.config.circuit_breaker_half_open_attempts,
-            storage=self.storage
+            storage=self._local_storage,
         )
 
-        self.correlation_id = str(uuid.uuid4())
+        # RL selector (experimental)
+        self.strategy_selector: Optional[RLStrategySelector] = None
+        if self.config.enable_energy_aware_rl or self.config.enable_multi_objective_rl:
+            self.strategy_selector = RLStrategySelector(self.config, enabled=True)
+            if self.adaptive_cost is not None and self.pareto_gating is not None:
+                self.strategy_selector.set_central_components(
+                    self.adaptive_cost, self.pareto_gating
+                )
 
-        # Access core sub-modules (if bio_core provided)
-        if self.bio_core:
-            self.event_broker = getattr(self.bio_core, 'event_broker', None)
-            self.self_healer = getattr(self.bio_core, 'self_healer', None)
-            self.alert_system = getattr(self.bio_core, 'alert_system', None)
-            self.anomaly_detection = getattr(self.bio_core, 'anomaly_detection', None)
-            self.cost_benefit_engine = getattr(self.bio_core, 'cost_benefit_engine', None)
-            self.workflow_orchestrator = getattr(self.bio_core, 'workflow_orchestrator', None)
-            self.swarm_coordinator = getattr(self.bio_core, 'swarm_coordinator', None)
-            self.health_monitor = getattr(self.bio_core, 'health_monitor', None)
-            self.degradation_manager = getattr(self.bio_core, 'degradation_manager', None)
-            self.competition_engine = getattr(self.bio_core, 'competition_engine', None)
-            self.token_supply_manager = getattr(self.bio_core, 'supply_manager', None)
-            self.token_allocator = getattr(self.bio_core, 'token_allocator', None)
-            if self.event_broker:
-                self._subscribe_events()
-        else:
-            self.event_broker = None
-            self.self_healer = None
-            self.alert_system = None
-            self.anomaly_detection = None
-            self.cost_benefit_engine = None
-            self.workflow_orchestrator = None
-            self.swarm_coordinator = None
-            self.health_monitor = None
-            self.degradation_manager = None
-            self.competition_engine = None
-            self.token_supply_manager = None
-            self.token_allocator = None
+        # Placeholders
+        self.swarm = SwarmCoordinatorPlaceholder(
+            self.config.agent_id,
+            enabled=self.config.enable_swarm_coordination,
+        )
+        self.healing = ProactiveHealingPlaceholder(
+            enabled=self.config.enable_proactive_healing,
+        )
+        self.drift = DriftPlaceholder(
+            detector=self.drift_detector,
+            enabled=self.config.enable_drift_integration,
+        )
 
-        self.internal_bus = EventBus()
+        # State
+        self.current_strategy: str = "balanced"
+        self.state: Dict[str, float] = self._initial_state()
+        self.agent_metrics: Dict[str, float] = {
+            "strategy_changes": 0,
+            "total_reward": 0.0,
+            "avg_reward": 0.0,
+        }
+        self.reward_history: deque = deque(maxlen=100)
+        self.correlation_id = uuid.uuid4().hex
 
-        # Swarm coordinator
-        if self.config.enable_swarm_coordination:
-            self.swarm_coordinator = SwarmCoordinator(self.config.agent_id, self.config, self.strategy_selector)
-        else:
-            self.swarm_coordinator = None
-
-        # Background tasks
+        # Lifecycle
         self._task_manager = TaskManager()
-        try:
-            self._task_manager.start_task("strategy_loop", self._strategy_update_loop)
-            self._task_manager.start_task("state_save", self._state_save_loop)
-            self._task_manager.start_task("daily_snapshot", self._daily_snapshot_loop)
-            if self.config.enable_swarm_coordination and self.swarm_coordinator:
-                self._task_manager.start_task("swarm_update", self._swarm_update_loop)
-        except RuntimeError:
-            logger.warning("No running event loop; background tasks not started. Call start() later.")
+        self._started = False
+        self._shutdown = False
 
-        # Load saved state
-        self._load_state_task = self._create_task(self.load_state())
+        # Metrics
+        self._prom = self._setup_metrics()
 
         logger.info(
-            f"BioIntegratedAgent v12.2.1 initialized",
+            "BioIntegratedAgent initialized",
             agent_id=self.config.agent_id,
             correlation_id=self.correlation_id,
-            mopd_enabled=self.config.mopd.enabled,
-            central_storage=isinstance(self.storage, CentralStorage),
-            central_queue=self.queue is not None,
+            rl_selector=self.strategy_selector is not None,
         )
 
-    def _create_task(self, coro):
-        try:
-            loop = asyncio.get_running_loop()
-            return loop.create_task(coro)
-        except RuntimeError:
-            logger.warning("No running event loop; task not started.")
-            return None
+    # ---------- lifecycle ----------
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
 
-    def _subscribe_events(self):
-        # Subscribe to relevant core events if available
-        pass
+        # Load state
+        await self._load_state()
 
-    def _get_initial_state(self):
-        return {
-            'system_load': 0.5,
-            'health_score': 0.8,
-            'token_balance': 500,
-            'energy_intensity': 0.5,
-            'helium_level': 0.5,
-            'carbon_leakage_proxy': 0.3,
-            'helium_trend': 0.0,
-            'alert_count': 0,
-            'q_penalty_carbon': 0.5,
-            'q_penalty_helium': 0.5,
-            'degradation_tier': 3,
-            'swarm_consensus': 0.5,
-            'workflow_success': 0.5,
-        }
+        # Start swarm (placeholder: no-op)
+        await self.swarm.start()
 
-    async def get_strategy_state(self):
-        return self._get_initial_state()
-
-    async def _compute_reward(self, state):
-        # Simplified reward calculation
-        weights = self.config.objective_weights
-        reward = (
-            weights['energy_efficiency'] * (1.0 - state['energy_intensity']) +
-            weights['helium_sustainability'] * state['helium_level'] +
-            weights['token_balance'] * min(1.0, state['token_balance'] / 1000) +
-            weights['health_score'] * state['health_score'] +
-            weights['carbon_leakage'] * (1.0 - state['carbon_leakage_proxy'])
+        # Start background tasks
+        self._task_manager.start_task(
+            "strategy_loop", self._strategy_update_loop
         )
-        return max(0.0, min(1.0, reward))
+        self._task_manager.start_task(
+            "state_save_loop", self._state_save_loop
+        )
 
-    async def _strategy_update_loop(self):
-        while True:
-            await asyncio.sleep(30)  # adjust as needed
-            state = await self.get_strategy_state()
-            old_strategy = self.current_strategy
-            new_strategy = self.strategy_selector.select_action(state) if self.strategy_selector else 'balanced'
-            if new_strategy != old_strategy:
-                self.current_strategy = new_strategy
-                self.strategy_change_time = datetime.now(timezone.utc)
-                self.agent_metrics['strategy_changes'] += 1
-                await self.apply_strategy(new_strategy)
-                logger.info(f"Strategy changed from {old_strategy} to {new_strategy}")
-                # Publish FeedbackEvent
-                if self.queue and FeedbackEvent:
-                    event = FeedbackEvent(
-                        source="bio_agent",
-                        feedback_type="routing",
-                        task_id=self.config.agent_id,
-                        context={"old_strategy": old_strategy, "new_strategy": new_strategy},
-                        action={"selected_action": new_strategy},
-                        performance={"quality_score": self.agent_metrics['avg_reward']},
-                        adaptive_cost_value=self.agent_metrics['avg_reward'],
-                        tags=["bio_agent", "strategy"],
-                    )
-                    await self.queue.publish("bio_agent_events", event.to_json())
-                # Audit
-                await self.auditor.record_event("strategy_change", {"old": old_strategy, "new": new_strategy}, importance=0.7)
+        logger.info("BioIntegratedAgent started", agent_id=self.config.agent_id)
 
-    async def apply_strategy(self, strategy):
-        # Apply strategy parameters to modules (simplified)
-        policy = self.config.strategy_policies.get(strategy, {})
-        if self.token_manager:
-            await self.token_manager.set_generation_rate(policy.get('token_generation_rate', 1.0))
-        if self.gradient_manager:
-            await self.gradient_manager.set_pump_rate(policy.get('gradient_pump_rate', 0.5))
-        if self.scheduler:
-            await self.scheduler.set_protons_per_rotation(policy.get('scheduler_protons_per_rotation', 12))
-        # Additional adjustments can be added here
-        logger.info(f"Applied strategy: {strategy}")
-
-    async def _state_save_loop(self):
-        while True:
-            await asyncio.sleep(self.config.state_save_interval_seconds)
-            await self.save_state()
-
-    async def _daily_snapshot_loop(self):
-        while True:
-            await asyncio.sleep(86400)
-            await self.auditor.record_event("daily_snapshot", self.state, importance=0.8)
-
-    async def _swarm_update_loop(self):
-        while True:
-            await asyncio.sleep(60)
-            if self.swarm_coordinator:
-                try:
-                    await self.swarm_coordinator.share({
-                        "agent_id": self.config.agent_id,
-                        "strategy": self.current_strategy,
-                        "state": self.state,
-                    })
-                except Exception as e:
-                    logger.error(f"Swarm share failed: {e}")
-
-    async def _update_metrics(self, state):
-        # Update internal metrics
-        reward = await self._compute_reward(state)
-        self.reward_history.append(reward)
-        self.agent_metrics['avg_reward'] = float(np.mean(self.reward_history)) if self.reward_history else 0.0
-        self.agent_metrics['energy_efficiency'] = 1.0 - state['energy_intensity']
-        self.agent_metrics['helium_efficiency'] = state['helium_level']
-        self.agent_metrics['total_reward'] += reward
-
-    # MOPD Public Methods
-    async def get_mopd_pareto_front(self):
-        if not self.config.mopd.enabled or not self.strategy_selector:
-            return []
-        return self.strategy_selector.get_pareto_front()
-
-    async def get_mopd_summary(self):
-        if not self.config.mopd.enabled or not self.strategy_selector:
-            return {"enabled": False}
-        return self.strategy_selector.get_mopd_summary()
-
-    # Teacher Policy for MTPD
-    async def policy_probs(self, state: Dict[str, Any]) -> List[float]:
-        if not self.strategy_selector:
-            return [1.0 / len(self.config.rl_strategies)] * len(self.config.rl_strategies)
-
-        if self.adaptive_cost and self.pareto_gating:
-            objectives = {
-                'energy_efficiency': 1.0 - state.get('energy_intensity', 0.5),
-                'helium_sustainability': state.get('helium_level', 0.5),
-                'token_balance': min(1.0, state.get('token_balance', 500) / 1000),
-                'health_score': state.get('health_score', 0.8),
-                'carbon_leakage': state.get('carbon_leakage_proxy', 0.3),
-            }
-            candidates = []
-            for strategy in self.config.rl_strategies:
-                cost = self.adaptive_cost.compute(
-                    quality=objectives['energy_efficiency'],
-                    carbon_g=objectives['carbon_leakage'] * 1000,
-                    latency_ms=0.0,
-                    energy_joules=0.0,
-                    health=objectives['health_score'],
-                    atp=objectives['token_balance']
-                )
-                candidates.append({'strategy': strategy, 'score': cost})
-            filtered = self.pareto_gating.filter(candidates)
-            if filtered:
-                scores = [c['score'] for c in filtered]
-                exp = np.exp(scores - np.max(scores))
-                probs = exp / exp.sum()
-                full = [0.0] * len(self.config.rl_strategies)
-                for c, p in zip(filtered, probs):
-                    idx = self.config.rl_strategies.index(c['strategy'])
-                    full[idx] = p
-                return full
-        # Fallback
-        q_vals = self.strategy_selector.q_table.get(self.strategy_selector._state_to_key(state), {})
-        if q_vals:
-            q = np.array([q_vals.get(s, 0.0) for s in self.config.rl_strategies])
-            exp = np.exp(q - np.max(q))
-            return (exp / exp.sum()).tolist()
-        return [1.0 / len(self.config.rl_strategies)] * len(self.config.rl_strategies)
-
-    # Persistence
-    async def save_state(self):
-        state_data = {
-            'agent_id': self.config.agent_id,
-            'current_strategy': self.current_strategy,
-            'strategy_change_time': self.strategy_change_time.isoformat(),
-            'state': self.state,
-            'metrics': self.agent_metrics,
-            'pareto_front': [p.to_dict() for p in self.strategy_selector.get_pareto_front()] if self.config.mopd.enabled else []
-        }
-        if isinstance(self.storage, CentralStorage):
-            self.storage.save_state("bio_agent_state", json.dumps(state_data, default=str))
-        else:
-            with open(self.config.state_save_path, 'w') as f:
-                json.dump(state_data, f, default=str, indent=2)
-
-    async def load_state(self, path=None):
+    async def ready(self) -> bool:
+        """Returns True when the agent is started and its core components are ready."""
+        if not self._started:
+            return False
+        if self.strategy_selector is None:
+            return False
+        # Storage check
         try:
-            if isinstance(self.storage, CentralStorage):
-                data = self.storage.load_state("bio_agent_state")
-                if data:
-                    state_data = json.loads(data)
-                else:
-                    return
-            else:
-                if not os.path.exists(self.config.state_save_path):
-                    return
-                with open(self.config.state_save_path, 'r') as f:
-                    state_data = json.load(f)
-            self.current_strategy = state_data.get('current_strategy', 'balanced')
-            self.state = state_data.get('state', self._get_initial_state())
-            self.agent_metrics = state_data.get('metrics', self.agent_metrics)
-            # Load Pareto front if present
-            if 'pareto_front' in state_data and self.strategy_selector:
-                self.strategy_selector.pareto_front = [MOPDPoint.from_dict(p) for p in state_data['pareto_front']]
+            self._local_storage.ledger_size()
+        except Exception:
+            return False
+        return True
+
+    async def __aenter__(self) -> "BioIntegratedAgent":
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.shutdown()
+
+    async def shutdown(self, timeout: Optional[float] = None) -> None:
+        if self._shutdown:
+            return
+        self._shutdown = True
+        timeout = timeout or float(self.config.shutdown_timeout_seconds)
+        logger.info("BioIntegratedAgent shutting down", agent_id=self.config.agent_id)
+
+        # Stop swarm
+        try:
+            await self.swarm.stop()
         except Exception as e:
-            logger.error(f"State load failed: {e}")
+            logger.warning("Swarm stop failed", error=str(e))
 
-    async def shutdown(self):
-        await self._task_manager.stop_all()
-        if self.swarm_coordinator:
-            await self.swarm_coordinator.stop()
-        await self.save_state()
-        logger.info("BioIntegratedAgent shutdown complete")
+        # Drain tasks
+        try:
+            await asyncio.wait_for(self._task_manager.drain(timeout), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Task drain timed out")
 
-# ============================================================================
-# Example usage
-# ============================================================================
+        # Flush state
+        try:
+            await self._save_state()
+        except Exception as e:
+            logger.warning("State flush failed", error=str(e))
+
+        # Audit shutdown
+        try:
+            await self.audit.record(
+                "shutdown",
+                {"agent_id": self.config.agent_id, "correlation_id": self.correlation_id},
+                importance=0.4,
+            )
+        except Exception:
+            pass
+
+        logger.info("BioIntegratedAgent shutdown complete", agent_id=self.config.agent_id)
+
+    # ---------- state ----------
+    def _initial_state(self) -> Dict[str, float]:
+        return {
+            "system_load": 0.5,
+            "health_score": 0.8,
+            "token_balance": 500.0,
+            "energy_intensity": 0.5,
+            "helium_level": 0.5,
+            "carbon_leakage_proxy": 0.3,
+            "alert_count": 0,
+        }
+
+    async def _refresh_state(self) -> None:
+        """
+        Pull live metrics from available services. Safe: any missing service
+        leaves the corresponding state fields at their current values.
+        """
+        # Token service via circuit breaker
+        if self.queue is not None:
+            pass  # queue does not carry state
+        token_summary = None
+        for provider_name in ("token_manager", "token_service", "token_provider"):
+            provider = getattr(self, provider_name, None)
+            if provider is None and self.bio_core is not None:
+                provider = getattr(self.bio_core, provider_name, None)
+            if provider is None:
+                continue
+            summary_fn = getattr(provider, "get_system_summary", None)
+            if summary_fn is None:
+                continue
+            try:
+                async def _call(fn=summary_fn):
+                    r = fn()
+                    if asyncio.iscoroutine(r):
+                        r = await r
+                    return r
+                token_summary = await self._token_circuit.call(_call)
+                break
+            except Exception:
+                token_summary = None
+        if isinstance(token_summary, dict):
+            self.state["token_balance"] = float(token_summary.get("total_balance", self.state["token_balance"]))
+
+        # Gradient service
+        gradient_strengths = None
+        for provider_name in ("gradient_manager", "gradient_service"):
+            provider = getattr(self, provider_name, None)
+            if provider is None and self.bio_core is not None:
+                provider = getattr(self.bio_core, provider_name, None)
+            if provider is None:
+                continue
+            strengths_fn = getattr(provider, "get_field_strengths", None)
+            if strengths_fn is None:
+                continue
+            try:
+                async def _call(fn=strengths_fn):
+                    r = fn()
+                    if asyncio.iscoroutine(r):
+                        r = await r
+                    return r
+                gradient_strengths = await self._gradient_circuit.call(_call)
+                break
+            except Exception:
+                gradient_strengths = None
+        if isinstance(gradient_strengths, dict):
+            self.state["helium_level"] = float(
+                gradient_strengths.get("helium", self.state["helium_level"])
+            )
+            self.state["carbon_leakage_proxy"] = float(
+                1.0 - gradient_strengths.get("carbon", 1.0 - self.state["carbon_leakage_proxy"])
+            )
+
+    async def _update_metrics(self, reward: float) -> None:
+        self.reward_history.append(reward)
+        self.agent_metrics["total_reward"] += reward
+        if self.reward_history:
+            self.agent_metrics["avg_reward"] = float(np.mean(self.reward_history))
+        if self._prom:
+            try:
+                self._prom["avg_reward"].set(self.agent_metrics["avg_reward"])
+                self._prom["strategy_changes"].set(self.agent_metrics["strategy_changes"])
+                if self.strategy_selector is not None:
+                    self._prom["q_table_size"].set(self.strategy_selector.q_table_size())
+                    self._prom["pareto_size"].set(len(self.strategy_selector.pareto_front))
+            except Exception:
+                pass
+
+    def _objectives_from_state(self, state: Dict[str, float]) -> Dict[str, float]:
+        return {
+            "energy_efficiency": 1.0 - float(state.get("energy_intensity", 0.5)),
+            "helium_sustainability": float(state.get("helium_level", 0.5)),
+            "token_balance": min(1.0, float(state.get("token_balance", 0.0)) / 1000.0),
+            "health_score": float(state.get("health_score", 0.8)),
+            "carbon_leakage": float(state.get("carbon_leakage_proxy", 1.0)),
+        }
+
+    async def _compute_reward(self, state: Dict[str, float]) -> float:
+        w = self.config.objective_weights
+        r = (
+            w["energy_efficiency"] * (1.0 - state["energy_intensity"])
+            + w["helium_sustainability"] * state["helium_level"]
+            + w["token_balance"] * min(1.0, state["token_balance"] / 1000.0)
+            + w["health_score"] * state["health_score"]
+            + w["carbon_leakage"] * (1.0 - state["carbon_leakage_proxy"])
+        )
+        return max(0.0, min(1.0, float(r)))
+
+    # ---------- strategy ----------
+    async def _strategy_update_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self.config.strategy_update_interval)
+
+                # 1. Refresh state from services
+                await self._refresh_state()
+
+                # 2. Compute reward and update metrics
+                reward = await self._compute_reward(self.state)
+                await self._update_metrics(reward)
+
+                # 3. Check drift (placeholder-safe)
+                try:
+                    drift_score = await self.drift.check(
+                        self.adaptive_cost.get_current_weights()
+                        if self.adaptive_cost and hasattr(self.adaptive_cost, "get_current_weights")
+                        else {}
+                    )
+                except Exception:
+                    drift_score = 0.0
+
+                # 4. RL selector proposes an action
+                if self.strategy_selector is None:
+                    continue
+                action = self.strategy_selector.select_action(self.state)
+
+                # 5. Update Q-table with the reward for the previously-chosen action
+                objectives = self._objectives_from_state(self.state)
+                self.strategy_selector.update(
+                    state=self.state,
+                    action=self.current_strategy if self.current_strategy in self.strategy_selector.actions else action,
+                    reward=reward,
+                    next_state=self.state,
+                    objectives=objectives,
+                )
+
+                # 6. Apply if changed
+                if action != self.current_strategy:
+                    old = self.current_strategy
+                    self.current_strategy = action
+                    self.agent_metrics["strategy_changes"] += 1
+                    await self._apply_strategy(action)
+                    await self.audit.record(
+                        "strategy_change",
+                        {"old": old, "new": action, "reward": reward, "drift": drift_score},
+                        importance=0.7,
+                    )
+                    await self._publish_feedback_event(old, action, reward)
+
+                # 7. Proactive healing (placeholder: no-op)
+                try:
+                    await self.healing.evaluate(self.state)
+                except Exception:
+                    pass
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Strategy loop error", error=str(e))
+                await asyncio.sleep(5)
+
+    async def _apply_strategy(self, strategy: str) -> None:
+        """Apply strategy to available services. Missing methods are no-ops."""
+        policy = {
+            "conservative": {"rate": 0.5},
+            "balanced": {"rate": 1.0},
+            "performance": {"rate": 2.0},
+        }.get(strategy, {"rate": 1.0})
+
+        # Try known providers; only call methods that exist
+        for provider_name in ("token_manager", "token_service", "token_provider"):
+            provider = getattr(self, provider_name, None)
+            if provider is None and self.bio_core is not None:
+                provider = getattr(self.bio_core, provider_name, None)
+            if provider is None:
+                continue
+            fn = getattr(provider, "set_generation_rate", None)
+            if fn is None:
+                continue
+            try:
+                r = fn(policy["rate"])
+                if asyncio.iscoroutine(r):
+                    await r
+                break
+            except Exception as e:
+                logger.debug("set_generation_rate failed", error=str(e))
+
+        # Log application regardless
+        logger.info("Strategy applied", strategy=strategy, agent_id=self.config.agent_id)
+
+    async def _publish_feedback_event(self, old: str, new: str, reward: float) -> None:
+        if self.queue is None:
+            return
+        payload = {
+            "source": "bio_agent",
+            "feedback_type": "routing",
+            "task_id": self.config.agent_id,
+            "selected_action": new,
+            "previous_action": old,
+            "reward": reward,
+            "correlation_id": self.correlation_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            if FeedbackEvent is not None and hasattr(FeedbackEvent, "create_with_context"):
+                event = FeedbackEvent.create_with_context(
+                    task_id=self.config.agent_id,
+                    selected_action=new,
+                    quality_score=reward,
+                    energy_joules=0.0,
+                    carbon_g=0.0,
+                    feedback_type="routing",
+                    adaptive_cost_value=reward,
+                    state={"old_strategy": old, "new_strategy": new, "state": self.state},
+                    candidates=[{"action": s} for s in self.config.rl_strategies],
+                    source="bio_agent",
+                    environment="production",
+                    tags=["bio_agent", "strategy"],
+                )
+                await self.queue.publish("bio_agent_events", event.to_json())
+            else:
+                await self.queue.publish("bio_agent_events", json.dumps(payload, default=str))
+        except Exception as e:
+            logger.warning("Feedback publish failed", error=str(e))
+
+    # ---------- persistence ----------
+    async def _save_state(self) -> None:
+        data = {
+            "_v": 1,
+            "agent_id": self.config.agent_id,
+            "correlation_id": self.correlation_id,
+            "current_strategy": self.current_strategy,
+            "state": self.state,
+            "agent_metrics": self.agent_metrics,
+            "q_table_size": self.strategy_selector.q_table_size() if self.strategy_selector else 0,
+            "pareto_size": len(self.strategy_selector.pareto_front) if self.strategy_selector else 0,
+        }
+        try:
+            with open(self.config.state_save_path, "w") as f:
+                json.dump(data, f, default=str, indent=2)
+        except Exception as e:
+            logger.warning("State save failed", error=str(e))
+
+    async def _load_state(self) -> None:
+        path = self.config.state_save_path
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            if data.get("_v") != 1:
+                logger.warning("Unknown state version; ignoring")
+                return
+            self.current_strategy = data.get("current_strategy", self.current_strategy)
+            self.state = {**self._initial_state(), **data.get("state", {})}
+            self.agent_metrics.update(data.get("agent_metrics", {}))
+        except Exception as e:
+            logger.warning("State load failed", error=str(e))
+
+    async def _state_save_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self.config.state_save_interval)
+                await self._save_state()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("State save loop error", error=str(e))
+                await asyncio.sleep(10)
+
+    # ---------- public API ----------
+    async def policy_probs(self, state: Dict[str, Any]) -> List[float]:
+        """Teacher policy over strategies. Always returns a valid probability vector."""
+        strategies = self.config.rl_strategies
+        n = len(strategies)
+        uniform = [1.0 / n] * n
+        if self.strategy_selector is None:
+            return uniform
+
+        # Try adaptive cost + pareto
+        if self.adaptive_cost is not None and self.pareto_gating is not None:
+            try:
+                objectives = self._objectives_from_state(state)
+                costs = []
+                for s in strategies:
+                    c = self.adaptive_cost.compute(
+                        quality=objectives["energy_efficiency"],
+                        carbon_g=objectives["carbon_leakage"] * 1000.0,
+                        latency_ms=0.0,
+                        energy_joules=0.0,
+                        health=objectives["health_score"],
+                        atp=objectives["token_balance"],
+                    )
+                    costs.append(float(c))
+                # Convert costs to probabilities (lower cost = higher prob)
+                costs_arr = np.array(costs)
+                exp = np.exp(-(costs_arr - costs_arr.min()))
+                probs = exp / exp.sum()
+                return probs.tolist()
+            except Exception:
+                pass
+
+        # Fallback: softmax over Q-values
+        key = self.strategy_selector._state_to_key(state)
+        q = self.strategy_selector.q_table.get(key)
+        if q:
+            arr = np.array([q.get(s, 0.0) for s in strategies])
+            exp = np.exp(arr - arr.max())
+            return (exp / exp.sum()).tolist()
+        return uniform
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "agent_id": self.config.agent_id,
+            "correlation_id": self.correlation_id,
+            "started": self._started,
+            "shutdown": self._shutdown,
+            "current_strategy": self.current_strategy,
+            "metrics": dict(self.agent_metrics),
+            "rl_selector": {
+                "enabled": self.strategy_selector is not None,
+                "q_table_size": self.strategy_selector.q_table_size() if self.strategy_selector else 0,
+                "pareto_size": len(self.strategy_selector.pareto_front) if self.strategy_selector else 0,
+            },
+            "swarm": {"available": self.swarm.available, "peers": len(self.swarm.peers)},
+            "healing": {"available": self.healing.available},
+            "drift": {"available": self.drift.available, "last_score": self.drift.last_score},
+            "audit": {"ledger_size": self._local_storage.ledger_size()},
+            "security_backend": self.security.backend,
+            "module_status": MODULE_STATUS,
+            "circuit_breakers": {
+                "token": self._token_circuit.snapshot(),
+                "gradient": self._gradient_circuit.snapshot(),
+            },
+        }
+
+    # ---------- metrics ----------
+    def _setup_metrics(self) -> Dict[str, Any]:
+        if not self.config.enable_prometheus or not PROMETHEUS_AVAILABLE:
+            return {}
+        try:
+            return {
+                "avg_reward": Gauge("bio_agent_avg_reward", "Rolling average reward"),
+                "strategy_changes": Gauge("bio_agent_strategy_changes", "Strategy changes"),
+                "q_table_size": Gauge("bio_agent_q_table_size", "Q-table size"),
+                "pareto_size": Gauge("bio_agent_pareto_size", "Pareto front size"),
+            }
+        except Exception:
+            return {}
+
+
+# =============================================================================
+# SECTION 11. TESTS
+# =============================================================================
+class _Tests(unittest.TestCase):
+    def _tmp_config(self) -> Dict[str, Any]:
+        import tempfile
+        td = tempfile.mkdtemp()
+        return {
+            "state_save_path": os.path.join(td, "state.json"),
+            "storage_db_path": os.path.join(td, "storage.db"),
+            "pqc_key_dir": os.path.join(td, "keys"),
+            "strategy_update_interval": 0.2,
+            "state_save_interval": 0.5,
+            "enable_prometheus": False,
+        }
+
+    def test_start_shutdown_roundtrip(self):
+        async def go():
+            agent = BioIntegratedAgent(config=self._tmp_config())
+            self.assertFalse(await agent.ready())
+            await agent.start()
+            self.assertTrue(await agent.ready())
+            await asyncio.sleep(0.5)
+            await agent.shutdown()
+            self.assertTrue(agent._shutdown)
+        asyncio.run(go())
+
+    def test_async_context_manager(self):
+        async def go():
+            async with BioIntegratedAgent(config=self._tmp_config()) as agent:
+                self.assertTrue(await agent.ready())
+        asyncio.run(go())
+
+    def test_q_table_bounded(self):
+        cfg = self._tmp_config()
+        cfg["q_table_max_size"] = 50
+        agent = BioIntegratedAgent(config=cfg)
+        sel = agent.strategy_selector
+        self.assertIsNotNone(sel)
+        for i in range(500):
+            state = {
+                "system_load": (i % 10) / 10.0,
+                "health_score": ((i * 7) % 10) / 10.0,
+                "token_balance": float(i * 100),
+                "energy_intensity": ((i * 3) % 10) / 10.0,
+                "helium_level": ((i * 5) % 10) / 10.0,
+                "carbon_leakage_proxy": ((i * 11) % 10) / 10.0,
+                "alert_count": i % 5,
+            }
+            sel.select_action(state)
+        self.assertLessEqual(sel.q_table_size(), cfg["q_table_max_size"])
+
+    def test_pareto_filter(self):
+        pts = [
+            MOPDPoint("a", 1.0, 1.0, 1.0, 1.0, 0.1),
+            MOPDPoint("b", 0.5, 0.5, 0.5, 0.5, 0.5),  # dominated
+            MOPDPoint("c", 1.0, 1.0, 1.0, 1.0, 0.5),  # dominated
+        ]
+        front = pareto_filter(pts)
+        self.assertEqual([p.strategy for p in front], ["a"])
+
+    def test_policy_probs_valid(self):
+        async def go():
+            agent = BioIntegratedAgent(config=self._tmp_config())
+            try:
+                state = agent._initial_state()
+                probs = await agent.policy_probs(state)
+                self.assertEqual(len(probs), len(agent.config.rl_strategies))
+                self.assertTrue(all(p >= 0 for p in probs))
+                self.assertAlmostEqual(sum(probs), 1.0, places=6)
+            finally:
+                await agent.shutdown()
+        asyncio.run(go())
+
+    def test_audit_chain(self):
+        import tempfile
+        async def go():
+            td = tempfile.mkdtemp()
+            storage = LocalCircuitBreakerStorage(os.path.join(td, "s.db"))
+            security = SecurityService(os.path.join(td, "k"))
+            audit = AuditService(storage, security, in_memory_max=10)
+            for i in range(5):
+                await audit.record("test", {"i": i}, importance=0.5)
+            self.assertTrue(audit.verify_chain())
+            self.assertEqual(len(audit.recent()), 5)
+        asyncio.run(go())
+
+    def test_placeholders(self):
+        swarm = SwarmCoordinatorPlaceholder("a", enabled=False)
+        self.assertFalse(swarm.available)
+        healing = ProactiveHealingPlaceholder(enabled=False)
+        self.assertFalse(healing.available)
+        drift = DriftPlaceholder(enabled=False)
+        self.assertFalse(drift.available)
+
+        async def go():
+            await swarm.start()
+            await swarm.share({"x": 1})
+            await swarm.stop()
+            self.assertEqual(await healing.evaluate({}), [])
+            self.assertEqual(await drift.check({}), 0.0)
+        asyncio.run(go())
+
+    def test_circuit_breaker_transitions(self):
+        import tempfile
+        async def go():
+            td = tempfile.mkdtemp()
+            storage = LocalCircuitBreakerStorage(os.path.join(td, "cb.db"))
+            cb = CircuitBreaker(
+                "t", failure_threshold=2, recovery_timeout=0.5,
+                half_open_attempts=1, storage=storage,
+            )
+
+            async def ok():
+                return 1
+
+            async def fail():
+                raise RuntimeError("boom")
+
+            self.assertEqual(await cb.call(ok), 1)
+            for _ in range(2):
+                try:
+                    await cb.call(fail)
+                except RuntimeError:
+                    pass
+            self.assertEqual(cb.snapshot()["state"], "open")
+            with self.assertRaises(RuntimeError):
+                await cb.call(ok)
+            await asyncio.sleep(0.6)
+            self.assertEqual(await cb.call(ok), 1)
+            self.assertEqual(cb.snapshot()["state"], "closed")
+        asyncio.run(go())
+
+    def test_idempotent_shutdown(self):
+        async def go():
+            agent = BioIntegratedAgent(config=self._tmp_config())
+            await agent.start()
+            await agent.shutdown()
+            await agent.shutdown()
+        asyncio.run(go())
+
+
+def run_tests() -> int:
+    suite = unittest.TestLoader().loadTestsFromTestCase(_Tests)
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
+# =============================================================================
+# SECTION 12. ENTRY POINT
+# =============================================================================
+async def _example() -> None:
+    config = {
+        "state_save_path": "./agent_state.json",
+        "storage_db_path": "./agent_storage.db",
+        "pqc_key_dir": "./pqc_keys",
+    }
+    async with BioIntegratedAgent(config=config) as agent:
+        await asyncio.sleep(2)
+        print(json.dumps(agent.get_status(), indent=2, default=str))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Bio-Integrated Green Agent v13.0.0")
+    parser.add_argument("--test", action="store_true", help="Run embedded tests")
+    parser.add_argument("--example", action="store_true", help="Run example")
+    parser.add_argument("--status", action="store_true", help="Print module statuses")
+    args = parser.parse_args()
+
+    if args.status:
+        for name, status in MODULE_STATUS.items():
+            print(f"{name:22s} {status}")
+        return
+
+    if args.test:
+        sys.exit(run_tests())
+
+    if args.example:
+        asyncio.run(_example())
+        return
+
+    print("Bio-Integrated Green Agent v13.0.0 — no mode selected.")
+    print("Use --test, --example, or --status.")
+
+
 if __name__ == "__main__":
-    pass
+    main()
