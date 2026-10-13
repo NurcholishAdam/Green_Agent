@@ -1,41 +1,33 @@
 """
-federated_green_learning.py — Enhanced v17.0.0
-===============================================
+federated_green_learning.py — Enhanced v17.1.0
+================================================
 
-Cross-deployment federated weight sharing for MOPD — now extended with:
+Cross-deployment federated weight sharing for MOPD, extended with ten
+advanced Green Agent enhancements in a single self-contained file.
 
-  * **Correct weight aggregation** — deserialize → average → serialize
-    (replaces the semantically broken byte-wise averaging).
-  * **Weighted FedAvg** — weights each client by its sample count.
-  * **Client reputation tracking** — untrusted or stale instances are
-    down-weighted or excluded.
-  * **Differential-privacy noise injection** — Laplace mechanism on
-    float tensors before sharing.
-  * **Convergence detection** — early stopping when the global model
-    stabilises.
-  * **Model version compatibility** — refuses to merge weights with
-    mismatched architecture fingerprints.
-  * **Backward compatibility** — the original byte-wise API is still
-    available under `share_weights_legacy`, `pull_aggregated_weights_legacy`,
-    and `apply_aggregated_weights_legacy`.
+FIXES OVER v17.0.0:
+ - share_weights carbon gate no longer blocks every share. The intensity
+   used for the defer check is caller-supplied (default reads config).
+ - record_reputation uses an instance-level lock (was a fresh lock per call).
+ - has_converged accepts model_id/version; snapshots prior state before the
+   pull so it is idempotent and can actually return True.
+ - Pickle aggregation no longer produces an empty dict (keys initialization
+   fixed).
+ - _try_deserialize requires explicit magic prefixes; garbage bytes are no
+   longer interpreted as a float32 array.
+ - apply_aggregated_weights preserves keys present in only one side.
+ - dp_epsilon is read from the caller-supplied config (was read from
+   storage.config, which is almost always missing).
+ - Reputation decays each round; unknown instances start at a lower default.
+ - FedAvg blend factor is computed from local/global sample counts when
+   available; explicit `blend=` still honoured.
+ - Strict mode refuses to merge mismatched formats instead of silently
+   falling back to the majority.
+ - File-level: log_event shim, Prometheus metrics, orchestrator lifecycle
+   (aclose / __aenter__ / __aexit__) and get_running_loop().
+ - All shared bugs from the ten bundled enhancements fixed (see each class).
 
-All **ten advanced Green Agent enhancements** are implemented in a single
-self-contained file:
-
-   1. Quantum-Distillation Integration        → QuantumDistillationEngine
-   2. Causal Reinforcement Learning           → CausalGraphLearner + CausalPolicyAdapter
-   3. Federated Green Learning                → FederatedGreenAggregator (this class)
-   4. Advanced Multi-Agent Coordination       → MultiAgentCoordinator
-   5. Temporal Logic & Formal Verification    → TemporalLogicVerifier
-   6. Explainable AI                          → XAIDecisionExplainer
-   7. Adaptive Precision Switching            → AdaptivePrecisionSwitcher
-   8. Carbon Markets / REC                    → CarbonMarketIntegrator
-   9. Resilience Engineering / Chaos Testing  → ChaosTestingEngine
-  10. HITL Active Learning                    → ActiveUserPreferenceLearner
-
-Unified entry point: **FederatedOrchestratorV17**
-
-The file is self-contained: Python stdlib + optional numpy / torch.
+Self-contained: Python stdlib + optional numpy / torch.
 All storage interactions soft-fail.
 """
 
@@ -45,31 +37,66 @@ import asyncio
 import hashlib
 import io
 import json
+import logging
 import math
 import pickle
 import random
 import re
-import struct
 import time
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, FrozenSet, List, Optional, Set, Tuple
 
+# ---------- Optional dependencies ----------
 try:
     import numpy as np
     NUMPY_AVAILABLE = True
-except ImportError:
+except ImportError:  # pragma: no cover
+    np = None  # type: ignore
     NUMPY_AVAILABLE = False
 
 try:
     import torch
     TORCH_AVAILABLE = True
-except ImportError:
+except ImportError:  # pragma: no cover
+    torch = None  # type: ignore
     TORCH_AVAILABLE = False
 
-import logging
+# ---------- Prometheus (optional) ----------
+try:
+    from prometheus_client import Counter as _PromCounter, Gauge
+    PROMETHEUS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    PROMETHEUS_AVAILABLE = False
+
+# ---------- structlog / stdlib logger ----------
+try:
+    import structlog
+    _STRUCTLOG_LOGGER = structlog.get_logger(__name__)
+    _STRUCTLOG_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _STRUCTLOG_LOGGER = logging.getLogger(__name__)
+    _STRUCTLOG_AVAILABLE = False
+    logging.basicConfig(level=logging.INFO)
+
+# ---------- Preserved module-level logger ----------
 logger = logging.getLogger(__name__)
+
+
+def log_event(level: str, message: str, **kwargs: Any) -> None:
+    """Structured-logging shim (structlog or stdlib)."""
+    if _STRUCTLOG_AVAILABLE:
+        getattr(_STRUCTLOG_LOGGER, level)(message, **kwargs)
+    else:
+        if kwargs:
+            extra = " ".join(f"{k}={v!r}" for k, v in kwargs.items())
+            message = f"{message} | {extra}"
+        getattr(logger, level)(message)
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 # =============================================================================
@@ -94,41 +121,101 @@ def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
 
 
 # =============================================================================
-# ENHANCEMENT 3 — FEDERATED GREEN LEARNING (enhanced original)
+# PROMETHEUS METRICS (module scope: single registration)
+# =============================================================================
+if PROMETHEUS_AVAILABLE:
+    _M_FED_SHARES = _PromCounter(
+        "federated_shares_total", "Federated weight shares",
+        ["model_id", "status"],
+    )
+    _M_FED_PULLS = _PromCounter(
+        "federated_pulls_total", "Federated pulls",
+        ["model_id", "status"],
+    )
+    _M_FED_ROUNDS = Gauge(
+        "federated_rounds", "Federated rounds completed",
+    )
+    _M_FED_TRUSTED = Gauge(
+        "federated_trusted_instances", "Trusted instances",
+    )
+    _M_FED_CONVERGENCE = _PromCounter(
+        "federated_convergence_checks_total",
+        "Federated convergence checks",
+        ["converged"],
+    )
+    _M_FED_REPUTATION = Gauge(
+        "federated_reputation",
+        "Reputation score",
+        ["instance_id"],
+    )
+    _M_FED_DP = _PromCounter(
+        "federated_dp_applied_total",
+        "Times DP noise was applied",
+    )
+else:
+    class _Dummy:
+        def labels(self, **kwargs): return self
+        def inc(self, *args, **kwargs): pass
+        def set(self, *args, **kwargs): pass
+
+    _M_FED_SHARES = _M_FED_PULLS = _M_FED_ROUNDS = _Dummy()
+    _M_FED_TRUSTED = _M_FED_CONVERGENCE = _M_FED_REPUTATION = _Dummy()
+    _M_FED_DP = _Dummy()
+
+
+# =============================================================================
+# ENHANCEMENT 3 — FEDERATED GREEN LEARNING
 # =============================================================================
 class FederatedGreenAggregator:
     """
     Cross-deployment federated weight sharing for MOPD.
 
-    v17 enhancements over v1.0:
-      * Correct aggregation via **deserialize → average → serialize**.
+    v17.1 enhancements:
+      * Correct aggregation via deserialize → average → serialize.
       * Weighted FedAvg (sample-count weighting).
-      * Client reputation filtering.
-      * Differential-privacy noise injection.
-      * Convergence detection.
-      * Model version + architecture fingerprint compatibility.
+      * Client reputation filtering with decay and endorsement.
+      * Differential-privacy noise injection (local DP).
+      * Convergence detection (numeric deltas + fingerprints).
+      * Format compatibility checks (numpy magic prefix, torch, pickle).
       * Integration hooks for the other nine enhancements.
     """
 
-    # ------------------------------------------------------------------
+    # Explicit magic prefixes for the supported serialization formats.
+    _MAGIC_TORCH = b"TRC1"
+    _MAGIC_PICKLE = b"PKL1"
+    _MAGIC_NUMPY = b"NPY1"
+    KNOWN_FORMATS: FrozenSet[str] = frozenset({"torch", "pickle", "numpy_f32"})
+
     def __init__(self,
-                 storage,
+                 storage: Any,
                  instance_id: str,
                  share_interval: int = 3600,
-                 # Enhancement hooks (all optional)
                  carbon_market: Optional["CarbonMarketIntegrator"] = None,
                  chaos: Optional["ChaosTestingEngine"] = None,
                  temporal: Optional["TemporalLogicVerifier"] = None,
                  xai: Optional["XAIDecisionExplainer"] = None,
                  precision: Optional["AdaptivePrecisionSwitcher"] = None,
                  hitl: Optional["ActiveUserPreferenceLearner"] = None,
-                 multi_agent: Optional["MultiAgentCoordinator"] = None):
+                 multi_agent: Optional["MultiAgentCoordinator"] = None,
+                 *,
+                 config: Any = None,
+                 strict_format: bool = True,
+                 default_reputation: float = 0.5,
+                 reputation_floor: float = 0.3,
+                 reputation_decay: float = 0.99,
+                 seed: Optional[int] = None):
         self.storage = storage
         self.instance_id = instance_id
-        self.share_interval = share_interval
-        self.rounds = 0
+        self.share_interval = int(share_interval)
+        self.config = config
 
-        # Enhancement hooks
+        self.rounds = 0
+        self.strict_format = bool(strict_format)
+        self.default_reputation = float(default_reputation)
+        self.reputation_floor = float(reputation_floor)
+        self.reputation_decay = float(reputation_decay)
+
+        # Enhancement hooks.
         self.carbon_market = carbon_market
         self.chaos = chaos
         self.temporal = temporal
@@ -137,130 +224,214 @@ class FederatedGreenAggregator:
         self.hitl = hitl
         self.multi_agent = multi_agent
 
-        # DP config
-        self.dp_epsilon = float(_cfg_get(
-            _cfg_get(self.storage, "config", {}),
-            "federated_dp_epsilon", 1.0))
+        # DP config (from the caller-supplied config, not storage).
+        self.dp_epsilon = float(
+            _cfg_get(config, "federated_dp_epsilon", 1.0) or 1.0
+        )
 
-        # Convergence tracking
+        # Convergence tracking.
         self._last_aggregate: Optional[bytes] = None
         self._last_aggregate_fp: Optional[str] = None
 
-        # Reputation table (instance_id -> score)
-        self.reputation: Dict[str, float] = defaultdict(lambda: 1.0)
+        # Reputation table (instance_id -> score).
+        self.reputation: Dict[str, float] = defaultdict(
+            lambda: self.default_reputation
+        )
+        self._reputation_lock = asyncio.Lock()
 
-        # Aggregation history
+        # Aggregation history.
         self.history: Deque[Dict[str, Any]] = deque(maxlen=500)
+
+        # Deterministic RNG for DP noise.
+        self._seed = seed if seed is not None else int.from_bytes(
+            uuid.uuid4().bytes[:4], "little")
+        self._rng = np.random.default_rng(self._seed) if NUMPY_AVAILABLE else None
 
     # ------------------------------------------------------------------
     # Fingerprinting
     # ------------------------------------------------------------------
     @staticmethod
     def _fingerprint(weights: bytes) -> str:
-        return hashlib.sha256(weights).hexdigest()[:16]
+        # Full SHA256 hex; used for equality checks only.
+        return hashlib.sha256(weights).hexdigest()
 
     # ------------------------------------------------------------------
-    # Serialization helpers
+    # Serialization
     # ------------------------------------------------------------------
-    @staticmethod
-    def _try_deserialize(weights: bytes) -> Optional[Any]:
-        """Attempt to deserialize weights via torch / pickle / numpy."""
-        if TORCH_AVAILABLE:
+    def _try_deserialize(self, weights: Optional[bytes]) -> Optional[Dict[str, Any]]:
+        """
+        Attempt to deserialize weights via torch / pickle / numpy.
+
+        Requires an explicit 4-byte magic prefix to avoid misinterpreting
+        arbitrary bytes as a float32 array.
+        """
+        if not weights or len(weights) < 4:
+            return None
+        magic, payload = weights[:4], weights[4:]
+
+        if magic == self._MAGIC_TORCH:
+            if not TORCH_AVAILABLE:
+                return None
             try:
-                buf = io.BytesIO(weights)
-                return {"format": "torch", "data": torch.load(buf, map_location="cpu")}
-            except Exception:
-                pass
-        try:
-            return {"format": "pickle", "data": pickle.loads(weights)}
-        except Exception:
-            pass
-        if NUMPY_AVAILABLE:
+                return {"format": "torch",
+                        "data": torch.load(io.BytesIO(payload), map_location="cpu")}
+            except Exception as exc:
+                log_event("warning", f"torch deserialize failed: {exc}")
+                return None
+
+        if magic == self._MAGIC_PICKLE:
             try:
-                arr = np.frombuffer(weights, dtype=np.float32)
+                return {"format": "pickle", "data": pickle.loads(payload)}
+            except Exception as exc:
+                log_event("warning", f"pickle deserialize failed: {exc}")
+                return None
+
+        if magic == self._MAGIC_NUMPY:
+            if not NUMPY_AVAILABLE:
+                return None
+            if len(payload) % 4 != 0:
+                return None
+            try:
+                arr = np.frombuffer(payload, dtype=np.float32).copy()
                 return {"format": "numpy_f32", "data": arr}
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("warning", f"numpy deserialize failed: {exc}")
+                return None
+
+        log_event("warning", f"Unknown magic prefix: {magic!r}")
         return None
 
-    @staticmethod
-    def _serialize(obj: Any) -> bytes:
+    def _serialize(self, obj: Any) -> bytes:
         fmt = obj.get("format")
         data = obj.get("data")
-        if fmt == "torch" and TORCH_AVAILABLE:
+        if fmt == "torch":
+            if not TORCH_AVAILABLE:
+                raise ValueError("torch is not installed")
             buf = io.BytesIO()
             torch.save(data, buf)
-            return buf.getvalue()
+            return self._MAGIC_TORCH + buf.getvalue()
         if fmt == "pickle":
-            return pickle.dumps(data)
+            return self._MAGIC_PICKLE + pickle.dumps(data)
         if fmt == "numpy_f32":
-            return data.astype("float32").tobytes()
-        if fmt == "raw":
-            return bytes(data)
-        raise ValueError(f"Unknown format: {fmt}")
+            if not NUMPY_AVAILABLE:
+                raise ValueError("numpy is not installed")
+            return self._MAGIC_NUMPY + data.astype("float32").tobytes()
+        raise ValueError(f"Unknown format: {fmt!r}")
 
     # ------------------------------------------------------------------
-    # Differential privacy
+    # Differential privacy (local DP on numeric leaves)
     # ------------------------------------------------------------------
-    def _add_dp_noise(self, obj: Any) -> Any:
-        """Inject Laplace noise into numeric leaves of the weights."""
+    def _add_dp_noise(self, obj: Dict[str, Any]) -> Dict[str, Any]:
         if self.dp_epsilon is None or self.dp_epsilon <= 0:
             return obj
         scale = 1.0 / self.dp_epsilon
         fmt = obj.get("format")
         data = obj.get("data")
+        rng = self._rng if self._rng is not None else np.random.default_rng()
         try:
             if fmt == "torch" and TORCH_AVAILABLE and hasattr(data, "items"):
                 noisy = {}
                 for k, v in data.items():
                     noise = torch.from_numpy(
-                        np.random.laplace(0, scale, size=tuple(v.shape))
+                        rng.laplace(0.0, scale, size=tuple(v.shape))
                     ).to(v.dtype)
                     noisy[k] = v + noise
+                try:
+                    _M_FED_DP.inc()
+                except Exception:
+                    pass
                 return {"format": "torch", "data": noisy}
             if fmt == "numpy_f32" and NUMPY_AVAILABLE:
-                noise = np.random.laplace(0, scale, size=data.shape)
+                noise = rng.laplace(0.0, scale, size=data.shape)
+                try:
+                    _M_FED_DP.inc()
+                except Exception:
+                    pass
                 return {"format": "numpy_f32",
                         "data": (data + noise).astype("float32")}
             if fmt == "pickle" and NUMPY_AVAILABLE:
-                # Recursively add noise to numeric leaves
                 def _walk(x):
                     if isinstance(x, dict):
                         return {k: _walk(v) for k, v in x.items()}
                     if isinstance(x, list):
                         return [_walk(v) for v in x]
-                    if isinstance(x, (int, float)):
-                        return float(x) + np.random.laplace(0, scale)
+                    if isinstance(x, (int, float)) and not isinstance(x, bool):
+                        return float(x) + float(rng.laplace(0.0, scale))
                     return x
+                try:
+                    _M_FED_DP.inc()
+                except Exception:
+                    pass
                 return {"format": "pickle", "data": _walk(data)}
-        except Exception:
-            pass
+        except Exception as exc:
+            log_event("warning", f"DP noise failed: {exc}")
         return obj
 
     # ------------------------------------------------------------------
     # Reputation
     # ------------------------------------------------------------------
-    async def record_reputation(self, instance_id: str, reward: float):
+    async def record_reputation(self, instance_id: str, reward: float) -> None:
         """Update an instance's reputation from a training reward."""
-        async with asyncio.Lock():
-            old = self.reputation.get(instance_id, 1.0)
-            self.reputation[instance_id] = max(0.0, min(1.0,
-                old + 0.1 * (reward - 0.5)))
+        try:
+            r = float(reward)
+        except (TypeError, ValueError):
+            return
+        async with self._reputation_lock:
+            old = self.reputation.get(instance_id, self.default_reputation)
+            new = max(0.0, min(1.0, old + 0.1 * (r - 0.5)))
+            self.reputation[instance_id] = new
+            try:
+                _M_FED_REPUTATION.labels(instance_id=instance_id).set(new)
+            except Exception:
+                pass
 
-    def _is_trusted(self, instance_id: str, floor: float = 0.3) -> bool:
-        return self.reputation.get(instance_id, 1.0) >= floor
+    def _decay_reputation_locked(self) -> None:
+        """Decay every reputation by a fixed factor (call under lock)."""
+        for iid in list(self.reputation.keys()):
+            self.reputation[iid] = max(
+                0.0, self.reputation[iid] * self.reputation_decay
+            )
+
+    def endorse(self, instance_id: str, endorser: str) -> bool:
+        """
+        Bootstrap reputation for a new instance via an endorsement.
+
+        The endorser must itself be trusted. The new instance is assigned
+        the endorser's reputation as its initial score.
+        """
+        if not self._is_trusted(endorser):
+            return False
+        self.reputation[instance_id] = self.reputation.get(endorser,
+                                                           self.default_reputation)
+        return True
+
+    def _is_trusted(self, instance_id: str, floor: Optional[float] = None) -> bool:
+        if floor is None:
+            floor = self.reputation_floor
+        return self.reputation.get(instance_id, self.default_reputation) >= floor
 
     # ------------------------------------------------------------------
     # Carbon-aware sharing
     # ------------------------------------------------------------------
-    async def _carbon_defer(self) -> bool:
+    async def _carbon_defer(self, intensity: Optional[float] = None) -> bool:
+        """
+        Ask the carbon market whether to defer the current share.
+
+        `intensity` defaults to the value from config (or 0.2 if not set),
+        which is *below* the default defer threshold. Callers can override.
+        """
         if self.carbon_market is None:
             return False
+        if intensity is None:
+            intensity = float(
+                _cfg_get(self.config, "federated_intensity", 0.2) or 0.2
+            )
         try:
             decision = await self.carbon_market.net_zero_schedule(
-                workload_kwh=0.1, intensity=0.4)
+                workload_kwh=0.1, intensity=intensity, commit=False)
             return decision.get("action") == "defer"
-        except Exception:
+        except Exception as exc:
+            log_event("debug", f"carbon_defer check failed: {exc}")
             return False
 
     # ------------------------------------------------------------------
@@ -271,27 +442,40 @@ class FederatedGreenAggregator:
                             weights: bytes,
                             sample_count: int = 1,
                             version: str = "1.0.0",
-                            apply_dp: bool = True) -> None:
+                            apply_dp: bool = True,
+                            *,
+                            intensity: Optional[float] = None,
+                            skip_carbon_gate: bool = False) -> None:
         """
         Publish local weights to the federated registry.
 
         Args:
-            model_id: logical model name (e.g., "mopd_student")
+            model_id: logical model name
             weights: serialized weights (torch / pickle / numpy)
             sample_count: number of samples the model was trained on
             version: semantic version of the model architecture
             apply_dp: whether to add differential-privacy noise
+            intensity: grid intensity used for the carbon defer check
+            skip_carbon_gate: bypass the carbon defer decision
         """
-        # 1. Carbon-aware deferral
-        if await self._carbon_defer():
+        if not weights:
+            return
+
+        # 1. Carbon-aware deferral (opt-in via skip_carbon_gate=False).
+        if not skip_carbon_gate and await self._carbon_defer(intensity):
             self.history.append({
                 "action": "share_deferred",
                 "model_id": model_id,
                 "reason": "high_carbon_window",
-                "ts": datetime.now(timezone.utc).isoformat()})
+                "ts": _now_utc().isoformat()})
+            try:
+                _M_FED_SHARES.labels(
+                    model_id=model_id, status="deferred").inc()
+            except Exception:
+                pass
             return
 
-        # 2. Differential privacy
+        # 2. Differential privacy (local DP).
         payload = weights
         if apply_dp:
             obj = self._try_deserialize(weights)
@@ -299,26 +483,42 @@ class FederatedGreenAggregator:
                 noisy = self._add_dp_noise(obj)
                 try:
                     payload = self._serialize(noisy)
-                except Exception:
+                except Exception as exc:
+                    log_event("warning", f"DP serialization failed: {exc}")
                     payload = weights
 
-        # 3. Persist
+        # 3. Persist.
         versioned_id = f"{model_id}@{version}"
         try:
             await asyncio.to_thread(
                 self.storage.save_federated_weights,
                 self.instance_id, versioned_id, payload,
                 float(sample_count), self.rounds)
-        except Exception:
-            pass
+        except Exception as exc:
+            log_event("warning", f"Federated share persist failed: {exc}")
+            try:
+                _M_FED_SHARES.labels(
+                    model_id=versioned_id, status="error").inc()
+            except Exception:
+                pass
+            return
+
+        # 4. Reputation decay (per share).
+        async with self._reputation_lock:
+            self._decay_reputation_locked()
 
         self.history.append({
             "action": "share",
             "model_id": versioned_id,
             "bytes": len(payload),
-            "sample_count": sample_count,
-            "dp_applied": apply_dp,
-            "ts": datetime.now(timezone.utc).isoformat()})
+            "sample_count": int(sample_count),
+            "dp_applied": bool(apply_dp),
+            "ts": _now_utc().isoformat()})
+        try:
+            _M_FED_SHARES.labels(
+                model_id=versioned_id, status="ok").inc()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Pull
@@ -326,37 +526,56 @@ class FederatedGreenAggregator:
     async def pull_aggregated_weights(self,
                                       model_id: str,
                                       version: str = "1.0.0",
-                                      reputation_floor: float = 0.3
+                                      reputation_floor: Optional[float] = None
                                       ) -> Optional[bytes]:
         """
-        Fetch all instances' weights and average them **correctly**.
+        Fetch all instances' weights and average them.
 
         Steps:
           1. Fetch rows for the versioned model_id.
           2. Filter by reputation.
           3. Deserialize all valid blobs.
-          4. Verify format agreement (all torch / all numpy / etc.).
+          4. Verify format agreement (strict or majority).
           5. Weighted average using sample counts.
           6. Re-serialize.
         """
+        if reputation_floor is None:
+            reputation_floor = self.reputation_floor
         versioned_id = f"{model_id}@{version}"
         try:
             rows = await asyncio.to_thread(
                 self.storage.get_federated_weights, versioned_id)
-        except Exception:
+        except Exception as exc:
+            log_event("warning", f"Federated pull storage failed: {exc}")
+            try:
+                _M_FED_PULLS.labels(
+                    model_id=versioned_id, status="error").inc()
+            except Exception:
+                pass
             return None
         if not rows:
+            try:
+                _M_FED_PULLS.labels(
+                    model_id=versioned_id, status="empty").inc()
+            except Exception:
+                pass
             return None
 
-        # Reputation filtering
+        # Reputation filtering.
         rows = [r for r in rows
-                if self._is_trusted(r["instance_id"], reputation_floor)]
+                if self._is_trusted(r.get("instance_id", ""),
+                                    reputation_floor)]
         if not rows:
+            try:
+                _M_FED_PULLS.labels(
+                    model_id=versioned_id, status="filtered").inc()
+            except Exception:
+                pass
             return None
 
-        # Sample-count weights
-        weights_list = []
-        objs_list = []
+        # Deserialize.
+        weights_list: List[float] = []
+        objs_list: List[Dict[str, Any]] = []
         for r in rows:
             blob = r.get("weights")
             if not blob:
@@ -370,28 +589,37 @@ class FederatedGreenAggregator:
         if not objs_list:
             return None
 
-        # Normalise weights
+        # Normalise weights.
         total_w = sum(weights_list) or 1.0
         weights_list = [w / total_w for w in weights_list]
 
-        # Format agreement check
+        # Format agreement.
         formats = {o["format"] for o in objs_list}
         if len(formats) > 1:
-            logger.warning("Federated pull: format mismatch %s", formats)
-            # Fall back to majority format
-            majority = max(formats, key=lambda f: sum(
-                1 for o in objs_list if o["format"] == f))
+            if self.strict_format:
+                log_event(
+                    "warning",
+                    f"Format mismatch in strict mode: {formats}; "
+                    "refusing to merge.")
+                try:
+                    _M_FED_PULLS.labels(
+                        model_id=versioned_id, status="format_mismatch").inc()
+                except Exception:
+                    pass
+                return None
+            majority = max(
+                formats, key=lambda f: sum(1 for o in objs_list if o["format"] == f))
             objs_list = [o for o in objs_list if o["format"] == majority]
             weights_list = weights_list[:len(objs_list)]
             total_w = sum(weights_list) or 1.0
             weights_list = [w / total_w for w in weights_list]
 
-        # Aggregate
+        # Aggregate.
         fmt = objs_list[0]["format"]
         try:
             if fmt == "torch" and TORCH_AVAILABLE:
-                avg_sd = {}
-                keys = objs_list[0]["data"].keys()
+                avg_sd: Dict[str, Any] = {}
+                keys = list(objs_list[0]["data"].keys())
                 for key in keys:
                     stacked = torch.stack([
                         o["data"][key].float() * w
@@ -407,21 +635,27 @@ class FederatedGreenAggregator:
                 agg = {"format": "numpy_f32",
                        "data": acc.astype(np.float32)}
             elif fmt == "pickle":
-                # Recursively average numeric leaves
-                def _avg_numeric(items, ws):
+                def _avg_numeric(items: List[Any], ws: List[float]) -> Any:
                     try:
-                        if all(isinstance(x, (int, float)) for x in items):
+                        if all(isinstance(x, (int, float)) and
+                               not isinstance(x, bool) for x in items):
                             return sum(x * w for x, w in zip(items, ws))
                         if all(isinstance(x, list) for x in items):
                             length = min(len(x) for x in items)
                             return [_avg_numeric([x[i] for x in items], ws)
                                     for i in range(length)]
                         if all(isinstance(x, dict) for x in items):
-                            keys = set()
+                            keys: Optional[Set[str]] = None
                             for x in items:
-                                keys &= set(x.keys()) if keys else set(x.keys())
-                            return {k: _avg_numeric([x.get(k, 0) for x in items], ws)
-                                    for k in keys}
+                                xk = set(x.keys())
+                                keys = xk if keys is None else (keys & xk)
+                            if not keys:
+                                return {}
+                            return {
+                                k: _avg_numeric(
+                                    [x.get(k, 0.0) for x in items], ws)
+                                for k in keys
+                            }
                     except Exception:
                         pass
                     return items[0]
@@ -431,24 +665,34 @@ class FederatedGreenAggregator:
             else:
                 return None
             result = self._serialize(agg)
-        except Exception as e:
-            logger.warning("Federated aggregation failed: %s", e)
+        except Exception as exc:
+            log_event("warning", f"Aggregation failed: {exc}")
             return None
 
-        # Convergence tracking
+        # Convergence tracking.
         fp = self._fingerprint(result)
         self._last_aggregate = result
         self._last_aggregate_fp = fp
         self.rounds += 1
+
+        try:
+            _M_FED_ROUNDS.set(self.rounds)
+            _M_FED_PULLS.labels(
+                model_id=versioned_id, status="ok").inc()
+            _M_FED_TRUSTED.set(
+                sum(1 for r in self.reputation.values()
+                    if r >= self.reputation_floor))
+        except Exception:
+            pass
 
         self.history.append({
             "action": "pull",
             "model_id": versioned_id,
             "instances": len(objs_list),
             "format": fmt,
-            "fingerprint": fp,
+            "fingerprint": fp[:16],
             "round": self.rounds,
-            "ts": datetime.now(timezone.utc).isoformat()})
+            "ts": _now_utc().isoformat()})
         return result
 
     # ------------------------------------------------------------------
@@ -458,53 +702,86 @@ class FederatedGreenAggregator:
                                        model_id: str,
                                        current: bytes,
                                        version: str = "1.0.0",
-                                       blend: float = 0.5) -> bytes:
+                                       blend: float = 0.5,
+                                       *,
+                                       local_sample_count: Optional[int] = None,
+                                       global_sample_count: Optional[int] = None
+                                       ) -> bytes:
         """
         Blend local weights with the federated average.
 
         Args:
             current: local serialized weights
-            blend: 0.0 = keep local, 1.0 = use aggregate only
+            blend: 0.0 = keep local, 1.0 = use aggregate only. Ignored
+                when local_sample_count and global_sample_count are given,
+                in which case blend is computed as
+                local / (local + global).
         """
         agg = await self.pull_aggregated_weights(model_id, version)
         if agg is None:
             return current
+
+        # Compute blend from sample counts if provided.
+        if (local_sample_count is not None and
+                global_sample_count is not None and
+                local_sample_count + global_sample_count > 0):
+            blend = float(local_sample_count) / float(
+                local_sample_count + global_sample_count)
+        blend = max(0.0, min(1.0, float(blend)))
 
         obj_cur = self._try_deserialize(current)
         obj_agg = self._try_deserialize(agg)
         if obj_cur is None or obj_agg is None:
             return current
         if obj_cur["format"] != obj_agg["format"]:
-            return current
+            if self.strict_format:
+                log_event("warning",
+                          "Format mismatch on apply; returning local weights")
+                return current
 
         fmt = obj_cur["format"]
         try:
             if fmt == "torch" and TORCH_AVAILABLE:
-                merged = {}
-                for k in obj_cur["data"]:
-                    if k not in obj_agg["data"]:
+                merged: Dict[str, Any] = {}
+                keys = set(obj_cur["data"].keys()) | set(obj_agg["data"].keys())
+                for k in keys:
+                    if k in obj_cur["data"] and k in obj_agg["data"]:
+                        merged[k] = (
+                            (1 - blend) * obj_cur["data"][k].float()
+                            + blend * obj_agg["data"][k].float()
+                        )
+                    elif k in obj_cur["data"]:
                         merged[k] = obj_cur["data"][k]
-                        continue
-                    merged[k] = (1 - blend) * obj_cur["data"][k].float() + \
-                                blend * obj_agg["data"][k].float()
+                    else:
+                        merged[k] = obj_agg["data"][k]
                 out = {"format": "torch", "data": merged}
             elif fmt == "numpy_f32" and NUMPY_AVAILABLE:
                 a = obj_cur["data"]
                 b = obj_agg["data"]
                 n = min(len(a), len(b))
                 out_arr = (1 - blend) * a[:n] + blend * b[:n]
-                out = {"format": "numpy_f32", "data": out_arr.astype(np.float32)}
+                out = {"format": "numpy_f32",
+                       "data": out_arr.astype(np.float32)}
             elif fmt == "pickle":
-                # Simple: if both are dicts of same keys, blend numerics
-                def _blend(a, b, w):
+                def _blend(a: Any, b: Any, w: float) -> Any:
                     try:
                         if isinstance(a, dict) and isinstance(b, dict):
-                            keys = set(a.keys()) & set(b.keys())
-                            return {k: _blend(a[k], b[k], w) for k in keys}
+                            merged_dict: Dict[str, Any] = {}
+                            for k in set(a.keys()) | set(b.keys()):
+                                if k in a and k in b:
+                                    merged_dict[k] = _blend(a[k], b[k], w)
+                                elif k in a:
+                                    merged_dict[k] = a[k]
+                                else:
+                                    merged_dict[k] = b[k]
+                            return merged_dict
                         if isinstance(a, list) and isinstance(b, list):
                             n = min(len(a), len(b))
                             return [_blend(a[i], b[i], w) for i in range(n)]
-                        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                        if (isinstance(a, (int, float)) and
+                                isinstance(b, (int, float)) and
+                                not isinstance(a, bool) and
+                                not isinstance(b, bool)):
                             return (1 - w) * float(a) + w * float(b)
                     except Exception:
                         pass
@@ -514,45 +791,76 @@ class FederatedGreenAggregator:
             else:
                 return current
             return self._serialize(out)
-        except Exception as e:
-            logger.warning("Federated blend failed: %s", e)
+        except Exception as exc:
+            log_event("warning", f"Federated blend failed: {exc}")
             return current
 
     # ------------------------------------------------------------------
     # Convergence detection
     # ------------------------------------------------------------------
-    async def has_converged(self, threshold: float = 0.001) -> bool:
-        """Return True if the last two aggregates are nearly identical."""
+    async def has_converged(self,
+                            threshold: float = 0.001,
+                            *,
+                            model_id: str = "mopd_student",
+                            version: str = "1.0.0") -> bool:
+        """
+        Return True if the last two aggregates are within `threshold`.
+
+        Snapshots the previous aggregate and fingerprint before pulling so
+        the check is idempotent and can actually return True.
+        """
         if self._last_aggregate is None:
             return False
-        new = await self.pull_aggregated_weights("default", "1.0.0")
+
+        prev_blob = self._last_aggregate
+        prev_fp = self._last_aggregate_fp
+        new = await self.pull_aggregated_weights(model_id, version)
         if new is None:
+            # Restore state and report no change.
+            self._last_aggregate = prev_blob
+            self._last_aggregate_fp = prev_fp
             return False
-        # If we just pulled, `_last_aggregate` equals `new` — no change
-        obj = self._try_deserialize(new)
-        if obj is None or obj["format"] != "numpy_f32" or not NUMPY_AVAILABLE:
-            # Fall back to fingerprint comparison
-            prev_fp = self._last_aggregate_fp
-            new_fp = self._fingerprint(new)
-            return prev_fp == new_fp
-        # Numeric comparison
+
+        # Numeric comparison when possible.
+        obj_new = self._try_deserialize(new)
+        obj_prev = self._try_deserialize(prev_blob)
+        converged = False
+        if (obj_new is not None and obj_prev is not None and
+                obj_new["format"] == "numpy_f32" == obj_prev["format"] and
+                NUMPY_AVAILABLE):
+            try:
+                a = obj_new["data"]
+                b = obj_prev["data"]
+                n = min(len(a), len(b))
+                if n > 0:
+                    delta = float(np.abs(a[:n] - b[:n]).mean())
+                    converged = delta < threshold
+                else:
+                    converged = True
+            except Exception:
+                converged = False
+        else:
+            # Fingerprint fallback.
+            converged = (self._fingerprint(new) == prev_fp)
+
+        # Update stored state to the newly-pulled aggregate.
+        self._last_aggregate = new
+        self._last_aggregate_fp = self._fingerprint(new)
+
         try:
-            data = obj["data"]
-            prev_obj = self._try_deserialize(self._last_aggregate)
-            if prev_obj is None or prev_obj["format"] != "numpy_f32":
-                return False
-            prev_data = prev_obj["data"]
-            n = min(len(data), len(prev_data))
-            diff = float(np.abs(data[:n] - prev_data[:n]).mean())
-            return diff < threshold
+            _M_FED_CONVERGENCE.labels(
+                converged=str(converged)).inc()
         except Exception:
-            return False
+            pass
+        return converged
 
     # ------------------------------------------------------------------
     # Legacy API (byte-wise) — retained for backward compatibility
     # ------------------------------------------------------------------
     async def share_weights_legacy(self, model_id: str, weights: bytes) -> None:
         """Deprecated: use `share_weights` instead."""
+        if not weights:
+            return
         try:
             await asyncio.to_thread(
                 self.storage.save_federated_weights,
@@ -594,12 +902,15 @@ class FederatedGreenAggregator:
         return {
             "instance_id": self.instance_id,
             "rounds": self.rounds,
-            "last_fingerprint": self._last_aggregate_fp,
+            "last_fingerprint": (self._last_aggregate_fp[:16]
+                                 if self._last_aggregate_fp else None),
             "trusted_instances": sum(
-                1 for i, r in self.reputation.items() if r >= 0.3),
+                1 for r in self.reputation.values()
+                if r >= self.reputation_floor),
             "known_instances": len(self.reputation),
             "history_size": len(self.history),
             "dp_epsilon": self.dp_epsilon,
+            "strict_format": self.strict_format,
         }
 
 
@@ -607,27 +918,34 @@ class FederatedGreenAggregator:
 # ENHANCEMENT 1 — QUANTUM-DISTILLATION ENGINE
 # =============================================================================
 class QuantumDistillationEngine:
-    def __init__(self, temperature=2.0, alpha=0.5, n_actions=5):
-        self.temperature = temperature
-        self.alpha = alpha
-        self.n_actions = n_actions
+    def __init__(self, temperature: float = 2.0, alpha: float = 0.5,
+                 n_actions: int = 5):
+        self.temperature = float(temperature)
+        self.alpha = float(alpha)
+        self.n_actions = int(n_actions)
         self.teachers: Dict[str, List[float]] = {}
-        self.student_policy = [1.0 / n_actions] * n_actions
+        self.student_policy = [1.0 / self.n_actions] * self.n_actions
         self.history: Deque[Dict[str, Any]] = deque(maxlen=500)
 
-    def register_teacher(self, name, policy):
+    def register_teacher(self, name: str, policy: List[float]) -> None:
         if not policy:
             return
         s = sum(policy) or 1.0
-        self.teachers[name] = [p / s for p in policy]
+        self.teachers[str(name)] = [max(0.0, p / s) for p in policy]
 
-    def _softmax(self, x, temp):
+    def unregister_teacher(self, name: str) -> None:
+        self.teachers.pop(name, None)
+
+    def _softmax(self, x: List[float], temp: float) -> List[float]:
+        if not x:
+            return []
         m = max(x)
-        exps = [math.exp((v - m) / max(temp, 1e-6)) for v in x]
+        t = max(temp, 1e-6)
+        exps = [math.exp((v - m) / t) for v in x]
         s = sum(exps) or 1.0
         return [e / s for e in exps]
 
-    def _superpose(self):
+    def _superpose(self) -> List[float]:
         if not self.teachers:
             return list(self.student_policy)
         n = self.n_actions
@@ -640,7 +958,8 @@ class QuantumDistillationEngine:
         s = sum(sq) or 1.0
         return [x / s for x in sq]
 
-    async def step(self, storage, student_id="fed_student"):
+    async def step(self, storage: Any,
+                   student_id: str = "fed_student") -> Dict[str, Any]:
         target = self._softmax(self._superpose(), self.temperature)
         lr = 0.1
         new = []
@@ -649,11 +968,31 @@ class QuantumDistillationEngine:
             new.append(max(0.01, s - lr * grad))
         ns = sum(new) or 1.0
         self.student_policy = [x / ns for x in new]
-        entry = {"target": target, "student": list(self.student_policy)}
+
+        # Per-teacher KL against the teacher's own distribution.
+        for tid, pol in self.teachers.items():
+            weight = float(pol[0]) if pol else 0.0
+            amplitude = math.sqrt(max(weight, 1e-9))
+            kl = 0.0
+            for i in range(self.n_actions):
+                pi = pol[i] if i < len(pol) else 1e-9
+                si = self.student_policy[i]
+                pi = max(pi, 1e-9)
+                si = max(si, 1e-9)
+                kl += pi * math.log(pi / si)
+            try:
+                await asyncio.to_thread(
+                    storage.save_teacher_superposition,
+                    student_id, tid, weight, self.temperature, amplitude, kl)
+            except Exception:
+                pass
+
+        entry = {"target": target, "student": list(self.student_policy),
+                 "ts": _now_utc().isoformat()}
         self.history.append(entry)
         return entry
 
-    def get_policy(self):
+    def get_policy(self) -> List[float]:
         return list(self.student_policy)
 
 
@@ -661,28 +1000,35 @@ class QuantumDistillationEngine:
 # ENHANCEMENT 2 — CAUSAL RL
 # =============================================================================
 class CausalGraphLearner:
-    def __init__(self, storage=None):
+    def __init__(self, storage: Any = None):
         self.storage = storage
         self.graph: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(dict)
         self.variables: List[str] = []
         self._lock = asyncio.Lock()
 
-    async def learn(self, samples, variables, threshold=0.25):
+    async def learn(self, samples: List[Dict[str, float]],
+                    variables: List[str],
+                    threshold: float = 0.25) -> Dict[str, Any]:
         self.variables = list(variables)
         if len(samples) < 5 or not NUMPY_AVAILABLE:
             async with self._lock:
                 self.graph.clear()
-                for i, s in enumerate(variables):
-                    for j, t in enumerate(variables):
-                        if i < j and random.random() < 0.25:
-                            w = random.uniform(0.1, 0.9)
-                            self.graph[s][t] = {"weight": w, "confidence": w}
             return self.summary()
-        X = np.array([[s[v] for v in variables] for s in samples], dtype=float)
-        if X.shape[0] < 2:
+        try:
+            X = np.array(
+                [[float(s.get(v, 0.0)) for v in variables] for s in samples],
+                dtype=float)
+        except Exception as exc:
+            log_event("warning", f"Causal samples parse failed: {exc}")
+            return self.summary()
+        if X.shape[0] < 2 or X.shape[1] < 2:
             return self.summary()
         X = (X - X.mean(0)) / (X.std(0) + 1e-9)
-        corr = np.corrcoef(X, rowvar=False)
+        try:
+            corr = np.corrcoef(X, rowvar=False)
+        except Exception:
+            return self.summary()
+
         async with self._lock:
             self.graph.clear()
             for i in range(len(variables)):
@@ -690,18 +1036,29 @@ class CausalGraphLearner:
                     if i == j:
                         continue
                     c = abs(float(corr[i, j]))
-                    if c > threshold:
-                        vi, vj = float(X[:, i].var()), float(X[:, j].var())
-                        src, dst = (variables[i], variables[j]) if vi > vj \
-                            else (variables[j], variables[i])
-                        self.graph[src][dst] = {"weight": float(corr[i, j]),
-                                                "confidence": c}
+                    if not math.isfinite(c) or c <= threshold:
+                        continue
+                    vi, vj = float(X[:, i].var()), float(X[:, j].var())
+                    src, dst = (variables[i], variables[j]) if vi > vj \
+                        else (variables[j], variables[i])
+                    self.graph[src][dst] = {"weight": float(corr[i, j]),
+                                            "confidence": c}
+                    if self.storage is not None:
+                        try:
+                            await asyncio.to_thread(
+                                self.storage.save_causal_edge,
+                                src, dst, float(corr[i, j]), c)
+                        except Exception:
+                            pass
         return self.summary()
 
-    def parents(self, node):
+    def parents(self, node: str) -> List[str]:
         return [s for s, e in self.graph.items() if node in e]
 
-    def summary(self):
+    def children(self, node: str) -> List[str]:
+        return list(self.graph.get(node, {}).keys())
+
+    def summary(self) -> Dict[str, Any]:
         return {"nodes": len(self.variables),
                 "edges": sum(len(v) for v in self.graph.values()),
                 "variables": list(self.variables)}
@@ -709,24 +1066,36 @@ class CausalGraphLearner:
 
 class CausalPolicyAdapter:
     ACTIONS = ["performance", "carbon", "cost", "hybrid", "adaptive"]
+    STRATEGY_MAP: Dict[str, str] = {
+        "performance": "balanced",
+        "carbon": "carbon_focus",
+        "cost": "operational_focus",
+        "hybrid": "balanced",
+        "adaptive": "balanced",
+    }
 
-    def __init__(self, config, storage, graph):
+    def __init__(self, config: Any, storage: Any, graph: CausalGraphLearner):
         self.config = config
         self.storage = storage
         self.graph = graph
-        self.values = defaultdict(float)
-        self.counts = defaultdict(int)
+        self.values: Dict[str, float] = defaultdict(float)
+        self.counts: Dict[str, int] = defaultdict(int)
         self.policy = [1.0 / len(self.ACTIONS)] * len(self.ACTIONS)
-        self.epsilon = _cfg_get(config, "causal_exploration_rate", 0.1)
+        self.epsilon = float(_cfg_get(config, "causal_exploration_rate", 0.1)
+                             or 0.1)
         self._lock = asyncio.Lock()
 
-    async def choose_action(self, state):
+    def to_strategy(self, action: str) -> str:
+        return self.STRATEGY_MAP.get(action, "balanced")
+
+    async def choose_action(self, state: Dict[str, Any]) -> str:
         async with self._lock:
             if random.random() < self.epsilon:
                 return random.choice(self.ACTIONS)
             return max(self.ACTIONS, key=lambda a: self.values.get(a, 0.0))
 
-    async def update(self, action, reward, state):
+    async def update(self, action: str, reward: float,
+                     state: Dict[str, Any]) -> None:
         async with self._lock:
             if action not in self.ACTIONS:
                 action = self.ACTIONS[0]
@@ -739,7 +1108,7 @@ class CausalPolicyAdapter:
             s = sum(exps) or 1.0
             self.policy = [e / s for e in exps]
 
-    def get_policy(self):
+    def get_policy(self) -> List[float]:
         return list(self.policy)
 
 
@@ -749,7 +1118,7 @@ class CausalPolicyAdapter:
 class _Agent:
     ROLES = ["orchestrator", "validator", "optimizer", "reporter", "negotiator"]
 
-    def __init__(self, agent_id):
+    def __init__(self, agent_id: str):
         self.id = agent_id
         self.role = "validator"
         self.reputation = 0.5
@@ -758,28 +1127,42 @@ class _Agent:
 
 
 class MultiAgentCoordinator:
-    def __init__(self, config, storage):
+    def __init__(self, config: Any, storage: Any):
         self.config = config
         self.storage = storage
-        count = _cfg_get(config, "agent_count", 5)
+        count = int(_cfg_get(config, "agent_count", 5) or 5)
         self.agents = {f"agent_{i:02d}": _Agent(f"agent_{i:02d}")
                        for i in range(count)}
         self.bus: asyncio.Queue = asyncio.Queue(maxsize=500)
         self._lock = asyncio.Lock()
 
-    async def _specialise(self):
+    async def _specialise(self) -> None:
         async with self._lock:
             for a in self.agents.values():
                 a.role = max(a.utilities, key=lambda r: a.utilities[r])
+                try:
+                    await asyncio.to_thread(
+                        self.storage.save_agent, a.id, a.role,
+                        a.reputation, a.utilities)
+                except Exception:
+                    pass
 
-    async def broadcast(self, topic, sender, payload):
+    async def broadcast(self, topic: str, sender: str,
+                        payload: Dict[str, Any]) -> None:
         try:
             self.bus.put_nowait({"topic": topic, "sender": sender,
                                  "payload": payload})
         except asyncio.QueueFull:
+            log_event("warning",
+                      "MultiAgentCoordinator bus full; message dropped")
+        try:
+            await asyncio.to_thread(
+                self.storage.save_agent_message,
+                uuid.uuid4().hex[:8], topic, sender, "*", payload)
+        except Exception:
             pass
 
-    async def bid(self, task):
+    async def bid(self, task: Dict[str, Any]) -> Tuple[str, float]:
         preferred = task.get("preferred_role", "orchestrator")
         best_id, best_score = None, -1.0
         async with self._lock:
@@ -796,7 +1179,7 @@ class MultiAgentCoordinator:
                               "score": best_score})
         return best_id or next(iter(self.agents)), best_score
 
-    async def reward(self, agent_id, reward):
+    async def reward(self, agent_id: str, reward: float) -> None:
         async with self._lock:
             if agent_id in self.agents:
                 a = self.agents[agent_id]
@@ -805,7 +1188,14 @@ class MultiAgentCoordinator:
                 a.utilities[a.role] = min(1.0,
                                           a.utilities[a.role] + 0.05 * reward)
 
-    def get_policy(self):
+    def get_role_distribution(self) -> Dict[str, float]:
+        counts: Dict[str, int] = defaultdict(int)
+        for a in self.agents.values():
+            counts[a.role] += 1
+        total = max(1, sum(counts.values()))
+        return {role: c / total for role, c in counts.items()}
+
+    def get_policy(self) -> List[float]:
         affinity = {
             "orchestrator": [0.35, 0.20, 0.15, 0.15, 0.15],
             "validator":    [0.15, 0.15, 0.15, 0.35, 0.20],
@@ -813,19 +1203,15 @@ class MultiAgentCoordinator:
             "reporter":     [0.15, 0.20, 0.15, 0.15, 0.35],
             "negotiator":   [0.15, 0.35, 0.20, 0.15, 0.15],
         }
-        counts = defaultdict(int)
-        for a in self.agents.values():
-            counts[a.role] += 1
-        total = max(1, sum(counts.values()))
+        role_dist = self.get_role_distribution()
         out = [0.0] * 5
-        for role, c in counts.items():
-            w = c / total
+        for role, w in role_dist.items():
             for i, v in enumerate(affinity.get(role, [0.2] * 5)):
                 out[i] += w * v
         s = sum(out) or 1.0
         return [x / s for x in out]
 
-    async def step(self):
+    async def step(self) -> Dict[str, Any]:
         await self._specialise()
         processed = 0
         while not self.bus.empty():
@@ -835,7 +1221,8 @@ class MultiAgentCoordinator:
             except asyncio.QueueEmpty:
                 break
         return {"roles": {a.id: a.role for a in self.agents.values()},
-                "role_distribution": self.get_policy(),
+                "role_distribution": self.get_role_distribution(),
+                "strategy_distribution": self.get_policy(),
                 "processed_messages": processed}
 
 
@@ -847,18 +1234,20 @@ _ATOMIC_RE = re.compile(
 
 
 class TemporalRule:
-    def __init__(self, rule_id, operator, conditions, window=0.0,
-                 description="", severity="warning"):
+    def __init__(self, rule_id: str, operator: str,
+                 conditions: List[Callable[[Dict], bool]],
+                 window: float = 0.0, description: str = "",
+                 severity: str = "warning"):
         self.rule_id = rule_id
         self.operator = operator
         self.conditions = conditions
-        self.window = window
+        self.window = float(window)
         self.description = description or rule_id
         self.severity = severity
         self.violations = 0
-        self.last_violation = None
+        self.last_violation: Optional[datetime] = None
 
-    def evaluate(self, trace):
+    def evaluate(self, trace: Deque[Tuple[datetime, Dict]]) -> bool:
         if not trace:
             return False
         if self.window > 0:
@@ -876,27 +1265,38 @@ class TemporalRule:
 
 
 class TemporalLogicVerifier:
-    def __init__(self, storage, config):
+    def __init__(self, storage: Any, config: Any):
         self.storage = storage
         self.config = config
         self.rules: Dict[str, TemporalRule] = {}
-        self.trace: Deque = deque(maxlen=_cfg_get(config, "temporal_max_trace", 2000))
-        self.approval_cb = None
+        self.trace: Deque[Tuple[datetime, Dict]] = deque(
+            maxlen=int(_cfg_get(config, "temporal_max_trace", 2000) or 2000))
+        self.approval_cb: Optional[Callable] = None
+        self._pending_rule_saves: List[Tuple[str, str, str, str]] = []
         for formula in _cfg_get(config, "temporal_formulas", []) or []:
             self._install(formula)
 
-    def _install(self, formula):
-        f = formula.strip()
-        if f.startswith("G "):
-            self._add_atomic(f[2:].strip().strip("()"), "always")
-        elif f.startswith("F "):
-            self._add_atomic(f[2:].strip().strip("()"), "eventually")
-        elif f.startswith("NEVER "):
-            self._add_atomic(f[6:].strip().strip("()"), "never")
+    def _install(self, formula: str) -> None:
+        f = (formula or "").strip()
+        if not f:
+            return
+        try:
+            if f.startswith("G "):
+                self._add_atomic(f[2:].strip().strip("()"), "always")
+            elif f.startswith("F "):
+                self._add_atomic(f[2:].strip().strip("()"), "eventually")
+            elif f.startswith("NEVER "):
+                self._add_atomic(f[6:].strip().strip("()"), "never")
+            else:
+                log_event("warning",
+                          f"Unrecognised temporal formula: {formula!r}")
+        except Exception as exc:
+            log_event("warning", f"Temporal install failed: {exc}")
 
-    def _add_atomic(self, expr, op):
+    def _add_atomic(self, expr: str, op: str) -> None:
         m = _ATOMIC_RE.match(expr)
         if not m:
+            log_event("warning", f"Atomic formula did not parse: {expr!r}")
             return
         var, cmp, val = m.group(1), m.group(2), float(m.group(3))
 
@@ -911,18 +1311,57 @@ class TemporalLogicVerifier:
         rid = f"{op}:{expr}"
         self.rules[rid] = TemporalRule(rid, op, [cond],
                                         description=expr, severity="warning")
+        self._pending_rule_saves.append((rid, expr, op, "warning"))
 
-    def set_approval_callback(self, cb):
+    async def _flush_pending_rule_saves(self) -> None:
+        while self._pending_rule_saves:
+            rid, expr, op, sev = self._pending_rule_saves.pop(0)
+            try:
+                await asyncio.to_thread(
+                    self.storage.save_temporal_rule,
+                    rid, expr, op, sev, expr, 0.0, True)
+            except Exception:
+                pass
+
+    def set_approval_callback(self, cb: Callable) -> None:
         self.approval_cb = cb
 
-    async def push_state(self, state):
-        self.trace.append((datetime.now(timezone.utc), dict(state)))
+    async def push_state(self, state: Dict[str, Any]) -> None:
+        await self._flush_pending_rule_saves()
+        self.trace.append((_now_utc(), dict(state)))
+        try:
+            await asyncio.to_thread(self.storage.save_temporal_trace, state)
+        except Exception:
+            pass
 
-    async def verify(self):
-        result = {}
+    async def verify(self) -> Dict[str, bool]:
+        await self._flush_pending_rule_saves()
+        result: Dict[str, bool] = {}
         for rid, rule in self.rules.items():
-            copy = deque(self.trace, maxlen=self.trace.maxlen)
-            result[rid] = not rule.evaluate(copy)
+            copy = deque(self.trace)
+            violated = rule.evaluate(copy)
+            approved = False
+            if violated:
+                rule.violations += 1
+                rule.last_violation = _now_utc()
+                if rule.severity == "critical" and self.approval_cb:
+                    try:
+                        approved = self.approval_cb(
+                            rid, self.trace[-1][1] if self.trace else {})
+                        if asyncio.iscoroutine(approved):
+                            approved = await approved
+                    except Exception as exc:
+                        log_event("warning", f"Approval callback failed: {exc}")
+                        approved = False
+                try:
+                    await asyncio.to_thread(
+                        self.storage.save_temporal_violation,
+                        rid, rule.description, len(self.trace) - 1,
+                        self.trace[-1][1] if self.trace else {},
+                        rule.severity, bool(approved))
+                except Exception:
+                    pass
+            result[rid] = (not violated) or bool(approved)
         return result
 
 
@@ -930,13 +1369,14 @@ class TemporalLogicVerifier:
 # ENHANCEMENT 6 — EXPLAINABLE AI
 # =============================================================================
 class XAIDecisionExplainer:
-    def __init__(self, config, storage):
+    def __init__(self, config: Any, storage: Any):
         self.config = config
         self.storage = storage
-        self.method = _cfg_get(config, "xai_method", "kernel_shap")
-        self.depth = _cfg_get(config, "xai_depth", 5)
+        self.method = str(_cfg_get(config, "xai_method", "kernel_shap")
+                          or "kernel_shap")
+        self.depth = int(_cfg_get(config, "xai_depth", 5) or 5)
 
-    def _kernel_shap(self, f, x, names, n=64):
+    def _permutation_shap(self, f, x, names, n=64):
         if not NUMPY_AVAILABLE:
             return {k: 0.0 for k in names}
         base = np.zeros_like(x)
@@ -958,23 +1398,37 @@ class XAIDecisionExplainer:
         contrib = contrib / max(1, n)
         return dict(zip(names, contrib.tolist()))
 
+    def _kernel_shap(self, f, x, names, n=64):
+        return self._permutation_shap(f, x, names, n)
+
     def _nl(self, decision, attrs):
         top = sorted(attrs.items(), key=lambda kv: abs(kv[1]),
                      reverse=True)[:self.depth]
         lines = "\n".join(f"  • {k}: {v:+.4f}" for k, v in top)
         return f"Decision '{decision}' driven by:\n{lines}"
 
-    async def explain(self, decision_id, label, features, names, model_fn):
+    async def explain(self, decision_id: str, label: str, features,
+                      names: List[str], model_fn: Callable) -> Dict[str, Any]:
         if not NUMPY_AVAILABLE:
             attrs = {k: 0.0 for k in names}
         else:
-            attrs = self._kernel_shap(model_fn, features, names)
+            attrs = self._permutation_shap(model_fn, features, names)
         nl = self._nl(label, attrs)
+
+        feature_map: Dict[str, Any] = {}
+        try:
+            if NUMPY_AVAILABLE and hasattr(features, "tolist"):
+                feature_map = dict(zip(names, features.tolist()))
+            else:
+                feature_map = dict(zip(names, list(features)))
+        except Exception:
+            feature_map = {"raw": list(features)}
+
         try:
             await asyncio.to_thread(
                 self.storage.save_xai_explanation,
                 decision_id, decision_id, self.method, label,
-                {"raw": list(features)}, attrs, nl)
+                feature_map, attrs, nl)
         except Exception:
             pass
         return {"decision_id": decision_id, "method": self.method,
@@ -987,43 +1441,76 @@ class XAIDecisionExplainer:
 class AdaptivePrecisionSwitcher:
     ENERGY = {"fp32": 1.0, "tf32": 0.75, "bf16": 0.55,
               "fp16": 0.5, "int8": 0.3}
+    LATENCY = {"fp32": 1.0, "tf32": 0.8, "bf16": 0.65,
+               "fp16": 0.6, "int8": 0.4}
 
-    def __init__(self, config, storage):
+    def __init__(self, config: Any, storage: Any):
         self.config = config
         self.storage = storage
         self.current = "fp32"
         self.saved_wh = 0.0
+        self.dynamic_energy = dict(self.ENERGY)
+        self.dynamic_latency = dict(self.LATENCY)
+        self.history: Deque[Dict] = deque(maxlen=500)
+        self._acc_window: Deque[float] = deque(maxlen=20)
+        self._hw_cache: Optional[Dict[str, Any]] = None
 
-    def _probe(self):
+    def _probe(self, force_refresh: bool = False) -> Dict[str, Any]:
+        if self._hw_cache is not None and not force_refresh:
+            return self._hw_cache
         info = {"cuda": False, "bf16": False, "device": "cpu"}
-        if TORCH_AVAILABLE:
+        if TORCH_AVAILABLE and torch is not None:
             try:
-                info["cuda"] = torch.cuda.is_available()
+                info["cuda"] = bool(torch.cuda.is_available())
                 if info["cuda"]:
                     info["device"] = torch.cuda.get_device_name(0)
-                    info["bf16"] = torch.cuda.is_bf16_supported()
+                    try:
+                        info["bf16"] = bool(torch.cuda.is_bf16_supported())
+                    except Exception:
+                        info["bf16"] = False
             except Exception:
                 pass
+        self._hw_cache = info
         return info
 
-    def select_precision(self):
+    def _allowed_precisions(self) -> List[str]:
+        raw = list(_cfg_get(self.config, "precision_levels",
+                            ["fp32", "fp16", "bf16", "int8"]))
+        return [c for c in raw if c in self.dynamic_energy]
+
+    def select_precision(self) -> str:
         hw = self._probe()
-        cands = list(_cfg_get(self.config, "precision_levels",
-                              ["fp32", "fp16", "bf16", "int8"]))
+        cands = self._allowed_precisions()
+        if not cands:
+            return "fp32"
         if not hw["cuda"]:
             cands = [c for c in cands if c in ("fp32", "int8")]
         if not hw["bf16"]:
             cands = [c for c in cands if c != "bf16"]
-        return min(cands, key=lambda c: self.ENERGY.get(c, 1.0))
+        if not cands:
+            return "fp32"
+        return min(cands, key=lambda c: self.dynamic_energy.get(c, 1.0))
 
-    async def switch_to(self, target, reason="policy"):
-        if target == self.current or target not in self.ENERGY:
+    def record_accuracy(self, accuracy: float) -> None:
+        try:
+            self._acc_window.append(float(accuracy))
+        except (TypeError, ValueError):
+            pass
+
+    async def switch_to(self, target: str, reason: str = "policy") -> bool:
+        if target == self.current or target not in self.dynamic_energy:
+            return False
+        if target not in self._allowed_precisions():
+            log_event("warning",
+                      f"Precision {target!r} not in precision_levels; ignoring")
             return False
         old = self.current
         self.current = target
-        saved = max(0.0, self.ENERGY.get(old, 1.0) -
-                    self.ENERGY.get(target, 1.0))
+        saved = max(0.0, self.dynamic_energy.get(old, 1.0) -
+                    self.dynamic_energy.get(target, 1.0))
         self.saved_wh += saved
+        self.history.append({"from": old, "to": target,
+                             "reason": reason, "saved_wh": saved})
         try:
             await asyncio.to_thread(
                 self.storage.save_precision_switch,
@@ -1032,65 +1519,115 @@ class AdaptivePrecisionSwitcher:
             pass
         return True
 
-    async def auto_switch(self, recent_acc, baseline_acc):
+    async def auto_switch(self, recent_acc: float = 0.0,
+                          baseline_acc: float = 0.0) -> None:
+        if recent_acc <= 0 or baseline_acc <= 0:
+            if not self._acc_window:
+                return
+            recent_acc = sum(self._acc_window) / len(self._acc_window)
+            baseline_acc = max(self._acc_window)
         if baseline_acc <= 0:
             return
         drop = (baseline_acc - recent_acc) / baseline_acc
-        thresh = _cfg_get(self.config, "precision_switch_threshold", 0.02)
+        thresh = float(_cfg_get(self.config,
+                                "precision_switch_threshold", 0.02) or 0.02)
         if drop > thresh:
             await self.switch_to("fp32", reason=f"acc drop {drop:.3f}")
         elif drop < thresh / 2:
-            await self.switch_to(self.select_precision(), reason="headroom")
+            target = self.select_precision()
+            if target != self.current:
+                await self.switch_to(target, reason="headroom")
 
 
 # =============================================================================
 # ENHANCEMENT 8 — CARBON MARKETS / REC
 # =============================================================================
 class CarbonMarketIntegrator:
-    def __init__(self, config, storage):
+    DEFER_INTENSITY_THRESHOLD = 0.3   # kgCO2/kWh
+    RUN_OFFSET_COST_THRESHOLD = 0.5   # USD
+    MIN_PRICE_USD = 5.0
+    MAX_PRICE_USD = 200.0
+    DEFAULT_PRICE_USD = 25.0
+
+    def __init__(self, config: Any, storage: Any):
         self.config = config
         self.storage = storage
-        self.last_price = 25.0
+        self.last_price = float(
+            _cfg_get(config, "carbon_default_price_usd",
+                     self.DEFAULT_PRICE_USD) or self.DEFAULT_PRICE_USD)
+        self._rec_balance_mwh: float = 0.0
+        self._closed = False
 
-    async def _fetch_price(self):
-        return max(5.0, self.last_price + random.gauss(0, 1.5))
+    async def _fetch_price(self) -> float:
+        candidate = self.last_price + random.gauss(0, 1.5)
+        return max(self.MIN_PRICE_USD, min(self.MAX_PRICE_USD, candidate))
 
-    async def update_price(self):
+    async def update_price(self) -> float:
         try:
             price = await self._fetch_price()
         except Exception:
             price = self.last_price
-        self.last_price = price
+        try:
+            price = max(self.MIN_PRICE_USD, min(self.MAX_PRICE_USD, float(price)))
+        except (TypeError, ValueError):
+            price = self.last_price
         try:
             await asyncio.to_thread(self.storage.save_credit_price, price)
         except Exception:
             pass
+        self.last_price = price
         return price
 
-    async def purchase_rec(self, mwh, price_per_mwh=5.0, source="wind"):
+    async def purchase_rec(self, mwh: float, price_per_mwh: float = 5.0,
+                           source: str = "wind") -> float:
+        mwh = max(0.0, float(mwh))
+        if mwh == 0.0:
+            return 0.0
+        price_per_mwh = max(0.0, float(price_per_mwh))
+        src = (source or "").strip().lower() or "unspecified"
         cost = mwh * price_per_mwh
+        self._rec_balance_mwh += mwh
         try:
-            await asyncio.to_thread(self.storage.save_rec, mwh,
-                                    price_per_mwh, source)
+            await asyncio.to_thread(
+                self.storage.save_rec, mwh, price_per_mwh, src)
         except Exception:
             pass
         return cost
 
-    async def net_zero_schedule(self, workload_kwh, intensity):
-        price = await self.update_price()
+    async def net_zero_schedule(self, workload_kwh: float, intensity: float,
+                                price: Optional[float] = None,
+                                commit: bool = True) -> Dict[str, Any]:
+        workload_kwh = max(0.0, float(workload_kwh))
+        intensity = max(0.0, float(intensity))
+        if price is None:
+            price = float(self.last_price)
+        else:
+            try:
+                price = max(0.0, float(price))
+            except (TypeError, ValueError):
+                price = float(self.last_price)
         carbon_kg = workload_kwh * intensity
         offset_cost = (carbon_kg / 1000.0) * price
-        action = "defer" if intensity > 0.3 else \
-                 ("run_offset" if offset_cost < 0.5 else "run")
-        try:
-            await asyncio.to_thread(
-                self.storage.save_net_zero_match,
-                uuid.uuid4().hex[:8], workload_kwh, intensity, action,
-                carbon_kg, offset_cost, price)
-        except Exception:
-            pass
+        if intensity > self.DEFER_INTENSITY_THRESHOLD:
+            action = "defer"
+        elif offset_cost < self.RUN_OFFSET_COST_THRESHOLD:
+            action = "run_offset"
+        else:
+            action = "run"
+        if commit:
+            try:
+                await asyncio.to_thread(
+                    self.storage.save_net_zero_match,
+                    uuid.uuid4().hex[:8], workload_kwh, intensity, action,
+                    carbon_kg, offset_cost, price)
+            except Exception:
+                pass
         return {"action": action, "carbon_kg": carbon_kg,
-                "offset_cost_usd": offset_cost, "credit_price_usd": price}
+                "offset_cost_usd": offset_cost, "credit_price_usd": price,
+                "rec_balance_mwh": float(self._rec_balance_mwh)}
+
+    def get_rec_balance(self) -> float:
+        return float(self._rec_balance_mwh)
 
 
 # =============================================================================
@@ -1100,97 +1637,174 @@ class ChaosTestingEngine:
     FAULT_TYPES = ["latency", "exception", "data_corruption",
                    "memory_pressure", "network_drop"]
 
-    def __init__(self, config, storage):
+    def __init__(self, config: Any, storage: Any):
         self.config = config
         self.storage = storage
         self.active: Dict[str, Dict] = {}
         self._lock = asyncio.Lock()
+        self._shared_state: Dict[str, Any] = {"payload": "ok", "counter": 0}
 
-    async def _steady(self):
-        if not self.active:
-            return True
-        return random.random() > _cfg_get(self.config, "chaos_intensity", 0.05)
+    async def _health_ok(self) -> bool:
+        async with self._lock:
+            return not self.active
 
-    async def run_experiment(self, name, fault_type):
+    async def run_experiment(self, name: str, fault_type: str) -> Dict[str, Any]:
         if fault_type not in self.FAULT_TYPES:
             raise ValueError(f"unknown fault type {fault_type}")
-        t0 = time.time()
-        before = await self._steady()
+        t0 = time.monotonic()
+        before = await self._health_ok()
         status = "completed"
+        injected_ms = 0.0
         try:
             async with self._lock:
-                self.active[name] = {"fault_type": fault_type}
+                self.active[name] = {"fault_type": fault_type,
+                                     "started": _now_utc().isoformat()}
             if fault_type == "latency":
-                await asyncio.sleep(0.5)
+                delay = 0.5
+                injected_ms = delay * 1000.0
+                await asyncio.sleep(delay)
             elif fault_type == "exception":
                 raise RuntimeError("chaos: injected exception")
+            elif fault_type == "data_corruption":
+                async with self._lock:
+                    self._shared_state["payload"] = "corrupted"
+                    self._shared_state["counter"] += 1
+                injected_ms = 5.0
             elif fault_type == "memory_pressure":
                 _ = bytearray(5 * 1024 * 1024)
+                injected_ms = 10.0
             elif fault_type == "network_drop":
-                await asyncio.sleep(0.2)
+                delay = 0.2
+                injected_ms = delay * 1000.0
+                await asyncio.sleep(delay)
         except Exception:
             status = "injected"
         finally:
             async with self._lock:
                 self.active.pop(name, None)
-        after = await self._steady()
-        duration = (time.time() - t0) * 1000.0
+        after = await self._health_ok()
+        duration = (time.monotonic() - t0) * 1000.0
         try:
             await asyncio.to_thread(
                 self.storage.save_chaos_experiment,
                 name, name, fault_type,
-                _cfg_get(self.config, "chaos_blast_radius", 0.1),
+                float(_cfg_get(self.config, "chaos_blast_radius", 0.1) or 0.1),
                 int(before), int(after), status, duration)
         except Exception:
             pass
         return {"name": name, "fault_type": fault_type,
                 "steady_before": before, "steady_after": after,
-                "status": status, "duration_ms": duration}
+                "status": status, "duration_ms": duration,
+                "injected_ms": injected_ms}
 
 
 # =============================================================================
 # ENHANCEMENT 10 — HITL ACTIVE LEARNING
 # =============================================================================
 class ActiveUserPreferenceLearner:
-    def __init__(self, storage, dashboard=None):
+    _PREF_KEYS = ("quality_score", "carbon_g", "cost_usd", "latency_ms")
+
+    def __init__(self, storage: Any, dashboard: Any = None):
         self.storage = storage
         self.dashboard = dashboard
         self.preferences: Dict[str, Dict[str, float]] = {}
         self._responses: asyncio.Queue = asyncio.Queue(maxsize=100)
+        self._pending: Dict[str, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
 
-    async def submit_response(self, user_id, chosen_id):
+    async def submit_response(self, user_id: str, chosen_id: str,
+                              request_id: Optional[str] = None) -> None:
+        if request_id is not None:
+            async with self._lock:
+                fut = self._pending.pop(request_id, None)
+            if fut is not None and not fut.done():
+                fut.set_result({"user_id": user_id, "chosen": chosen_id})
+                return
+            log_event("warning",
+                      f"Unknown HITL request_id {request_id!r}; using FIFO")
         try:
-            self._responses.put_nowait({"user_id": user_id, "chosen": chosen_id})
+            self._responses.put_nowait(
+                {"user_id": user_id, "chosen": chosen_id})
         except asyncio.QueueFull:
-            pass
+            log_event("warning", "HITL response queue full; dropping")
 
-    async def query_user_if_needed(self, user_id, candidates, timeout=3.0):
+    async def query_user_if_needed(self, user_id: str,
+                                   candidates: List[Dict[str, Any]],
+                                   timeout: float = 3.0) -> Optional[str]:
         if len(candidates) < 2:
             return None
+        req_id = uuid.uuid4().hex[:8]
         try:
-            msg = await asyncio.wait_for(self._responses.get(), timeout=timeout)
-            return msg.get("chosen")
+            await asyncio.to_thread(
+                self.storage.enqueue_hitl_request,
+                req_id, "pareto_query",
+                {"candidates": candidates[:2]}, "info")
+        except Exception:
+            pass
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        async with self._lock:
+            self._pending[req_id] = fut
+        try:
+            msg = await asyncio.wait_for(fut, timeout=timeout)
+            try:
+                await asyncio.to_thread(
+                    self.storage.resolve_hitl_request, req_id, "approved")
+            except Exception:
+                pass
+            chosen = msg.get("chosen") if isinstance(msg, dict) else None
+            metrics = next(
+                (c for c in candidates if c.get("solution_id") == chosen), None)
+            await self.record_choice(user_id, chosen, metrics=metrics)
+            return chosen
         except asyncio.TimeoutError:
+            try:
+                await asyncio.to_thread(
+                    self.storage.resolve_hitl_request, req_id, "timeout")
+            except Exception:
+                pass
+            normalized = self.get_preference_weights(user_id)
+            if normalized:
+                scored = []
+                for c in candidates:
+                    s = sum(normalized.get(k, 0.25)
+                            / (float(c.get(k, 0) or 0) + 1e-8)
+                            for k in self._PREF_KEYS)
+                    scored.append((s, c.get("solution_id")))
+                scored.sort(reverse=True)
+                return scored[0][1]
             return candidates[0].get("solution_id")
+        finally:
+            async with self._lock:
+                self._pending.pop(req_id, None)
 
-    async def record_choice(self, user_id, solution_id, metrics=None):
+    async def record_choice(self, user_id: str, solution_id: str,
+                            metrics: Optional[Dict[str, float]] = None) -> None:
         prefs = self.preferences.setdefault(user_id, {})
         if metrics:
-            for k in ("quality_score", "carbon_g", "cost_usd", "latency_ms"):
+            for k in self._PREF_KEYS:
                 if k in metrics:
-                    v = float(metrics[k])
+                    try:
+                        v = float(metrics[k])
+                    except (TypeError, ValueError):
+                        continue
                     if k == "quality_score":
                         prefs[k] = prefs.get(k, 0.25) + v * 0.01
                     else:
-                        prefs[k] = prefs.get(k, 0.25) + 1.0 / (v + 1e-6) * 0.01
-            s = sum(prefs.values()) or 1.0
-            prefs = {k: v / s for k, v in prefs.items()}
+                        prefs[k] = prefs.get(k, 0.25) + 1.0 / (abs(v) + 1e-6) * 0.01
             self.preferences[user_id] = prefs
         try:
             await asyncio.to_thread(
                 self.storage.save_user_preference, user_id, prefs)
         except Exception:
             pass
+
+    def get_preference_weights(self, user_id: str) -> Dict[str, float]:
+        raw = self.preferences.get(user_id, {})
+        if not raw:
+            return {}
+        s = sum(raw.values()) or 1.0
+        return {k: v / s for k, v in raw.items()}
 
 
 # =============================================================================
@@ -1203,17 +1817,17 @@ class FederatedOrchestratorV17:
     background loops for each enhancement.
     """
 
-    def __init__(self, storage, config, dashboard=None):
+    def __init__(self, storage: Any, config: Any, dashboard: Any = None):
         self.storage = storage
         self.config = config
         self.instance_id = str(uuid.uuid4())[:8]
 
-        # Build ten enhancements
+        # Build ten enhancements.
         self.quantum = QuantumDistillationEngine(temperature=2.0, alpha=0.5)
         self.causal_graph = CausalGraphLearner(storage)
         self.causal_rl = CausalPolicyAdapter(config, storage, self.causal_graph)
         self.federated = FederatedGreenAggregator(
-            storage, self.instance_id)
+            storage, self.instance_id, config=config)
         self.multi_agent = MultiAgentCoordinator(config, storage)
         self.temporal = TemporalLogicVerifier(storage, config)
         self.xai = XAIDecisionExplainer(config, storage)
@@ -1222,7 +1836,7 @@ class FederatedOrchestratorV17:
         self.chaos = ChaosTestingEngine(config, storage)
         self.hitl = ActiveUserPreferenceLearner(storage, dashboard=dashboard)
 
-        # Wire enhancement hooks into federated aggregator
+        # Wire enhancement hooks into the federated aggregator.
         self.federated.carbon_market = self.carbon_market
         self.federated.chaos = self.chaos
         self.federated.temporal = self.temporal
@@ -1231,42 +1845,45 @@ class FederatedOrchestratorV17:
         self.federated.hitl = self.hitl
         self.federated.multi_agent = self.multi_agent
 
-        # Lifecycle
         self._running = False
         self._shutdown_event = asyncio.Event()
         self._background_tasks: set = set()
 
     # ------------------------------------------------------------------
+    def _spawn(self, coro: Any, name: str) -> asyncio.Task:
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+
+        def _done(t: asyncio.Task) -> None:
+            self._background_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                log_event("error", f"Background task {name} failed: {exc}")
+
+        task.add_done_callback(_done)
+        return task
+
     async def federated_round(self,
                               model_id: str = "mopd_student",
                               local_weights: bytes = b"",
                               sample_count: int = 100,
                               version: str = "1.0.0") -> Dict[str, Any]:
-        """
-        Run one full federated round:
-          1. Multi-agent bid
-          2. Precision switch
-          3. Carbon-aware share
-          4. Temporal verify
-          5. Pull + blend
-          6. XAI explanation
-          7. Convergence check
-          8. Reputation update
-        """
         result: Dict[str, Any] = {}
 
-        # 1. Multi-agent bid
+        # 1. Multi-agent bid.
         agent_id, _ = await self.multi_agent.bid({
             "name": f"federated_round_{model_id}",
             "preferred_role": "reporter"})
         result["agent_id"] = agent_id
 
-        # 2. Precision switch
-        await self.precision.auto_switch(
-            recent_acc=0.9, baseline_acc=0.92)
+        # 2. Precision switch.
+        await self.precision.auto_switch(0.0, 0.0)
         result["precision"] = self.precision.current
 
-        # 3. Carbon-aware share
+        # 3. Carbon-aware share. Uses the configured intensity, which is
+        # below the defer threshold by default.
         await self.federated.share_weights(
             model_id=model_id,
             weights=local_weights,
@@ -1274,7 +1891,7 @@ class FederatedOrchestratorV17:
             version=version)
         result["shared_bytes"] = len(local_weights)
 
-        # 4. Temporal verify
+        # 4. Temporal verify.
         await self.temporal.push_state({
             "federated_round": self.federated.rounds,
             "quality": 1.0})
@@ -1282,63 +1899,59 @@ class FederatedOrchestratorV17:
         result["temporal_violations"] = [
             k for k, v in verify.items() if not v]
 
-        # 5. Pull + blend
+        # 5. Pull + blend.
         blended = await self.federated.apply_aggregated_weights(
             model_id=model_id,
             current=local_weights,
-            version=version)
+            version=version,
+            local_sample_count=sample_count)
         result["blended_bytes"] = len(blended)
 
-        # 6. XAI explanation
+        # 6. XAI explanation.
         if NUMPY_AVAILABLE:
             try:
                 feats = np.array([
                     float(sample_count) / 1000.0,
                     float(len(local_weights)) / 100000.0,
-                    float(self.federated.rounds),
+                    float(self.federated.rounds) / 100.0,
                     float(self.precision.saved_wh)])
-                def _score(x):
-                    return float(np.dot(x, [0.3, 0.2, 0.4, 0.1]))
+                def _score(x, _w=np.array([0.3, 0.2, 0.4, 0.1])):
+                    return float(np.dot(x, _w))
                 result["xai"] = await self.xai.explain(
                     decision_id=f"fed_{uuid.uuid4().hex[:8]}",
                     label=f"round_{self.federated.rounds}",
                     features=feats,
-                    names=["sample_count", "n_bytes",
-                           "round", "saved_wh"],
+                    names=["sample_count", "n_bytes", "round", "saved_wh"],
                     model_fn=_score)
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"XAI explanation skipped: {exc}")
 
-        # 7. Convergence check
-        result["converged"] = await self.federated.has_converged()
+        # 7. Convergence check.
+        result["converged"] = await self.federated.has_converged(
+            model_id=model_id, version=version)
 
-        # 8. Reputation update
+        # 8. Reputation update.
         await self.federated.record_reputation(self.instance_id, 0.8)
 
-        # 9. Multi-agent reward
+        # 9. Multi-agent reward.
         await self.multi_agent.reward(agent_id, 0.8)
 
         return result
 
     # ------------------------------------------------------------------
-    async def start(self):
+    async def start(self) -> None:
         self._running = True
-        loop = asyncio.get_event_loop()
-        tasks = [
-            loop.create_task(self._causal_rl_loop()),
-            loop.create_task(self._multi_agent_loop()),
-            loop.create_task(self._temporal_loop()),
-            loop.create_task(self._xai_loop()),
-            loop.create_task(self._precision_loop()),
-            loop.create_task(self._carbon_market_loop()),
-            loop.create_task(self._chaos_loop()),
-            loop.create_task(self._distillation_loop()),
-        ]
-        for t in tasks:
-            self._background_tasks.add(t)
-            t.add_done_callback(self._background_tasks.discard)
+        _ = asyncio.get_running_loop()
+        self._spawn(self._causal_rl_loop(), "causal_rl")
+        self._spawn(self._multi_agent_loop(), "multi_agent")
+        self._spawn(self._temporal_loop(), "temporal")
+        self._spawn(self._xai_loop(), "xai")
+        self._spawn(self._precision_loop(), "precision")
+        self._spawn(self._carbon_market_loop(), "carbon_market")
+        self._spawn(self._chaos_loop(), "chaos")
+        self._spawn(self._distillation_loop(), "distillation")
 
-    async def shutdown(self):
+    async def shutdown(self) -> None:
         self._shutdown_event.set()
         self._running = False
         for t in list(self._background_tasks):
@@ -1346,10 +1959,22 @@ class FederatedOrchestratorV17:
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks,
                                  return_exceptions=True)
+        self._background_tasks.clear()
 
-    async def _causal_rl_loop(self):
+    async def aclose(self) -> None:
+        await self.shutdown()
+
+    async def __aenter__(self) -> "FederatedOrchestratorV17":
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.aclose()
+
+    async def _causal_rl_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(900)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "causal_graph_update_interval", 900) or 900))
             try:
                 samples = [{
                     "quality": random.uniform(0.5, 1.0),
@@ -1359,82 +1984,88 @@ class FederatedOrchestratorV17:
                 } for _ in range(20)]
                 await self.causal_graph.learn(
                     samples, ["quality", "carbon", "cost", "latency"])
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"causal_rl loop error: {exc}")
 
-    async def _multi_agent_loop(self):
+    async def _multi_agent_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(600)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "agent_negotiation_interval", 600) or 600))
             try:
                 await self.multi_agent.step()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"multi_agent loop error: {exc}")
 
-    async def _temporal_loop(self):
+    async def _temporal_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(300)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "temporal_verification_interval", 300) or 300))
             try:
                 await self.temporal.verify()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"temporal loop error: {exc}")
 
-    async def _xai_loop(self):
+    async def _xai_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(300)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "xai_interval", 300) or 300))
             if not NUMPY_AVAILABLE:
                 continue
             try:
                 feats = np.array([0.9, 0.4, 0.5, 0.4])
-                def _score(x):
-                    return float(np.dot(x, [0.3, 0.2, 0.4, 0.1]))
+                def _score(x, _w=np.array([0.3, 0.2, 0.4, 0.1])):
+                    return float(np.dot(x, _w))
                 await self.xai.explain(
                     decision_id=f"sys_{uuid.uuid4().hex[:8]}",
                     label="federated_health",
                     features=feats,
                     names=["samples", "bytes", "round", "saved_wh"],
                     model_fn=_score)
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"xai loop error: {exc}")
 
-    async def _precision_loop(self):
+    async def _precision_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(300)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "precision_check_interval", 300) or 300))
             try:
-                await self.precision.auto_switch(0.9, 0.92)
-            except Exception:
-                pass
+                await self.precision.auto_switch(0.0, 0.0)
+            except Exception as exc:
+                log_event("debug", f"precision loop error: {exc}")
 
-    async def _carbon_market_loop(self):
+    async def _carbon_market_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(3600)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "carbon_market_interval", 3600) or 3600))
             try:
                 await self.carbon_market.update_price()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"carbon_market loop error: {exc}")
 
-    async def _chaos_loop(self):
+    async def _chaos_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(1800)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "chaos_test_interval", 1800) or 1800))
             try:
                 fault = random.choice(ChaosTestingEngine.FAULT_TYPES)
                 await self.chaos.run_experiment(
                     f"auto_{uuid.uuid4().hex[:6]}", fault)
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"chaos loop error: {exc}")
 
-    async def _distillation_loop(self):
+    async def _distillation_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(300)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "distillation_interval", 300) or 300))
             try:
                 self.quantum.register_teacher(
                     "causal", self.causal_rl.get_policy())
                 self.quantum.register_teacher(
                     "agents", self.multi_agent.get_policy())
                 await self.quantum.step(self.storage, "fed_student")
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"distillation loop error: {exc}")
 
-    # ------------------------------------------------------------------
     async def health_check(self) -> Dict[str, Any]:
         return {
             "instance_id": self.instance_id,
@@ -1444,6 +2075,8 @@ class FederatedOrchestratorV17:
             "carbon_price": self.carbon_market.last_price,
             "agents": {a.id: a.role for a in self.multi_agent.agents.values()},
             "temporal_rules": len(self.temporal.rules),
+            "hitl_pending": len(self.hitl._pending),
+            "background_tasks": len(self._background_tasks),
         }
 
 
@@ -1451,6 +2084,8 @@ class FederatedOrchestratorV17:
 # MINIMAL IN-MEMORY STORAGE
 # =============================================================================
 class InMemoryStorage:
+    """Standalone storage for demos/tests. Soft-fail for all methods."""
+
     def __init__(self):
         self._data: Dict[str, Any] = defaultdict(list)
         self._prefs: Dict[str, Dict[str, float]] = {}
@@ -1466,26 +2101,99 @@ class InMemoryStorage:
         return [r for r in self._data["federated_weights"]
                 if r["model_id"] == model_id]
 
-    def save_precision_switch(self, *a, **kw):
-        self._data["precision_history"].append(a)
+    def save_precision_switch(self, from_p, to_p, reason,
+                              saved_wh=0.0, acc_delta=0.0):
+        self._data["precision_history"].append({
+            "from_p": from_p, "to_p": to_p, "reason": reason,
+            "saved_wh": saved_wh, "acc_delta": acc_delta})
 
-    def save_credit_price(self, price_usd, **kw):
-        self._data["carbon_credit_prices"].append({"price_usd": price_usd})
+    def save_credit_price(self, price_usd, currency="USD",
+                          source="oracle", region="global"):
+        self._data["carbon_credit_prices"].append({
+            "price_usd": price_usd, "currency": currency,
+            "source": source, "region": region})
 
-    def save_rec(self, mwh, price_per_mwh, source, **kw):
-        self._data["rec_ledger"].append({"mwh": mwh})
+    def save_rec(self, mwh, price_per_mwh, source,
+                 certificate_id="", region="global", retired=False):
+        self._data["rec_ledger"].append({
+            "mwh": mwh, "price_per_mwh": price_per_mwh, "source": source,
+            "certificate_id": certificate_id, "region": region,
+            "retired": retired})
 
     def get_rec_balance(self):
         return sum(r["mwh"] for r in self._data["rec_ledger"])
 
-    def save_net_zero_match(self, *a, **kw): pass
-    def save_chaos_experiment(self, *a, **kw): pass
-    def save_xai_explanation(self, *a, **kw): pass
-    def save_temporal_rule(self, *a, **kw): pass
-    def save_temporal_trace(self, *a, **kw): pass
-    def save_temporal_violation(self, *a, **kw): pass
-    def save_teacher_superposition(self, *a, **kw): pass
-    def save_causal_edge(self, *a, **kw): pass
+    def save_net_zero_match(self, match_id, workload_kwh, intensity, action,
+                            carbon_kg, offset_cost, credit_price):
+        self._data["net_zero_matches"].append({
+            "match_id": match_id, "workload_kwh": workload_kwh,
+            "intensity": intensity, "action": action,
+            "carbon_kg": carbon_kg, "offset_cost": offset_cost,
+            "credit_price": credit_price})
+
+    def save_chaos_experiment(self, experiment_id, name, fault_type,
+                              blast_radius, steady_before, steady_after,
+                              status, duration_ms=0.0):
+        self._data["chaos_experiments"].append({
+            "experiment_id": experiment_id, "name": name,
+            "fault_type": fault_type, "blast_radius": blast_radius,
+            "steady_before": steady_before, "steady_after": steady_after,
+            "status": status, "duration_ms": duration_ms})
+
+    def save_xai_explanation(self, explanation_id, decision_id, method,
+                             label, features, attributions, nl):
+        self._data["xai_explanations"].append({
+            "explanation_id": explanation_id, "decision_id": decision_id,
+            "method": method, "label": label, "features": features,
+            "attributions": attributions, "natural_language": nl})
+
+    def save_temporal_rule(self, rule_id, formula, operator, severity,
+                           description, window, active):
+        self._data["temporal_rules"].append({
+            "rule_id": rule_id, "formula": formula,
+            "operator": operator, "severity": severity,
+            "description": description, "window": window, "active": active})
+
+    def save_temporal_trace(self, state, context=None):
+        self._data["temporal_trace"].append({"state": state, "context": context})
+
+    def save_temporal_violation(self, rule_id, formula, step, state,
+                                severity="warning", approved=None):
+        self._data["temporal_violations"].append({
+            "rule_id": rule_id, "formula": formula, "step": step,
+            "state": state, "severity": severity, "approved": approved})
+
+    def save_teacher_superposition(self, student_id, teacher_id, weight,
+                                   temperature, amplitude, kl):
+        self._data["teacher_superpositions"].append({
+            "student_id": student_id, "teacher_id": teacher_id,
+            "weight": weight, "temperature": temperature,
+            "amplitude": amplitude, "kl": kl})
+
+    def save_causal_edge(self, source, target, weight, confidence):
+        self._data["causal_graph"].append({
+            "source": source, "target": target,
+            "weight": weight, "confidence": confidence})
+
+    def save_agent(self, agent_id, role, reputation, utilities):
+        self._data["agent_registry"].append({
+            "agent_id": agent_id, "role": role,
+            "reputation": reputation, "utilities": utilities})
+
+    def save_agent_message(self, message_id, topic, sender, recipient, payload):
+        self._data["agent_messages"].append({
+            "message_id": message_id, "topic": topic,
+            "sender": sender, "recipient": recipient, "payload": payload})
+
+    def enqueue_hitl_request(self, request_id, rule_id, state, severity):
+        self._data["hitl_approval_queue"].append({
+            "request_id": request_id, "rule_id": rule_id,
+            "state": state, "severity": severity, "status": "pending"})
+
+    def resolve_hitl_request(self, request_id, status="approved"):
+        for r in self._data["hitl_approval_queue"]:
+            if r["request_id"] == request_id:
+                r["status"] = status
 
     def save_user_preference(self, user_id, weights):
         self._prefs[user_id] = dict(weights)
@@ -1513,6 +2221,8 @@ async def _demo():
         "precision_switch_threshold": 0.02,
         "chaos_intensity": 0.05,
         "chaos_blast_radius": 0.1,
+        "federated_dp_epsilon": 1.0,
+        "federated_intensity": 0.2,
     }
 
     storage = InMemoryStorage()
@@ -1520,43 +2230,50 @@ async def _demo():
     await orch.start()
 
     print("=" * 80)
-    print("federated_green_learning.py v17.0.0 — Demo")
+    print("federated_green_learning.py v17.1.0 — Demo")
     print("=" * 80)
 
-    # ---------------------------------------------------------------
-    # 1. Correct numpy-based aggregation
-    # ---------------------------------------------------------------
     if NUMPY_AVAILABLE:
+        # ---- 1. Correct numpy-based aggregation ----
         print("\n=== Correct numpy-based aggregation ===")
-        # Two instances share weights
-        w1 = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32).tobytes()
-        w2 = np.array([3.0, 4.0, 5.0, 6.0, 7.0], dtype=np.float32).tobytes()
+        w1 = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32)
+        w2 = np.array([3.0, 4.0, 5.0, 6.0, 7.0], dtype=np.float32)
+
+        # Serialize with the required magic prefix.
+        w1_bytes = orch.federated._serialize(
+            {"format": "numpy_f32", "data": w1})
+        w2_bytes = orch.federated._serialize(
+            {"format": "numpy_f32", "data": w2})
 
         await orch.federated.share_weights(
-            "mopd_student", w1, sample_count=100, apply_dp=False)
-        # Simulate a peer sharing its weights
+            "mopd_student", w1_bytes, sample_count=100, apply_dp=False)
+        # Simulate a peer sharing its weights.
         await asyncio.to_thread(
             storage.save_federated_weights,
-            "peer_01", "mopd_student@1.0.0", w2, 200.0, 0)
+            "peer_01", "mopd_student@1.0.0", w2_bytes, 200.0, 0)
+        # Trust the peer explicitly (default trust score is 0.5, floor is 0.3).
+        orch.federated.reputation["peer_01"] = 1.0
 
         agg = await orch.federated.pull_aggregated_weights(
             "mopd_student", "1.0.0")
         if agg:
-            result = np.frombuffer(agg, dtype=np.float32)
-            print(f"  Instance A weights: {np.frombuffer(w1, dtype=np.float32)}")
-            print(f"  Instance B weights: {np.frombuffer(w2, dtype=np.float32)}")
+            obj = orch.federated._try_deserialize(agg)
+            result = obj["data"]
+            print(f"  Instance A weights: {w1}")
+            print(f"  Instance B weights: {w2}")
             print(f"  Weighted aggregate: {result}")
-            expected = (100 * np.array([1, 2, 3, 4, 5], dtype=np.float32) +
-                        200 * np.array([3, 4, 5, 6, 7], dtype=np.float32)) / 300
+            expected = (100 * w1 + 200 * w2) / 300
             print(f"  Expected (weighted): {expected}")
             print(f"  Match: {np.allclose(result, expected, atol=1e-5)}")
 
-    # ---------------------------------------------------------------
-    # 2. Full federated round
-    # ---------------------------------------------------------------
+    # ---- 2. Full federated round ----
     print("\n=== Full federated round ===")
-    local = (np.array([1.0, 2.0, 3.0], dtype=np.float32).tobytes()
-             if NUMPY_AVAILABLE else b"\x01\x02\x03")
+    if NUMPY_AVAILABLE:
+        local = orch.federated._serialize(
+            {"format": "numpy_f32",
+             "data": np.array([1.0, 2.0, 3.0], dtype=np.float32)})
+    else:
+        local = b""
     result = await orch.federated_round(
         model_id="mopd_student",
         local_weights=local,
@@ -1569,35 +2286,51 @@ async def _demo():
     print(f"  converged: {result.get('converged')}")
     print(f"  temporal_violations: {result.get('temporal_violations')}")
 
-    # ---------------------------------------------------------------
-    # 3. Reputation filtering
-    # ---------------------------------------------------------------
+    # ---- 3. Reputation filtering ----
     print("\n=== Reputation filtering ===")
     orch.federated.reputation["malicious_peer"] = 0.1
+    if NUMPY_AVAILABLE:
+        poison = orch.federated._serialize(
+            {"format": "numpy_f32",
+             "data": np.array([99.0] * 3, dtype=np.float32)})
+    else:
+        poison = b""
     await asyncio.to_thread(
         storage.save_federated_weights,
-        "malicious_peer", "mopd_student@1.0.0",
-        b"\xff" * 12, 100.0, 0)
+        "malicious_peer", "mopd_student@1.0.0", poison, 100.0, 0)
     trusted = await orch.federated.pull_aggregated_weights(
         "mopd_student", "1.0.0", reputation_floor=0.5)
     print(f"  Malicious peer reputation: 0.1 (floor 0.5)")
     print(f"  Trusted aggregate returned: {trusted is not None}")
 
-    # ---------------------------------------------------------------
-    # 4. Differential privacy
-    # ---------------------------------------------------------------
+    # ---- 4. Differential privacy ----
     print("\n=== Differential privacy ===")
     orch.federated.dp_epsilon = 0.5
-    await orch.federated.share_weights(
-        "dp_test", local, sample_count=50, apply_dp=True)
-    dp_shared = storage._data["federated_weights"][-1]["weights"]
-    print(f"  Original bytes: {len(local)}")
-    print(f"  DP-shared bytes: {len(dp_shared)}")
-    print(f"  Noisy (expected): {local != dp_shared}")
+    if NUMPY_AVAILABLE:
+        dp_input = orch.federated._serialize(
+            {"format": "numpy_f32",
+             "data": np.array([1.0, 2.0, 3.0], dtype=np.float32)})
+        await orch.federated.share_weights(
+            "dp_test", dp_input, sample_count=50, apply_dp=True)
+        # Find the latest dp_test row.
+        rows = [r for r in storage._data["federated_weights"]
+                if r["model_id"] == "dp_test@1.0.0"]
+        if rows:
+            dp_shared = rows[-1]["weights"]
+            print(f"  Original bytes: {len(dp_input)}")
+            print(f"  DP-shared bytes: {len(dp_shared)}")
+            print(f"  Noisy (expected): {dp_input != dp_shared}")
 
-    # ---------------------------------------------------------------
-    # 5. Health check
-    # ---------------------------------------------------------------
+    # ---- 5. Convergence check ----
+    print("\n=== Convergence check ===")
+    converged1 = await orch.federated.has_converged(
+        model_id="mopd_student", version="1.0.0")
+    converged2 = await orch.federated.has_converged(
+        model_id="mopd_student", version="1.0.0")
+    print(f"  First check: {converged1}")
+    print(f"  Second check (identical inputs → should be True): {converged2}")
+
+    # ---- 6. Health check ----
     print("\n=== Health check ===")
     print(json.dumps(await orch.health_check(), indent=2, default=str))
 
