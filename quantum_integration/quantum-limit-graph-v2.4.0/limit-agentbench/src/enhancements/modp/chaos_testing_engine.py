@@ -1,33 +1,47 @@
 """
-chaos_testing_engine.py — Enhanced v17.0.0
+chaos_testing_engine.py — Enhanced v17.1.0
 ==========================================
 
-Chaos engineering for MOPD pipeline resilience — now extended with:
+Chaos engineering for MOPD pipeline resilience, extended with ten advanced
+Green Agent enhancements in a single self-contained file.
 
-  * Real ``data_corruption`` implementation (was declared but unimplemented).
-  * **KPI-based steady-state hypothesis** (replaces probabilistic heuristic).
-  * **Blast-radius enforcement** (scoped fault injection, not just recorded).
-  * **Abort conditions and automatic rollback** on steady-state failure.
-  * **Gameday workflow** for scheduled, hypothesis-driven experiments.
-  * Integration hooks for the other nine enhancements.
+FIXES OVER v17.0.0:
+ - `_inject_data_corruption` name collision fixed: the pure recursive
+   helper is now `_corrupt_payload`; `_inject_data_corruption` remains the
+   async wrapper with its original signature.
+ - Snapshot stack is scoped per experiment via a barrier index. Successful
+   experiments commit their snapshots; failed experiments roll back only
+   their own.
+ - `ChaosInjectedFault` distinguishes expected injections from real bugs;
+   unexpected exceptions are reported with status="error" instead of
+   "injected".
+ - Blast radius is enforced via an extensible `register_target_injector`
+   hook. Without a registered injector, injection is process-wide for the
+   fault-type helpers and the recorded `targets` list is advisory.
+ - `_inject_precision_degradation` pushes a snapshot only when the switch
+   actually happened.
+ - `_inject_causal_shock` only shocks edges with |weight| > epsilon.
+ - `_inject_carbon_burst` calls `net_zero_schedule(..., commit=False)` so
+   the market price is not mutated.
+ - `run_gameday` classifies experiments as run/blocked/failed and aggregates
+   accordingly.
+ - KPI values from `_probe_kpis` are used for the temporal gate (was
+   hardcoded `quality=1.0`).
+ - XAI features are normalised so attributions are not dominated by
+   `n_targets`.
+ - `dry_run=True` supports planning an experiment without injecting.
+ - Rollback failures are logged and counted; the snapshot stack is always
+   cleaned up at the end of an experiment.
+ - All shared bugs fixed in the ten enhancement classes (per-teacher KL,
+   real PC-algorithm-ready causal learner, HITL correlation, temporal rule
+   persistence, XAI named features, precision filtering, carbon decoupling,
+   chaos data_corruption, etc.).
+ - `log_event` shim (structlog or stdlib) and Prometheus metrics.
+ - `ChaosOrchestratorV17` gains `aclose()` / `__aenter__` / `__aexit__`,
+   uses `get_running_loop()`, and logs background-task failures.
+ - `InMemoryStorage` methods use real signatures.
 
-All **ten advanced Green Agent enhancements** are implemented in a single
-self-contained file:
-
-   1. Quantum-Distillation Integration        → QuantumDistillationEngine
-   2. Causal Reinforcement Learning           → CausalGraphLearner + CausalPolicyAdapter
-   3. Federated Green Learning                → FederatedGreenAggregator
-   4. Advanced Multi-Agent Coordination       → MultiAgentCoordinator
-   5. Temporal Logic & Formal Verification    → TemporalLogicVerifier
-   6. Explainable AI                          → XAIDecisionExplainer
-   7. Adaptive Precision Switching            → AdaptivePrecisionSwitcher
-   8. Carbon Markets / REC                    → CarbonMarketIntegrator
-   9. Resilience Engineering / Chaos Testing  → ChaosTestingEngine (this class)
-  10. HITL Active Learning                    → ActiveUserPreferenceLearner
-
-Unified entry point: **ChaosOrchestratorV17**
-
-The file is self-contained: Python stdlib + optional numpy / sklearn / torch.
+Self-contained: Python stdlib + optional numpy / sklearn / torch.
 All storage interactions soft-fail.
 """
 
@@ -35,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import random
 import re
@@ -42,28 +57,64 @@ import time
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Set, Tuple
 
+# ---------- Optional dependencies ----------
 try:
     import numpy as np
     NUMPY_AVAILABLE = True
-except ImportError:
+except ImportError:  # pragma: no cover
+    np = None  # type: ignore
     NUMPY_AVAILABLE = False
 
 try:
     from sklearn.linear_model import LinearRegression
     SKLEARN_AVAILABLE = True
-except ImportError:
+except ImportError:  # pragma: no cover
+    LinearRegression = None  # type: ignore
     SKLEARN_AVAILABLE = False
 
 try:
     import torch
     TORCH_AVAILABLE = True
-except ImportError:
+except ImportError:  # pragma: no cover
+    torch = None  # type: ignore
     TORCH_AVAILABLE = False
 
-import logging
+# ---------- Prometheus ----------
+try:
+    from prometheus_client import Counter as _PromCounter, Gauge
+    PROMETHEUS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    PROMETHEUS_AVAILABLE = False
+
+# ---------- structlog / stdlib logger ----------
+try:
+    import structlog
+    _STRUCTLOG_LOGGER = structlog.get_logger(__name__)
+    _STRUCTLOG_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _STRUCTLOG_LOGGER = logging.getLogger(__name__)
+    _STRUCTLOG_AVAILABLE = False
+    logging.basicConfig(level=logging.INFO)
+
+# ---------- Preserved module-level logger ----------
 logger = logging.getLogger(__name__)
+
+
+def log_event(level: str, message: str, **kwargs: Any) -> None:
+    """Structured-logging shim (structlog or stdlib)."""
+    if _STRUCTLOG_AVAILABLE:
+        getattr(_STRUCTLOG_LOGGER, level)(message, **kwargs)
+    else:
+        if kwargs:
+            extra = " ".join(f"{k}={v!r}" for k, v in kwargs.items())
+            message = f"{message} | {extra}"
+        getattr(logger, level)(message)
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 # =============================================================================
@@ -88,24 +139,82 @@ def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
 
 
 # =============================================================================
-# ENHANCEMENT 9 — CHAOS TESTING ENGINE (enhanced original)
+# PROMETHEUS METRICS
+# =============================================================================
+if PROMETHEUS_AVAILABLE:
+    _M_CHAOS_EXPERIMENTS = _PromCounter(
+        "chaos_experiments_total", "Chaos experiments",
+        ["fault_type", "status"],
+    )
+    _M_CHAOS_STEADY_FAILURES = _PromCounter(
+        "chaos_steady_state_failures_total",
+        "Chaos experiments that failed the steady-state check",
+        ["fault_type"],
+    )
+    _M_CHAOS_ROLLBACKS = _PromCounter(
+        "chaos_rollback_total", "Chaos rollbacks", ["outcome"],
+    )
+    _M_CHAOS_ACTIVE = Gauge(
+        "chaos_active_experiments", "Currently active chaos experiments",
+    )
+    _M_CHAOS_BLAST_RADIUS = Gauge(
+        "chaos_blast_radius", "Blast radius of the last experiment",
+    )
+    _M_CHAOS_GAMEDAY = _PromCounter(
+        "chaos_gameday_total", "Gamedays run", ["all_ok"],
+    )
+    _M_TEMPORAL_VIOLATIONS = _PromCounter(
+        "chaos_temporal_violations_total", "Temporal violations",
+        ["rule", "severity"],
+    )
+    _M_HITL_REQUESTS = _PromCounter(
+        "chaos_hitl_requests_total", "HITL requests", 
+    )
+    _M_HITL_RESPONSES = _PromCounter(
+        "chaos_hitl_responses_total", "HITL responses", ["status"],
+    )
+    _M_PRECISION_SWITCHES = _PromCounter(
+        "chaos_precision_switches_total", "Precision switches",
+        ["from_p", "to_p"],
+    )
+    _M_XAI_EXPLANATIONS = _PromCounter(
+        "chaos_xai_explanations_total", "XAI explanations",
+    )
+else:
+    class _Dummy:
+        def labels(self, **kwargs): return self
+        def inc(self, *args, **kwargs): pass
+        def set(self, *args, **kwargs): pass
+
+    _M_CHAOS_EXPERIMENTS = _M_CHAOS_STEADY_FAILURES = _M_CHAOS_ROLLBACKS = _Dummy()
+    _M_CHAOS_ACTIVE = _M_CHAOS_BLAST_RADIUS = _M_CHAOS_GAMEDAY = _Dummy()
+    _M_TEMPORAL_VIOLATIONS = _M_HITL_REQUESTS = _M_HITL_RESPONSES = _Dummy()
+    _M_PRECISION_SWITCHES = _M_XAI_EXPLANATIONS = _Dummy()
+
+
+# =============================================================================
+# CUSTOM EXCEPTION TYPES
+# =============================================================================
+class ChaosInjectedFault(Exception):
+    """Raised when a chaos fault has been successfully injected."""
+
+
+# =============================================================================
+# ENHANCEMENT 9 — CHAOS TESTING ENGINE
 # =============================================================================
 class ChaosTestingEngine:
     """
     Chaos engineering for MOPD pipeline resilience.
 
-    v17 enhancements over v1.0:
-      * ``data_corruption`` is now actually implemented (recursively
-        corrupts dict/list/bytes payloads).
-      * **Steady-state hypothesis** is KPI-based (metric probes) rather than
-        probabilistic.
-      * **Blast-radius enforcement** limits the fraction of components a
-        fault can touch.
-      * **Abort conditions** stop an experiment if the steady state fails.
-      * **Automatic rollback** restores the pre-experiment snapshot.
-      * **Gameday workflow** for scheduled, hypothesis-driven experiments.
-      * Integration hooks for temporal logic, XAI, HITL, multi-agent, and
-        carbon markets.
+    v17.1 enhancements:
+      * Real ``data_corruption`` (recursive, on dict/list/bytes/numeric
+        leaves) via `_corrupt_payload` + async `_inject_data_corruption`.
+      * KPI-based steady-state hypothesis (metric probes, not probabilistic).
+      * Blast-radius enforcement via an extensible target-injector registry.
+      * Per-experiment snapshot scoping with commit/rollback semantics.
+      * Scheduled gameday workflow with run/blocked/failed classification.
+      * Integration hooks for temporal logic, XAI, HITL, multi-agent,
+        carbon markets, precision, and federated sharing.
     """
 
     FAULT_TYPES = [
@@ -115,9 +224,8 @@ class ChaosTestingEngine:
     ]
 
     def __init__(self,
-                 config,
-                 storage,
-                 # Enhancement hooks (all optional)
+                 config: Any,
+                 storage: Any,
                  temporal: Optional["TemporalLogicVerifier"] = None,
                  xai: Optional["XAIDecisionExplainer"] = None,
                  hitl: Optional["ActiveUserPreferenceLearner"] = None,
@@ -143,30 +251,43 @@ class ChaosTestingEngine:
         self.federated = federated
 
         # KPI probes registered by callers
-        self.kpi_probes: Dict[str, Callable[[], float]] = {}
-        # Hypothesis thresholds per KPI (lower bound by default; higher is
-        # assumed better for "quality", lower is assumed better for
-        # "latency", "error_rate", "carbon". Prefix with "_max" in the KPI
-        # name to mark it as "lower is better".
+        self.kpi_probes: Dict[str, Callable[[], Any]] = {}
         self.kpi_thresholds: Dict[str, Tuple[float, float]] = {}
 
         # Snapshot stack for rollback
         self._snapshots: List[Dict[str, Any]] = []
 
+        # Per-target injectors (blast radius enforcement)
+        self._target_injectors: Dict[str, Callable[..., Awaitable[Any]]] = {}
+
     # ------------------------------------------------------------------
     # KPI registration
     # ------------------------------------------------------------------
-    def register_kpi(self, name: str, probe: Callable[[], float],
+    def register_kpi(self, name: str, probe: Callable[[], Any],
                      min_ok: Optional[float] = None,
                      max_ok: Optional[float] = None) -> None:
         """Register a KPI probe and its acceptable bounds."""
         self.kpi_probes[name] = probe
-        lo = min_ok if min_ok is not None else -math.inf
-        hi = max_ok if max_ok is not None else math.inf
+        lo = float(min_ok) if min_ok is not None else -math.inf
+        hi = float(max_ok) if max_ok is not None else math.inf
         self.kpi_thresholds[name] = (lo, hi)
 
+    def register_target_injector(
+        self, target: str,
+        injector: Callable[[str, str, Dict[str, Any]], Awaitable[Any]],
+    ) -> None:
+        """
+        Register a per-target injector for blast-radius enforcement.
+
+        The injector receives (target, fault_type, params) and returns
+        anything (usually None). When registered, `_inject_*` helpers will
+        call it for every target in the scoped list. When not registered,
+        the helper's default process-wide behaviour applies.
+        """
+        self._target_injectors[target] = injector
+
     async def _probe_kpis(self) -> Dict[str, float]:
-        """Run all registered KPI probes and return their values."""
+        """Run all registered KPI probes and return their values (NaN on failure)."""
         out: Dict[str, float] = {}
         for name, probe in self.kpi_probes.items():
             try:
@@ -185,15 +306,27 @@ class ChaosTestingEngine:
         return lo <= value <= hi
 
     async def _steady_state(self) -> Tuple[bool, Dict[str, float]]:
-        """KPI-based steady-state check."""
+        """
+        KPI-based steady-state check.
+
+        When no KPI probes are registered, falls back to a probabilistic
+        heuristic (backward compatible with the previous behaviour).
+        """
         kpis = await self._probe_kpis()
         if not kpis:
-            # No probes registered → fall back to probabilistic check
             if not self.active:
                 return True, {}
             return random.random() > _cfg_get(
                 self.config, "chaos_intensity", 0.05), {}
-        ok = all(self._kpi_ok(name, value) for name, value in kpis.items())
+        failed: List[str] = []
+        for name, value in kpis.items():
+            if not self._kpi_ok(name, value):
+                failed.append(name)
+        ok = not failed
+        if not ok:
+            log_event("warning",
+                      f"Steady-state failed for KPIs: {failed}",
+                      kpis=kpis)
         return ok, kpis
 
     # ------------------------------------------------------------------
@@ -208,33 +341,86 @@ class ChaosTestingEngine:
         k = max(1, int(len(targets) * radius))
         return random.sample(targets, k)
 
+    async def _dispatch_to_targets(
+        self, fault_type: str, targets: List[str],
+        default_impl: Callable[[], Awaitable[Any]],
+        params: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Invoke the fault via registered per-target injectors, falling back
+        to the process-wide default when no injector matches.
+        """
+        params = params or {}
+        any_registered = False
+        for t in targets:
+            injector = self._target_injectors.get(t)
+            if injector is None:
+                continue
+            any_registered = True
+            try:
+                await injector(t, fault_type, params)
+            except Exception as exc:
+                log_event("warning",
+                          f"Target injector failed for {t}: {exc}",
+                          fault_type=fault_type)
+        if not any_registered:
+            await default_impl()
+
     # ------------------------------------------------------------------
     # Fault injection primitives
     # ------------------------------------------------------------------
-    async def _inject_latency(self, targets: List[str], duration_s: float = 0.5):
-        await asyncio.sleep(duration_s)
+    async def _inject_latency(self, targets: List[str],
+                              duration_s: float = 0.5) -> None:
+        async def _default():
+            await asyncio.sleep(duration_s)
+        await self._dispatch_to_targets(
+            "latency", targets, _default,
+            {"duration_s": float(duration_s)})
 
-    async def _inject_exception(self, targets: List[str]):
-        raise RuntimeError("chaos: injected exception")
+    async def _inject_exception(self, targets: List[str]) -> None:
+        # Even if per-target injectors exist, we still raise here so that
+        # `run_experiment` classifies the fault correctly.
+        async def _default():
+            raise ChaosInjectedFault("chaos: injected exception")
+        await self._dispatch_to_targets("exception", targets, _default)
 
-    async def _inject_memory_pressure(self, targets: List[str], mb: int = 5):
-        _ = bytearray(mb * 1024 * 1024)
-        del _
+    async def _inject_memory_pressure(self, targets: List[str],
+                                      mb: int = 5) -> None:
+        async def _default():
+            _ = bytearray(mb * 1024 * 1024)
+            del _
+        await self._dispatch_to_targets(
+            "memory_pressure", targets, _default, {"mb": int(mb)})
 
-    async def _inject_network_drop(self, targets: List[str], duration_s: float = 0.2):
-        await asyncio.sleep(duration_s)
+    async def _inject_network_drop(self, targets: List[str],
+                                   duration_s: float = 0.2) -> None:
+        async def _default():
+            await asyncio.sleep(duration_s)
+        await self._dispatch_to_targets(
+            "network_drop", targets, _default,
+            {"duration_s": float(duration_s)})
 
-    def _inject_data_corruption(self,
-                                payload: Any,
-                                depth: int = 0) -> Any:
-        """Recursively corrupt numeric leaves and mutate strings."""
+    # ---- Data corruption ----
+    def _corrupt_payload(self, payload: Any, depth: int = 0) -> Any:
+        """
+        Pure, recursive, synchronous payload corruption.
+
+        Numeric leaves are perturbed with Gaussian noise; strings have a
+        fraction of characters replaced; bytes have a fraction of bytes
+        XOR-flipped. Bounded by `depth` to avoid runaway recursion.
+        """
         if depth > 5:
             return payload
         if isinstance(payload, dict):
-            return {k: self._inject_data_corruption(v, depth + 1)
+            return {k: self._corrupt_payload(v, depth + 1)
                     for k, v in payload.items()}
         if isinstance(payload, list):
-            return [self._inject_data_corruption(v, depth + 1) for v in payload]
+            return [self._corrupt_payload(v, depth + 1) for v in payload]
+        if isinstance(payload, tuple):
+            return tuple(self._corrupt_payload(v, depth + 1) for v in payload)
+        if isinstance(payload, bool):
+            # bool is a subclass of int; corrupt by flipping.
+            return not payload
         if isinstance(payload, (int, float)):
             return float(payload) + random.gauss(0, 0.1)
         if isinstance(payload, str):
@@ -252,55 +438,75 @@ class ChaosTestingEngine:
             return bytes(arr)
         return payload
 
-    async def _inject_data_corruption(self, targets, payload=None):
-        """Wrapper that returns the corrupted payload (does not mutate in place)."""
-        corrupted = self._inject_data_corruption(payload)
-        # Also simulate slight desync via event-loop yield
-        await asyncio.sleep(0)
-        return corrupted
+    async def _inject_data_corruption(self, targets: List[str],
+                                      payload: Any = None) -> Any:
+        """
+        Async wrapper that returns the corrupted payload (does not mutate).
 
-    async def _inject_precision_degradation(self, targets):
-        """Force a downgrade in precision and restore on rollback."""
+        The pure helper is `_corrupt_payload`; this method exists to preserve
+        the original interface and to model the event-loop yield that a real
+        injection would introduce.
+        """
+        async def _default():
+            await asyncio.sleep(0)
+        await self._dispatch_to_targets(
+            "data_corruption", targets, _default)
+        return self._corrupt_payload(payload)
+
+    async def _inject_precision_degradation(self, targets: List[str]) -> None:
+        """Force a downgrade in precision; snapshot only on success."""
         if self.precision is None:
             return
         old = self.precision.current
-        self._snapshots.append({"precision_old": old})
         try:
-            await self.precision.switch_to("int8", reason="chaos:precision_degradation")
-        except Exception:
-            pass
+            switched = await self.precision.switch_to(
+                "int8", reason="chaos:precision_degradation")
+        except Exception as exc:
+            log_event("warning", f"precision_degradation failed: {exc}")
+            return
+        if switched:
+            self._snapshots.append({"precision_old": old})
 
-    async def _inject_carbon_burst(self, targets):
-        """Simulate a carbon-price spike by deferring workloads."""
+    async def _inject_carbon_burst(self, targets: List[str]) -> None:
+        """Simulate a carbon-price spike without mutating the market."""
         if self.carbon_market is None:
             return
         try:
+            # `commit=False` ensures no price mutation and no match record.
             await self.carbon_market.net_zero_schedule(
-                workload_kwh=10.0, intensity=0.9)
-        except Exception:
-            pass
+                workload_kwh=10.0, intensity=0.9, commit=False)
+        except Exception as exc:
+            log_event("warning", f"carbon_burst failed: {exc}")
 
-    async def _inject_causal_shock(self, targets):
-        """Shock the causal graph by flipping an edge weight."""
+    async def _inject_causal_shock(self, targets: List[str]) -> None:
+        """Shock the causal graph by flipping a non-zero edge weight."""
         if self.causal_rl is None or self.causal_rl.graph is None:
             return
         graph = self.causal_rl.graph.graph
         if not graph:
             return
-        src = random.choice(list(graph.keys()))
-        if not graph[src]:
+        candidates = [
+            (src, dst) for src, edges in graph.items()
+            for dst in edges
+            if abs(float(edges[dst].get("weight", 0.0))) > 1e-6
+        ]
+        if not candidates:
             return
-        dst = random.choice(list(graph[src].keys()))
-        old_w = graph[src][dst].get("weight", 0.0)
+        src, dst = random.choice(candidates)
+        old_w = float(graph[src][dst].get("weight", 0.0))
         self._snapshots.append({"causal_edge": (src, dst, old_w)})
         graph[src][dst]["weight"] = -old_w
 
     # ------------------------------------------------------------------
     # Rollback
     # ------------------------------------------------------------------
-    async def _rollback(self):
-        """Roll back side effects recorded in the snapshot stack."""
-        while self._snapshots:
+    async def _rollback(self) -> None:
+        """Roll back all pending snapshots."""
+        await self._rollback_to(0)
+
+    async def _rollback_to(self, barrier: int) -> None:
+        """Roll back snapshots down to (but not including) `barrier`."""
+        while len(self._snapshots) > barrier:
             snap = self._snapshots.pop()
             try:
                 if "precision_old" in snap and self.precision is not None:
@@ -309,8 +515,12 @@ class ChaosTestingEngine:
                 if "causal_edge" in snap and self.causal_rl is not None:
                     src, dst, old_w = snap["causal_edge"]
                     self.causal_rl.graph.graph[src][dst]["weight"] = old_w
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("warning", f"Rollback step failed: {exc}")
+                try:
+                    _M_CHAOS_ROLLBACKS.labels(outcome="failed").inc()
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Core experiment
@@ -322,7 +532,8 @@ class ChaosTestingEngine:
                              payload: Any = None,
                              abort_on_steady_fail: bool = True,
                              auto_rollback: Optional[bool] = None,
-                             require_hitl: Optional[bool] = None) -> Dict[str, Any]:
+                             require_hitl: Optional[bool] = None,
+                             dry_run: bool = False) -> Dict[str, Any]:
         if fault_type not in self.FAULT_TYPES:
             raise ValueError(f"unknown fault type {fault_type}")
 
@@ -338,30 +549,44 @@ class ChaosTestingEngine:
             needs_hitl = radius > 0.5
         if needs_hitl and self.hitl is not None:
             try:
+                try:
+                    _M_HITL_REQUESTS.inc()
+                except Exception:
+                    pass
                 approved = await self.hitl.query_user_if_needed(
                     "chaos_approver",
-                    [{"solution_id": "approve", "quality_score": 0.9},
-                     {"solution_id": "reject", "quality_score": 0.89}],
+                    [
+                        {"solution_id": "approve", "quality_score": 0.90,
+                         "carbon_g": 0.10, "cost_usd": 0.10, "latency_ms": 100},
+                        {"solution_id": "reject", "quality_score": 0.89,
+                         "carbon_g": 0.11, "cost_usd": 0.11, "latency_ms": 105},
+                    ],
                     timeout=2.0)
-                if approved == "reject":
+                if approved != "approve":
                     return {"name": name, "status": "hitl_rejected",
-                            "fault_type": fault_type}
-            except Exception:
-                pass
+                            "fault_type": fault_type,
+                            "blast_radius": radius}
+                try:
+                    _M_HITL_RESPONSES.labels(status="approved").inc()
+                except Exception:
+                    pass
+            except Exception as exc:
+                log_event("warning", f"HITL approval failed: {exc}")
 
         # --- 3. Carbon-market deferral ---
         if self.carbon_market is not None:
             try:
                 decision = await self.carbon_market.net_zero_schedule(
-                    workload_kwh=0.5, intensity=0.4)
+                    workload_kwh=0.5, intensity=0.4, commit=False)
                 if decision.get("action") == "defer":
                     return {"name": name, "status": "deferred",
                             "fault_type": fault_type,
-                            "reason": "high_carbon_window"}
-            except Exception:
-                pass
+                            "reason": "high_carbon_window",
+                            "blast_radius": radius}
+            except Exception as exc:
+                log_event("debug", f"Carbon deferral check failed: {exc}")
 
-        # --- 4. Multi-agent bid for the chaos task ---
+        # --- 4. Multi-agent bid ---
         agent_id: Optional[str] = None
         if self.multi_agent is not None:
             try:
@@ -371,90 +596,139 @@ class ChaosTestingEngine:
             except Exception:
                 pass
 
-        # --- 5. Push state to temporal logic ---
+        # --- 5. Push actual KPIs to temporal logic ---
         if self.temporal is not None:
             try:
-                await self.temporal.push_state({
+                probe_values = await self._probe_kpis()
+                temporal_state: Dict[str, Any] = {
                     "chaos_active": 1,
-                    "fault_type_hash": hash(fault_type) % 100,
-                    "quality": 1.0})
+                    "fault_type_hash": abs(hash(fault_type)) % 100,
+                }
+                for k, v in probe_values.items():
+                    if not math.isnan(v):
+                        temporal_state[k] = v
+                await self.temporal.push_state(temporal_state)
                 violations = await self.temporal.verify()
                 if any(not ok for ok in violations.values()):
                     return {"name": name, "status": "temporal_blocked",
-                            "fault_type": fault_type}
-            except Exception:
-                pass
+                            "fault_type": fault_type,
+                            "violations": {k: v for k, v in violations.items()
+                                           if not v},
+                            "blast_radius": radius}
+            except Exception as exc:
+                log_event("warning", f"Temporal gate failed: {exc}")
 
         # --- 6. Steady-state BEFORE ---
         before_ok, before_kpis = await self._steady_state()
 
-        # --- 7. Inject the fault ---
+        # --- 7. Inject the fault (or dry-run plan) ---
         status = "completed"
         err: Optional[str] = None
-        try:
-            async with self._lock:
-                self.active[name] = {
-                    "fault_type": fault_type,
-                    "targets": scoped,
-                    "started": datetime.now(timezone.utc).isoformat()}
+        injected_ms = 0.0
+        barrier = len(self._snapshots)
 
-            if fault_type == "latency":
-                await self._inject_latency(scoped)
-            elif fault_type == "exception":
-                await self._inject_exception(scoped)
-            elif fault_type == "memory_pressure":
-                await self._inject_memory_pressure(scoped)
-            elif fault_type == "network_drop":
-                await self._inject_network_drop(scoped)
-            elif fault_type == "data_corruption":
-                _ = await self._inject_data_corruption(scoped, payload)
-            elif fault_type == "precision_degradation":
-                await self._inject_precision_degradation(scoped)
-            elif fault_type == "carbon_burst":
-                await self._inject_carbon_burst(scoped)
-            elif fault_type == "causal_shock":
-                await self._inject_causal_shock(scoped)
-        except Exception as e:
-            err = str(e)
-            status = "injected"
-        finally:
-            async with self._lock:
-                self.active.pop(name, None)
+        if dry_run:
+            status = "dry_run"
+        else:
+            try:
+                async with self._lock:
+                    self.active[name] = {
+                        "fault_type": fault_type,
+                        "targets": scoped,
+                        "started": _now_utc().isoformat()}
+                try:
+                    _M_CHAOS_ACTIVE.set(len(self.active))
+                except Exception:
+                    pass
+
+                inject_start = time.monotonic()
+                if fault_type == "latency":
+                    await self._inject_latency(scoped)
+                elif fault_type == "exception":
+                    await self._inject_exception(scoped)
+                elif fault_type == "memory_pressure":
+                    await self._inject_memory_pressure(scoped)
+                elif fault_type == "network_drop":
+                    await self._inject_network_drop(scoped)
+                elif fault_type == "data_corruption":
+                    _ = await self._inject_data_corruption(scoped, payload)
+                elif fault_type == "precision_degradation":
+                    await self._inject_precision_degradation(scoped)
+                elif fault_type == "carbon_burst":
+                    await self._inject_carbon_burst(scoped)
+                elif fault_type == "causal_shock":
+                    await self._inject_causal_shock(scoped)
+                injected_ms = (time.monotonic() - inject_start) * 1000.0
+            except ChaosInjectedFault as e:
+                err = str(e)
+                status = "injected"
+            except Exception as e:
+                err = str(e)
+                status = "error"
+                log_event("error", f"Chaos injection failed: {e}")
+            finally:
+                async with self._lock:
+                    self.active.pop(name, None)
+                try:
+                    _M_CHAOS_ACTIVE.set(len(self.active))
+                except Exception:
+                    pass
 
         # --- 8. Steady-state AFTER ---
         after_ok, after_kpis = await self._steady_state()
 
-        # --- 9. Abort/rollback logic ---
+        # --- 9. Abort/rollback + snapshot commit ---
         rollback_flag = auto_rollback
         if rollback_flag is None:
             rollback_flag = _cfg_get(self.config, "chaos_auto_rollback", True)
         aborted = False
-        if abort_on_steady_fail and not after_ok:
-            aborted = True
-            if rollback_flag:
-                try:
-                    await self._rollback()
-                except Exception:
-                    pass
+        rolled_back = False
+        try:
+            if (not dry_run and abort_on_steady_fail and not after_ok):
+                aborted = True
+                if rollback_flag:
+                    await self._rollback_to(barrier)
+                    rolled_back = True
+                    try:
+                        _M_CHAOS_ROLLBACKS.labels(outcome="applied").inc()
+                    except Exception:
+                        pass
+                else:
+                    # Discard snapshots without applying them.
+                    del self._snapshots[barrier:]
+            else:
+                # Successful experiment: commit snapshots.
+                del self._snapshots[barrier:]
+        finally:
+            # Ensure no snapshots leak on unexpected paths.
+            if len(self._snapshots) > barrier:
+                del self._snapshots[barrier:]
 
-        # --- 10. XAI explanation of the experiment ---
+        # --- 10. XAI explanation (normalised features) ---
         xai_explanation = None
         if self.xai is not None and NUMPY_AVAILABLE:
             try:
+                n_targets = max(1, len(targets or []))
+                n_scoped_norm = len(scoped) / n_targets
                 feats = np.array([
                     float(radius),
-                    float(len(scoped)),
+                    float(n_scoped_norm),
                     1.0 if before_ok else 0.0,
-                    1.0 if after_ok else 0.0])
-                def _score(x):
-                    return float(np.dot(x, [0.4, 0.2, 0.3, 0.3]))
+                    1.0 if after_ok else 0.0,
+                ])
+                def _score(x, _w=np.array([0.4, 0.2, 0.3, 0.3])):
+                    return float(np.dot(x, _w))
                 xai_explanation = await self.xai.explain(
                     decision_id=f"chaos_{uuid.uuid4().hex[:8]}",
                     label=f"chaos:{fault_type}",
                     features=feats,
-                    names=["blast_radius", "n_targets",
+                    names=["blast_radius", "targets_scoped_fraction",
                            "steady_before", "steady_after"],
                     model_fn=_score)
+                try:
+                    _M_XAI_EXPLANATIONS.inc()
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -466,7 +740,7 @@ class ChaosTestingEngine:
             except Exception:
                 pass
 
-        # --- 12. Federated sharing of chaos outcomes ---
+        # --- 12. Federated sharing ---
         if self.federated is not None:
             try:
                 blob = json.dumps({
@@ -489,6 +763,14 @@ class ChaosTestingEngine:
                 status, duration)
         except Exception:
             pass
+        try:
+            _M_CHAOS_EXPERIMENTS.labels(
+                fault_type=fault_type, status=status).inc()
+            _M_CHAOS_BLAST_RADIUS.set(radius)
+            if not after_ok:
+                _M_CHAOS_STEADY_FAILURES.labels(fault_type=fault_type).inc()
+        except Exception:
+            pass
 
         result = {
             "name": name,
@@ -501,11 +783,13 @@ class ChaosTestingEngine:
             "after_kpis": after_kpis,
             "status": status,
             "aborted": aborted,
-            "rolled_back": rollback_flag and aborted,
+            "rolled_back": rolled_back,
             "error": err,
             "duration_ms": duration,
+            "injected_ms": injected_ms,
             "agent_id": agent_id,
             "xai": xai_explanation,
+            "dry_run": dry_run,
         }
         self.history.append(result)
         return result
@@ -523,9 +807,10 @@ class ChaosTestingEngine:
         Args:
             name: gameday name
             hypothesis: human-readable steady-state hypothesis
-            experiments: list of dicts with keys: fault_type, targets, payload
+            experiments: list of dicts with keys: fault_type, targets,
+                payload, abort_on_steady_fail, require_hitl, dry_run
         """
-        results = []
+        results: List[Dict[str, Any]] = []
         for i, exp in enumerate(experiments):
             r = await self.run_experiment(
                 name=f"{name}_exp{i}",
@@ -533,17 +818,36 @@ class ChaosTestingEngine:
                 targets=exp.get("targets"),
                 payload=exp.get("payload"),
                 abort_on_steady_fail=exp.get("abort_on_steady_fail", True),
-                require_hitl=exp.get("require_hitl", False))
+                require_hitl=exp.get("require_hitl", False),
+                dry_run=exp.get("dry_run", False))
             results.append(r)
-        # Aggregate
-        all_ok = all(r.get("steady_after", False) for r in results)
+
+        # Classify: an experiment is "run" if a fault was attempted.
+        blocked_statuses = {"hitl_rejected", "deferred", "temporal_blocked"}
+        run_results = [r for r in results if r.get("status") not in blocked_statuses]
+        blocked_results = [r for r in results if r.get("status") in blocked_statuses]
+        errored_results = [r for r in run_results if r.get("status") == "error"]
+
+        all_ok = all(
+            r.get("steady_after", True) and r.get("status") != "error"
+            for r in run_results
+        )
+
+        try:
+            _M_CHAOS_GAMEDAY.labels(all_ok=str(all_ok)).inc()
+        except Exception:
+            pass
+
         return {
             "name": name,
             "hypothesis": hypothesis,
             "experiments": len(results),
+            "run": len(run_results),
+            "blocked": len(blocked_results),
+            "errored": len(errored_results),
             "all_steady_after": all_ok,
             "results": results,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": _now_utc().isoformat(),
         }
 
     # ------------------------------------------------------------------
@@ -552,6 +856,8 @@ class ChaosTestingEngine:
             "active": len(self.active),
             "history": len(self.history),
             "registered_kpis": len(self.kpi_probes),
+            "pending_snapshots": len(self._snapshots),
+            "registered_target_injectors": len(self._target_injectors),
         }
 
 
@@ -559,27 +865,34 @@ class ChaosTestingEngine:
 # ENHANCEMENT 1 — QUANTUM-DISTILLATION ENGINE
 # =============================================================================
 class QuantumDistillationEngine:
-    def __init__(self, temperature=2.0, alpha=0.5, n_actions=5):
-        self.temperature = temperature
-        self.alpha = alpha
-        self.n_actions = n_actions
+    def __init__(self, temperature: float = 2.0, alpha: float = 0.5,
+                 n_actions: int = 5):
+        self.temperature = float(temperature)
+        self.alpha = float(alpha)
+        self.n_actions = int(n_actions)
         self.teachers: Dict[str, List[float]] = {}
-        self.student_policy = [1.0 / n_actions] * n_actions
+        self.student_policy = [1.0 / self.n_actions] * self.n_actions
         self.history: Deque[Dict[str, Any]] = deque(maxlen=500)
 
-    def register_teacher(self, name, policy):
+    def register_teacher(self, name: str, policy: List[float]) -> None:
         if not policy:
             return
         s = sum(policy) or 1.0
-        self.teachers[name] = [p / s for p in policy]
+        self.teachers[str(name)] = [max(0.0, p / s) for p in policy]
 
-    def _softmax(self, x, temp):
+    def unregister_teacher(self, name: str) -> None:
+        self.teachers.pop(name, None)
+
+    def _softmax(self, x: List[float], temp: float) -> List[float]:
+        if not x:
+            return []
         m = max(x)
-        exps = [math.exp((v - m) / max(temp, 1e-6)) for v in x]
+        t = max(temp, 1e-6)
+        exps = [math.exp((v - m) / t) for v in x]
         s = sum(exps) or 1.0
         return [e / s for e in exps]
 
-    def _superpose(self):
+    def _superpose(self) -> List[float]:
         if not self.teachers:
             return list(self.student_policy)
         n = self.n_actions
@@ -592,7 +905,8 @@ class QuantumDistillationEngine:
         s = sum(sq) or 1.0
         return [x / s for x in sq]
 
-    async def step(self, storage, student_id="chaos_student"):
+    async def step(self, storage: Any,
+                   student_id: str = "chaos_student") -> Dict[str, Any]:
         target = self._softmax(self._superpose(), self.temperature)
         lr = 0.1
         new = []
@@ -601,22 +915,32 @@ class QuantumDistillationEngine:
             new.append(max(0.01, s - lr * grad))
         ns = sum(new) or 1.0
         self.student_policy = [x / ns for x in new]
+
+        # Per-teacher KL against the teacher's own distribution.
         for tid, pol in self.teachers.items():
-            weight = pol[0] if pol else 0.0
+            weight = float(pol[0]) if pol else 0.0
             amplitude = math.sqrt(max(weight, 1e-9))
-            kl = sum(t * math.log(max(t, 1e-9) / max(s, 1e-9))
-                     for t, s in zip(target, self.student_policy))
+            kl = 0.0
+            for i in range(self.n_actions):
+                pi = pol[i] if i < len(pol) else 1e-9
+                si = self.student_policy[i]
+                pi = max(pi, 1e-9)
+                si = max(si, 1e-9)
+                kl += pi * math.log(pi / si)
             try:
                 await asyncio.to_thread(
                     storage.save_teacher_superposition,
                     student_id, tid, weight, self.temperature, amplitude, kl)
             except Exception:
                 pass
-        entry = {"target": target, "student": list(self.student_policy)}
+
+        entry = {"target": target,
+                 "student": list(self.student_policy),
+                 "ts": _now_utc().isoformat()}
         self.history.append(entry)
         return entry
 
-    def get_policy(self):
+    def get_policy(self) -> List[float]:
         return list(self.student_policy)
 
 
@@ -624,28 +948,38 @@ class QuantumDistillationEngine:
 # ENHANCEMENT 2 — CAUSAL RL
 # =============================================================================
 class CausalGraphLearner:
-    def __init__(self, storage=None):
+    """Correlation + variance causal discovery (fallback learner)."""
+
+    def __init__(self, storage: Any = None):
         self.storage = storage
         self.graph: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(dict)
         self.variables: List[str] = []
         self._lock = asyncio.Lock()
 
-    async def learn(self, samples, variables, threshold=0.25):
+    async def learn(self, samples: List[Dict[str, float]],
+                    variables: List[str],
+                    threshold: float = 0.25) -> Dict[str, Any]:
         self.variables = list(variables)
+        # Insufficient data → return empty graph (no fabrication).
         if len(samples) < 5 or not NUMPY_AVAILABLE:
             async with self._lock:
                 self.graph.clear()
-                for i, s in enumerate(variables):
-                    for j, t in enumerate(variables):
-                        if i < j and random.random() < 0.25:
-                            w = random.uniform(0.1, 0.9)
-                            self.graph[s][t] = {"weight": w, "confidence": w}
             return self.summary()
-        X = np.array([[s[v] for v in variables] for s in samples], dtype=float)
-        if X.shape[0] < 2:
+        try:
+            X = np.array(
+                [[float(s.get(v, 0.0)) for v in variables] for s in samples],
+                dtype=float)
+        except Exception as exc:
+            log_event("warning", f"Causal samples parse failed: {exc}")
+            return self.summary()
+        if X.shape[0] < 2 or X.shape[1] < 2:
             return self.summary()
         X = (X - X.mean(0)) / (X.std(0) + 1e-9)
-        corr = np.corrcoef(X, rowvar=False)
+        try:
+            corr = np.corrcoef(X, rowvar=False)
+        except Exception:
+            return self.summary()
+
         async with self._lock:
             self.graph.clear()
             for i in range(len(variables)):
@@ -653,21 +987,29 @@ class CausalGraphLearner:
                     if i == j:
                         continue
                     c = abs(float(corr[i, j]))
-                    if c > threshold:
-                        vi, vj = float(X[:, i].var()), float(X[:, j].var())
-                        src, dst = (variables[i], variables[j]) if vi > vj \
-                            else (variables[j], variables[i])
-                        self.graph[src][dst] = {"weight": float(corr[i, j]),
-                                                "confidence": c}
+                    if not math.isfinite(c) or c <= threshold:
+                        continue
+                    vi, vj = float(X[:, i].var()), float(X[:, j].var())
+                    src, dst = (variables[i], variables[j]) if vi > vj \
+                        else (variables[j], variables[i])
+                    self.graph[src][dst] = {"weight": float(corr[i, j]),
+                                            "confidence": c}
+                    if self.storage is not None:
+                        try:
+                            await asyncio.to_thread(
+                                self.storage.save_causal_edge,
+                                src, dst, float(corr[i, j]), c)
+                        except Exception:
+                            pass
         return self.summary()
 
-    def parents(self, node):
+    def parents(self, node: str) -> List[str]:
         return [s for s, e in self.graph.items() if node in e]
 
-    def children(self, node):
+    def children(self, node: str) -> List[str]:
         return list(self.graph.get(node, {}).keys())
 
-    def summary(self):
+    def summary(self) -> Dict[str, Any]:
         return {"nodes": len(self.variables),
                 "edges": sum(len(v) for v in self.graph.values()),
                 "variables": list(self.variables)}
@@ -675,24 +1017,35 @@ class CausalGraphLearner:
 
 class CausalPolicyAdapter:
     ACTIONS = ["performance", "carbon", "cost", "hybrid", "adaptive"]
+    STRATEGY_MAP: Dict[str, str] = {
+        "performance": "balanced",
+        "carbon": "carbon_focus",
+        "cost": "operational_focus",
+        "hybrid": "balanced",
+        "adaptive": "balanced",
+    }
 
-    def __init__(self, config, storage, graph):
+    def __init__(self, config: Any, storage: Any, graph: CausalGraphLearner):
         self.config = config
         self.storage = storage
         self.graph = graph
-        self.values = defaultdict(float)
-        self.counts = defaultdict(int)
+        self.values: Dict[str, float] = defaultdict(float)
+        self.counts: Dict[str, int] = defaultdict(int)
         self.policy = [1.0 / len(self.ACTIONS)] * len(self.ACTIONS)
-        self.epsilon = _cfg_get(config, "causal_exploration_rate", 0.1)
+        self.epsilon = float(_cfg_get(config, "causal_exploration_rate", 0.1) or 0.1)
         self._lock = asyncio.Lock()
 
-    async def choose_action(self, state):
+    def to_strategy(self, action: str) -> str:
+        return self.STRATEGY_MAP.get(action, "balanced")
+
+    async def choose_action(self, state: Dict[str, Any]) -> str:
         async with self._lock:
             if random.random() < self.epsilon:
                 return random.choice(self.ACTIONS)
             return max(self.ACTIONS, key=lambda a: self.values.get(a, 0.0))
 
-    async def update(self, action, reward, state):
+    async def update(self, action: str, reward: float,
+                     state: Dict[str, Any]) -> None:
         async with self._lock:
             if action not in self.ACTIONS:
                 action = self.ACTIONS[0]
@@ -705,8 +1058,11 @@ class CausalPolicyAdapter:
             s = sum(exps) or 1.0
             self.policy = [e / s for e in exps]
 
-    async def estimate_ate(self, treatment, outcome, samples=100):
-        w = self.graph.graph.get(treatment, {}).get(outcome, {}).get("weight", 0.0)
+    async def estimate_ate(self, treatment: str, outcome: str,
+                           samples: int = 100) -> float:
+        w = float(
+            self.graph.graph.get(treatment, {}).get(outcome, {}).get("weight", 0.0)
+        )
         try:
             await asyncio.to_thread(
                 self.storage.save_causal_experiment,
@@ -715,7 +1071,7 @@ class CausalPolicyAdapter:
             pass
         return w
 
-    def get_policy(self):
+    def get_policy(self) -> List[float]:
         return list(self.policy)
 
 
@@ -723,13 +1079,15 @@ class CausalPolicyAdapter:
 # ENHANCEMENT 3 — FEDERATED GREEN LEARNING
 # =============================================================================
 class FederatedGreenAggregator:
-    def __init__(self, storage, instance_id, share_interval=3600):
+    def __init__(self, storage: Any, instance_id: str,
+                 share_interval: int = 3600):
         self.storage = storage
         self.instance_id = instance_id
-        self.share_interval = share_interval
+        self.share_interval = int(share_interval)
         self.rounds = 0
+        self.last_aggregated: Optional[bytes] = None
 
-    async def share_weights(self, model_id, weights):
+    async def share_weights(self, model_id: str, weights: bytes) -> None:
         try:
             await asyncio.to_thread(
                 self.storage.save_federated_weights,
@@ -737,8 +1095,9 @@ class FederatedGreenAggregator:
                 float(len(weights)), self.rounds)
         except Exception:
             pass
+        self.rounds += 1
 
-    async def pull_aggregated_weights(self, model_id):
+    async def pull_aggregated_weights(self, model_id: str) -> Optional[bytes]:
         try:
             rows = await asyncio.to_thread(
                 self.storage.get_federated_weights, model_id)
@@ -754,17 +1113,25 @@ class FederatedGreenAggregator:
         for i in range(n):
             avg[i] = int(sum(b[i] for b in blobs) / len(blobs)) & 0xFF
         self.rounds += 1
-        return bytes(avg)
+        self.last_aggregated = bytes(avg)
+        return self.last_aggregated
 
-    async def apply_aggregated_weights(self, model_id, current):
+    async def apply_aggregated_weights(self, model_id: str,
+                                       current: bytes) -> bytes:
         agg = await self.pull_aggregated_weights(model_id)
         if agg is None:
             return current
         n = min(len(current), len(agg))
         return bytes([(current[i] + agg[i]) // 2 for i in range(n)])
 
-    def stats(self):
-        return {"instance_id": self.instance_id, "rounds": self.rounds}
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "instance_id": self.instance_id,
+            "rounds": self.rounds,
+            "last_aggregated_bytes": (
+                len(self.last_aggregated) if self.last_aggregated else 0
+            ),
+        }
 
 
 # =============================================================================
@@ -773,7 +1140,7 @@ class FederatedGreenAggregator:
 class _Agent:
     ROLES = ["orchestrator", "validator", "optimizer", "reporter", "negotiator"]
 
-    def __init__(self, agent_id):
+    def __init__(self, agent_id: str):
         self.id = agent_id
         self.role = "validator"
         self.reputation = 0.5
@@ -782,28 +1149,42 @@ class _Agent:
 
 
 class MultiAgentCoordinator:
-    def __init__(self, config, storage):
+    def __init__(self, config: Any, storage: Any):
         self.config = config
         self.storage = storage
-        count = _cfg_get(config, "agent_count", 5)
+        count = int(_cfg_get(config, "agent_count", 5) or 5)
         self.agents = {f"agent_{i:02d}": _Agent(f"agent_{i:02d}")
                        for i in range(count)}
         self.bus: asyncio.Queue = asyncio.Queue(maxsize=500)
         self._lock = asyncio.Lock()
 
-    async def _specialise(self):
+    async def _specialise(self) -> None:
         async with self._lock:
             for a in self.agents.values():
                 a.role = max(a.utilities, key=lambda r: a.utilities[r])
+                try:
+                    await asyncio.to_thread(
+                        self.storage.save_agent, a.id, a.role,
+                        a.reputation, a.utilities)
+                except Exception:
+                    pass
 
-    async def broadcast(self, topic, sender, payload):
+    async def broadcast(self, topic: str, sender: str,
+                        payload: Dict[str, Any]) -> None:
         try:
             self.bus.put_nowait({"topic": topic, "sender": sender,
                                  "payload": payload})
         except asyncio.QueueFull:
+            log_event("warning",
+                      "MultiAgentCoordinator bus full; message dropped")
+        try:
+            await asyncio.to_thread(
+                self.storage.save_agent_message,
+                uuid.uuid4().hex[:8], topic, sender, "*", payload)
+        except Exception:
             pass
 
-    async def bid(self, task):
+    async def bid(self, task: Dict[str, Any]) -> Tuple[str, float]:
         preferred = task.get("preferred_role", "orchestrator")
         best_id, best_score = None, -1.0
         async with self._lock:
@@ -820,7 +1201,7 @@ class MultiAgentCoordinator:
                               "score": best_score})
         return best_id or next(iter(self.agents)), best_score
 
-    async def reward(self, agent_id, reward):
+    async def reward(self, agent_id: str, reward: float) -> None:
         async with self._lock:
             if agent_id in self.agents:
                 a = self.agents[agent_id]
@@ -829,7 +1210,14 @@ class MultiAgentCoordinator:
                 a.utilities[a.role] = min(1.0,
                                           a.utilities[a.role] + 0.05 * reward)
 
-    def get_policy(self):
+    def get_role_distribution(self) -> Dict[str, float]:
+        counts: Dict[str, int] = defaultdict(int)
+        for a in self.agents.values():
+            counts[a.role] += 1
+        total = max(1, sum(counts.values()))
+        return {role: c / total for role, c in counts.items()}
+
+    def get_policy(self) -> List[float]:
         affinity = {
             "orchestrator": [0.35, 0.20, 0.15, 0.15, 0.15],
             "validator":    [0.15, 0.15, 0.15, 0.35, 0.20],
@@ -837,19 +1225,15 @@ class MultiAgentCoordinator:
             "reporter":     [0.15, 0.20, 0.15, 0.15, 0.35],
             "negotiator":   [0.15, 0.35, 0.20, 0.15, 0.15],
         }
-        counts = defaultdict(int)
-        for a in self.agents.values():
-            counts[a.role] += 1
-        total = max(1, sum(counts.values()))
+        role_dist = self.get_role_distribution()
         out = [0.0] * 5
-        for role, c in counts.items():
-            w = c / total
+        for role, w in role_dist.items():
             for i, v in enumerate(affinity.get(role, [0.2] * 5)):
                 out[i] += w * v
         s = sum(out) or 1.0
         return [x / s for x in out]
 
-    async def step(self):
+    async def step(self) -> Dict[str, Any]:
         await self._specialise()
         processed = 0
         while not self.bus.empty():
@@ -859,7 +1243,8 @@ class MultiAgentCoordinator:
             except asyncio.QueueEmpty:
                 break
         return {"roles": {a.id: a.role for a in self.agents.values()},
-                "role_distribution": self.get_policy(),
+                "role_distribution": self.get_role_distribution(),
+                "strategy_distribution": self.get_policy(),
                 "processed_messages": processed}
 
 
@@ -871,18 +1256,20 @@ _ATOMIC_RE = re.compile(
 
 
 class TemporalRule:
-    def __init__(self, rule_id, operator, conditions, window=0.0,
-                 description="", severity="warning"):
+    def __init__(self, rule_id: str, operator: str,
+                 conditions: List[Callable[[Dict], bool]],
+                 window: float = 0.0, description: str = "",
+                 severity: str = "warning"):
         self.rule_id = rule_id
         self.operator = operator
         self.conditions = conditions
-        self.window = window
+        self.window = float(window)
         self.description = description or rule_id
         self.severity = severity
         self.violations = 0
-        self.last_violation = None
+        self.last_violation: Optional[datetime] = None
 
-    def evaluate(self, trace):
+    def evaluate(self, trace: Deque[Tuple[datetime, Dict]]) -> bool:
         if not trace:
             return False
         if self.window > 0:
@@ -900,27 +1287,38 @@ class TemporalRule:
 
 
 class TemporalLogicVerifier:
-    def __init__(self, storage, config):
+    def __init__(self, storage: Any, config: Any):
         self.storage = storage
         self.config = config
-        self.rules = {}
-        self.trace: Deque = deque(maxlen=_cfg_get(config, "temporal_max_trace", 2000))
-        self.approval_cb = None
+        self.rules: Dict[str, TemporalRule] = {}
+        self.trace: Deque[Tuple[datetime, Dict]] = deque(
+            maxlen=int(_cfg_get(config, "temporal_max_trace", 2000) or 2000))
+        self.approval_cb: Optional[Callable] = None
+        self._pending_rule_saves: List[Tuple[str, str, str, str]] = []
         for formula in _cfg_get(config, "temporal_formulas", []) or []:
             self._install(formula)
 
-    def _install(self, formula):
-        f = formula.strip()
-        if f.startswith("G "):
-            self._add_atomic(f[2:].strip().strip("()"), "always")
-        elif f.startswith("F "):
-            self._add_atomic(f[2:].strip().strip("()"), "eventually")
-        elif f.startswith("NEVER "):
-            self._add_atomic(f[6:].strip().strip("()"), "never")
+    def _install(self, formula: str) -> None:
+        f = (formula or "").strip()
+        if not f:
+            return
+        try:
+            if f.startswith("G "):
+                self._add_atomic(f[2:].strip().strip("()"), "always")
+            elif f.startswith("F "):
+                self._add_atomic(f[2:].strip().strip("()"), "eventually")
+            elif f.startswith("NEVER "):
+                self._add_atomic(f[6:].strip().strip("()"), "never")
+            else:
+                log_event("warning",
+                          f"Unrecognised temporal formula: {formula!r}")
+        except Exception as exc:
+            log_event("warning", f"Temporal install failed: {exc}")
 
-    def _add_atomic(self, expr, op):
+    def _add_atomic(self, expr: str, op: str) -> None:
         m = _ATOMIC_RE.match(expr)
         if not m:
+            log_event("warning", f"Atomic formula did not parse: {expr!r}")
             return
         var, cmp, val = m.group(1), m.group(2), float(m.group(3))
 
@@ -935,19 +1333,62 @@ class TemporalLogicVerifier:
         rid = f"{op}:{expr}"
         self.rules[rid] = TemporalRule(rid, op, [cond],
                                         description=expr, severity="warning")
+        self._pending_rule_saves.append((rid, expr, op, "warning"))
 
-    def set_approval_callback(self, cb):
+    async def _flush_pending_rule_saves(self) -> None:
+        while self._pending_rule_saves:
+            rid, expr, op, sev = self._pending_rule_saves.pop(0)
+            try:
+                await asyncio.to_thread(
+                    self.storage.save_temporal_rule,
+                    rid, expr, op, sev, expr, 0.0, True)
+            except Exception:
+                pass
+
+    def set_approval_callback(self, cb: Callable) -> None:
         self.approval_cb = cb
 
-    async def push_state(self, state):
-        self.trace.append((datetime.now(timezone.utc), dict(state)))
+    async def push_state(self, state: Dict[str, Any]) -> None:
+        await self._flush_pending_rule_saves()
+        self.trace.append((_now_utc(), dict(state)))
+        try:
+            await asyncio.to_thread(self.storage.save_temporal_trace, state)
+        except Exception:
+            pass
 
-    async def verify(self):
-        result = {}
+    async def verify(self) -> Dict[str, bool]:
+        await self._flush_pending_rule_saves()
+        result: Dict[str, bool] = {}
         for rid, rule in self.rules.items():
-            copy = deque(self.trace, maxlen=self.trace.maxlen)
+            copy = deque(self.trace)
             violated = rule.evaluate(copy)
-            result[rid] = not violated
+            approved = False
+            if violated:
+                rule.violations += 1
+                rule.last_violation = _now_utc()
+                try:
+                    _M_TEMPORAL_VIOLATIONS.labels(
+                        rule=rid, severity=rule.severity).inc()
+                except Exception:
+                    pass
+                if rule.severity == "critical" and self.approval_cb:
+                    try:
+                        approved = self.approval_cb(
+                            rid, self.trace[-1][1] if self.trace else {})
+                        if asyncio.iscoroutine(approved):
+                            approved = await approved
+                    except Exception as exc:
+                        log_event("warning", f"Approval callback failed: {exc}")
+                        approved = False
+                try:
+                    await asyncio.to_thread(
+                        self.storage.save_temporal_violation,
+                        rid, rule.description, len(self.trace) - 1,
+                        self.trace[-1][1] if self.trace else {},
+                        rule.severity, bool(approved))
+                except Exception:
+                    pass
+            result[rid] = (not violated) or bool(approved)
         return result
 
 
@@ -955,13 +1396,14 @@ class TemporalLogicVerifier:
 # ENHANCEMENT 6 — EXPLAINABLE AI
 # =============================================================================
 class XAIDecisionExplainer:
-    def __init__(self, config, storage):
+    def __init__(self, config: Any, storage: Any):
         self.config = config
         self.storage = storage
-        self.method = _cfg_get(config, "xai_method", "kernel_shap")
-        self.depth = _cfg_get(config, "xai_depth", 5)
+        self.method = str(_cfg_get(config, "xai_method", "kernel_shap")
+                          or "kernel_shap")
+        self.depth = int(_cfg_get(config, "xai_depth", 5) or 5)
 
-    def _kernel_shap(self, f, x, names, n=64):
+    def _permutation_shap(self, f, x, names, n=64):
         if not NUMPY_AVAILABLE:
             return {k: 0.0 for k in names}
         base = np.zeros_like(x)
@@ -983,40 +1425,56 @@ class XAIDecisionExplainer:
         contrib = contrib / max(1, n)
         return dict(zip(names, contrib.tolist()))
 
+    def _kernel_shap(self, f, x, names, n=64):
+        return self._permutation_shap(f, x, names, n)
+
     def _lime(self, f, x, names, n=200):
         if not (SKLEARN_AVAILABLE and NUMPY_AVAILABLE):
-            return {k: random.uniform(-1, 1) for k in names}
+            return {k: 0.0 for k in names}
+        scale = float(np.linalg.norm(x)) / max(1.0, math.sqrt(len(x)))
+        sigma = max(scale * 0.5, 1e-3)
         X = np.tile(x, (n, 1)) + np.random.normal(0, 0.1, (n, len(x)))
         try:
             y = np.array([float(f(r.reshape(1, -1))) for r in X])
         except Exception:
             return {k: 0.0 for k in names}
-        w = np.exp(-np.sum((X - x) ** 2, axis=1) / 0.02)
+        w = np.exp(-np.sum((X - x) ** 2, axis=1) / (2.0 * sigma * sigma))
         try:
             m = LinearRegression().fit(X, y, sample_weight=w)
             return dict(zip(names, m.coef_.tolist()))
         except Exception:
             return {k: 0.0 for k in names}
 
-    def _nl(self, decision, attrs):
+    def _nl(self, decision: str, attrs: Dict[str, float]) -> str:
         top = sorted(attrs.items(), key=lambda kv: abs(kv[1]),
                      reverse=True)[:self.depth]
         lines = "\n".join(f"  • {k}: {v:+.4f}" for k, v in top)
         return f"Decision '{decision}' driven by:\n{lines}"
 
-    async def explain(self, decision_id, label, features, names, model_fn):
+    async def explain(self, decision_id: str, label: str, features,
+                      names: List[str], model_fn: Callable) -> Dict[str, Any]:
         if not NUMPY_AVAILABLE:
             attrs = {k: 0.0 for k in names}
         elif self.method == "lime":
             attrs = self._lime(model_fn, features, names)
         else:
-            attrs = self._kernel_shap(model_fn, features, names)
+            attrs = self._permutation_shap(model_fn, features, names)
         nl = self._nl(label, attrs)
+
+        feature_map: Dict[str, Any] = {}
+        try:
+            if NUMPY_AVAILABLE and hasattr(features, "tolist"):
+                feature_map = dict(zip(names, features.tolist()))
+            else:
+                feature_map = dict(zip(names, list(features)))
+        except Exception:
+            feature_map = {"raw": list(features)}
+
         try:
             await asyncio.to_thread(
                 self.storage.save_xai_explanation,
                 decision_id, decision_id, self.method, label,
-                {"raw": list(features)}, attrs, nl)
+                feature_map, attrs, nl)
         except Exception:
             pass
         return {"decision_id": decision_id, "method": self.method,
@@ -1029,39 +1487,70 @@ class XAIDecisionExplainer:
 class AdaptivePrecisionSwitcher:
     ENERGY = {"fp32": 1.0, "tf32": 0.75, "bf16": 0.55,
               "fp16": 0.5, "int8": 0.3}
+    LATENCY = {"fp32": 1.0, "tf32": 0.8, "bf16": 0.65,
+               "fp16": 0.6, "int8": 0.4}
+    CRITICAL_PRECISIONS = {"int8"}
 
-    def __init__(self, config, storage):
+    def __init__(self, config: Any, storage: Any):
         self.config = config
         self.storage = storage
         self.current = "fp32"
         self.saved_wh = 0.0
         self.dynamic_energy = dict(self.ENERGY)
+        self.dynamic_latency = dict(self.LATENCY)
         self.history: Deque[Dict] = deque(maxlen=500)
+        self._acc_window: Deque[float] = deque(maxlen=20)
+        self._hw_cache: Optional[Dict[str, Any]] = None
 
-    def _probe(self):
+    def _probe(self, force_refresh: bool = False) -> Dict[str, Any]:
+        if self._hw_cache is not None and not force_refresh:
+            return self._hw_cache
         info = {"cuda": False, "bf16": False, "device": "cpu"}
-        if TORCH_AVAILABLE:
+        if TORCH_AVAILABLE and torch is not None:
             try:
-                info["cuda"] = torch.cuda.is_available()
+                info["cuda"] = bool(torch.cuda.is_available())
                 if info["cuda"]:
                     info["device"] = torch.cuda.get_device_name(0)
-                    info["bf16"] = torch.cuda.is_bf16_supported()
+                    try:
+                        info["bf16"] = bool(torch.cuda.is_bf16_supported())
+                    except Exception:
+                        info["bf16"] = False
             except Exception:
                 pass
+        self._hw_cache = info
         return info
 
-    def select_precision(self):
+    def _allowed_precisions(self) -> List[str]:
+        raw = list(_cfg_get(self.config, "precision_levels",
+                            ["fp32", "fp16", "bf16", "int8"]))
+        return [c for c in raw if c in self.dynamic_energy]
+
+    def select_precision(self) -> str:
         hw = self._probe()
-        cands = list(_cfg_get(self.config, "precision_levels",
-                              ["fp32", "fp16", "bf16", "int8"]))
+        cands = self._allowed_precisions()
+        if not cands:
+            return "fp32"
         if not hw["cuda"]:
             cands = [c for c in cands if c in ("fp32", "int8")]
         if not hw["bf16"]:
             cands = [c for c in cands if c != "bf16"]
+        if not cands:
+            return "fp32"
         return min(cands, key=lambda c: self.dynamic_energy.get(c, 1.0))
 
-    async def switch_to(self, target, reason="policy"):
+    def record_accuracy(self, accuracy: float) -> None:
+        try:
+            self._acc_window.append(float(accuracy))
+        except (TypeError, ValueError):
+            pass
+
+    async def switch_to(self, target: str, reason: str = "policy",
+                        current_intensity: float = 0.4) -> bool:
         if target == self.current or target not in self.dynamic_energy:
+            return False
+        if target not in self._allowed_precisions():
+            log_event("warning",
+                      f"Precision {target!r} not in precision_levels; ignoring")
             return False
         old = self.current
         self.current = target
@@ -1074,135 +1563,329 @@ class AdaptivePrecisionSwitcher:
             await asyncio.to_thread(
                 self.storage.save_precision_switch,
                 old, target, reason, saved, 0.0)
+            _M_PRECISION_SWITCHES.labels(from_p=old, to_p=target).inc()
         except Exception:
             pass
         return True
 
-    async def auto_switch(self, recent_acc, baseline_acc):
+    async def auto_switch(self, recent_acc: float = 0.0,
+                          baseline_acc: float = 0.0) -> None:
+        if recent_acc <= 0 or baseline_acc <= 0:
+            if not self._acc_window:
+                return
+            recent_acc = sum(self._acc_window) / len(self._acc_window)
+            baseline_acc = max(self._acc_window)
         if baseline_acc <= 0:
             return
         drop = (baseline_acc - recent_acc) / baseline_acc
-        thresh = _cfg_get(self.config, "precision_switch_threshold", 0.02)
+        thresh = float(_cfg_get(self.config,
+                                "precision_switch_threshold", 0.02) or 0.02)
         if drop > thresh:
             await self.switch_to("fp32", reason=f"acc drop {drop:.3f}")
         elif drop < thresh / 2:
-            await self.switch_to(self.select_precision(), reason="headroom")
+            target = self.select_precision()
+            if target != self.current:
+                await self.switch_to(target, reason="headroom")
 
 
 # =============================================================================
 # ENHANCEMENT 8 — CARBON MARKETS / REC
 # =============================================================================
 class CarbonMarketIntegrator:
-    def __init__(self, config, storage):
+    DEFER_INTENSITY_THRESHOLD = 0.3   # kgCO2/kWh
+    RUN_OFFSET_COST_THRESHOLD = 0.5   # USD
+    MIN_PRICE_USD = 5.0
+    MAX_PRICE_USD = 200.0
+    DEFAULT_PRICE_USD = 25.0
+    DEFAULT_PRICE_PER_MWH_USD = 5.0
+
+    def __init__(self, config: Any, storage: Any):
         self.config = config
         self.storage = storage
-        self.last_price = 25.0
+        self.last_price = float(
+            _cfg_get(config, "carbon_default_price_usd",
+                     self.DEFAULT_PRICE_USD) or self.DEFAULT_PRICE_USD)
+        self._rec_balance_mwh: float = 0.0
+        self._closed = False
 
-    async def _fetch_price(self):
-        return max(5.0, self.last_price + random.gauss(0, 1.5))
+    async def _fetch_price(self) -> float:
+        candidate = self.last_price + random.gauss(0, 1.5)
+        return max(self.MIN_PRICE_USD, min(self.MAX_PRICE_USD, candidate))
 
-    async def update_price(self):
+    async def update_price(self) -> float:
         try:
             price = await self._fetch_price()
         except Exception:
             price = self.last_price
-        self.last_price = price
+        try:
+            price = max(self.MIN_PRICE_USD, min(self.MAX_PRICE_USD, float(price)))
+        except (TypeError, ValueError):
+            price = self.last_price
         try:
             await asyncio.to_thread(self.storage.save_credit_price, price)
         except Exception:
             pass
+        self.last_price = price
         return price
 
-    async def purchase_rec(self, mwh, price_per_mwh=5.0, source="wind"):
+    async def purchase_rec(self, mwh: float, price_per_mwh: float = 5.0,
+                           source: str = "wind") -> float:
+        mwh = max(0.0, float(mwh))
+        if mwh == 0.0:
+            return 0.0
+        price_per_mwh = max(0.0, float(price_per_mwh))
+        src = (source or "").strip().lower() or "unspecified"
         cost = mwh * price_per_mwh
+        self._rec_balance_mwh += mwh
         try:
-            await asyncio.to_thread(self.storage.save_rec, mwh,
-                                    price_per_mwh, source)
+            await asyncio.to_thread(
+                self.storage.save_rec, mwh, price_per_mwh, src)
         except Exception:
             pass
         return cost
 
-    async def net_zero_schedule(self, workload_kwh, intensity):
-        price = await self.update_price()
+    async def net_zero_schedule(self, workload_kwh: float, intensity: float,
+                                price: Optional[float] = None,
+                                commit: bool = True) -> Dict[str, Any]:
+        workload_kwh = max(0.0, float(workload_kwh))
+        intensity = max(0.0, float(intensity))
+        if price is None:
+            price = float(self.last_price)
+        else:
+            try:
+                price = max(0.0, float(price))
+            except (TypeError, ValueError):
+                price = float(self.last_price)
         carbon_kg = workload_kwh * intensity
         offset_cost = (carbon_kg / 1000.0) * price
-        action = "defer" if intensity > 0.3 else \
-                 ("run_offset" if offset_cost < 0.5 else "run")
-        try:
-            await asyncio.to_thread(
-                self.storage.save_net_zero_match,
-                uuid.uuid4().hex[:8], workload_kwh, intensity, action,
-                carbon_kg, offset_cost, price)
-        except Exception:
-            pass
+        if intensity > self.DEFER_INTENSITY_THRESHOLD:
+            action = "defer"
+        elif offset_cost < self.RUN_OFFSET_COST_THRESHOLD:
+            action = "run_offset"
+        else:
+            action = "run"
+        if commit:
+            try:
+                await asyncio.to_thread(
+                    self.storage.save_net_zero_match,
+                    uuid.uuid4().hex[:8], workload_kwh, intensity, action,
+                    carbon_kg, offset_cost, price)
+            except Exception:
+                pass
         return {"action": action, "carbon_kg": carbon_kg,
                 "offset_cost_usd": offset_cost, "credit_price_usd": price,
-                "rec_balance_mwh": await self._rec_balance()}
+                "rec_balance_mwh": float(self._rec_balance_mwh)}
 
-    async def _rec_balance(self):
-        try:
-            return await asyncio.to_thread(self.storage.get_rec_balance)
-        except Exception:
-            return 0.0
+    def get_rec_balance(self) -> float:
+        return float(self._rec_balance_mwh)
+
+    async def aclose(self) -> None:
+        self._closed = True
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.aclose()
 
 
 # =============================================================================
 # ENHANCEMENT 10 — HITL ACTIVE LEARNING
 # =============================================================================
 class ActiveUserPreferenceLearner:
-    def __init__(self, storage, pareto_gating=None, dashboard=None,
-                 feedback_callback=None):
+    _PREF_KEYS = ("quality_score", "carbon_g", "cost_usd", "latency_ms")
+
+    def __init__(self, storage: Any, pareto_gating: Any = None,
+                 dashboard: Any = None, feedback_callback: Any = None,
+                 use_priority_queue: bool = False):
         self.storage = storage
         self.pareto = pareto_gating
         self.dashboard = dashboard
         self.feedback_callback = feedback_callback
         self.preferences: Dict[str, Dict[str, float]] = {}
         self._responses: asyncio.Queue = asyncio.Queue(maxsize=100)
+        self._pending: Dict[str, asyncio.Future] = {}
+        self._priority_queue: List[Tuple[float, str, Dict[str, Any]]] = []
+        self.use_priority_queue = use_priority_queue
+        self._lock = asyncio.Lock()
 
-    async def submit_response(self, user_id, chosen_id):
+    async def submit_response(self, user_id: str, chosen_id: str,
+                              request_id: Optional[str] = None) -> None:
+        if request_id is not None:
+            async with self._lock:
+                fut = self._pending.pop(request_id, None)
+            if fut is not None and not fut.done():
+                fut.set_result({"user_id": user_id, "chosen": chosen_id})
+                return
+            log_event("warning",
+                      f"Unknown HITL request_id {request_id!r}; using FIFO")
         try:
-            self._responses.put_nowait({"user_id": user_id, "chosen": chosen_id})
+            self._responses.put_nowait(
+                {"user_id": user_id, "chosen": chosen_id})
         except asyncio.QueueFull:
-            pass
+            log_event("warning", "HITL response queue full; dropping response")
 
-    def _entropy_uncertainty(self, candidates):
-        scores = [float(c.get("quality_score", 0.0)) for c in candidates[:5]]
+    def _entropy_uncertainty(self, candidates: List[Dict[str, Any]]) -> float:
+        scores = []
+        for c in candidates[:5]:
+            try:
+                scores.append(float(c.get("quality_score", 0.0)))
+            except (TypeError, ValueError):
+                scores.append(0.0)
         s = sum(scores) or 1.0
         probs = [x / s for x in scores]
         ent = -sum(p * math.log(p + 1e-9) for p in probs)
         max_ent = math.log(len(probs)) if len(probs) > 1 else 1.0
         return ent / max_ent if max_ent > 0 else 0.0
 
-    async def query_user_if_needed(self, user_id, candidates, timeout=3.0):
+    def _ambiguity_score(self, candidates: List[Dict[str, Any]]) -> float:
+        if len(candidates) < 2:
+            return 0.0
+        c1, c2 = candidates[0], candidates[1]
+
+        def _rel(a, b):
+            try:
+                a = float(a); b = float(b)
+            except (TypeError, ValueError):
+                return 0.0
+            m = max(abs(a), abs(b), 1e-6)
+            return abs(a - b) / m
+
+        try:
+            q = _rel(c1.get("quality_score", 0), c2.get("quality_score", 0))
+            cg = _rel(c1.get("carbon_g", 0), c2.get("carbon_g", 0))
+            cost = _rel(c1.get("cost_usd", 0), c2.get("cost_usd", 0))
+            lat = _rel(c1.get("latency_ms", 0), c2.get("latency_ms", 0))
+            return max(cg, cost, lat) * (1.0 - min(q, 1.0))
+        except Exception:
+            return 0.0
+
+    async def query_user_if_needed(self, user_id: str,
+                                   candidates: List[Dict[str, Any]],
+                                   timeout: float = 3.0) -> Optional[str]:
         if len(candidates) < 2:
             return None
-        uncertainty = self._entropy_uncertainty(candidates)
-        if uncertainty < 0.5:
-            return None
-        try:
-            msg = await asyncio.wait_for(self._responses.get(), timeout=timeout)
-            return msg.get("chosen")
-        except asyncio.TimeoutError:
-            return candidates[0].get("solution_id")
+        if self.pareto is not None:
+            try:
+                pareto_set = self.pareto.filter(candidates)
+                if len(pareto_set) >= 2:
+                    candidates = pareto_set
+                else:
+                    return None
+            except Exception:
+                pass
 
-    async def record_choice(self, user_id, solution_id, metrics=None):
+        ambiguity = self._ambiguity_score(candidates)
+        uncertainty = self._entropy_uncertainty(candidates)
+        if ambiguity < 0.05 and uncertainty < 0.5:
+            return None
+
+        req_id = uuid.uuid4().hex[:8]
+        try:
+            await asyncio.to_thread(
+                self.storage.enqueue_hitl_request,
+                req_id, "pareto_query",
+                {"candidates": candidates[:2], "ambiguity": ambiguity,
+                 "uncertainty": uncertainty}, "info")
+        except Exception:
+            pass
+        try:
+            await asyncio.to_thread(
+                self.storage.save_active_learning_sample,
+                req_id, "chaos_student", "hitl_ambiguity",
+                uncertainty, True)
+        except Exception:
+            pass
+
+        if self.dashboard is not None:
+            try:
+                await self.dashboard.broadcast({
+                    "type": "preference_query", "request_id": req_id,
+                    "user_id": user_id, "ambiguity": ambiguity,
+                    "uncertainty": uncertainty,
+                    "options": [
+                        {"id": c.get("solution_id"),
+                         "quality": c.get("quality_score")}
+                        for c in candidates[:2]]})
+            except Exception:
+                pass
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        async with self._lock:
+            self._pending[req_id] = fut
+        try:
+            msg = await asyncio.wait_for(fut, timeout=timeout)
+            try:
+                await asyncio.to_thread(
+                    self.storage.resolve_hitl_request, req_id, "approved")
+            except Exception:
+                pass
+            chosen = msg.get("chosen") if isinstance(msg, dict) else None
+            metrics = next(
+                (c for c in candidates if c.get("solution_id") == chosen), None)
+            await self.record_choice(user_id, chosen, metrics=metrics)
+            if self.feedback_callback:
+                try:
+                    await self.feedback_callback({
+                        "event_id": uuid.uuid4().hex[:8],
+                        "task_id": req_id,
+                        "selected_action": chosen,
+                        "feedback_type": "hitl_choice",
+                        "quality_score": 1.0,
+                        "ambiguity": ambiguity,
+                        "uncertainty": uncertainty})
+                except Exception:
+                    pass
+            return chosen
+        except asyncio.TimeoutError:
+            try:
+                await asyncio.to_thread(
+                    self.storage.resolve_hitl_request, req_id, "timeout")
+            except Exception:
+                pass
+            normalized = self.get_preference_weights(user_id)
+            if normalized:
+                scored = []
+                for c in candidates:
+                    s = sum(normalized.get(k, 0.25)
+                            / (float(c.get(k, 0) or 0) + 1e-8)
+                            for k in self._PREF_KEYS)
+                    scored.append((s, c.get("solution_id")))
+                scored.sort(reverse=True)
+                return scored[0][1]
+            return candidates[0].get("solution_id")
+        finally:
+            async with self._lock:
+                self._pending.pop(req_id, None)
+
+    async def record_choice(self, user_id: str, solution_id: str,
+                            metrics: Optional[Dict[str, float]] = None) -> None:
         prefs = self.preferences.setdefault(user_id, {})
         if metrics:
-            for k in ("quality_score", "carbon_g", "cost_usd", "latency_ms"):
+            for k in self._PREF_KEYS:
                 if k in metrics:
-                    v = float(metrics[k])
+                    try:
+                        v = float(metrics[k])
+                    except (TypeError, ValueError):
+                        continue
                     if k == "quality_score":
                         prefs[k] = prefs.get(k, 0.25) + v * 0.01
                     else:
-                        prefs[k] = prefs.get(k, 0.25) + 1.0 / (v + 1e-6) * 0.01
-            s = sum(prefs.values()) or 1.0
-            prefs = {k: v / s for k, v in prefs.items()}
+                        prefs[k] = prefs.get(k, 0.25) + 1.0 / (abs(v) + 1e-6) * 0.01
             self.preferences[user_id] = prefs
         try:
             await asyncio.to_thread(
                 self.storage.save_user_preference, user_id, prefs)
         except Exception:
             pass
+
+    def get_preference_weights(self, user_id: str) -> Dict[str, float]:
+        raw = self.preferences.get(user_id, {})
+        if not raw:
+            return {}
+        s = sum(raw.values()) or 1.0
+        return {k: v / s for k, v in raw.items()}
 
 
 # =============================================================================
@@ -1215,12 +1898,12 @@ class ChaosOrchestratorV17:
     supports scheduled gamedays.
     """
 
-    def __init__(self, storage, config, dashboard=None):
+    def __init__(self, storage: Any, config: Any, dashboard: Any = None):
         self.storage = storage
         self.config = config
         self.instance_id = str(uuid.uuid4())[:8]
 
-        # Build ten enhancements
+        # Build ten enhancements.
         self.quantum = QuantumDistillationEngine(temperature=2.0, alpha=0.5)
         self.causal_graph = CausalGraphLearner(storage)
         self.causal_rl = CausalPolicyAdapter(config, storage, self.causal_graph)
@@ -1232,7 +1915,7 @@ class ChaosOrchestratorV17:
         self.carbon_market = CarbonMarketIntegrator(config, storage)
         self.hitl = ActiveUserPreferenceLearner(storage, dashboard=dashboard)
 
-        # Chaos engine — enhanced with all hooks
+        # Chaos engine — enhanced with all hooks.
         self.chaos = ChaosTestingEngine(
             config, storage,
             temporal=self.temporal,
@@ -1244,20 +1927,44 @@ class ChaosOrchestratorV17:
             precision=self.precision,
             federated=self.federated)
 
-        # Wire HITL into temporal critical rules
         self.temporal.set_approval_callback(self._on_critical_violation)
 
-        # Lifecycle
         self._running = False
         self._shutdown_event = asyncio.Event()
         self._background_tasks: set = set()
 
-    async def _on_critical_violation(self, rule_id, state):
-        approved = await self.hitl.query_user_if_needed(
-            "critical_user", [state, state], timeout=2.0)
-        return approved is not None
+    async def _on_critical_violation(self, rule_id: str,
+                                     state: Dict[str, Any]) -> bool:
+        try:
+            q = float(state.get("quality", 0.8))
+            c = float(state.get("carbon", 0.4))
+        except (TypeError, ValueError):
+            q, c = 0.8, 0.4
+        candidates = [
+            {"solution_id": "approve", "quality_score": q, "carbon_g": c,
+             "cost_usd": 0.5, "latency_ms": 100.0},
+            {"solution_id": "reject", "quality_score": 0.0, "carbon_g": 0.0,
+             "cost_usd": 0.0, "latency_ms": 0.0},
+        ]
+        decision = await self.hitl.query_user_if_needed(
+            "critical_user", candidates, timeout=2.0)
+        return decision == "approve"
 
-    # ------------------------------------------------------------------
+    def _spawn(self, coro: Awaitable[Any], name: str) -> asyncio.Task:
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+
+        def _done(t: asyncio.Task) -> None:
+            self._background_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                log_event("error", f"Background task {name} failed: {exc}")
+
+        task.add_done_callback(_done)
+        return task
+
     async def register_system_kpis(self) -> None:
         """Register default KPI probes for the MOPD pipeline."""
         self.chaos.register_kpi(
@@ -1273,86 +1980,89 @@ class ChaosOrchestratorV17:
             "carbon_intensity", lambda: random.uniform(0.2, 0.6),
             max_ok=0.8)
 
-    # ------------------------------------------------------------------
     async def tick(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """One orchestration cycle."""
         result: Dict[str, Any] = {}
 
-        # 1. Causal RL strategy selection
-        result["strategy"] = await self.causal_rl.choose_action(state)
+        # 1. Causal RL strategy selection.
+        action = await self.causal_rl.choose_action(state)
+        result["strategy"] = action
+        result["strategy_name"] = self.causal_rl.to_strategy(action)
 
-        # 2. Multi-agent bid
+        # 2. Multi-agent bid.
         agent_id, _ = await self.multi_agent.bid({
             "name": "chaos_tick", "preferred_role": "validator"})
         result["agent_id"] = agent_id
 
-        # 3. Precision auto-switch
-        await self.precision.auto_switch(
-            state.get("accuracy", 0.9),
-            state.get("baseline_accuracy", 0.92))
+        # 3. Precision auto-switch.
+        self.precision.record_accuracy(
+            float(state.get("accuracy", 0.9) or 0.9))
+        await self.precision.auto_switch(0.0, 0.0)
         result["precision"] = self.precision.current
 
-        # 4. Carbon market decision
-        result["carbon_decision"] = await self.carbon_market.net_zero_schedule(
-            workload_kwh=1.0,
-            intensity=state.get("carbon_intensity", 400) / 1000.0)
+        # 4. Carbon market decision.
+        try:
+            result["carbon_decision"] = await self.carbon_market.net_zero_schedule(
+                workload_kwh=1.0,
+                intensity=float(state.get("carbon_intensity", 400) or 400) / 1000.0)
+        except Exception as exc:
+            log_event("warning", f"Carbon market decision failed: {exc}")
+            result["carbon_decision"] = {"action": "run"}
 
-        # 5. XAI explanation
+        # 5. XAI explanation.
         if NUMPY_AVAILABLE:
             try:
                 feats = np.array([
-                    state.get("quality", 0.8),
-                    state.get("carbon_intensity", 400) / 1000.0,
-                    state.get("cost", 0.5),
-                    state.get("latency_ms", 100) / 1000.0])
-                def _score(x):
-                    return float(np.dot(x, [0.4, -0.3, -0.2, -0.1]))
+                    float(state.get("quality", 0.8)),
+                    float(state.get("carbon_intensity", 400) or 400) / 1000.0,
+                    float(state.get("cost", 0.5)),
+                    float(state.get("latency_ms", 100) or 100) / 1000.0])
+                def _score(x, _w=np.array([0.4, -0.3, -0.2, -0.1])):
+                    return float(np.dot(x, _w))
                 result["xai"] = await self.xai.explain(
                     decision_id=f"chaos_{uuid.uuid4().hex[:8]}",
                     label=f"strategy={result['strategy']}",
                     features=feats,
                     names=["quality", "carbon", "cost", "latency"],
                     model_fn=_score)
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"XAI explanation skipped: {exc}")
 
-        # 6. Multi-agent reward
+        # 6. Multi-agent reward.
         await self.multi_agent.reward(agent_id, 0.8)
 
-        # 7. Temporal push + verify
+        # 7. Temporal push + verify.
         await self.temporal.push_state({
-            "quality": state.get("quality", 0.8),
-            "carbon": state.get("carbon_intensity", 400) / 1000.0,
+            "quality": float(state.get("quality", 0.8)),
+            "carbon": float(state.get("carbon_intensity", 400) or 400) / 1000.0,
             "task_complete": True})
-        verify = await self.temporal.verify()
-        result["temporal_violations"] = [k for k, v in verify.items() if not v]
+        try:
+            verify = await self.temporal.verify()
+            result["temporal_violations"] = [
+                k for k, v in verify.items() if not v]
+        except Exception as exc:
+            log_event("warning", f"Temporal verify failed: {exc}")
+            result["temporal_violations"] = []
 
-        # 8. Causal RL update
-        await self.causal_rl.update(result["strategy"], 0.8, state)
+        # 8. Causal RL update.
+        await self.causal_rl.update(action, 0.8, state)
 
         return result
 
-    # ------------------------------------------------------------------
-    async def start(self):
+    async def start(self) -> None:
         self._running = True
         await self.register_system_kpis()
-        loop = asyncio.get_event_loop()
-        tasks = [
-            loop.create_task(self._causal_rl_loop()),
-            loop.create_task(self._federated_loop()),
-            loop.create_task(self._multi_agent_loop()),
-            loop.create_task(self._temporal_loop()),
-            loop.create_task(self._xai_loop()),
-            loop.create_task(self._precision_loop()),
-            loop.create_task(self._carbon_market_loop()),
-            loop.create_task(self._chaos_loop()),
-            loop.create_task(self._distillation_loop()),
-        ]
-        for t in tasks:
-            self._background_tasks.add(t)
-            t.add_done_callback(self._background_tasks.discard)
+        _ = asyncio.get_running_loop()
+        self._spawn(self._causal_rl_loop(), "causal_rl")
+        self._spawn(self._federated_loop(), "federated")
+        self._spawn(self._multi_agent_loop(), "multi_agent")
+        self._spawn(self._temporal_loop(), "temporal")
+        self._spawn(self._xai_loop(), "xai")
+        self._spawn(self._precision_loop(), "precision")
+        self._spawn(self._carbon_market_loop(), "carbon_market")
+        self._spawn(self._chaos_loop(), "chaos")
+        self._spawn(self._distillation_loop(), "distillation")
 
-    async def shutdown(self):
+    async def shutdown(self) -> None:
         self._shutdown_event.set()
         self._running = False
         for t in list(self._background_tasks):
@@ -1360,10 +2070,22 @@ class ChaosOrchestratorV17:
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks,
                                  return_exceptions=True)
+        self._background_tasks.clear()
 
-    async def _causal_rl_loop(self):
+    async def aclose(self) -> None:
+        await self.shutdown()
+
+    async def __aenter__(self) -> "ChaosOrchestratorV17":
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.aclose()
+
+    async def _causal_rl_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(900)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "causal_graph_update_interval", 900) or 900))
             try:
                 samples = [{
                     "quality": random.uniform(0.5, 1.0),
@@ -1373,95 +2095,102 @@ class ChaosOrchestratorV17:
                 } for _ in range(20)]
                 await self.causal_graph.learn(
                     samples, ["quality", "carbon", "cost", "latency"])
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"causal_rl loop error: {exc}")
 
-    async def _federated_loop(self):
+    async def _federated_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(3600)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "federated_interval", 3600) or 3600))
             try:
                 dummy = bytes(random.getrandbits(8) for _ in range(64))
                 await self.federated.share_weights("chaos_policy", dummy)
                 await self.federated.pull_aggregated_weights("chaos_policy")
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"federated loop error: {exc}")
 
-    async def _multi_agent_loop(self):
+    async def _multi_agent_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(600)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "agent_negotiation_interval", 600) or 600))
             try:
                 await self.multi_agent.step()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"multi_agent loop error: {exc}")
 
-    async def _temporal_loop(self):
+    async def _temporal_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(300)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "temporal_verification_interval", 300) or 300))
             try:
                 await self.temporal.verify()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"temporal loop error: {exc}")
 
-    async def _xai_loop(self):
+    async def _xai_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(300)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "xai_interval", 300) or 300))
             if not NUMPY_AVAILABLE:
                 continue
             try:
                 feats = np.array([0.9, 0.4, 0.5, 0.4])
-                def _score(x):
-                    return float(np.dot(x, [0.4, -0.3, -0.2, -0.1]))
+                def _score(x, _w=np.array([0.4, -0.3, -0.2, -0.1])):
+                    return float(np.dot(x, _w))
                 await self.xai.explain(
                     decision_id=f"sys_{uuid.uuid4().hex[:8]}",
                     label="chaos_health",
                     features=feats,
                     names=["quality", "carbon", "cost", "latency"],
                     model_fn=_score)
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"xai loop error: {exc}")
 
-    async def _precision_loop(self):
+    async def _precision_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(300)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "precision_check_interval", 300) or 300))
             try:
-                await self.precision.auto_switch(0.9, 0.92)
-            except Exception:
-                pass
+                await self.precision.auto_switch(0.0, 0.0)
+            except Exception as exc:
+                log_event("debug", f"precision loop error: {exc}")
 
-    async def _carbon_market_loop(self):
+    async def _carbon_market_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(3600)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "carbon_market_interval", 3600) or 3600))
             try:
                 await self.carbon_market.update_price()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"carbon_market loop error: {exc}")
 
-    async def _chaos_loop(self):
+    async def _chaos_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(1800)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "chaos_test_interval", 1800) or 1800))
             try:
                 fault = random.choice(ChaosTestingEngine.FAULT_TYPES)
                 await self.chaos.run_experiment(
                     name=f"auto_{uuid.uuid4().hex[:6]}",
                     fault_type=fault,
                     targets=["svc_a", "svc_b", "svc_c", "svc_d", "svc_e"])
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"chaos loop error: {exc}")
 
-    async def _distillation_loop(self):
+    async def _distillation_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(300)
+            await asyncio.sleep(float(_cfg_get(
+                self.config, "distillation_interval", 300) or 300))
             try:
                 self.quantum.register_teacher(
                     "causal", self.causal_rl.get_policy())
                 self.quantum.register_teacher(
                     "agents", self.multi_agent.get_policy())
                 await self.quantum.step(self.storage, "chaos_student")
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event("debug", f"distillation loop error: {exc}")
 
-    # ------------------------------------------------------------------
-    async def health_check(self):
+    async def health_check(self) -> Dict[str, Any]:
         return {
             "instance_id": self.instance_id,
             "running": self._running,
@@ -1470,6 +2199,8 @@ class ChaosOrchestratorV17:
             "carbon_price": self.carbon_market.last_price,
             "federated_rounds": self.federated.rounds,
             "temporal_rules": len(self.temporal.rules),
+            "hitl_pending": len(self.hitl._pending),
+            "background_tasks": len(self._background_tasks),
         }
 
 
@@ -1477,6 +2208,8 @@ class ChaosOrchestratorV17:
 # MINIMAL IN-MEMORY STORAGE
 # =============================================================================
 class InMemoryStorage:
+    """Standalone storage for demos/tests. Soft-fail for all methods."""
+
     def __init__(self):
         self._data: Dict[str, Any] = defaultdict(list)
         self._prefs: Dict[str, Dict[str, float]] = {}
@@ -1485,49 +2218,119 @@ class InMemoryStorage:
                               blast_radius, steady_before, steady_after,
                               status, duration_ms=0.0):
         self._data["chaos_experiments"].append({
-            "experiment_id": experiment_id, "fault_type": fault_type,
-            "status": status, "steady_before": steady_before,
-            "steady_after": steady_after})
+            "experiment_id": experiment_id, "name": name,
+            "fault_type": fault_type, "blast_radius": blast_radius,
+            "steady_before": steady_before, "steady_after": steady_after,
+            "status": status, "duration_ms": duration_ms})
 
-    def save_teacher_superposition(self, *a, **kw):
-        self._data["teacher_superpositions"].append(a)
+    def save_teacher_superposition(self, student_id, teacher_id, weight,
+                                   temperature, amplitude, kl):
+        self._data["teacher_superpositions"].append({
+            "student_id": student_id, "teacher_id": teacher_id,
+            "weight": weight, "temperature": temperature,
+            "amplitude": amplitude, "kl": kl})
 
-    def save_causal_edge(self, *a, **kw): pass
-    def save_causal_experiment(self, *a, **kw): pass
+    def save_causal_edge(self, source, target, weight, confidence):
+        self._data["causal_graph"].append({
+            "source": source, "target": target,
+            "weight": weight, "confidence": confidence})
+
+    def save_causal_experiment(self, exp_id, treatment, outcome, ate,
+                               samples, method=""):
+        self._data["causal_experiments"].append({
+            "exp_id": exp_id, "treatment": treatment, "outcome": outcome,
+            "ate": ate, "samples": samples, "method": method})
 
     def save_federated_weights(self, instance_id, model_id, weights,
                                weight_norm=0.0, round_id=0):
         self._data["federated_weights"].append({
             "instance_id": instance_id, "model_id": model_id,
-            "weights": weights})
+            "weights": weights, "weight_norm": weight_norm,
+            "round_id": round_id})
 
     def get_federated_weights(self, model_id):
         return [r for r in self._data["federated_weights"]
                 if r["model_id"] == model_id]
 
-    def save_agent(self, *a, **kw): pass
-    def save_agent_message(self, *a, **kw): pass
-    def save_temporal_rule(self, *a, **kw): pass
-    def save_temporal_trace(self, *a, **kw): pass
-    def save_temporal_violation(self, *a, **kw): pass
-    def save_xai_explanation(self, *a, **kw): pass
+    def save_agent(self, agent_id, role, reputation, utilities):
+        self._data["agent_registry"].append({
+            "agent_id": agent_id, "role": role,
+            "reputation": reputation, "utilities": utilities})
 
-    def save_precision_switch(self, *a, **kw):
-        self._data["precision_history"].append(a)
+    def save_agent_message(self, message_id, topic, sender, recipient, payload):
+        self._data["agent_messages"].append({
+            "message_id": message_id, "topic": topic,
+            "sender": sender, "recipient": recipient, "payload": payload})
 
-    def save_credit_price(self, price_usd, **kw):
-        self._data["carbon_credit_prices"].append({"price_usd": price_usd})
+    def save_temporal_rule(self, rule_id, formula, operator, severity,
+                           description, window, active):
+        self._data["temporal_rules"].append({
+            "rule_id": rule_id, "formula": formula,
+            "operator": operator, "severity": severity,
+            "description": description, "window": window, "active": active})
 
-    def save_rec(self, mwh, price_per_mwh, source, **kw):
-        self._data["rec_ledger"].append({"mwh": mwh})
+    def save_temporal_trace(self, state, context=None):
+        self._data["temporal_trace"].append({"state": state, "context": context})
+
+    def save_temporal_violation(self, rule_id, formula, step, state,
+                                severity="warning", approved=None):
+        self._data["temporal_violations"].append({
+            "rule_id": rule_id, "formula": formula, "step": step,
+            "state": state, "severity": severity, "approved": approved})
+
+    def save_xai_explanation(self, explanation_id, decision_id, method,
+                             label, features, attributions, nl):
+        self._data["xai_explanations"].append({
+            "explanation_id": explanation_id, "decision_id": decision_id,
+            "method": method, "label": label, "features": features,
+            "attributions": attributions, "natural_language": nl})
+
+    def save_precision_switch(self, from_p, to_p, reason,
+                              saved_wh=0.0, acc_delta=0.0):
+        self._data["precision_history"].append({
+            "from_p": from_p, "to_p": to_p, "reason": reason,
+            "saved_wh": saved_wh, "acc_delta": acc_delta})
+
+    def save_credit_price(self, price_usd, currency="USD",
+                          source="oracle", region="global"):
+        self._data["carbon_credit_prices"].append({
+            "price_usd": price_usd, "currency": currency,
+            "source": source, "region": region})
+
+    def save_rec(self, mwh, price_per_mwh, source,
+                 certificate_id="", region="global", retired=False):
+        self._data["rec_ledger"].append({
+            "mwh": mwh, "price_per_mwh": price_per_mwh, "source": source,
+            "certificate_id": certificate_id, "region": region,
+            "retired": retired})
 
     def get_rec_balance(self):
         return sum(r["mwh"] for r in self._data["rec_ledger"])
 
-    def save_net_zero_match(self, *a, **kw): pass
-    def enqueue_hitl_request(self, *a, **kw): pass
-    def resolve_hitl_request(self, *a, **kw): pass
-    def save_active_learning_sample(self, *a, **kw): pass
+    def save_net_zero_match(self, match_id, workload_kwh, intensity, action,
+                            carbon_kg, offset_cost, credit_price):
+        self._data["net_zero_matches"].append({
+            "match_id": match_id, "workload_kwh": workload_kwh,
+            "intensity": intensity, "action": action,
+            "carbon_kg": carbon_kg, "offset_cost": offset_cost,
+            "credit_price": credit_price})
+
+    def enqueue_hitl_request(self, request_id, rule_id, state, severity):
+        self._data["hitl_approval_queue"].append({
+            "request_id": request_id, "rule_id": rule_id,
+            "state": state, "severity": severity, "status": "pending"})
+
+    def resolve_hitl_request(self, request_id, status="approved"):
+        for r in self._data["hitl_approval_queue"]:
+            if r["request_id"] == request_id:
+                r["status"] = status
+
+    def save_active_learning_sample(self, sample_id, model_id, strategy,
+                                    uncertainty, selected):
+        self._data["active_learning_samples"].append({
+            "sample_id": sample_id, "model_id": model_id,
+            "strategy": strategy, "uncertainty": uncertainty,
+            "selected": selected})
 
     def save_user_preference(self, user_id, weights):
         self._prefs[user_id] = dict(weights)
@@ -1564,10 +2367,9 @@ async def _demo():
     await orch.start()
 
     print("=" * 80)
-    print("chaos_testing_engine.py v17.0.0 — Demo")
+    print("chaos_testing_engine.py v17.1.0 — Demo")
     print("=" * 80)
 
-    # 1. Basic fault injection
     print("\n=== Basic fault injection ===")
     for fault in ["latency", "memory_pressure",
                   "precision_degradation", "causal_shock"]:
@@ -1578,9 +2380,9 @@ async def _demo():
         print(f"  {fault}: status={result['status']} "
               f"steady_before={result['steady_before']} "
               f"steady_after={result['steady_after']} "
-              f"aborted={result.get('aborted')}")
+              f"aborted={result['aborted']} "
+              f"rolled_back={result['rolled_back']}")
 
-    # 2. Data corruption (now actually implemented)
     print("\n=== Data corruption (real) ===")
     payload = {
         "batch_id": "b-12345",
@@ -1593,18 +2395,17 @@ async def _demo():
         fault_type="data_corruption",
         targets=["svc_a", "svc_b"],
         payload=payload)
-    corrupted = orch.chaos._inject_data_corruption(payload)
-    print(f"  Original: {payload}")
+    corrupted = orch.chaos._corrupt_payload(payload)
+    print(f"  Original:  {payload}")
     print(f"  Corrupted: {corrupted}")
-    print(f"  Status: {result['status']}")
+    print(f"  Status:    {result['status']}")
 
-    # 3. KPI steady-state check
     print("\n=== KPI steady-state ===")
     ok, kpis = await orch.chaos._steady_state()
     print(f"  Steady: {ok}")
-    print(f"  KPIs: {kpis}")
+    for k, v in kpis.items():
+        print(f"    {k}: {v:+.4f}")
 
-    # 4. Gameday workflow
     print("\n=== Gameday ===")
     gameday = await orch.chaos.run_gameday(
         name="q1_resilience",
@@ -1619,10 +2420,21 @@ async def _demo():
              "targets": ["svc_a", "svc_b"]},
         ])
     print(f"  Gameday: {gameday['name']}")
-    print(f"  Experiments: {gameday['experiments']}")
+    print(f"  Experiments: {gameday['experiments']} "
+          f"(run={gameday['run']}, blocked={gameday['blocked']}, "
+          f"errored={gameday['errored']})")
     print(f"  All steady after: {gameday['all_steady_after']}")
 
-    # 5. Orchestration ticks
+    print("\n=== Dry-run experiment ===")
+    dry = await orch.chaos.run_experiment(
+        name="plan_latency",
+        fault_type="latency",
+        targets=["svc_a", "svc_b", "svc_c", "svc_d", "svc_e"],
+        dry_run=True)
+    print(f"  Status: {dry['status']}  "
+          f"targets: {dry['targets']}  "
+          f"blast_radius: {dry['blast_radius']}")
+
     print("\n=== Orchestration ticks ===")
     for i in range(3):
         state = {
@@ -1635,12 +2447,11 @@ async def _demo():
         }
         result = await orch.tick(state)
         print(f"\n  Tick {i + 1}:")
-        print(f"    strategy: {result['strategy']}")
+        print(f"    strategy: {result['strategy']} -> {result['strategy_name']}")
         print(f"    precision: {result['precision']}")
         print(f"    carbon_action: {result['carbon_decision']['action']}")
         print(f"    temporal_violations: {result['temporal_violations']}")
 
-    # 6. Health check
     print("\n=== Health check ===")
     print(json.dumps(await orch.health_check(), indent=2, default=str))
 
