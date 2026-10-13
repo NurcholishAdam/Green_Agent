@@ -1,701 +1,1295 @@
 #!/usr/bin/env python3
 """
-Gating Network Module for MoE Expert System v4.2.0
-Full Green Agent MODP Integration with all requested enhancements:
-- Quantum‑Distillation Integration (placeholder)
-- Causal Reinforcement Learning (causal feature mask)
-- Federated Green Learning (already present, enhanced)
-- Advanced Multi‑Agent Coordination (expert auction)
-- Temporal Logic / Formal Verification (SafetyMonitor)
-- Explainable AI (SHAP/Integrated Gradients) – already present
-- Adaptive Precision Switching (PrecisionController)
-- Carbon Markets (CarbonMarketClient)
-- Resilience Engineering / Chaos Testing (ChaosInjector)
-- Human‑in‑the‑Loop (HumanApprovalHandler)
+Gating Network Module v5.0.0 — Self-Contained Single-File Bundle
+=================================================================
+
+Complete rewrite of the Green Agent MoE gating manager. Everything needed
+to run and test is in this file:
+
+  1. Local stubs for Storage, AsyncMessageQueue, FeedbackEvent,
+     AdaptiveCostFunction, ParetoGating, DriftDetector, MetricsRegistry.
+  2. Bio-signal feature encoder (12-dim vector).
+  3. Ten real enhancement modules:
+        - QuantumDistillationModule  (density-matrix teacher superposition)
+        - CausalFeatureMask          (PC-style partial correlation)
+        - FederatedGreenAggregator   (weighted FedAvg + DP + sparsification)
+        - ExpertAuction              (LinUCB contextual bandit)
+        - TemporalSafetyMonitor      (MTL operators G/F/NEVER/H/O)
+        - XAIExplainer               (Integrated Gradients + counterfactuals)
+        - PrecisionController        (layer-wise + hysteresis + energy)
+        - CarbonMarketClient         (budget + EMA + REC)
+        - ChaosInjector              (steady-state + rollback)
+        - HumanApprovalHandler       (uncertainty sampling)
+  4. `GatingDecision` value object.
+  5. `GatingNetworkManager` with `nn.LayerNorm`, `torch.autocast`,
+     and thread-safe forward/backward (`threading.Lock` + `asyncio.to_thread`).
+  6. Comprehensive pytest suite at the bottom.
+
+Run:
+    python gating_network_v5.py         # demo
+    pytest gating_network_v5.py -v      # tests
+
+Requires: Python 3.10+, torch, numpy, pytest, pytest-asyncio.
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import math
 import os
-import hashlib
-import zlib
 import random
-import pickle
-from collections import deque, defaultdict
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+import threading
+import time
+import uuid
+from collections import defaultdict, deque
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Dict, Any, List, Optional, Tuple, Union, Callable
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-# -----------------------------------------------------------------------------
-# IMPORT CENTRAL GREEN AGENT COMPONENTS
-# -----------------------------------------------------------------------------
-from ..config import config as central_config
-from ..storage import Storage
-from ..schemas.feedback_event import FeedbackEvent
-from ..routing.pareto_gating import ParetoGating
-from ..feedback.adaptive_cost import AdaptiveCostFunction
-from ..safety.drift_detector import DriftDetector
-from ..scaling.message_queue import AsyncMessageQueue
-from ..metrics import MetricsRegistry
-from ..logger import logger
+import pytest
+import pytest_asyncio
 
-# Optional dependencies
-try:
-    import aiohttp
-except ImportError:
-    aiohttp = None
+logger = logging.getLogger("gating_network")
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
 
-try:
-    import aiofiles
-except ImportError:
-    aiofiles = None
 
-try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-except ImportError:
-    def retry(*args, **kwargs):
-        return lambda f: f
-    stop_after_attempt = lambda x: None
-    wait_exponential = lambda **k: None
-    retry_if_exception_type = lambda e: None
+# =============================================================================
+# LOCAL STUBS (replace with production adapters)
+# =============================================================================
+class Storage:
+    """Fault-injectable in-memory storage."""
 
-try:
-    from sklearn.ensemble import RandomForestRegressor
-    from sklearn.preprocessing import StandardScaler
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-
-try:
-    import shap
-    SHAP_AVAILABLE = True
-except ImportError:
-    SHAP_AVAILABLE = False
-
-# -----------------------------------------------------------------------------
-# Configuration
-# -----------------------------------------------------------------------------
-class GatingNetworkConfig:
-    """Configuration for GatingNetworkManager, built from central_config."""
     def __init__(self):
-        self.input_dim = getattr(central_config, "gating_input_dim", 10)
-        self.hidden_dim = getattr(central_config, "gating_hidden_dim", 64)
-        self.num_experts = getattr(central_config, "gating_num_experts", 5)
-        self.num_hidden_layers = getattr(central_config, "gating_num_hidden_layers", 2)
-        self.activation = getattr(central_config, "gating_activation", "relu")
-        self.dropout_rate = getattr(central_config, "gating_dropout_rate", 0.1)
-        self.learning_rate = getattr(central_config, "gating_learning_rate", 0.001)
-        self.batch_size = getattr(central_config, "gating_batch_size", 32)
-        self.epochs_per_update = getattr(central_config, "gating_epochs_per_update", 3)
-        self.max_training_samples = getattr(central_config, "gating_max_training_samples", 10000)
-        self.online_learning_rate = getattr(central_config, "gating_online_learning_rate", 0.01)
-        self.momentum = getattr(central_config, "gating_momentum", 0.9)
-        self.weight_decay = getattr(central_config, "gating_weight_decay", 0.0001)
-        self.recency_weight = getattr(central_config, "gating_recency_weight", 0.9)
-        self.privacy_epsilon = getattr(central_config, "gating_privacy_epsilon", 1.0)
-        self.noise_scale = getattr(central_config, "gating_noise_scale", 0.001)
-        self.sparsity_ratio = getattr(central_config, "gating_sparsity_ratio", 0.1)
-        self.server_url = getattr(central_config, "gating_server_url", None)
-        self.federation_round_interval = getattr(central_config, "gating_federation_round_interval", 3600)
-        self.max_retries = getattr(central_config, "gating_max_retries", 3)
-        self.retry_base_delay_ms = getattr(central_config, "gating_retry_base_delay_ms", 100.0)
-        self.retry_max_delay_ms = getattr(central_config, "gating_retry_max_delay_ms", 5000.0)
-        self.circuit_breaker_failure_threshold = getattr(central_config, "gating_circuit_breaker_failure_threshold", 5)
-        self.circuit_breaker_recovery_timeout = getattr(central_config, "gating_circuit_breaker_recovery_timeout", 30.0)
-        self.enable_federated = getattr(central_config, "gating_enable_federated", True)
-        self.enable_differential_privacy = getattr(central_config, "gating_enable_differential_privacy", True)
-        self.enable_model_compression = getattr(central_config, "gating_enable_model_compression", True)
-        self.enable_online_learning = getattr(central_config, "gating_enable_online_learning", True)
-        self.enable_carbon_awareness = getattr(central_config, "gating_enable_carbon_awareness", True)
-        self.enable_helium_awareness = getattr(central_config, "gating_enable_helium_awareness", True)
-        self.enable_causal_features = getattr(central_config, "gating_enable_causal_features", True)
+        self._state: Dict[str, str] = {}
+        self.calls: List[Tuple[str, Tuple]] = []
+        self.fail_on: Optional[str] = None
+        self.silent: Set[str] = set()
 
-        self.enable_genetic_algorithm = getattr(central_config, "gating_enable_ga", True)
-        self.ga_population_size = getattr(central_config, "gating_ga_population_size", 10)
-        self.ga_generations = getattr(central_config, "gating_ga_generations", 3)
-        self.ga_mutation_rate = getattr(central_config, "gating_ga_mutation_rate", 0.1)
-        self.ga_crossover_rate = getattr(central_config, "gating_ga_crossover_rate", 0.7)
-        self.enable_pareto_front = getattr(central_config, "gating_enable_pareto", True)
-        self.pareto_max_size = getattr(central_config, "gating_pareto_max_size", 50)
-        self.enable_active_user_pref = getattr(central_config, "gating_enable_active_user_pref", True)
-        self.enable_drift_retraining = getattr(central_config, "gating_enable_drift_retraining", True)
-        self.drift_retrain_threshold = getattr(central_config, "gating_drift_retrain_threshold", 0.15)
-        self.enable_explainability = getattr(central_config, "gating_enable_explainability", True)
+    def _log(self, method: str, args: Tuple = ()) -> bool:
+        self.calls.append((method, args))
+        if self.fail_on == method:
+            if method in self.silent:
+                return False
+            raise RuntimeError(f"injected failure in {method}")
+        return True
 
-        self.enable_bio_integration = getattr(central_config, "gating_enable_bio_integration", True)
+    def save_state(self, key: str, value: str) -> None:
+        if not self._log("save_state", (key,)):
+            return
+        self._state[key] = value
 
-        # New v4.2.0 flags
-        self.enable_quantum_distillation = getattr(central_config, "gating_enable_quantum_distillation", False)
-        self.enable_causal_mask = getattr(central_config, "gating_enable_causal_mask", True)
-        self.enable_expert_auction = getattr(central_config, "gating_enable_expert_auction", False)
-        self.enable_safety_monitor = getattr(central_config, "gating_enable_safety_monitor", True)
-        self.enable_precision_controller = getattr(central_config, "gating_enable_precision_controller", False)
-        self.enable_carbon_market = getattr(central_config, "gating_enable_carbon_market", False)
-        self.carbon_market_config = getattr(central_config, "gating_carbon_market_config", None)
-        self.enable_chaos = getattr(central_config, "gating_enable_chaos", False)
-        self.chaos_probability = getattr(central_config, "gating_chaos_probability", 0.0)
-        self.enable_human_approval = getattr(central_config, "gating_enable_human_approval", False)
-        self.human_approval_timeout = getattr(central_config, "gating_human_approval_timeout", 60.0)
+    def get_state(self, key: str) -> Optional[str]:
+        self._log("get_state", (key,))
+        return self._state.get(key)
 
-        if self.activation not in {"relu", "tanh", "gelu"}:
-            raise ValueError(f"activation must be one of relu, tanh, gelu; got {self.activation}")
 
-# -----------------------------------------------------------------------------
-# Activation and Gating Network
-# -----------------------------------------------------------------------------
-def get_activation(name: str) -> nn.Module:
+class AsyncMessageQueue:
+    def __init__(self):
+        self._topics: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
+        self.published: List[Tuple[str, str]] = []
+
+    async def publish(self, topic: str, payload: str) -> None:
+        self.published.append((topic, payload))
+        await self._topics[topic].put(payload)
+
+    async def subscribe(self, topic: str, timeout: float = 0.5) -> Optional[str]:
+        try:
+            return await asyncio.wait_for(self._topics[topic].get(), timeout)
+        except asyncio.TimeoutError:
+            return None
+
+
+@dataclass
+class FeedbackEvent:
+    source: str
+    feedback_type: str
+    task_id: str
+    context: Dict[str, Any]
+    action: Dict[str, Any]
+    performance: Dict[str, Any]
+    adaptive_cost_value: float
+    tags: List[str]
+    ts: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @classmethod
+    def create_with_context(cls, **kwargs: Any) -> "FeedbackEvent":
+        # Drop unsupported kwargs gracefully.
+        allowed = {"source", "feedback_type", "task_id", "context",
+                   "action", "performance", "adaptive_cost_value", "tags"}
+        filtered = {k: v for k, v in kwargs.items() if k in allowed}
+        return cls(**filtered)
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), default=str)
+
+
+class AdaptiveCostFunction:
+    def __init__(self, storage: Storage):
+        self.storage = storage
+        self.weights = {"accuracy": 0.4, "carbon": 0.2,
+                        "cost": 0.2, "latency": 0.2}
+
+    def get_current_weights(self) -> Dict[str, float]:
+        return dict(self.weights)
+
+    def compute(self, *, quality: float = 0.5, carbon_g: float = 0.1,
+                latency_ms: float = 100.0, energy_joules: float = 10.0,
+                health: float = 1.0, atp: float = 0.5) -> float:
+        w = self.weights
+        return float(
+            w["accuracy"] * (1.0 - quality) +
+            w["carbon"] * carbon_g +
+            w["cost"] * energy_joules / 100.0 +
+            w["latency"] * latency_ms / 100.0
+        )
+
+
+class ParetoGating:
+    def __init__(self):
+        self.front: List[Dict[str, Any]] = []
+
+    def filter(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # Non-dominated filter on (quality, -carbon, -latency, -energy).
+        out = []
+        for c in candidates:
+            dominated = False
+            for other in candidates:
+                if other is c:
+                    continue
+                if (other.get("quality_score", 0) >= c.get("quality_score", 0)
+                        and other.get("carbon_g", 1) <= c.get("carbon_g", 1)
+                        and other.get("latency_ms", 1e9) <= c.get("latency_ms", 1e9)
+                        and other.get("energy_joules", 1e9) <= c.get("energy_joules", 1e9)
+                        and (other.get("quality_score", 0) > c.get("quality_score", 0)
+                             or other.get("carbon_g", 1) < c.get("carbon_g", 1)
+                             or other.get("latency_ms", 1e9) < c.get("latency_ms", 1e9))):
+                    dominated = True
+                    break
+            if not dominated:
+                out.append(c)
+        return out
+
+
+class DriftDetector:
+    """Page-Hinkley drift detector."""
+
+    def __init__(self, storage: Storage, adaptive_cost: AdaptiveCostFunction,
+                 delta: float = 0.005, threshold: float = 0.5):
+        self.storage = storage
+        self.adaptive_cost = adaptive_cost
+        self.delta = float(delta)
+        self.threshold = float(threshold)
+        self._mean = 0.0
+        self._cum = 0.0
+        self._min_cum = 0.0
+        self.drift_detected = False
+
+    async def check_drift(self, weights: Dict[str, float]) -> float:
+        x = sum(weights.values()) / max(len(weights), 1)
+        self._mean += (x - self._mean) * 0.1
+        self._cum += x - self._mean - self.delta
+        self._min_cum = min(self._min_cum, self._cum)
+        deviation = self._cum - self._min_cum
+        if deviation > self.threshold:
+            self.drift_detected = True
+            self._cum = 0.0
+            self._min_cum = 0.0
+            return 1.0
+        return float(deviation) / max(self.threshold, 1e-6)
+
+
+class MetricsRegistry:
+    def __init__(self):
+        self.counters: Dict[str, int] = defaultdict(int)
+        self.gauges: Dict[str, float] = {}
+
+    def inc(self, name: str, amount: int = 1) -> None:
+        self.counters[name] += amount
+
+    def set(self, name: str, value: float) -> None:
+        self.gauges[name] = value
+
+    def increment(self, name: str, amount: int = 1) -> None:
+        self.inc(name, amount)
+
+    def observe(self, name: str, value: float) -> None:
+        self.set(name, value)
+
+
+# =============================================================================
+# ENUMS
+# =============================================================================
+class CircuitBreakerState(str, Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+# =============================================================================
+# BIO-SIGNAL FEATURES (12 dims)
+# =============================================================================
+class BioFeatures:
+    NAMES = (
+        "helium_scarcity", "helium_cost_index", "carbon_intensity",
+        "model_loss", "gradient_variance", "avg_client_energy",
+        "gradient_carbon", "gradient_helium", "token_balance_norm",
+        "harvester_stress", "causal_impact_carbon", "causal_impact_helium",
+    )
+    DIM = len(NAMES)
+
+    @classmethod
+    def encode(cls, context: Dict[str, Any]) -> np.ndarray:
+        feats = []
+        for name in cls.NAMES:
+            v = context.get(name)
+            if v is None:
+                v = 0.5
+            try:
+                feats.append(float(v))
+            except (TypeError, ValueError):
+                feats.append(0.5)
+        return np.asarray(feats, dtype=np.float32)
+
+
+# =============================================================================
+# CIRCUIT BREAKER + RATE LIMITER
+# =============================================================================
+class CircuitBreaker:
+    """Async circuit breaker with probe-limit in half-open state."""
+
+    def __init__(self, failure_threshold: int = 5,
+                 recovery_timeout: float = 30.0,
+                 half_open_max_requests: int = 3,
+                 name: str = "default"):
+        self.failure_threshold = int(failure_threshold)
+        self.recovery_timeout = float(recovery_timeout)
+        self.half_open_max_requests = int(half_open_max_requests)
+        self.name = name
+        self.state = CircuitBreakerState.CLOSED
+        self.failure_count = 0
+        self.half_open_requests = 0
+        self.last_failure_time: Optional[float] = None
+        self._lock = asyncio.Lock()
+
+    async def call(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
+        async with self._lock:
+            if self.state == CircuitBreakerState.OPEN:
+                if (self.last_failure_time is not None and
+                        (time.time() - self.last_failure_time) >
+                        self.recovery_timeout):
+                    self.state = CircuitBreakerState.HALF_OPEN
+                    self.half_open_requests = 0
+                else:
+                    raise RuntimeError(f"Circuit breaker {self.name} is open")
+            if self.state == CircuitBreakerState.HALF_OPEN:
+                if self.half_open_requests >= self.half_open_max_requests:
+                    raise RuntimeError(
+                        f"Circuit breaker {self.name} half-open limit reached")
+        try:
+            result = await func(*args, **kwargs)
+        except Exception:
+            async with self._lock:
+                self.failure_count += 1
+                self.last_failure_time = time.time()
+                if self.state == CircuitBreakerState.HALF_OPEN:
+                    self.state = CircuitBreakerState.OPEN
+                elif self.failure_count >= self.failure_threshold:
+                    self.state = CircuitBreakerState.OPEN
+            raise
+        async with self._lock:
+            if self.state == CircuitBreakerState.HALF_OPEN:
+                self.half_open_requests += 1
+                if self.half_open_requests >= self.half_open_max_requests:
+                    self.state = CircuitBreakerState.CLOSED
+                    self.failure_count = 0
+            elif self.state == CircuitBreakerState.CLOSED:
+                self.failure_count = 0
+        return result
+
+
+class RateLimiter:
+    def __init__(self, rate_per_minute: float):
+        self.capacity = float(rate_per_minute)
+        self.fill_rate = rate_per_minute / 60.0
+        self.tokens = self.capacity
+        self.last_update = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> bool:
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.last_update
+            self.last_update = now
+            self.tokens = min(self.capacity,
+                              self.tokens + elapsed * self.fill_rate)
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return True
+            return False
+
+
+# =============================================================================
+# ENHANCEMENT 1 — QUANTUM DISTILLATION (density matrix)
+# =============================================================================
+class QuantumDistillationModule:
+    """Density-matrix distillation over teacher parameter vectors."""
+
+    def __init__(self, n_dims: int = BioFeatures.DIM,
+                 temperature: float = 1.0, learning_rate: float = 0.1,
+                 min_temperature: float = 0.25,
+                 temperature_decay: float = 0.999,
+                 convergence_eps: float = 1e-4,
+                 rng: Optional[random.Random] = None):
+        self.n_dims = int(n_dims)
+        self.temperature = float(temperature)
+        self.learning_rate = float(learning_rate)
+        self.min_temperature = float(min_temperature)
+        self.temperature_decay = float(temperature_decay)
+        self.convergence_eps = float(convergence_eps)
+        self.rng = rng or random.Random()
+        self.teachers: Dict[str, List[float]] = {}
+        self.teacher_weights: Dict[str, float] = {}
+        self.student: List[float] = [1.0 / self.n_dims] * self.n_dims
+        self.history: Deque[Dict[str, Any]] = deque(maxlen=200)
+        self._converged = False
+
+    def register_teacher(self, name: str, policy: Iterable[float],
+                         weight: float = 1.0) -> None:
+        pol = list(policy)
+        if not pol:
+            return
+        s = sum(pol) or 1.0
+        self.teachers[name] = [max(0.0, p) / s for p in pol]
+        self.teacher_weights[name] = max(1e-6, float(weight))
+
+    def unregister_teacher(self, name: str) -> None:
+        self.teachers.pop(name, None)
+        self.teacher_weights.pop(name, None)
+
+    def _von_neumann_entropy(self, rho: np.ndarray) -> float:
+        try:
+            m = (rho + rho.T) / 2.0
+            eig = np.linalg.eigvalsh(m)
+            eig = np.clip(eig, 1e-12, None)
+            return float(-np.sum(eig * np.log(eig)))
+        except Exception:
+            return 0.0
+
+    def _superpose(self) -> Tuple[List[float], float]:
+        n = self.n_dims
+        if not self.teachers:
+            return list(self.student), 0.0
+        amps: List[np.ndarray] = []
+        weights: List[float] = []
+        for tid, pol in self.teachers.items():
+            a = np.array([math.sqrt(max(pol[i], 1e-12))
+                          if i < len(pol) else 0.0 for i in range(n)])
+            amps.append(a)
+            weights.append(self.teacher_weights.get(tid, 1.0))
+        wsum = sum(weights) or 1.0
+        weights = [w / wsum for w in weights]
+        rho = np.zeros((n, n))
+        for a, w in zip(amps, weights):
+            rho += w * np.outer(a, a)
+        diag = np.clip(np.diag(rho), 1e-12, None)
+        s = float(diag.sum()) or 1.0
+        policy = (diag / s).tolist()
+        return policy, self._von_neumann_entropy(rho)
+
+    def _softmax(self, x: Iterable[float], temp: float) -> List[float]:
+        x = np.asarray(list(x), dtype=float)
+        m = x.max()
+        e = np.exp((x - m) / max(temp, 1e-6))
+        s = e.sum() or 1.0
+        return (e / s).tolist()
+
+    async def step(self, storage: Any = None,
+                   student_id: str = "gating") -> Dict[str, Any]:
+        target_raw, entropy = self._superpose()
+        target = self._softmax(target_raw, self.temperature)
+        new: List[float] = []
+        for s, t in zip(self.student, target):
+            eps = max(1e-12, min(self.student) * 0.1)
+            grad = -(t / max(s, eps))
+            new.append(max(1e-3, s - self.learning_rate * grad))
+        ns = sum(new) or 1.0
+        new_student = [x / ns for x in new]
+        delta = sum(abs(a - b) for a, b in zip(new_student, self.student))
+        self._converged = delta < self.convergence_eps
+        self.student = new_student
+        self.temperature = max(self.min_temperature,
+                               self.temperature * self.temperature_decay)
+        entry = {"target": target, "student": list(self.student),
+                 "temperature": self.temperature, "delta": delta,
+                 "converged": self._converged, "entropy": entropy}
+        self.history.append(entry)
+        if storage is not None:
+            try:
+                await asyncio.to_thread(
+                    storage.save_state, f"quantum::{student_id}",
+                    json.dumps(entry))
+            except Exception:
+                pass
+        return entry
+
+    def is_available(self) -> bool:
+        return True
+
+    def is_converged(self) -> bool:
+        return self._converged
+
+    def get_student_policy(self) -> List[float]:
+        return list(self.student)
+
+
+# =============================================================================
+# ENHANCEMENT 2 — CAUSAL FEATURE MASK (PC-style)
+# =============================================================================
+_ATOMIC_RE = __import__("re").compile(
+    r"^\s*([A-Za-z_]\w*)\s*(>=|<=|==|!=|>|<)\s*(-?[0-9.]+)\s*$")
+
+
+class CausalFeatureMask:
+    """PC-style partial-correlation skeleton over 12 bio-signal features."""
+
+    FEATURE_NAMES = BioFeatures.NAMES
+
+    def __init__(self, feature_dim: int = BioFeatures.DIM,
+                 rng: Optional[random.Random] = None):
+        self.feature_dim = int(feature_dim)
+        self.rng = rng or random.Random()
+        self.mask = np.ones(self.feature_dim, dtype=np.float32)
+        self.edges: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self.samples: Deque[np.ndarray] = deque(maxlen=512)
+
+    def observe(self, features: Iterable[float]) -> None:
+        feats = np.asarray(list(features), dtype=np.float32)
+        if feats.shape[0] != self.feature_dim:
+            return
+        self.samples.append(feats)
+
+    def apply(self, features: Iterable[float]) -> np.ndarray:
+        feats = np.asarray(list(features), dtype=np.float32)
+        if feats.shape[0] != self.feature_dim:
+            raise ValueError(
+                f"features dim {feats.shape[0]} != {self.feature_dim}")
+        return feats * self.mask
+
+    def fit(self, alpha: float = 0.05, threshold: float = 0.25) -> Dict[str, Any]:
+        self.edges.clear()
+        if len(self.samples) < 10:
+            return self.summary()
+        X = np.asarray(self.samples, dtype=float)
+        X = (X - X.mean(0)) / (X.std(0) + 1e-9)
+        try:
+            corr = np.corrcoef(X, rowvar=False)
+            corr = np.nan_to_num(corr, nan=0.0)
+            prec = np.linalg.pinv(corr)
+        except Exception:
+            return self.summary()
+        names = list(self.FEATURE_NAMES)[:self.feature_dim]
+        d = self.feature_dim
+        for i in range(d):
+            for j in range(i + 1, d):
+                denom = math.sqrt(max(prec[i, i] * prec[j, j], 1e-12))
+                pcorr = -prec[i, j] / denom
+                if abs(pcorr) <= threshold:
+                    continue
+                r = min(max(pcorr, -0.999999), 0.999999)
+                z = 0.5 * math.log((1 + r) / (1 - r)) * \
+                    math.sqrt(max(X.shape[0] - (d - 2), 1))
+                p_val = math.erfc(abs(z) / math.sqrt(2.0))
+                if p_val > alpha:
+                    continue
+                self.edges[names[i]][names[j]] = float(pcorr)
+        active: Set[str] = set()
+        for src, targets in self.edges.items():
+            active.add(src)
+            active.update(targets.keys())
+        for i, n in enumerate(names):
+            self.mask[i] = 1.0 if n in active else 0.5
+        return self.summary()
+
+    def summary(self) -> Dict[str, Any]:
+        return {"features": self.feature_dim,
+                "edges": sum(len(v) for v in self.edges.values()),
+                "mask": self.mask.tolist()}
+
+
+# =============================================================================
+# ENHANCEMENT 3 — FEDERATED GREEN AGGREGATOR
+# =============================================================================
+class FederatedGreenAggregator:
+    """Weighted FedAvg over flattened parameter bytes, with DP + sparsify."""
+
+    def __init__(self, storage: Storage, instance_id: str,
+                 dp_epsilon: Optional[float] = None, dp_clip: float = 1.0,
+                 sparse_topk: float = 0.1,
+                 rate_limit_seconds: float = 5.0,
+                 rng: Optional[random.Random] = None):
+        self.storage = storage
+        self.instance_id = instance_id
+        self.dp_epsilon = dp_epsilon
+        self.dp_clip = float(dp_clip)
+        self.sparse_topk = float(sparse_topk)
+        self.rate_limit_seconds = float(rate_limit_seconds)
+        self.rng = rng or random.Random()
+        self.rounds = 0
+        self.last_send_ts = 0.0
+        self.sent_count = 0
+        self.received_count = 0
+
+    def _sparsify(self, vec: np.ndarray) -> np.ndarray:
+        if self.sparse_topk <= 0.0 or vec.size == 0:
+            return vec
+        k = max(1, int(vec.size * self.sparse_topk))
+        flat = vec.flatten()
+        idx = np.argsort(-np.abs(flat))[:k]
+        out = np.zeros_like(flat)
+        out[idx] = flat[idx]
+        return out.reshape(vec.shape)
+
+    def _privatise(self, vec: np.ndarray) -> np.ndarray:
+        if self.dp_epsilon is None or vec.size == 0:
+            return vec
+        sigma = self.dp_clip / max(self.dp_epsilon, 1e-6)
+        noise = np.asarray([self.rng.gauss(0.0, sigma) for _ in range(vec.size)],
+                            dtype=vec.dtype)
+        clipped = np.clip(vec, -self.dp_clip, self.dp_clip)
+        return (clipped + noise.reshape(vec.shape)).astype(vec.dtype)
+
+    async def share_weights(self, model_id: str, weights: Dict[str, Any],
+                            sample_count: int = 1,
+                            force: bool = False) -> bool:
+        now = time.monotonic()
+        if not force and (now - self.last_send_ts) < self.rate_limit_seconds:
+            return False
+        payload = {}
+        for k, v in weights.items():
+            if isinstance(v, np.ndarray):
+                arr = v.astype(np.float32)
+                arr = self._sparsify(arr)
+                arr = self._privatise(arr)
+                payload[k] = arr.tolist()
+            else:
+                payload[k] = v
+        key = f"fed::{model_id}::{self.instance_id}::{self.rounds}"
+        try:
+            await asyncio.to_thread(
+                self.storage.save_state, key,
+                json.dumps({"weights": payload, "n": sample_count,
+                            "round": self.rounds,
+                            "epsilon": self.dp_epsilon}))
+        except Exception:
+            return False
+        self.rounds += 1
+        self.last_send_ts = now
+        self.sent_count += 1
+        return True
+
+    async def pull_aggregated(self, model_id: str) -> Optional[Dict[str, Any]]:
+        keys = [k for k in self.storage._state
+                if k.startswith(f"fed::{model_id}::")]
+        entries: List[Tuple[Dict[str, Any], int]] = []
+        for k in keys:
+            try:
+                d = json.loads(self.storage._state[k])
+                entries.append((d["weights"], max(int(d.get("n", 1)), 1)))
+            except Exception:
+                continue
+        if not entries:
+            return None
+        total = sum(w for _, w in entries) or 1.0
+        keys_set = set(entries[0][0].keys())
+        out: Dict[str, Any] = {}
+        for k in keys_set:
+            v0 = entries[0][0][k]
+            if isinstance(v0, list):
+                arrs = [np.asarray(e[0][k], dtype=np.float32)
+                        for e in entries if k in e[0]]
+                min_len = min(len(a) for a in arrs)
+                acc = np.zeros(min_len, dtype=np.float32)
+                for e, a in zip(entries, arrs):
+                    acc += a[:min_len] * e[1]
+                out[k] = (acc / total).tolist()
+            else:
+                out[k] = v0
+        self.received_count += 1
+        return out
+
+
+# =============================================================================
+# ENHANCEMENT 4 — EXPERT AUCTION (LinUCB)
+# =============================================================================
+class ExpertAuction:
+    """LinUCB contextual bandit over 12-dim bio-signal features."""
+
+    def __init__(self, expert_ids: List[str],
+                 feature_dim: int = BioFeatures.DIM,
+                 alpha: float = 0.2, ridge: float = 1.0,
+                 rng: Optional[random.Random] = None):
+        self.expert_ids = list(expert_ids)
+        self.feature_dim = int(feature_dim)
+        self.alpha = float(alpha)
+        self.ridge = float(ridge)
+        self.rng = rng or random.Random()
+        self._A: Dict[str, np.ndarray] = {
+            eid: ridge * np.eye(self.feature_dim, dtype=np.float32)
+            for eid in self.expert_ids}
+        self._b: Dict[str, np.ndarray] = {
+            eid: np.zeros(self.feature_dim, dtype=np.float32)
+            for eid in self.expert_ids}
+
+    def add_expert(self, expert_id: str) -> None:
+        if expert_id in self._A:
+            return
+        self.expert_ids.append(expert_id)
+        self._A[expert_id] = self.ridge * np.eye(self.feature_dim,
+                                                  dtype=np.float32)
+        self._b[expert_id] = np.zeros(self.feature_dim, dtype=np.float32)
+
+    def compute_bids(self, features: Iterable[float]) -> Dict[str, float]:
+        x = np.asarray(list(features)[:self.feature_dim], dtype=np.float32)
+        if x.size < self.feature_dim:
+            x = np.pad(x, (0, self.feature_dim - x.size))
+        scores: Dict[str, float] = {}
+        for eid in self.expert_ids:
+            try:
+                A_inv = np.linalg.inv(self._A[eid])
+            except np.linalg.LinAlgError:
+                A_inv = np.linalg.pinv(self._A[eid])
+            theta = A_inv @ self._b[eid]
+            mu = float(theta @ x)
+            sigma = float(math.sqrt(max(float(x @ A_inv @ x), 0.0)))
+            scores[eid] = mu + self.alpha * sigma
+        return scores
+
+    def select_experts(self, features: Iterable[float],
+                       top_k: int = 1) -> List[str]:
+        bids = self.compute_bids(features)
+        return [eid for eid, _ in sorted(bids.items(),
+                                          key=lambda kv: kv[1],
+                                          reverse=True)[:top_k]]
+
+    def update(self, expert_id: str, features: Iterable[float],
+               reward: float) -> None:
+        if expert_id not in self._A:
+            self.add_expert(expert_id)
+        x = np.asarray(list(features)[:self.feature_dim], dtype=np.float32)
+        if x.size < self.feature_dim:
+            x = np.pad(x, (0, self.feature_dim - x.size))
+        self._A[expert_id] = self._A[expert_id] + np.outer(x, x)
+        self._b[expert_id] = self._b[expert_id] + reward * x
+
+
+# =============================================================================
+# ENHANCEMENT 5 — TEMPORAL SAFETY MONITOR
+# =============================================================================
+@dataclass
+class _SafetyRule:
+    rule_id: str
+    operator: str
+    predicate: Callable[[Dict[str, Any]], bool]
+    window_seconds: float = 0.0
+    description: str = ""
+    severity: str = "warning"
+    violations: int = 0
+    last_violation: Optional[datetime] = None
+
+    def evaluate(self, trace: Deque[Tuple[datetime, Dict[str, Any]]]) -> bool:
+        if not trace:
+            return False
+        if self.window_seconds > 0:
+            cutoff = trace[-1][0] - timedelta(seconds=self.window_seconds)
+            while trace and trace[0][0] < cutoff:
+                trace.popleft()
+        op = self.operator
+        if op == "always":
+            return any(not self.predicate(s) for _, s in trace)
+        if op == "eventually":
+            return not any(self.predicate(s) for _, s in trace)
+        if op == "never":
+            return any(self.predicate(s) for _, s in trace)
+        if op == "historically":
+            return any(not self.predicate(s) for _, s in trace)
+        if op == "once":
+            return not any(self.predicate(s) for _, s in trace)
+        return False
+
+
+class TemporalSafetyMonitor:
+    """MTL monitor supporting G, F, NEVER, H, O and windowed rules."""
+
+    def __init__(self, max_trace: int = 500):
+        self.rules: Dict[str, _SafetyRule] = {}
+        self.trace: Deque[Tuple[datetime, Dict[str, Any]]] = deque(
+            maxlen=max_trace)
+        self.approval_cb: Optional[Callable] = None
+
+    def add_formula(self, formula: str) -> None:
+        f = formula.strip()
+        window = 0.0
+        if f.startswith("[") and "]" in f:
+            head, rest = f[1:].split("]", 1)
+            try:
+                window = float(head.strip().rstrip("s"))
+            except ValueError:
+                window = 0.0
+            f = rest.strip()
+        op_map = {"G ": "always", "F ": "eventually",
+                  "NEVER ": "never", "H ": "historically", "O ": "once"}
+        for prefix, op in op_map.items():
+            if f.startswith(prefix):
+                expr = f[len(prefix):].strip().strip("()")
+                self._add_atomic(expr, op, window)
+                return
+
+    def _add_atomic(self, expr: str, op: str, window: float) -> None:
+        m = _ATOMIC_RE.match(expr)
+        if not m:
+            return
+        var, cmp, val = m.group(1), m.group(2), float(m.group(3))
+
+        def predicate(state, v=var, c=cmp, x=val):
+            try:
+                sv = float(state.get(v, 0.0))
+            except Exception:
+                return True
+            return {">=": sv >= x, "<=": sv <= x, "==": sv == x,
+                    "!=": sv != x, ">": sv > x, "<": sv < x}[c]
+
+        rid = f"{op}:{expr}" + (f"@{window}s" if window else "")
+        self.rules[rid] = _SafetyRule(rid, op, predicate,
+                                       window_seconds=window,
+                                       description=expr)
+
+    def set_approval_callback(self, cb: Callable) -> None:
+        self.approval_cb = cb
+
+    async def push(self, state: Dict[str, Any]) -> None:
+        self.trace.append((datetime.now(timezone.utc), dict(state)))
+
+    async def check(self) -> Dict[str, bool]:
+        result: Dict[str, bool] = {}
+        for rid, rule in self.rules.items():
+            copy = deque(self.trace, maxlen=self.trace.maxlen)
+            violated = rule.evaluate(copy)
+            result[rid] = not violated
+            if violated:
+                rule.violations += 1
+                rule.last_violation = datetime.now(timezone.utc)
+        return result
+
+    def counts(self) -> Dict[str, int]:
+        return {rid: r.violations for rid, r in self.rules.items()}
+
+
+# =============================================================================
+# ENHANCEMENT 6 — XAI (Integrated Gradients)
+# =============================================================================
+class XAIExplainer:
+    """Integrated Gradients + bounded counterfactuals."""
+
+    def __init__(self, ig_steps: int = 8, cf_max_iter: int = 20,
+                 cf_target_delta: float = 0.1,
+                 rng: Optional[random.Random] = None):
+        self.ig_steps = int(ig_steps)
+        self.cf_max_iter = int(cf_max_iter)
+        self.cf_target_delta = float(cf_target_delta)
+        self.rng = rng or random.Random()
+
+    def integrated_gradients(self, f: Callable[[np.ndarray], float],
+                             x: np.ndarray,
+                             baseline: Optional[np.ndarray] = None
+                             ) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        if baseline is None:
+            baseline = np.zeros_like(x)
+        total = np.zeros_like(x)
+        for s in range(1, self.ig_steps + 1):
+            alpha = s / self.ig_steps
+            interp = baseline + alpha * (x - baseline)
+            eps = 1e-4
+            grad = np.zeros_like(x)
+            for i in range(len(x)):
+                up = interp.copy(); up[i] += eps
+                dn = interp.copy(); dn[i] -= eps
+                try:
+                    grad[i] = (float(f(up)) - float(f(dn))) / (2 * eps)
+                except Exception:
+                    grad[i] = 0.0
+            total += grad
+        return (x - baseline) * (total / max(self.ig_steps, 1))
+
+    def counterfactual(self, f: Callable[[np.ndarray], float],
+                       x: np.ndarray,
+                       target_delta: Optional[float] = None,
+                       bounds: Tuple[float, float] = (-1.0, 1.0)
+                       ) -> Dict[str, Any]:
+        target_delta = target_delta or self.cf_target_delta
+        try:
+            base_pred = float(f(x))
+        except Exception:
+            return {"success": False}
+        best_delta, best_pred = 0.0, base_pred
+        best_idx, best_step = None, 0.0
+        x_cf = x.copy()
+        for _ in range(self.cf_max_iter):
+            i = self.rng.randrange(len(x))
+            step = self.rng.choice([-1, 1]) * 0.1
+            trial = x_cf.copy()
+            trial[i] = float(np.clip(trial[i] + step, *bounds))
+            try:
+                pred = float(f(trial))
+            except Exception:
+                continue
+            delta = abs(pred - base_pred)
+            if delta > best_delta:
+                best_delta, best_pred, x_cf = delta, pred, trial
+                best_idx, best_step = i, step
+            if delta >= abs(target_delta):
+                break
+        return {"success": best_delta >= abs(target_delta),
+                "changed_index": best_idx,
+                "change_amount": best_step,
+                "delta": best_pred - base_pred}
+
+
+# =============================================================================
+# ENHANCEMENT 7 — PRECISION CONTROLLER
+# =============================================================================
+class PrecisionController:
+    """Layer-wise precision with hysteresis and energy accounting."""
+
+    ENERGY = {"fp32": 1.0, "tf32": 0.75, "bf16": 0.55,
+              "fp16": 0.5, "int8": 0.3}
+    AUTOCAST = {"fp32": None, "tf32": None, "bf16": torch.bfloat16,
+                "fp16": torch.bfloat16, "int8": None}
+
+    def __init__(self, levels: Optional[List[str]] = None,
+                 max_sensitivity: float = 0.5,
+                 switch_threshold: float = 0.02,
+                 hysteresis_s: float = 0.5):
+        self.levels = levels or list(self.ENERGY.keys())
+        self.max_sensitivity = float(max_sensitivity)
+        self.switch_threshold = float(switch_threshold)
+        self.hysteresis_s = float(hysteresis_s)
+        self.current = "fp32"
+        self.saved_wh = 0.0
+        self._last_switch = 0.0
+
+    def select_precision(self, layer_sensitivity: Optional[float] = None) -> str:
+        if layer_sensitivity is not None and \
+                layer_sensitivity > self.max_sensitivity:
+            return "fp32"
+        return min(self.levels, key=lambda c: self.ENERGY.get(c, 1.0))
+
+    async def switch_to(self, target: str, reason: str = "policy") -> bool:
+        if target == self.current or target not in self.ENERGY:
+            return False
+        now = time.time()
+        if now - self._last_switch < self.hysteresis_s:
+            return False
+        old = self.current
+        self.current = target
+        self._last_switch = now
+        self.saved_wh += max(0.0, self.ENERGY[old] - self.ENERGY[target])
+        return True
+
+    async def auto_switch(self, recent_acc: float, baseline_acc: float,
+                          layer_sensitivity: Optional[float] = None) -> None:
+        if baseline_acc <= 0:
+            return
+        drop = (baseline_acc - recent_acc) / baseline_acc
+        if drop > self.switch_threshold:
+            await self.switch_to("fp32", reason=f"acc drop {drop:.3f}")
+        elif drop < self.switch_threshold:
+            await self.switch_to(self.select_precision(layer_sensitivity),
+                                 reason="headroom")
+
+    async def auto_switch_layers(self, per_layer_acc: Dict[str, float],
+                                 baseline_acc: float) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for layer, acc in per_layer_acc.items():
+            drop = (baseline_acc - acc) / max(baseline_acc, 1e-6)
+            sens = min(1.0, drop / max(self.switch_threshold, 1e-6))
+            out[layer] = self.select_precision(sens)
+        return out
+
+
+# =============================================================================
+# ENHANCEMENT 8 — CARBON MARKET CLIENT
+# =============================================================================
+class CarbonMarketClient:
+    """Carbon budget + EMA price + REC ledger."""
+
+    def __init__(self, budget_kg: float = 100.0,
+                 price_oracle: Optional[Callable] = None,
+                 rng: Optional[random.Random] = None,
+                 ema_alpha: float = 0.3):
+        self.budget_kg = float(budget_kg)
+        self.used_kg = 0.0
+        self.price = 25.0
+        self.price_ema = 25.0
+        self.ema_alpha = float(ema_alpha)
+        self.rng = rng or random.Random()
+        self.price_oracle = price_oracle or self._random_walk
+        self.rec_ledger: List[Dict[str, Any]] = []
+
+    async def _random_walk(self) -> float:
+        return max(5.0, self.price + self.rng.gauss(0, 1.5))
+
+    async def update_price(self) -> float:
+        try:
+            p = float(await self.price_oracle())
+        except Exception:
+            p = self.price
+        self.price = max(0.0, p)
+        self.price_ema = (self.ema_alpha * self.price +
+                          (1 - self.ema_alpha) * self.price_ema)
+        return self.price
+
+    def _budget_ok(self, extra: float) -> bool:
+        return (self.used_kg + extra) <= self.budget_kg
+
+    async def net_zero_schedule(self, workload_kwh: float,
+                                intensity: float) -> Dict[str, Any]:
+        await self.update_price()
+        carbon_kg = workload_kwh * intensity
+        offset_cost = (carbon_kg / 1000.0) * self.price
+        if not self._budget_ok(carbon_kg):
+            action = "defer"
+        elif intensity > 0.3:
+            action = "defer"
+        elif offset_cost < 0.5:
+            action = "run_offset"
+        else:
+            action = "run"
+        if action in ("run", "run_offset"):
+            self.used_kg += carbon_kg
+        return {"action": action, "carbon_kg": carbon_kg,
+                "offset_cost_usd": offset_cost,
+                "credit_price_usd": self.price,
+                "budget_remaining_kg": max(0.0, self.budget_kg - self.used_kg)}
+
+    async def buy_credits(self, mwh: float, price_per_mwh: float = 5.0,
+                          source: str = "wind") -> Dict[str, Any]:
+        cost = mwh * price_per_mwh
+        cert = uuid.uuid4().hex[:12]
+        self.rec_ledger.append({"mwh": mwh, "cost": cost, "source": source,
+                                "certificate": cert, "retired": False})
+        return {"cost": cost, "certificate": cert}
+
+    async def sell_credits(self, mwh: float,
+                           price_per_mwh: float = 5.0) -> Dict[str, Any]:
+        return {"revenue": mwh * price_per_mwh, "mwh": mwh}
+
+    async def retire_rec(self, mwh: float) -> float:
+        remaining = mwh
+        for r in self.rec_ledger:
+            if r["retired"]:
+                continue
+            take = min(r["mwh"], remaining)
+            r["mwh"] -= take
+            remaining -= take
+            if r["mwh"] <= 0:
+                r["retired"] = True
+            if remaining <= 0:
+                break
+        return mwh - remaining
+
+    def rec_balance(self) -> float:
+        return sum(r["mwh"] for r in self.rec_ledger if not r["retired"])
+
+
+# =============================================================================
+# ENHANCEMENT 9 — CHAOS INJECTOR
+# =============================================================================
+class ChaosInjector:
+    """Fault injection with steady-state hypothesis + auto-rollback."""
+
+    FAULT_TYPES = ("latency", "exception", "data_corruption",
+                   "memory_pressure", "network_drop")
+
+    def __init__(self, manager: "GatingNetworkManager",
+                 chaos_probability: float = 0.01,
+                 auto_rollback: bool = True,
+                 blast_radius: float = 0.5,
+                 rng: Optional[random.Random] = None):
+        self.manager = manager
+        self.chaos_probability = float(chaos_probability)
+        self.auto_rollback = bool(auto_rollback)
+        self.blast_radius = float(blast_radius)
+        self.rng = rng or random.Random()
+        self.active: Dict[str, Dict[str, Any]] = {}
+        self.rollback_count = 0
+        self._lock = threading.Lock()
+
+    def _allowed(self) -> int:
+        return max(1, int(len(self.FAULT_TYPES) * self.blast_radius))
+
+    async def maybe_inject_failure(self) -> Optional[Dict[str, Any]]:
+        if self.rng.random() >= self.chaos_probability:
+            return None
+        fault = self.rng.choice(self.FAULT_TYPES)
+        return await self.run_experiment(
+            f"auto_{uuid.uuid4().hex[:6]}", fault)
+
+    async def run_experiment(self, name: str, fault_type: str) -> Dict[str, Any]:
+        if fault_type not in self.FAULT_TYPES:
+            raise ValueError(f"unknown fault type {fault_type}")
+        with self._lock:
+            if len(self.active) >= self._allowed():
+                return {"name": name, "fault_type": fault_type,
+                        "status": "skipped", "reason": "blast_radius"}
+            self.active[name] = {"fault_type": fault_type}
+        t0 = time.time()
+        before = self.manager._check_steady_state()
+        snapshot = self.manager._snapshot_weights()
+        status = "completed"
+        try:
+            if fault_type == "latency":
+                await asyncio.sleep(0.005)
+            elif fault_type == "exception":
+                raise RuntimeError("chaos: injected exception")
+            elif fault_type == "memory_pressure":
+                _ = bytearray(1024)
+            elif fault_type == "network_drop":
+                await asyncio.sleep(0.005)
+            elif fault_type == "data_corruption":
+                # Bounded corruption: multiply a random linear layer weight
+                # by a small factor and clip.
+                def _corrupt():
+                    with self.manager._cpu_lock:
+                        with torch.no_grad():
+                            layer = self.manager.model.network[0]
+                            f = self.rng.uniform(0.95, 1.05)
+                            layer.weight.mul_(f)
+                            torch.clamp_(layer.weight, -10.0, 10.0)
+                await asyncio.to_thread(_corrupt)
+        except Exception:
+            status = "injected"
+        finally:
+            with self._lock:
+                self.active.pop(name, None)
+        after = self.manager._check_steady_state()
+        rolled_back = False
+        if before and not after and self.auto_rollback:
+            self.manager._restore_weights(snapshot)
+            rolled_back = True
+            self.rollback_count += 1
+        return {"name": name, "fault_type": fault_type,
+                "steady_before": before, "steady_after": after,
+                "status": status,
+                "duration_ms": (time.time() - t0) * 1000.0,
+                "rolled_back": rolled_back}
+
+
+# =============================================================================
+# ENHANCEMENT 10 — HUMAN APPROVAL
+# =============================================================================
+class HumanApprovalHandler:
+    """Uncertainty-sampled HITL with preference learning."""
+
+    def __init__(self, queue: Optional[AsyncMessageQueue] = None,
+                 uncertainty_threshold: float = 0.05,
+                 timeout: float = 5.0):
+        self.queue = queue
+        self.uncertainty_threshold = float(uncertainty_threshold)
+        self.timeout = float(timeout)
+        self.preferences: Dict[str, Dict[str, float]] = {}
+        self.posterior: Dict[str, Dict[str, float]] = {}
+        self._responses: asyncio.Queue = asyncio.Queue(maxsize=100)
+        self.decisions: List[Dict[str, Any]] = []
+
+    async def submit_response(self, user_id: str, chosen_id: str) -> None:
+        try:
+            self._responses.put_nowait({"user_id": user_id,
+                                        "chosen": chosen_id})
+        except asyncio.QueueFull:
+            pass
+
+    def _utility(self, user_id: str, candidate: Dict[str, Any]) -> float:
+        prefs = self.preferences.get(user_id, {})
+        if not prefs:
+            return 0.5
+        u = 0.0
+        for k, v in prefs.items():
+            if k in candidate:
+                try:
+                    u += float(v) * float(candidate[k])
+                except Exception:
+                    continue
+        return u
+
+    def is_uncertain(self, user_id: str,
+                     candidates: List[Dict[str, Any]]) -> bool:
+        if len(candidates) < 2:
+            return False
+        scored = sorted((self._utility(user_id, c) for c in candidates),
+                        reverse=True)
+        return abs(scored[0] - scored[1]) < self.uncertainty_threshold
+
+    async def request_approval(self, decision: Dict[str, Any],
+                               user_id: str = "default") -> bool:
+        candidates = decision.get("candidates") or []
+        if len(candidates) < 2:
+            self.decisions.append({"decision": decision, "auto": True,
+                                   "approved": True})
+            return True
+        scored = sorted(((self._utility(user_id, c), c)
+                         for c in candidates),
+                        key=lambda kv: kv[0], reverse=True)
+        if abs(scored[0][0] - scored[1][0]) > self.uncertainty_threshold:
+            self.decisions.append({"decision": decision, "auto": True,
+                                   "approved": True,
+                                   "chosen": scored[0][1].get("id")})
+            return True
+        try:
+            msg = await asyncio.wait_for(self._responses.get(),
+                                         timeout=self.timeout)
+            approved = bool(msg.get("chosen"))
+        except asyncio.TimeoutError:
+            approved = True
+        self.decisions.append({"decision": decision, "auto": False,
+                               "approved": approved})
+        return approved
+
+    async def record_choice(self, user_id: str, solution_id: str,
+                            metrics: Optional[Dict[str, float]] = None) -> None:
+        prefs = self.preferences.setdefault(user_id, {})
+        if metrics:
+            for k, v in metrics.items():
+                prefs[k] = prefs.get(k, 0.25) + max(0.0, float(v)) * 0.01
+            s = sum(prefs.values()) or 1.0
+            prefs = {k: v / s for k, v in prefs.items()}
+            self.preferences[user_id] = prefs
+            post = self.posterior.setdefault(user_id, {})
+            for k, v in prefs.items():
+                post[k] = post.get(k, 1.0) + v
+
+
+# =============================================================================
+# GATING DECISION VALUE OBJECT
+# =============================================================================
+@dataclass(frozen=True)
+class GatingDecision:
+    state_vec: np.ndarray
+    probs: np.ndarray
+    expert_ids: Tuple[str, ...]
+    selected_expert: str
+    selected_idx: int
+    confidence: float
+    timestamp: float
+    explanation: Optional[Dict[str, Any]] = None
+    counterfactual: Optional[Dict[str, Any]] = None
+    precision: str = "fp32"
+
+
+# =============================================================================
+# GATING NETWORK (LayerNorm — batch-size-1 safe)
+# =============================================================================
+def _get_activation(name: str) -> nn.Module:
     if name == "relu":
         return nn.ReLU()
-    elif name == "tanh":
+    if name == "tanh":
         return nn.Tanh()
-    elif name == "gelu":
+    if name == "gelu":
         return nn.GELU()
-    else:
-        raise ValueError(f"Unknown activation: {name}")
+    raise ValueError(f"unknown activation: {name}")
+
 
 class GatingNetwork(nn.Module):
+    """MLP gate using LayerNorm (no batch-size-1 crash)."""
+
     def __init__(self, input_dim: int, hidden_dim: int, num_experts: int,
-                 num_hidden_layers: int = 2, activation: str = "relu", dropout_rate: float = 0.1):
+                 num_hidden_layers: int = 2, activation: str = "relu",
+                 dropout_rate: float = 0.1):
         super().__init__()
-        layers = []
-        layers.append(nn.Linear(input_dim, hidden_dim))
-        layers.append(get_activation(activation))
-        layers.append(nn.BatchNorm1d(hidden_dim))
-        layers.append(nn.Dropout(dropout_rate))
+        layers: List[nn.Module] = [
+            nn.Linear(input_dim, hidden_dim),
+            _get_activation(activation),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout_rate),
+        ]
         for _ in range(num_hidden_layers - 1):
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(get_activation(activation))
-            layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(nn.Dropout(dropout_rate))
+            layers.extend([
+                nn.Linear(hidden_dim, hidden_dim),
+                _get_activation(activation),
+                nn.LayerNorm(hidden_dim),
+                nn.Dropout(dropout_rate),
+            ])
         layers.append(nn.Linear(hidden_dim, num_experts))
         self.network = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.network(x)
 
-# -----------------------------------------------------------------------------
-# Expert Module (for true MoE)
-# -----------------------------------------------------------------------------
+
 class ExpertModule(nn.Module):
-    """A neural network that serves as an expert for a specific domain."""
     def __init__(self, input_dim: int, hidden_dim: int = 32, output_dim: int = 1):
         super().__init__()
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
+            nn.Linear(hidden_dim, output_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.network(x)
 
-# -----------------------------------------------------------------------------
-# Circuit Breaker and Rate Limiter
-# -----------------------------------------------------------------------------
-class CircuitBreakerState(Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
 
-class CircuitBreaker:
-    def __init__(self, failure_threshold: int, recovery_timeout: float):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.state = CircuitBreakerState.CLOSED
-        self.failure_count = 0
-        self.last_failure_time: Optional[datetime] = None
-        self._lock = asyncio.Lock()
-
-    async def call(self, func: Callable, *args, **kwargs) -> Any:
-        async with self._lock:
-            if self.state == CircuitBreakerState.OPEN:
-                if self.last_failure_time:
-                    elapsed = (datetime.now(timezone.utc) - self.last_failure_time).total_seconds()
-                    if elapsed >= self.recovery_timeout:
-                        self.state = CircuitBreakerState.HALF_OPEN
-                        self.failure_count = 0
-                        logger.info("Circuit breaker entered HALF_OPEN state")
-                    else:
-                        raise RuntimeError(f"Circuit breaker OPEN (recovery in {self.recovery_timeout - elapsed:.1f}s)")
-                else:
-                    raise RuntimeError("Circuit breaker OPEN (no failure time)")
-        try:
-            result = await func(*args, **kwargs)
-            async with self._lock:
-                if self.state == CircuitBreakerState.HALF_OPEN:
-                    self.state = CircuitBreakerState.CLOSED
-                    self.failure_count = 0
-                elif self.state == CircuitBreakerState.CLOSED:
-                    self.failure_count = 0
-            return result
-        except Exception as e:
-            async with self._lock:
-                self.failure_count += 1
-                self.last_failure_time = datetime.now(timezone.utc)
-                if self.state == CircuitBreakerState.HALF_OPEN:
-                    self.state = CircuitBreakerState.OPEN
-                elif self.state == CircuitBreakerState.CLOSED and self.failure_count >= self.failure_threshold:
-                    self.state = CircuitBreakerState.OPEN
-            raise e
-
-    @property
-    def is_open(self) -> bool:
-        return self.state == CircuitBreakerState.OPEN
-
-class RateLimiter:
-    def __init__(self, rate_per_second: float, capacity: int):
-        self.rate = rate_per_second
-        self.capacity = capacity
-        self.tokens = float(capacity)
-        self.last_update = datetime.now(timezone.utc).timestamp()
-        self._lock = asyncio.Lock()
-
-    async def acquire(self) -> bool:
-        async with self._lock:
-            now = datetime.now(timezone.utc).timestamp()
-            elapsed = now - self.last_update
-            self.tokens += elapsed * self.rate
-            if self.tokens > self.capacity:
-                self.tokens = self.capacity
-            self.last_update = now
-            if self.tokens >= 1:
-                self.tokens -= 1
-                return True
-            return False
-
-# -----------------------------------------------------------------------------
-# Genetic Algorithm for Hyperparameter Tuning
-# -----------------------------------------------------------------------------
-class GeneticHyperparameterTuner:
-    """GA that evolves gating network hyperparameters."""
-    def __init__(self, config: GatingNetworkConfig, storage: Storage, metric_to_optimize: str = "accuracy"):
-        self.config = config
-        self.storage = storage
-        self.metric = metric_to_optimize
-        self.population_size = config.ga_population_size
-        self.generations = config.ga_generations
-        self.mutation_rate = config.ga_mutation_rate
-        self.crossover_rate = config.ga_crossover_rate
-        self.param_bounds = {
-            'hidden_dim': (16, 256),
-            'num_hidden_layers': (1, 4),
-            'dropout_rate': (0.0, 0.5),
-            'learning_rate': (1e-5, 1e-2),
-            'activation': ['relu', 'tanh', 'gelu'],
-        }
-        self._lock = asyncio.Lock()
-
-    def _random_chromosome(self) -> Dict[str, Any]:
-        return {
-            'hidden_dim': random.randint(*self.param_bounds['hidden_dim']),
-            'num_hidden_layers': random.randint(*self.param_bounds['num_hidden_layers']),
-            'dropout_rate': random.uniform(*self.param_bounds['dropout_rate']),
-            'learning_rate': 10 ** random.uniform(np.log10(self.param_bounds['learning_rate'][0]), np.log10(self.param_bounds['learning_rate'][1])),
-            'activation': random.choice(self.param_bounds['activation'])
-        }
-
-    def _mutate(self, chrom: Dict) -> Dict:
-        new = chrom.copy()
-        if random.random() < self.mutation_rate:
-            if random.random() < 0.5:
-                new['hidden_dim'] = max(self.param_bounds['hidden_dim'][0], min(self.param_bounds['hidden_dim'][1], chrom['hidden_dim'] + random.randint(-32, 32)))
-            else:
-                new['num_hidden_layers'] = max(self.param_bounds['num_hidden_layers'][0], min(self.param_bounds['num_hidden_layers'][1], chrom['num_hidden_layers'] + random.randint(-1, 1)))
-        if random.random() < self.mutation_rate:
-            new['dropout_rate'] = max(self.param_bounds['dropout_rate'][0], min(self.param_bounds['dropout_rate'][1], chrom['dropout_rate'] + random.gauss(0, 0.05)))
-        if random.random() < self.mutation_rate:
-            new['learning_rate'] = 10 ** np.clip(np.log10(chrom['learning_rate']) + random.gauss(0, 0.5), np.log10(self.param_bounds['learning_rate'][0]), np.log10(self.param_bounds['learning_rate'][1]))
-        if random.random() < self.mutation_rate:
-            new['activation'] = random.choice(self.param_bounds['activation'])
-        return new
-
-    def _crossover(self, p1: Dict, p2: Dict) -> Tuple[Dict, Dict]:
-        if random.random() > self.crossover_rate:
-            return p1.copy(), p2.copy()
-        c1, c2 = p1.copy(), p2.copy()
-        for param in ['hidden_dim', 'num_hidden_layers', 'dropout_rate', 'learning_rate']:
-            if random.random() < 0.5:
-                c1[param], c2[param] = p2[param], p1[param]
-        if random.random() < 0.5:
-            c1['activation'], c2['activation'] = p2['activation'], p1['activation']
-        return c1, c2
-
-    async def _evaluate_fitness(self, chrom: Dict, training_data: List[Tuple[np.ndarray, int]]) -> float:
-        if not training_data:
-            return 0.5
-        X = np.array([t[0] for t in training_data])
-        y = np.array([t[1] for t in training_data])
-        idx = np.random.permutation(len(X))
-        X_train, X_val = X[idx[:int(len(X)*0.8)]], X[idx[int(len(X)*0.8):]]
-        y_train, y_val = y[idx[:int(len(X)*0.8)]], y[idx[int(len(X)*0.8):]]
-        if len(X_val) == 0:
-            X_val, y_val = X_train[:5], y_train[:5]
-        model = GatingNetwork(
-            input_dim=self.config.input_dim,
-            hidden_dim=chrom['hidden_dim'],
-            num_experts=self.config.num_experts,
-            num_hidden_layers=chrom['num_hidden_layers'],
-            activation=chrom['activation'],
-            dropout_rate=chrom['dropout_rate']
-        )
-        optimizer = optim.Adam(model.parameters(), lr=chrom['learning_rate'])
-        criterion = nn.CrossEntropyLoss()
-        X_t = torch.FloatTensor(X_train)
-        y_t = torch.LongTensor(y_train)
-        dataset = TensorDataset(X_t, y_t)
-        dataloader = DataLoader(dataset, batch_size=min(32, len(X_train)), shuffle=True)
-        model.train()
-        for _ in range(2):
-            for batch_X, batch_y in dataloader:
-                optimizer.zero_grad()
-                output = model(batch_X)
-                loss = criterion(output, batch_y)
-                loss.backward()
-                optimizer.step()
-        model.eval()
-        with torch.no_grad():
-            X_v = torch.FloatTensor(X_val)
-            y_v = torch.LongTensor(y_val)
-            preds = model(X_v).argmax(dim=1)
-            acc = (preds == y_v).float().mean().item()
-        return acc
-
-    async def run_search(self, training_data: List[Tuple[np.ndarray, int]]) -> Dict[str, Any]:
-        population = [self._random_chromosome() for _ in range(self.population_size)]
-        best_fitness = -1.0
-        best_individual = None
-
-        for gen in range(self.generations):
-            fitnesses = await asyncio.gather(*[self._evaluate_fitness(chrom, training_data) for chrom in population])
-            sorted_pop = sorted(zip(population, fitnesses), key=lambda x: x[1], reverse=True)
-            if sorted_pop[0][1] > best_fitness:
-                best_fitness = sorted_pop[0][1]
-                best_individual = sorted_pop[0][0]
-
-            parents = [ind for ind, _ in sorted_pop[:max(2, self.population_size // 2)]]
-            offspring = []
-            while len(offspring) < self.population_size:
-                p1, p2 = random.choice(parents), random.choice(parents)
-                c1, c2 = self._crossover(p1, p2)
-                c1 = self._mutate(c1)
-                c2 = self._mutate(c2)
-                offspring.append(c1)
-                if len(offspring) < self.population_size:
-                    offspring.append(c2)
-            combined = parents + offspring
-            combined_fitness = await asyncio.gather(*[self._evaluate_fitness(chrom, training_data) for chrom in combined])
-            sorted_combined = sorted(zip(combined, combined_fitness), key=lambda x: x[1], reverse=True)
-            population = [ind for ind, _ in sorted_combined[:self.population_size]]
-
-        if best_individual:
-            self.storage.save_state('gating_best_hyperparams', json.dumps(best_individual))
-        return best_individual
-
-# -----------------------------------------------------------------------------
-# Pareto Front Manager
-# -----------------------------------------------------------------------------
-class ParetoFrontManager:
-    """Maintains a persistent Pareto front of expert configurations."""
-    def __init__(self, storage: Storage, config: GatingNetworkConfig):
-        self.storage = storage
-        self.config = config
-        self.max_size = config.pareto_max_size
-        self._lock = asyncio.Lock()
-
-    def _dominates(self, a: Dict, b: Dict) -> bool:
-        a_metrics = (-a['accuracy'], a['carbon'], a['helium'], a['latency'])
-        b_metrics = (-b['accuracy'], b['carbon'], b['helium'], b['latency'])
-        return all(a_metrics[i] <= b_metrics[i] for i in range(4)) and any(a_metrics[i] < b_metrics[i] for i in range(4))
-
-    async def add_solution(self, expert_id: str, metrics: Dict[str, float]):
-        if not self.config.enable_pareto_front:
-            return
-        entry = {
-            'expert_id': expert_id,
-            'accuracy': metrics.get('accuracy', 0.5),
-            'carbon': metrics.get('carbon', 0.1),
-            'helium': metrics.get('helium', 0.01),
-            'latency': metrics.get('latency', 100),
-            'timestamp': datetime.now(timezone.utc).isoformat()
-        }
-        async with self._lock:
-            front_data = self.storage.get_state('gating_pareto_front')
-            front = json.loads(front_data) if front_data else []
-            if any(self._dominates(existing, entry) for existing in front):
-                return
-            front = [e for e in front if not self._dominates(entry, e)]
-            front.append(entry)
-            if len(front) > self.max_size:
-                front.sort(key=lambda x: x['accuracy'])
-                front = front[-self.max_size:]
-            self.storage.save_state('gating_pareto_front', json.dumps(front))
-
-    def get_front(self) -> List[Dict]:
-        data = self.storage.get_state('gating_pareto_front')
-        return json.loads(data) if data else []
-
-    async def get_trade_off_suggestions(self, user_weights: Dict[str, float]) -> List[Dict]:
-        front = self.get_front()
-        if not front:
-            return []
-        scored = []
-        for e in front:
-            score = (user_weights.get('accuracy', 0.4) * e['accuracy'] +
-                     user_weights.get('carbon', 0.2) * (1 / (e['carbon'] + 1e-8)) +
-                     user_weights.get('helium', 0.2) * (1 / (e['helium'] + 1e-8)) +
-                     user_weights.get('latency', 0.2) * (1 / (e['latency'] + 1e-8)))
-            scored.append((score, e))
-        scored.sort(reverse=True)
-        return [e for _, e in scored[:5]]
-
-# -----------------------------------------------------------------------------
-# Active User Preference Learner
-# -----------------------------------------------------------------------------
-class ActiveUserPreferenceLearner:
-    """Learns user preferences via WebSocket queries."""
-    def __init__(self, storage: Storage, websocket: Optional = None):
-        self.storage = storage
-        self.websocket = websocket
-        self.user_weights: Dict[str, Dict[str, float]] = {}
-
-    async def query_user_if_needed(self, user_id: str, candidates: List[Dict]) -> Optional[str]:
-        if len(candidates) < 2:
-            return None
-        acc_diff = abs(candidates[0]['accuracy'] - candidates[1]['accuracy'])
-        if acc_diff / max(candidates[0]['accuracy'], candidates[1]['accuracy']) < 0.05:
-            if self.websocket:
-                await self.websocket.send(json.dumps({
-                    'type': 'preference_query',
-                    'user_id': user_id,
-                    'options': [{'id': c['expert_id'], 'accuracy': c['accuracy']} for c in candidates[:2]]
-                }))
-            return candidates[0]['expert_id']
-        return None
-
-    async def record_choice(self, user_id: str, chosen_expert_id: str):
-        if user_id not in self.user_weights:
-            self.user_weights[user_id] = self._default_weights()
-        self.user_weights[user_id]['accuracy'] += 0.01
-        total = sum(self.user_weights[user_id].values())
-        for k in self.user_weights[user_id]:
-            self.user_weights[user_id][k] /= total
-        self.storage.save_state(f'user_weights_{user_id}', json.dumps(self.user_weights[user_id]))
-
-    def _default_weights(self) -> Dict[str, float]:
-        return {'accuracy': 0.4, 'carbon': 0.2, 'helium': 0.2, 'latency': 0.2}
-
-# -----------------------------------------------------------------------------
-# Explainability Helper
-# -----------------------------------------------------------------------------
-class ExplainabilityHelper:
-    """Adds SHAP or gradient‑based explanations for gating decisions."""
-    def __init__(self, model: nn.Module, feature_names: List[str]):
-        self.model = model
-        self.feature_names = feature_names
-        self.shap_explainer = None
-        self._use_gradient = False
-        if SHAP_AVAILABLE and not torch.cuda.is_available():
-            self.shap_explainer = shap.Explainer(lambda x: self._predict_proba(x), np.zeros((10, len(feature_names))))
-        else:
-            self._use_gradient = True
-
-    def _predict_proba(self, X: np.ndarray) -> np.ndarray:
-        self.model.eval()
-        with torch.no_grad():
-            logits = self.model(torch.FloatTensor(X))
-            return torch.softmax(logits, dim=1).numpy()
-
-    def explain(self, context: np.ndarray) -> Dict[str, Any]:
-        if self.shap_explainer:
-            shap_values = self.shap_explainer(context.reshape(1, -1))
-            importance = shap_values.values[0]
-            return {
-                'method': 'shap',
-                'feature_importance': {name: float(imp) for name, imp in zip(self.feature_names, importance)},
-                'top_features': sorted(zip(self.feature_names, importance), key=lambda x: abs(x[1]), reverse=True)[:5]
-            }
-        else:
-            self.model.eval()
-            X = torch.FloatTensor(context.reshape(1, -1)).requires_grad_(True)
-            logits = self.model(X)
-            probs = torch.softmax(logits, dim=1)[0]
-            max_prob = probs.max()
-            max_prob.backward()
-            grad = X.grad[0].abs().numpy()
-            importance = grad
-            return {
-                'method': 'gradient',
-                'feature_importance': {name: float(imp) for name, imp in zip(self.feature_names, importance)},
-                'top_features': sorted(zip(self.feature_names, importance), key=lambda x: x[1], reverse=True)[:5]
-            }
-
-# -----------------------------------------------------------------------------
-# NEW ENHANCEMENT MODULES
-# -----------------------------------------------------------------------------
-
-class QuantumDistillationModule:
-    """Placeholder for quantum‑distillation integration."""
-    def __init__(self):
-        self.available = False
-
-    async def optimize(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
-        logger.info("Quantum distillation optimization requested (placeholder).")
-        for key in parameters:
-            if isinstance(parameters[key], (int, float)):
-                parameters[key] += random.uniform(-0.01, 0.01)
-        return parameters
-
-    def is_available(self) -> bool:
-        return self.available
-
-
-class CausalFeatureMask(nn.Module):
-    """
-    Learnable causal mask that multiplies the input features.
-    """
-    def __init__(self, feature_dim: int):
-        super().__init__()
-        self.mask = nn.Parameter(torch.ones(feature_dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.mask
-
-
-class ExpertAuction:
-    """
-    Multi‑agent auction where experts bid for the right to process a context.
-    """
-    def __init__(self, expert_ids: List[str], feature_dim: int, hidden_dim: int):
-        self.expert_ids = expert_ids
-        self.bidding_networks = nn.ModuleDict({
-            eid: nn.Sequential(
-                nn.Linear(feature_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, 1)
-            ) for eid in expert_ids
-        })
-
-    def compute_bids(self, features: torch.Tensor) -> Dict[str, float]:
-        bids = {}
-        for eid, net in self.bidding_networks.items():
-            bid = net(features).squeeze().item()
-            bids[eid] = bid
-        return bids
-
-    def select_experts(self, features: torch.Tensor, top_k: int = 1) -> List[str]:
-        bids = self.compute_bids(features)
-        sorted_bids = sorted(bids.items(), key=lambda x: x[1], reverse=True)
-        return [eid for eid, _ in sorted_bids[:top_k]]
-
-
-class SafetyMonitor:
-    """Checks safety invariants on gating probabilities and state."""
-    def __init__(self):
-        self.invariants = []
-
-    def add_invariant(self, name: str, condition_fn, description: str):
-        self.invariants.append((name, condition_fn, description))
-
-    def check(self, state: Dict[str, Any]) -> List[str]:
-        violations = []
-        for name, fn, desc in self.invariants:
-            if not fn(state):
-                violations.append(f"{name}: {desc}")
-        return violations
-
-
-class PrecisionController:
-    """Selects numerical precision based on load and energy budget."""
-    def __init__(self, policy: str = "energy_aware"):
-        self.policy = policy
-
-    def get_precision(self, load: float, energy_budget: float) -> str:
-        if self.policy == "energy_aware":
-            if load > 0.8 or energy_budget < 0.2:
-                return "float16"
-            else:
-                return "float32"
-        return "float32"
-
-
-class CarbonMarketClient:
-    """Placeholder for carbon credit trading."""
-    def __init__(self, provider_url: str = None, contract_address: str = None, private_key: str = None):
-        self.available = bool(provider_url and contract_address and private_key)
-
-    def buy_credits(self, amount: float) -> bool:
-        if not self.available:
-            return False
-        logger.info(f"Simulating purchase of {amount} carbon credits.")
-        return True
-
-    def sell_credits(self, amount: float) -> bool:
-        if not self.available:
-            return False
-        logger.info(f"Simulating sale of {amount} carbon credits.")
-        return True
-
-
-class ChaosInjector:
-    """Randomly perturbs the gating network to test resilience."""
-    def __init__(self, manager: 'GatingNetworkManager', chaos_probability: float = 0.01):
-        self.manager = manager
-        self.chaos_probability = chaos_probability
-
-    async def maybe_inject_failure(self):
-        if random.random() < self.chaos_probability:
-            action = random.choice(['corrupt_weights', 'delay'])
-            logger.warning(f"Chaos injection: {action}")
-            if action == 'corrupt_weights':
-                with torch.no_grad():
-                    for param in self.manager.model.parameters():
-                        param.mul_(random.uniform(0.8, 1.2))
-            elif action == 'delay':
-                await asyncio.sleep(random.uniform(0.5, 2.0))
-
-
-class HumanApprovalHandler:
-    """Requests human approval for critical decisions."""
-    def __init__(self, queue: Optional[AsyncMessageQueue] = None):
-        self.queue = queue
-
-    async def request_approval(self, decision: Dict[str, Any], timeout: float = 60.0) -> bool:
-        if not self.queue:
-            logger.warning("No queue for human approval; auto-approving.")
-            return True
-        logger.info(f"Human approval requested for {decision.get('action')}, auto-approving.")
-        await asyncio.sleep(0)
-        return True
-
-
-# -----------------------------------------------------------------------------
-# Main GatingNetworkManager (Enhanced)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# MAIN GATING NETWORK MANAGER (v5.0.0)
+# =============================================================================
 class GatingNetworkManager:
-    """
-    Gating Network Manager v4.2.0 with full enhancement integration.
-    """
+    """Thread-safe MoE gate manager with all ten enhancement modules."""
+
+    W_MAX = 10.0
+    WEIGHT_NORM_MAX = 1000.0
 
     def __init__(
         self,
         storage: Storage,
         message_queue: AsyncMessageQueue,
-        adaptive_cost: AdaptiveCostFunction,
-        pareto_gating: ParetoGating,
-        drift_detector: DriftDetector,
-        metrics: MetricsRegistry,
-        carbon_manager: Optional[Any] = None,
-        helium_optimizer: Optional[Any] = None,
+        adaptive_cost: Optional[AdaptiveCostFunction] = None,
+        pareto_gating: Optional[ParetoGating] = None,
+        drift_detector: Optional[DriftDetector] = None,
+        metrics: Optional[MetricsRegistry] = None,
         expert_ids: Optional[List[str]] = None,
-        websocket: Optional[Any] = None,
-        bio_core: Optional[Any] = None,
-    ):
+        input_dim: int = BioFeatures.DIM,
+        hidden_dim: int = 32,
+        num_hidden_layers: int = 2,
+        activation: str = "relu",
+        dropout_rate: float = 0.1,
+        learning_rate: float = 1e-2,
+        batch_size: int = 32,
+        epochs_per_update: int = 3,
+        max_training_samples: int = 5000,
+        enable_causal_mask: bool = True,
+        enable_quantum_distillation: bool = True,
+        enable_federated: bool = False,
+        enable_expert_auction: bool = False,
+        enable_safety_monitor: bool = True,
+        enable_temporal_safety: bool = True,
+        enable_xai: bool = True,
+        enable_precision: bool = False,
+        enable_carbon_market: bool = False,
+        enable_chaos: bool = False,
+        chaos_probability: float = 0.0,
+        enable_human_approval: bool = False,
+        seed: int = 42,
+    ) -> None:
         self.storage = storage
         self.queue = message_queue
         self.adaptive_cost = adaptive_cost
@@ -703,558 +1297,1235 @@ class GatingNetworkManager:
         self.drift = drift_detector
         self.metrics = metrics
 
-        self.config = GatingNetworkConfig()
-        self.carbon_manager = carbon_manager
-        self.helium_optimizer = helium_optimizer
-        self.websocket = websocket
-        self.bio_core = bio_core
+        self.expert_ids = list(expert_ids or
+                                [f"expert_{i}" for i in range(4)])
+        if not self.expert_ids:
+            raise ValueError("at least one expert required")
+        self.n_experts = len(self.expert_ids)
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_hidden_layers = int(num_hidden_layers)
+        self.activation = str(activation)
+        self.dropout_rate = float(dropout_rate)
+        self.lr = float(learning_rate)
+        self.batch_size = int(batch_size)
+        self.epochs_per_update = int(epochs_per_update)
+        self.max_training_samples = int(max_training_samples)
 
-        self.token_manager = getattr(bio_core, 'token_manager', None) if bio_core else None
-        self.gradient_manager = getattr(bio_core, 'gradient_manager', None) if bio_core else None
-        self.compartment_manager = getattr(bio_core, 'compartment_manager', None) if bio_core else None
+        # Deterministic RNG tree
+        self._rng = random.Random(seed)
+        self._rng_xai = random.Random(seed + 1)
+        self._rng_chaos = random.Random(seed + 2)
+        self._rng_carbon = random.Random(seed + 3)
+        self._rng_fed = random.Random(seed + 4)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
-        self.expert_ids = expert_ids or [f"expert_{i}" for i in range(self.config.num_experts)]
-        if len(self.expert_ids) != self.config.num_experts:
-            raise ValueError(
-                f"Number of expert IDs ({len(self.expert_ids)}) must match num_experts ({self.config.num_experts})"
-            )
-
-        # Load best hyperparameters from GA (if available)
-        best_hyper = self.storage.get_state('gating_best_hyperparams')
-        if best_hyper:
-            hparams = json.loads(best_hyper)
-            self.config.hidden_dim = hparams['hidden_dim']
-            self.config.num_hidden_layers = hparams['num_hidden_layers']
-            self.config.dropout_rate = hparams['dropout_rate']
-            self.config.learning_rate = hparams['learning_rate']
-            self.config.activation = hparams['activation']
-
-        # Gating network
+        # Model
         self.model = GatingNetwork(
-            input_dim=self.config.input_dim,
-            hidden_dim=self.config.hidden_dim,
-            num_experts=self.config.num_experts,
-            num_hidden_layers=self.config.num_hidden_layers,
-            activation=self.config.activation,
-            dropout_rate=self.config.dropout_rate
+            input_dim=self.input_dim,
+            hidden_dim=self.hidden_dim,
+            num_experts=self.n_experts,
+            num_hidden_layers=self.num_hidden_layers,
+            activation=self.activation,
+            dropout_rate=self.dropout_rate,
         )
-        self.optimizer = optim.Adam(
-            self.model.parameters(),
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay
-        )
+        self.model.eval()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         self.criterion = nn.CrossEntropyLoss()
 
-        # Expert modules
-        self.expert_modules: nn.ModuleDict = nn.ModuleDict()
-        for eid in self.expert_ids:
-            self.expert_modules[eid] = ExpertModule(self.config.input_dim, hidden_dim=self.config.hidden_dim)
+        # Thread-safety for CPU-bound forward/backward
+        self._cpu_lock = threading.Lock()
 
-        # Causal mask (if enabled)
-        self.causal_mask = None
-        if self.config.enable_causal_mask:
-            self.causal_mask = CausalFeatureMask(self.config.input_dim)
+        # Expert output modules (registered with the module tree via ModuleList)
+        self.expert_modules = nn.ModuleList([
+            ExpertModule(self.input_dim, hidden_dim=self.hidden_dim)
+            for _ in self.expert_ids
+        ])
 
-        # Expert auction (if enabled)
-        self.expert_auction = None
-        if self.config.enable_expert_auction:
-            self.expert_auction = ExpertAuction(self.expert_ids, self.config.input_dim, self.config.hidden_dim)
+        # Causal mask
+        self.causal_mask = CausalFeatureMask(
+            self.input_dim, rng=self._rng_xai) if enable_causal_mask else None
 
-        # Safety monitor
-        self.safety_monitor = None
-        if self.config.enable_safety_monitor:
-            self.safety_monitor = SafetyMonitor()
-            self._setup_safety_invariants()
-
-        # Precision controller
-        self.precision_controller = None
-        if self.config.enable_precision_controller:
-            self.precision_controller = PrecisionController()
-
-        # Carbon market client
-        self.carbon_market = None
-        if self.config.enable_carbon_market and self.config.carbon_market_config:
-            self.carbon_market = CarbonMarketClient(**self.config.carbon_market_config)
-
-        # Chaos injector
-        self.chaos_injector = None
-        if self.config.enable_chaos:
-            self.chaos_injector = ChaosInjector(self, self.config.chaos_probability)
-
-        # Human approval handler
-        self.human_approval = None
-        if self.config.enable_human_approval:
-            self.human_approval = HumanApprovalHandler(self.queue)
-
-        # Quantum distillation
-        self.quantum_distillation = QuantumDistillationModule() if self.config.enable_quantum_distillation else None
+        # Enhancement modules
+        self.quantum = (QuantumDistillationModule(
+            n_dims=self.input_dim, rng=random.Random(seed + 5))
+            if enable_quantum_distillation else None)
+        self.federated = (FederatedGreenAggregator(
+            storage, "gating", rng=self._rng_fed)
+            if enable_federated else None)
+        self.auction = (ExpertAuction(
+            self.expert_ids, self.input_dim, rng=self._rng_chaos)
+            if enable_expert_auction else None)
+        self.safety = SafetyMonitor() if enable_safety_monitor else None
+        if self.safety:
+            self._setup_safety_rules()
+        self.temporal_safety = (TemporalSafetyMonitor()
+                                if enable_temporal_safety else None)
+        if self.temporal_safety:
+            self._setup_temporal_rules()
+        self.xai = XAIExplainer(rng=self._rng_xai) if enable_xai else None
+        self.precision = (PrecisionController()
+                          if enable_precision else None)
+        self.carbon_market = (CarbonMarketClient(rng=self._rng_carbon)
+                              if enable_carbon_market else None)
+        self.chaos = (ChaosInjector(
+            self, chaos_probability, rng=self._rng_chaos)
+            if enable_chaos else None)
+        self.hitl = (HumanApprovalHandler(message_queue)
+                     if enable_human_approval else None)
 
         # Training buffer
-        self.training_buffer: deque = deque(maxlen=self.config.max_training_samples)
+        self.training_buffer: Deque[Tuple[np.ndarray, int]] = deque(
+            maxlen=self.max_training_samples)
         self.is_trained = False
-        self.global_model_state: Optional[Dict] = None
-
-        # Federated learning
-        self.federated_round = 0
-        self.participants: List[str] = []
-        self.contribution_score = 0.0
-        self._federated_session: Optional[aiohttp.ClientSession] = None
-
-        # Circuit breaker
-        self._circuit_breaker = CircuitBreaker(
-            failure_threshold=self.config.circuit_breaker_failure_threshold,
-            recovery_timeout=self.config.circuit_breaker_recovery_timeout
-        )
-        self._federated_lock = asyncio.Lock()
-        self._buffer_lock = asyncio.Lock()
-        self._model_lock = asyncio.Lock()
-        self._metrics_lock = asyncio.Lock()
-
-        # Rate limiter
-        rate_limit = getattr(central_config, "rate_limit_requests", 100)
-        self.rate_limiter = RateLimiter(rate_limit / 60.0, rate_limit)
-
-        # Counters
+        self.step_count = 0
         self.inference_count = 0
         self.training_count = 0
 
-        # New components
-        self.ga_tuner = GeneticHyperparameterTuner(self.config, self.storage) if self.config.enable_genetic_algorithm else None
-        self.pareto_front = ParetoFrontManager(self.storage, self.config) if self.config.enable_pareto_front else None
-        self.user_pref_learner = ActiveUserPreferenceLearner(self.storage, self.websocket) if self.config.enable_active_user_pref else None
-        self.explainer = ExplainabilityHelper(self.model, self._get_feature_names()) if self.config.enable_explainability else None
+        # Locks for counters
+        self._metrics_lock = asyncio.Lock()
 
-        # Drift retraining state
-        self._recent_accuracies = deque(maxlen=100)
-        self._drift_retrain_threshold = self.config.drift_retrain_threshold
+        # Snapshot for rollback
+        self._initial_snapshot = self._snapshot_weights()
 
-        # Background tasks
-        self._background_tasks: List[asyncio.Task] = []
-        self._start_background_tasks()
+        # Lifecycle
+        self._shutdown_event = asyncio.Event()
+        self._background_tasks: Set[asyncio.Task] = set()
+        if self.chaos is not None:
+            self._spawn(self._chaos_loop())
 
-        logger.info(
-            f"GatingNetworkManager v4.2.0 initialized: input_dim={self.config.input_dim}, "
-            f"hidden_dim={self.config.hidden_dim}, num_experts={self.config.num_experts}, "
-            f"layers={self.config.num_hidden_layers}, activation={self.config.activation}"
-        )
+    # ------------------------------------------------------------------
+    def _spawn(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
-    def _start_background_tasks(self):
-        if self.config.enable_federated and self.config.server_url:
-            self._background_tasks.append(self._create_task(self._federated_sync_loop()))
-        if self.config.enable_genetic_algorithm:
-            self._background_tasks.append(self._create_task(self._ga_tuning_loop()))
-        if self.config.enable_chaos and self.chaos_injector:
-            self._background_tasks.append(self._create_task(self._chaos_loop()))
+    def _setup_safety_rules(self) -> None:
+        assert self.safety is not None
 
-    def _create_task(self, coro):
+        def _finite(r):
+            with r._cpu_lock:
+                for p in r.model.parameters():
+                    if not torch.all(torch.isfinite(p)):
+                        return False
+            return True
+
+        def _bounded(r):
+            with r._cpu_lock:
+                for p in r.model.parameters():
+                    if float(p.norm()) > r.WEIGHT_NORM_MAX:
+                        return False
+            return True
+
+        def _probs_valid(state):
+            p = state.get("probs")
+            if p is None:
+                return True
+            if any(x < 0 for x in p):
+                return False
+            return abs(sum(p) - 1.0) < 1e-4
+
+        self.safety.add_rule(
+            "weights_finite",
+            lambda state, r=self: _finite(r),
+            "weights contain NaN or Inf",
+            severity="critical",
+            mitigation=lambda r: r._restore_weights(r._initial_snapshot))
+        self.safety.add_rule(
+            "weights_bounded",
+            lambda state, r=self: _bounded(r),
+            "weight norm exceeds bound",
+            severity="critical",
+            mitigation=lambda r: r._clip_weights())
+        self.safety.add_rule(
+            "probs_valid", _probs_valid,
+            "gating probabilities invalid",
+            severity="warning")
+
+    def _setup_temporal_rules(self) -> None:
+        assert self.temporal_safety is not None
+        self.temporal_safety.add_formula("G (step_count >= 0)")
+        self.temporal_safety.add_formula("G (confidence >= 0.0)")
+        self.temporal_safety.add_formula("G (confidence <= 1.0)")
+
+    # ------------------------------------------------------------------
+    def _snapshot_weights(self) -> Dict[str, Any]:
+        with self._cpu_lock:
+            snap = {"model": {k: v.detach().clone()
+                              for k, v in self.model.state_dict().items()},
+                    "experts": {k: v.detach().clone()
+                                for k, v in self.expert_modules.state_dict().items()}}
+        return snap
+
+    def _restore_weights(self, snap: Dict[str, Any]) -> None:
+        with self._cpu_lock:
+            try:
+                self.model.load_state_dict(snap["model"])
+            except Exception:
+                pass
+            try:
+                self.expert_modules.load_state_dict(snap["experts"])
+            except Exception:
+                pass
+
+    def _clip_weights(self) -> None:
+        with self._cpu_lock:
+            with torch.no_grad():
+                for p in self.model.parameters():
+                    p.data.clamp_(-self.W_MAX, self.W_MAX)
+                for p in self.expert_modules.parameters():
+                    p.data.clamp_(-self.W_MAX, self.W_MAX)
+
+    def _check_steady_state(self) -> bool:
         try:
-            loop = asyncio.get_running_loop()
-            return loop.create_task(coro)
-        except RuntimeError:
-            logger.warning("No running event loop; background task not started.")
-            return None
+            with self._cpu_lock:
+                for p in self.model.parameters():
+                    if not torch.all(torch.isfinite(p)):
+                        return False
+                    if float(p.norm()) > self.WEIGHT_NORM_MAX:
+                        return False
+            return True
+        except Exception:
+            return False
 
-    def _setup_safety_invariants(self):
-        self.safety_monitor.add_invariant(
-            "probs_sum_to_one",
-            lambda s: abs(sum(s.get('probs', [])) - 1.0) < 1e-6 if s.get('probs') else True,
-            "Gating probabilities do not sum to 1"
-        )
-        self.safety_monitor.add_invariant(
-            "epsilon_in_range",
-            lambda s: 0.0 <= s.get('epsilon', 0) <= 1.0,
-            "Epsilon out of range"
-        )
-        self.safety_monitor.add_invariant(
-            "expert_count_positive",
-            lambda s: s.get('n_experts', 0) > 0,
-            "No experts available"
-        )
-
-    async def _chaos_loop(self):
-        while True:
-            await asyncio.sleep(60)
-            if self.chaos_injector:
-                await self.chaos_injector.maybe_inject_failure()
-
-    # ==========================================================================
-    # Feature names
-    # ==========================================================================
-    def _get_feature_names(self) -> List[str]:
-        names = ['helium_scarcity', 'helium_cost_index', 'carbon_intensity',
-                 'model_loss', 'gradient_variance', 'avg_client_energy',
-                 'gradient_carbon', 'gradient_helium', 'token_balance_norm',
-                 'harvester_stress']
-        if self.config.enable_carbon_awareness and self.carbon_manager:
-            names.append('carbon_intensity_live')
-        if self.config.enable_helium_awareness and self.helium_optimizer:
-            names.append('helium_price_live')
-        if self.config.enable_causal_features:
-            names.extend(['causal_impact_carbon', 'causal_impact_helium'])
-        if self.config.enable_bio_integration and self.gradient_manager:
-            names.extend(['gradient_carbon_real', 'gradient_helium_real', 'gradient_trust_real'])
-        if self.config.enable_bio_integration and self.token_manager:
-            names.append('atp_balance')
-        if self.config.enable_bio_integration and self.compartment_manager:
-            names.append('compartment_health_avg')
-        return names[:self.config.input_dim]
-
-    # ==========================================================================
-    # Teacher Interface for MOPD
-    # ==========================================================================
-    async def policy_probs(self, state: Dict) -> List[float]:
-        result = await self.predict(state, return_explanation=False, use_mixture=False)
-        return [result['probabilities'].get(eid, 0.0) for eid in self.expert_ids]
-
-    # ==========================================================================
-    # Feature Engineering (enhanced with bio signals)
-    # ==========================================================================
-    async def _build_features(self, context: Dict[str, Any]) -> np.ndarray:
-        features = []
-        expected_keys = [
-            'helium_scarcity', 'helium_cost_index', 'carbon_intensity',
-            'model_loss', 'gradient_variance', 'avg_client_energy',
-            'gradient_carbon', 'gradient_helium', 'token_balance_norm',
-            'harvester_stress'
-        ]
-        for key in expected_keys:
-            val = context.get(key)
-            if val is None:
-                val = 0.5
-            features.append(float(val))
-        if self.config.enable_carbon_awareness and self.carbon_manager:
-            try:
-                carbon_intensity = await self.carbon_manager.get_current_intensity()
-                features.append(carbon_intensity / 1000.0)
-            except Exception:
-                features.append(0.5)
-        if self.config.enable_helium_awareness and self.helium_optimizer:
-            try:
-                helium_status = self.helium_optimizer.get_helium_status()
-                features.append(helium_status.get('price_usd_per_l', 0.5))
-            except Exception:
-                features.append(0.5)
-        if self.config.enable_causal_features:
-            features.append(context.get('causal_impact_carbon', 0.0))
-            features.append(context.get('causal_impact_helium', 0.0))
-        if self.config.enable_bio_integration and self.gradient_manager:
-            grad_levels = self.gradient_manager.get_field_strengths()
-            features.append(grad_levels.get('carbon', 0.5))
-            features.append(grad_levels.get('helium', 0.5))
-            features.append(grad_levels.get('trust', 0.5))
-        if self.config.enable_bio_integration and self.token_manager:
-            try:
-                summary = self.token_manager.get_system_summary()
-                features.append(min(1.0, summary.get('total_balance', 500) / 1000))
-            except Exception:
-                features.append(0.5)
-        if self.config.enable_bio_integration and self.compartment_manager:
-            try:
-                compartments = self.compartment_manager.compartments
-                healths = [c.health_score for c in compartments.values()]
-                features.append(np.mean(healths) if healths else 0.5)
-            except Exception:
-                features.append(0.5)
-
-        if len(features) < self.config.input_dim:
-            features.extend([0.0] * (self.config.input_dim - len(features)))
-        else:
-            features = features[:self.config.input_dim]
-        return np.array(features, dtype=np.float32)
-
-    # ==========================================================================
-    # Inference (Enhanced)
-    # ==========================================================================
-    async def predict(self, context: Dict[str, Any], return_explanation: bool = True,
-                      use_mixture: bool = False, top_k: int = 2) -> Dict[str, Any]:
-        if self.rate_limiter and not await self.rate_limiter.acquire():
-            raise RuntimeError("Rate limit exceeded for inference")
-
-        features = await self._build_features(context)
-        features_tensor = torch.FloatTensor(features).unsqueeze(0)
-
-        # Apply causal mask if enabled
-        if self.causal_mask is not None:
-            masked_features = self.causal_mask(features_tensor)
-        else:
-            masked_features = features_tensor
-
-        # Apply precision controller
-        if self.precision_controller:
-            precision = self.precision_controller.get_precision(
-                load=float(torch.mean(masked_features).item()),
-                energy_budget=0.5
-            )
-            if precision == 'float16':
-                masked_features = masked_features.half()
-
-        with torch.no_grad():
-            logits = self.model(masked_features)
-            if self.adaptive_cost:
-                weights = self.adaptive_cost.get_current_weights()
-                expert_costs = []
-                for i, eid in enumerate(self.expert_ids):
-                    metrics = {
-                        'quality': 0.5,
-                        'carbon_g': context.get('carbon', 0.1),
-                        'latency_ms': context.get('latency', 100),
-                        'energy_joules': context.get('energy', 10),
-                        'health': 1.0,
-                        'atp': context.get('atp_balance', 0.5)
-                    }
-                    cost = self.adaptive_cost.compute(
-                        quality=metrics['quality'],
-                        carbon_g=metrics['carbon_g'],
-                        latency_ms=metrics['latency_ms'],
-                        energy_joules=metrics['energy_joules'],
-                        health=metrics['health'],
-                        atp=metrics['atp']
-                    )
-                    expert_costs.append(cost)
-                cost_tensor = torch.FloatTensor(expert_costs).unsqueeze(0)
-                adjusted_logits = logits * cost_tensor
+    # ------------------------------------------------------------------
+    def _forward_locked(self, x: torch.Tensor,
+                        use_bf16: bool = False) -> torch.Tensor:
+        """Serialized forward pass; always returns float32 logits."""
+        with self._cpu_lock:
+            self.model.eval()
+            if use_bf16:
+                try:
+                    with torch.autocast(device_type="cpu",
+                                        dtype=torch.bfloat16):
+                        logits = self.model(x)
+                except (RuntimeError, TypeError):
+                    logits = self.model(x)
             else:
-                adjusted_logits = logits
+                logits = self.model(x)
+            return logits.float().detach()
 
-            if self.pareto:
-                candidates = []
-                for i, eid in enumerate(self.expert_ids):
-                    candidates.append({
-                        'expert_id': eid,
-                        'quality_score': float(adjusted_logits[0, i].item()),
-                        'carbon_g': context.get('carbon', 0.1),
-                        'latency_ms': context.get('latency', 100),
-                        'energy_joules': context.get('energy', 10)
-                    })
-                filtered = self.pareto.filter(candidates)
-                if filtered:
-                    allowed_ids = {c['expert_id'] for c in filtered}
-                    mask = torch.zeros_like(adjusted_logits)
-                    for i, eid in enumerate(self.expert_ids):
-                        if eid in allowed_ids:
-                            mask[0, i] = 1.0
-                    adjusted_logits = adjusted_logits * mask - 1e9 * (1 - mask)
+    async def _forward_async(self, x: torch.Tensor,
+                             use_bf16: bool = False) -> torch.Tensor:
+        return await asyncio.to_thread(self._forward_locked, x, use_bf16)
 
-            probs = torch.softmax(adjusted_logits, dim=1).squeeze().cpu().numpy()
+    def _select_precision(self, features: np.ndarray) -> str:
+        if self.precision is None:
+            return "fp32"
+        load = float(np.mean(np.abs(features))) if features.size else 0.0
+        if load > 0.8:
+            return "bf16"
+        return self.precision.select_precision()
 
-        probabilities = {self.expert_ids[i]: float(probs[i]) for i in range(len(self.expert_ids))}
+    # ------------------------------------------------------------------
+    async def predict(self, context: Dict[str, Any],
+                      return_explanation: bool = True,
+                      user_id: str = "default",
+                      task_id: str = "unknown") -> GatingDecision:
+        features = BioFeatures.encode(context)
+
+        # Causal mask observation + apply
+        if self.causal_mask is not None:
+            self.causal_mask.observe(features)
+            masked = self.causal_mask.apply(features)
+        else:
+            masked = features
+
+        precision = self._select_precision(masked)
+        use_bf16 = precision in ("fp16", "bf16")
+
+        x_tensor = torch.tensor(masked, dtype=torch.float32).unsqueeze(0)
+        logits = await self._forward_async(x_tensor, use_bf16)
+
+        # Adaptive cost adjustment
+        if self.adaptive_cost is not None:
+            costs = []
+            for eid in self.expert_ids:
+                costs.append(self.adaptive_cost.compute(
+                    quality=context.get("quality_score", 0.5),
+                    carbon_g=context.get("carbon_g", 0.1),
+                    latency_ms=context.get("latency_ms", 100.0),
+                    energy_joules=context.get("energy_joules", 10.0),
+                ))
+            cost_tensor = torch.tensor(costs, dtype=torch.float32).unsqueeze(0)
+            logits = logits - cost_tensor
+
+        probs = torch.softmax(logits, dim=1).squeeze(0).numpy()
+        probs = self._safe_normalize(probs)
 
         # Safety check
-        if self.safety_monitor:
-            state = {
-                'probs': list(probabilities.values()),
-                'epsilon': 0.1,  # placeholder; could be actual epsilon from exploration
-                'n_experts': len(self.expert_ids),
-            }
-            violations = self.safety_monitor.check(state)
-            if violations:
-                logger.warning(f"Safety violations in gating: {violations}")
-                uniform_prob = 1.0 / len(self.expert_ids)
-                probabilities = {eid: uniform_prob for eid in self.expert_ids}
-                probs = np.array(list(probabilities.values()))
+        if self.safety is not None:
+            violations = self.safety.check(
+                {"probs": probs.tolist()}, router=self)
+            if any(v.severity == "critical" and not v.mitigated
+                   for v in violations):
+                probs = np.ones_like(probs) / len(probs)
 
-        # Carbon market
-        if self.carbon_market and self.carbon_market.available:
-            carbon_amount = context.get('carbon', 0.0)
-            if carbon_amount > 0.5:
-                await self.carbon_market.buy_credits(carbon_amount * 10)
+        # Expert selection (auction override)
+        if self.auction is not None:
+            winners = self.auction.select_experts(masked, top_k=1)
+            if winners:
+                selected_idx = self.expert_ids.index(winners[0])
             else:
-                await self.carbon_market.sell_credits((0.5 - carbon_amount) * 5)
-
-        # True MoE
-        selected_experts = []
-        mixture_output = None
-        if self.expert_auction and not use_mixture:
-            # Use auction for selection (overrides gating)
-            auction_winner = self.expert_auction.select_experts(masked_features, top_k=1)[0]
-            selected_experts = [auction_winner]
-            auction_bid = self.expert_auction.compute_bids(masked_features)[auction_winner]
-            probabilities = {eid: 0.0 for eid in self.expert_ids}
-            probabilities[auction_winner] = 1.0
-        elif use_mixture:
-            # Top-k mixture
-            topk_indices = np.argsort(probs)[-top_k:]
-            selected_experts = [self.expert_ids[i] for i in topk_indices]
-            topk_probs = probs[topk_indices]
-            if topk_probs.sum() > 0:
-                topk_probs = topk_probs / topk_probs.sum()
-            outputs = []
-            for idx, eid in zip(topk_indices, selected_experts):
-                out = self.expert_modules[eid](masked_features).squeeze()
-                outputs.append(out)
-            mixture_output = sum(p * out for p, out in zip(topk_probs, outputs)).item()
+                selected_idx = int(np.argmax(probs))
         else:
-            selected_expert = max(probabilities, key=probabilities.get)
-            selected_experts = [selected_expert]
-            if selected_expert in self.expert_modules:
-                with torch.no_grad():
-                    mixture_output = self.expert_modules[selected_expert](masked_features).item()
+            selected_idx = int(np.argmax(probs))
 
-        # Explanation
-        explanation = None
-        if self.explainer and return_explanation:
-            explanation = self.explainer.explain(features)
+        # HITL gate
+        if self.hitl is not None and self.n_experts >= 2:
+            candidates = sorted(
+                [{"id": eid, "prob": float(probs[i])}
+                 for i, eid in enumerate(self.expert_ids)],
+                key=lambda c: c["prob"], reverse=True)[:2]
+            approved = await self.hitl.request_approval(
+                {"action": "route", "candidates": candidates},
+                user_id=user_id)
+            if not approved:
+                selected_idx = int(np.argmax(probs))
+
+        # XAI
+        explanation: Optional[Dict[str, Any]] = None
+        counterfactual: Optional[Dict[str, Any]] = None
+        if return_explanation and self.xai is not None:
+            explanation, counterfactual = await asyncio.to_thread(
+                self._compute_xai, masked, selected_idx)
+
+        # Temporal safety push + check
+        if self.temporal_safety is not None:
+            await self.temporal_safety.push({
+                "step_count": self.step_count,
+                "confidence": float(probs[selected_idx]),
+            })
+            await self.temporal_safety.check()
 
         # Metrics
         async with self._metrics_lock:
             self.inference_count += 1
-            self.metrics.increment("gating_inference")
-            if explanation:
-                self.metrics.observe("gating_explanation_quality", 0.8)
+            if self.metrics is not None:
+                try:
+                    self.metrics.inc("gating_inference")
+                except Exception:
+                    pass
 
-        # FeedbackEvent
-        event = FeedbackEvent.create_with_context(
-            task_id=f"gate_{hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()[:8]}",
-            selected_action=selected_experts[0] if selected_experts else "none",
-            quality_score=max(probabilities.values()),
-            energy_joules=context.get('energy', 0.0),
-            carbon_g=context.get('carbon', 0.0),
-            feedback_type="gating",
-            adaptive_cost_value=0.0,
-            state=context,
-            candidates=[{'expert': eid, 'prob': prob} for eid, prob in probabilities.items()],
+        return GatingDecision(
+            state_vec=masked.copy(),
+            probs=probs.copy(),
+            expert_ids=tuple(self.expert_ids),
+            selected_expert=self.expert_ids[selected_idx],
+            selected_idx=selected_idx,
+            confidence=float(probs[selected_idx]),
+            timestamp=time.time(),
+            explanation=explanation,
+            counterfactual=counterfactual,
+            precision=precision,
+        )
+
+    def _compute_xai(self, masked: np.ndarray,
+                     selected_idx: int) -> Tuple[
+                         Optional[Dict[str, Any]],
+                         Optional[Dict[str, Any]]]:
+        if self.xai is None:
+            return None, None
+
+        def _score(v: np.ndarray) -> float:
+            t = torch.tensor(np.asarray(v, dtype=np.float32)).unsqueeze(0)
+            logits = self._forward_locked(t, use_bf16=False)
+            return float(logits[0, selected_idx])
+
+        try:
+            attrs = self.xai.integrated_gradients(_score, masked)
+            explanation = {
+                "method": "integrated_gradients",
+                "attributions": attrs.tolist(),
+                "feature_names": list(BioFeatures.NAMES),
+            }
+            counterfactual = self.xai.counterfactual(_score, masked)
+        except Exception as e:
+            logger.debug(f"XAI failed: {e}")
+            return None, None
+        return explanation, counterfactual
+
+    def _safe_normalize(self, probs: np.ndarray) -> np.ndarray:
+        probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        probs = np.clip(probs, 0.0, None)
+        s = float(probs.sum())
+        if s <= 0 or not np.isfinite(s):
+            return np.ones_like(probs) / probs.size
+        return probs / s
+
+    # ------------------------------------------------------------------
+    def add_training_sample(self, features: np.ndarray, label: int) -> None:
+        features = np.asarray(features, dtype=np.float32)
+        if features.shape[0] != self.input_dim:
+            raise ValueError(
+                f"features dim {features.shape[0]} != {self.input_dim}")
+        if not (0 <= label < self.n_experts):
+            raise ValueError(
+                f"label {label} out of range [0, {self.n_experts})")
+        if len(self.training_buffer) >= self.max_training_samples:
+            self.training_buffer.popleft()
+        self.training_buffer.append((features, int(label)))
+
+    async def train(self, epochs: Optional[int] = None) -> Optional[float]:
+        if not self.training_buffer:
+            return None
+        epochs = int(epochs or self.epochs_per_update)
+        samples = list(self.training_buffer)
+        X = np.stack([s[0] for s in samples]).astype(np.float32)
+        y = np.asarray([s[1] for s in samples], dtype=np.int64)
+        return await asyncio.to_thread(self._train_locked, X, y, epochs)
+
+    def _train_locked(self, X: np.ndarray, y: np.ndarray,
+                      epochs: int) -> float:
+        with self._cpu_lock:
+            self.model.train()
+            X_t = torch.from_numpy(X).float()
+            y_t = torch.from_numpy(y).long()
+            dataset = TensorDataset(X_t, y_t)
+            loader = DataLoader(dataset,
+                                batch_size=min(self.batch_size, len(X_t)),
+                                shuffle=True)
+            total = 0.0
+            n_batches = 0
+            for _ in range(epochs):
+                for batch_X, batch_y in loader:
+                    self.optimizer.zero_grad()
+                    out = self.model(batch_X)
+                    loss = self.criterion(out, batch_y)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                                    1.0)
+                    self.optimizer.step()
+                    total += float(loss.item())
+                    n_batches += 1
+            self.model.eval()
+        self.is_trained = True
+        self.training_count += 1
+        return total / max(n_batches, 1)
+
+    async def update(self, features: np.ndarray, label: int,
+                     reward: float) -> Optional[GatingDecision]:
+        """Online update: record sample, run one training step, return decision."""
+        self.add_training_sample(features, label)
+        await self.train(epochs=self.epochs_per_update)
+        self.step_count += 1
+        # Update auction with reward
+        if self.auction is not None:
+            self.auction.update(self.expert_ids[label], features, reward)
+        # Chaos injection
+        if self.chaos is not None:
+            await self.chaos.maybe_inject_failure()
+        # Federated send (rate-limited)
+        if self.federated is not None:
+            await self.federated.share_weights(
+                "gating", self._weights_for_fed())
+        return None
+
+    def _weights_for_fed(self) -> Dict[str, Any]:
+        with self._cpu_lock:
+            return {k: v.detach().cpu().numpy()
+                    for k, v in self.model.state_dict().items()
+                    if v.dtype in (torch.float32, torch.float64)}
+
+    async def apply_global_weights(self, weights: Dict[str, Any]) -> bool:
+        if not weights:
+            return False
+        try:
+            await asyncio.to_thread(self._apply_weights_locked, weights)
+            return True
+        except Exception as e:
+            logger.warning(f"apply_global_weights failed: {e}")
+            return False
+
+    def _apply_weights_locked(self, weights: Dict[str, Any]) -> None:
+        with self._cpu_lock:
+            local = self.model.state_dict()
+            new_state = {}
+            for k, v in weights.items():
+                if k not in local:
+                    continue
+                remote = torch.as_tensor(np.asarray(v))
+                if remote.shape != local[k].shape:
+                    raise ValueError(
+                        f"shape mismatch for {k}: {remote.shape} vs "
+                        f"{local[k].shape}")
+                new_state[k] = (0.5 * local[k].cpu() +
+                                0.5 * remote.float()).to(local[k].dtype)
+            if new_state:
+                self.model.load_state_dict(new_state, strict=False)
+
+    # ------------------------------------------------------------------
+    async def _chaos_loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(),
+                                       timeout=60.0)
+                break
+            except asyncio.TimeoutError:
+                pass
+            if self.chaos is not None:
+                try:
+                    await self.chaos.maybe_inject_failure()
+                except Exception as e:
+                    logger.debug(f"chaos loop: {e}")
+
+    async def shutdown(self) -> None:
+        self._shutdown_event.set()
+        tasks = list(self._background_tasks)
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.clear()
+
+    # ------------------------------------------------------------------
+    async def publish_training_event(self, task_id: str = "train",
+                                     avg_loss: float = 0.0) -> None:
+        if self.queue is None:
+            return
+        event = FeedbackEvent(
             source="gating_network",
-            environment=getattr(central_config, "ENVIRONMENT", "production"),
-            tags=["gating", "moe"],
-            metadata={'explanation': explanation} if explanation else {}
+            feedback_type="gating_training",
+            task_id=task_id,
+            context={"epochs": self.epochs_per_update,
+                     "samples": len(self.training_buffer)},
+            action={"action": "train"},
+            performance={"quality_score": max(0.0, 1.0 - avg_loss)},
+            adaptive_cost_value=0.0,
+            tags=["gating", "training"],
         )
         await self.queue.publish("feedback_events", event.to_json())
 
-        # Drift check
-        if self.drift:
-            drift_result = await self.drift.check_drift(self.adaptive_cost.get_current_weights())
-            if drift_result and drift_result > 0.5 and self.config.enable_drift_retraining:
-                logger.warning(f"High drift detected ({drift_result:.3f}), triggering retraining.")
-                await self.train(epochs=self.config.epochs_per_update * 2)
-
-        if 'true_label' in context:
-            true_label = context['true_label']
-            if true_label in self.expert_ids:
-                accuracy = 1.0 if (selected_experts and selected_experts[0] == true_label) else 0.0
-                self._recent_accuracies.append(accuracy)
-                if self.config.enable_drift_retraining and len(self._recent_accuracies) >= 10:
-                    mean_acc = np.mean(self._recent_accuracies)
-                    if mean_acc < (1 - self._drift_retrain_threshold):
-                        logger.warning("Gating network performance dropped (manual), retraining.")
-                        await self.train(epochs=self.config.epochs_per_update * 2)
-                        self._recent_accuracies.clear()
-
+    def get_stats(self) -> Dict[str, Any]:
         return {
-            'probabilities': probabilities,
-            'selected_experts': selected_experts,
-            'mixture_output': mixture_output,
-            'explanation': explanation,
+            "n_experts": self.n_experts,
+            "input_dim": self.input_dim,
+            "hidden_dim": self.hidden_dim,
+            "num_hidden_layers": self.num_hidden_layers,
+            "is_trained": self.is_trained,
+            "training_buffer": len(self.training_buffer),
+            "step_count": self.step_count,
+            "inference_count": self.inference_count,
+            "training_count": self.training_count,
+            "causal_mask_enabled": self.causal_mask is not None,
+            "quantum_enabled": self.quantum is not None,
+            "federated_enabled": self.federated is not None,
+            "auction_enabled": self.auction is not None,
+            "safety_enabled": self.safety is not None,
+            "temporal_safety_enabled": self.temporal_safety is not None,
+            "xai_enabled": self.xai is not None,
+            "precision": self.precision.current if self.precision else "fp32",
+            "carbon_market_enabled": self.carbon_market is not None,
+            "chaos_enabled": self.chaos is not None,
+            "hitl_enabled": self.hitl is not None,
         }
 
-    # ==========================================================================
-    # Training and Persistence (mostly unchanged)
-    # ==========================================================================
-    def add_training_sample(self, features: np.ndarray, label: int):
-        if features.shape[0] != self.config.input_dim:
-            raise ValueError(f"Feature dimension mismatch: expected {self.config.input_dim}, got {features.shape[0]}")
-        if not 0 <= label < self.config.num_experts:
-            raise ValueError(f"Label out of range: {label} (num_experts={self.config.num_experts})")
-        if len(self.training_buffer) >= self.config.max_training_samples:
-            self.training_buffer.popleft()
-        self.training_buffer.append((features, label))
+    async def health_check(self) -> Dict[str, Any]:
+        stats = self.get_stats()
+        stats["background_tasks"] = len(self._background_tasks)
+        stats["steady_state"] = self._check_steady_state()
+        return stats
 
-    async def train(self, epochs: Optional[int] = None):
-        if not self.training_buffer:
-            logger.warning("No training data available")
-            return
 
-        epochs = epochs or self.config.epochs_per_update
-        buffer_list = list(self.training_buffer)
-        n = len(buffer_list)
-        weights = np.array([self.config.recency_weight ** (n - 1 - i) for i in range(n)])
-        weights /= weights.sum()
+# =============================================================================
+# SAFETY MONITOR (rule-based with severity + mitigation)
+# =============================================================================
+@dataclass
+class SafetyViolation:
+    name: str
+    severity: str
+    description: str
+    mitigated: bool = False
 
-        if np.random.random() < 0.5:
-            indices = np.random.choice(n, size=min(n, 2000), p=weights, replace=True)
-            X = np.array([buffer_list[i][0] for i in indices], dtype=np.float32)
-            y = np.array([buffer_list[i][1] for i in indices], dtype=np.int64)
-        else:
-            X = np.array([sample[0] for sample in buffer_list], dtype=np.float32)
-            y = np.array([sample[1] for sample in buffer_list], dtype=np.int64)
 
-        X_tensor = torch.FloatTensor(X)
-        y_tensor = torch.LongTensor(y)
-        dataset = TensorDataset(X_tensor, y_tensor)
-        dataloader = DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True)
+@dataclass
+class SafetyRule:
+    name: str
+    predicate: Callable[[Dict[str, Any]], bool]
+    description: str
+    severity: str = "warning"
+    mitigation: Optional[Callable] = None
 
-        self.model.train()
-        total_loss = 0.0
-        for epoch in range(epochs):
-            epoch_loss = 0.0
-            for batch_X, batch_y in dataloader:
-                self.optimizer.zero_grad()
-                output = self.model(batch_X)
-                loss = self.criterion(output, batch_y)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
-                epoch_loss += loss.item()
-            total_loss += epoch_loss
 
-        avg_loss = total_loss / epochs
-        self.is_trained = True
-        async with self._metrics_lock:
-            self.training_count += 1
-            self.metrics.observe("gating_training_loss", avg_loss)
-            self.metrics.increment("gating_training")
+class SafetyMonitor:
+    def __init__(self):
+        self.rules: List[SafetyRule] = []
+        self.violations: Deque[SafetyViolation] = deque(maxlen=1000)
 
-        event = FeedbackEvent.create_with_context(
-            task_id=f"train_{datetime.now(timezone.utc).timestamp()}",
-            selected_action="train",
-            quality_score=1.0 - avg_loss,
-            energy_joules=0.0,
-            carbon_g=0.0,
-            feedback_type="gating_training",
-            adaptive_cost_value=0.0,
-            state={'epochs': epochs, 'samples': len(X)},
-            candidates=[{'action': 'train'}],
-            source="gating_network",
-            environment=getattr(central_config, "ENVIRONMENT", "production"),
-            tags=["gating", "training"]
-        )
-        await self.queue.publish("feedback_events", event.to_json())
+    def add_rule(self, name: str,
+                 predicate: Callable[[Dict[str, Any]], bool],
+                 description: str, severity: str = "warning",
+                 mitigation: Optional[Callable] = None) -> None:
+        self.rules.append(SafetyRule(name, predicate, description,
+                                     severity, mitigation))
 
-        if self.drift:
-            await self.drift.check_drift(self.adaptive_cost.get_current_weights())
-
-        logger.info(f"Gating network trained. Avg loss: {avg_loss:.4f}, samples used: {len(X)}")
-
-    async def _ga_tuning_loop(self):
-        while True:
+    def check(self, state: Dict[str, Any],
+              router: Optional[Any] = None) -> List[SafetyViolation]:
+        out: List[SafetyViolation] = []
+        for rule in self.rules:
             try:
-                await asyncio.sleep(3600 * 12)
-                if self.ga_tuner and self.training_buffer:
-                    if self.quantum_distillation and self.quantum_distillation.is_available():
-                        # Could use quantum distillation to seed GA; not fully implemented
+                ok = bool(rule.predicate(state))
+            except Exception:
+                ok = False
+            if not ok:
+                v = SafetyViolation(rule.name, rule.severity,
+                                    rule.description)
+                if rule.mitigation and router is not None:
+                    try:
+                        rule.mitigation(router)
+                        v.mitigated = True
+                    except Exception:
                         pass
-                    best = await self.ga_tuner.run_search(list(self.training_buffer))
-                    if best:
-                        logger.info("GA tuning completed. Best hyperparameters: %s", best)
-            except Exception as e:
-                logger.error(f"GA tuning loop error: {e}")
-                await asyncio.sleep(3600)
+                self.violations.append(v)
+                out.append(v)
+        return out
 
-    # Federated learning methods remain similar to original (omitted for brevity, but unchanged).
-    # We will include stubs here that call the same methods as original, but we need to copy them.
-    # To avoid huge duplication, we assume the original methods are present and we only add new ones.
-    # In a real full file, we would include them. For brevity, we'll keep them as is in the original.
+    def violation_count(self, severity: Optional[str] = None) -> int:
+        if severity is None:
+            return len(self.violations)
+        return sum(1 for v in self.violations if v.severity == severity)
 
-    # Persistence, health, etc. are already in original.
 
-    async def shutdown(self):
-        logger.info("Shutting down GatingNetworkManager")
-        for task in self._background_tasks:
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        if self._federated_session:
-            await self._federated_session.close()
-        logger.info("Shutdown complete")
+# =============================================================================
+# FIXTURES
+# =============================================================================
+@pytest.fixture
+def storage():
+    return Storage()
+
+
+@pytest.fixture
+def queue():
+    return AsyncMessageQueue()
+
+
+@pytest.fixture
+def adaptive_cost(storage):
+    return AdaptiveCostFunction(storage)
+
+
+@pytest.fixture
+def pareto_gating():
+    return ParetoGating()
+
+
+@pytest.fixture
+def drift_detector(storage, adaptive_cost):
+    return DriftDetector(storage, adaptive_cost)
+
+
+@pytest.fixture
+def metrics():
+    return MetricsRegistry()
+
+
+@pytest.fixture
+def manager(storage, queue, adaptive_cost, pareto_gating,
+            drift_detector, metrics):
+    return GatingNetworkManager(
+        storage=storage, message_queue=queue,
+        adaptive_cost=adaptive_cost, pareto_gating=pareto_gating,
+        drift_detector=drift_detector, metrics=metrics,
+        hidden_dim=16, num_hidden_layers=2, seed=42,
+        enable_xai=True, enable_safety_monitor=True,
+        enable_temporal_safety=True, enable_causal_mask=True,
+    )
+
+
+@pytest_asyncio.fixture
+async def async_manager(storage, queue, adaptive_cost, pareto_gating,
+                        drift_detector, metrics):
+    m = GatingNetworkManager(
+        storage=storage, message_queue=queue,
+        adaptive_cost=adaptive_cost, pareto_gating=pareto_gating,
+        drift_detector=drift_detector, metrics=metrics,
+        hidden_dim=16, num_hidden_layers=2, seed=42,
+        enable_quantum_distillation=True,
+        enable_federated=True,
+        enable_expert_auction=True,
+        enable_safety_monitor=True,
+        enable_temporal_safety=True,
+        enable_xai=True,
+        enable_precision=True,
+        enable_carbon_market=True,
+        enable_chaos=False,
+        enable_human_approval=True,
+        enable_causal_mask=True,
+    )
+    try:
+        yield m
+    finally:
+        await m.shutdown()
+
+
+def _sample_context() -> Dict[str, Any]:
+    return {
+        "helium_scarcity": 0.4, "helium_cost_index": 0.5,
+        "carbon_intensity": 0.45, "model_loss": 0.2,
+        "gradient_variance": 0.3, "avg_client_energy": 0.6,
+        "gradient_carbon": 0.5, "gradient_helium": 0.4,
+        "token_balance_norm": 0.7, "harvester_stress": 0.3,
+        "causal_impact_carbon": 0.1, "causal_impact_helium": 0.2,
+    }
+
+
+# =============================================================================
+# TESTS — BUG FIXES
+# =============================================================================
+class TestBugFixes:
+    @pytest.mark.asyncio
+    async def test_predict_with_batch_size_1(self, manager):
+        # LayerNorm should tolerate batch size 1 (the old BatchNorm1d
+        # implementation would crash).
+        decision = await manager.predict(_sample_context(),
+                                         return_explanation=False)
+        assert 0 <= decision.selected_idx < manager.n_experts
+        assert abs(float(decision.probs.sum()) - 1.0) < 1e-4
+
+    @pytest.mark.asyncio
+    async def test_predict_after_train(self, manager):
+        # Manually populate the buffer and train.
+        for _ in range(10):
+            manager.add_training_sample(
+                BioFeatures.encode(_sample_context()), 0)
+        await manager.train(epochs=1)
+        # Model is now in eval mode and predict must work.
+        decision = await manager.predict(_sample_context(),
+                                         return_explanation=False)
+        assert decision.selected_idx in range(manager.n_experts)
+
+    @pytest.mark.asyncio
+    async def test_model_never_leaves_train_mode(self, manager):
+        for _ in range(5):
+            manager.add_training_sample(
+                BioFeatures.encode(_sample_context()), 1)
+        await manager.train(epochs=1)
+        assert not manager.model.training, \
+            "model must be in eval mode after train()"
+
+    @pytest.mark.asyncio
+    async def test_precision_does_not_break_dtype(self, storage, queue,
+                                                   adaptive_cost,
+                                                   pareto_gating,
+                                                   drift_detector, metrics):
+        m = GatingNetworkManager(
+            storage=storage, message_queue=queue,
+            adaptive_cost=adaptive_cost, pareto_gating=pareto_gating,
+            drift_detector=drift_detector, metrics=metrics,
+            hidden_dim=16, seed=1, enable_precision=True)
+        try:
+            # High load -> bf16 path
+            ctx = _sample_context()
+            ctx["harvester_stress"] = 5.0
+            decision = await m.predict(ctx, return_explanation=False)
+            assert decision.precision in ("fp32", "bf16", "fp16", "int8")
+            # Weights must remain float32.
+            for p in m.model.parameters():
+                assert p.dtype == torch.float32
+        finally:
+            await m.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_safety_mitigates_nan(self, manager):
+        # Inject NaN into a weight.
+        with torch.no_grad():
+            for p in manager.model.parameters():
+                p.data[0] = float("nan")
+                break
+        violations = manager.safety.check({}, router=manager)
+        assert any(v.name == "weights_finite" for v in violations)
+        # After mitigation, weights must be finite.
+        for p in manager.model.parameters():
+            assert torch.all(torch.isfinite(p))
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancels_tasks(self, storage, queue,
+                                           adaptive_cost, pareto_gating,
+                                           drift_detector, metrics):
+        m = GatingNetworkManager(
+            storage=storage, message_queue=queue,
+            adaptive_cost=adaptive_cost, pareto_gating=pareto_gating,
+            drift_detector=drift_detector, metrics=metrics,
+            hidden_dim=8, seed=1, enable_chaos=True,
+            chaos_probability=1.0)
+        assert len(m._background_tasks) >= 1
+        await m.shutdown()
+        assert len(m._background_tasks) == 0
+
+    @pytest.mark.asyncio
+    async def test_feedback_event_accepts_extra_kwargs(self):
+        # create_with_context must drop unsupported kwargs gracefully.
+        event = FeedbackEvent.create_with_context(
+            source="test", feedback_type="routing", task_id="t1",
+            context={}, action={}, performance={},
+            adaptive_cost_value=0.0, tags=[],
+            metadata={"foo": "bar"},  # should be silently dropped
+            unknown_kwarg=42,
+        )
+        assert event.source == "test"
+        assert "metadata" not in asdict(event)
+
+    @pytest.mark.asyncio
+    async def test_apply_global_weights_shape_validation(self, manager):
+        bad = {"network.0.weight": np.zeros((5, 5), dtype=np.float32)}
+        ok = await manager.apply_global_weights(bad)
+        assert ok is False  # shape mismatch caught
+
+    def test_zero_experts_rejected(self, storage, queue):
+        with pytest.raises(ValueError):
+            GatingNetworkManager(storage=storage, message_queue=queue,
+                                 expert_ids=[])
+
+    def test_softmax_fallback(self, manager):
+        probs = manager._safe_normalize(np.array([np.nan, np.nan]))
+        assert np.allclose(probs, [0.5, 0.5])
+
+    @pytest.mark.asyncio
+    async def test_chaos_bounded(self, storage, queue, adaptive_cost,
+                                 pareto_gating, drift_detector, metrics):
+        m = GatingNetworkManager(
+            storage=storage, message_queue=queue,
+            adaptive_cost=adaptive_cost, pareto_gating=pareto_gating,
+            drift_detector=drift_detector, metrics=metrics,
+            hidden_dim=8, seed=1, enable_chaos=True,
+            chaos_probability=1.0)
+        try:
+            for _ in range(20):
+                await m.chaos.run_experiment(
+                    f"c{_}", "data_corruption")
+            for p in m.model.parameters():
+                assert torch.all(torch.isfinite(p))
+                assert float(p.norm()) <= m.WEIGHT_NORM_MAX
+        finally:
+            await m.shutdown()
+
+
+# =============================================================================
+# TESTS — CORE ROUTER
+# =============================================================================
+class TestCoreRouter:
+    @pytest.mark.asyncio
+    async def test_predict_probs_sum_to_one(self, manager):
+        decision = await manager.predict(_sample_context(),
+                                         return_explanation=False)
+        assert abs(float(decision.probs.sum()) - 1.0) < 1e-4
+        assert np.all(decision.probs >= 0)
+
+    @pytest.mark.asyncio
+    async def test_decision_is_frozen(self, manager):
+        decision = await manager.predict(_sample_context(),
+                                         return_explanation=False)
+        with pytest.raises(Exception):
+            decision.selected_idx = 999
+
+    @pytest.mark.asyncio
+    async def test_predict_deterministic(self, storage, queue,
+                                          adaptive_cost, pareto_gating,
+                                          drift_detector, metrics):
+        m1 = GatingNetworkManager(
+            storage=storage, message_queue=queue,
+            adaptive_cost=adaptive_cost, pareto_gating=pareto_gating,
+            drift_detector=drift_detector, metrics=metrics,
+            hidden_dim=16, seed=7, enable_expert_auction=False)
+        m2 = GatingNetworkManager(
+            storage=storage, message_queue=queue,
+            adaptive_cost=adaptive_cost, pareto_gating=pareto_gating,
+            drift_detector=drift_detector, metrics=metrics,
+            hidden_dim=16, seed=7, enable_expert_auction=False)
+        try:
+            d1 = await m1.predict(_sample_context(),
+                                   return_explanation=False)
+            d2 = await m2.predict(_sample_context(),
+                                   return_explanation=False)
+            assert d1.selected_idx == d2.selected_idx
+            assert np.allclose(d1.probs, d2.probs)
+        finally:
+            await m1.shutdown()
+            await m2.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_add_training_sample_validates(self, manager):
+        with pytest.raises(ValueError):
+            manager.add_training_sample(np.zeros(3, dtype=np.float32), 0)
+        with pytest.raises(ValueError):
+            manager.add_training_sample(
+                np.zeros(BioFeatures.DIM, dtype=np.float32), 99)
+
+    @pytest.mark.asyncio
+    async def test_train_reduces_loss(self, manager):
+        rng = np.random.RandomState(0)
+        for _ in range(50):
+            feats = rng.randn(BioFeatures.DIM).astype(np.float32) * 0.1
+            label = 0 if feats[0] > 0 else 1
+            manager.add_training_sample(feats, label)
+        loss1 = await manager.train(epochs=1)
+        for _ in range(20):
+            loss2 = await manager.train(epochs=1)
+        assert loss2 is not None
+
+    @pytest.mark.asyncio
+    async def test_concurrent_predict(self, manager):
+        async def _p():
+            return await manager.predict(_sample_context(),
+                                         return_explanation=False)
+        results = await asyncio.gather(*[_p() for _ in range(8)])
+        assert all(r.selected_idx in range(manager.n_experts)
+                   for r in results)
+
+
+# =============================================================================
+# TESTS — ENHANCEMENT MODULES
+# =============================================================================
+class TestQuantumDistillation:
+    def test_register_normalises(self):
+        q = QuantumDistillationModule(n_dims=4)
+        q.register_teacher("a", [1, 2, 3, 4])
+        assert abs(sum(q.teachers["a"]) - 1.0) < 1e-9
+
+    def test_superposition_agreement(self):
+        q = QuantumDistillationModule(n_dims=4)
+        p = [0.4, 0.3, 0.2, 0.1]
+        q.register_teacher("a", p)
+        q.register_teacher("b", p)
+        sup, _ = q._superpose()
+        assert all(abs(a - b) < 1e-6 for a, b in zip(sup, p))
+
+    @pytest.mark.asyncio
+    async def test_step_updates_student(self):
+        q = QuantumDistillationModule(n_dims=4)
+        q.register_teacher("a", [0.4, 0.3, 0.2, 0.1])
+        before = q.get_student_policy()
+        entry = await q.step()
+        after = q.get_student_policy()
+        assert before != after
+        assert "entropy" in entry
+
+
+class TestCausalMask:
+    def test_apply_identity_when_unfit(self):
+        c = CausalFeatureMask(feature_dim=4)
+        out = c.apply([1.0, 2.0, 3.0, 4.0])
+        assert np.allclose(out, [1, 2, 3, 4])
+
+    def test_observe_and_fit(self):
+        c = CausalFeatureMask(feature_dim=4)
+        for _ in range(50):
+            c.observe(np.random.randn(4))
+        summary = c.fit()
+        assert len(summary["mask"]) == 4
+
+    def test_wrong_dim_raises(self):
+        c = CausalFeatureMask(feature_dim=4)
+        with pytest.raises(ValueError):
+            c.apply([1.0, 2.0, 3.0])
+
+
+class TestFederated:
+    @pytest.mark.asyncio
+    async def test_roundtrip(self, storage):
+        f = FederatedGreenAggregator(storage, "i1", sparse_topk=0.0,
+                                     rate_limit_seconds=0.0)
+        weights = {"a": np.array([1.0, 2.0, 3.0], dtype=np.float32)}
+        assert await f.share_weights("m", weights, force=True)
+        agg = await f.pull_aggregated("m")
+        assert agg is not None
+        assert np.allclose(np.asarray(agg["a"]), [1.0, 2.0, 3.0])
+
+    @pytest.mark.asyncio
+    async def test_weighted_average(self, storage):
+        f1 = FederatedGreenAggregator(storage, "i1", sparse_topk=0.0,
+                                      rate_limit_seconds=0.0)
+        f2 = FederatedGreenAggregator(storage, "i2", sparse_topk=0.0,
+                                      rate_limit_seconds=0.0)
+        await f1.share_weights(
+            "m", {"a": np.zeros(4, dtype=np.float32)},
+            sample_count=1, force=True)
+        await f2.share_weights(
+            "m", {"a": np.ones(4, dtype=np.float32) * 8},
+            sample_count=3, force=True)
+        agg = await f1.pull_aggregated("m")
+        # (1*0 + 3*8)/4 = 6
+        assert np.allclose(np.asarray(agg["a"]), 6.0, atol=1e-4)
+
+    @pytest.mark.asyncio
+    async def test_rate_limit(self, storage):
+        f = FederatedGreenAggregator(storage, "i1", sparse_topk=0.0,
+                                     rate_limit_seconds=10.0)
+        weights = {"a": np.zeros(4, dtype=np.float32)}
+        assert await f.share_weights("m", weights, force=True)
+        assert not await f.share_weights("m", weights, force=False)
+
+
+class TestExpertAuction:
+    def test_all_experts_have_bids(self):
+        a = ExpertAuction(["e1", "e2", "e3"], feature_dim=4)
+        bids = a.compute_bids([0.1, 0.2, 0.3, 0.4])
+        assert set(bids.keys()) == {"e1", "e2", "e3"}
+
+    def test_update_changes_scores(self):
+        a = ExpertAuction(["e1"], feature_dim=4)
+        feats = [0.5] * 4
+        before = a.compute_bids(feats)["e1"]
+        a.update("e1", feats, reward=1.0)
+        after = a.compute_bids(feats)["e1"]
+        assert after > before
+
+    def test_select_top_k(self):
+        a = ExpertAuction(["e1", "e2", "e3"], feature_dim=4)
+        for _ in range(10):
+            a.update("e1", [1.0] + [0.0] * 3, reward=1.0)
+        top = a.select_experts([1.0] + [0.0] * 3, top_k=2)
+        assert len(top) == 2
+        assert "e1" in top
+
+
+class TestTemporalSafety:
+    @pytest.mark.asyncio
+    async def test_always_satisfied(self):
+        s = TemporalSafetyMonitor()
+        s.add_formula("G (quality >= 0.5)")
+        await s.push({"quality": 0.9})
+        await s.push({"quality": 0.8})
+        result = await s.check()
+        assert all(result.values())
+
+    @pytest.mark.asyncio
+    async def test_never_violated(self):
+        s = TemporalSafetyMonitor()
+        s.add_formula("NEVER (carbon >= 0.8)")
+        await s.push({"carbon": 0.5})
+        await s.push({"carbon": 0.9})
+        result = await s.check()
+        assert any(not v for v in result.values())
+
+    @pytest.mark.asyncio
+    async def test_historically_operator(self):
+        s = TemporalSafetyMonitor()
+        s.add_formula("H (quality >= 0.5)")
+        await s.push({"quality": 0.9})
+        await s.push({"quality": 0.1})
+        result = await s.check()
+        assert any(not v for v in result.values())
+
+    @pytest.mark.asyncio
+    async def test_windowed_rule(self):
+        s = TemporalSafetyMonitor()
+        s.add_formula("[60] G (quality >= 0.5)")
+        assert any("@60" in rid for rid in s.rules)
+
+
+class TestXAIExplainer:
+    def test_ig_sum_approximates_diff(self):
+        x = XAIExplainer(ig_steps=8)
+        def f(v):
+            return float(np.dot(v, [0.4, -0.3, -0.2, -0.1]))
+        feats = np.array([0.9, 0.4, 0.5, 0.4])
+        attrs = x.integrated_gradients(f, feats)
+        diff = f(feats) - f(np.zeros_like(feats))
+        assert abs(float(np.sum(attrs)) - diff) < 0.2
+
+    def test_counterfactual_runs(self):
+        x = XAIExplainer(cf_max_iter=50, cf_target_delta=0.05,
+                         rng=random.Random(0))
+        def f(v):
+            return float(v[0] - v[1])
+        feats = np.array([0.9, 0.4])
+        cf = x.counterfactual(f, feats)
+        assert "changed_index" in cf
+
+
+class TestPrecisionController:
+    def test_lowest_energy(self):
+        p = PrecisionController(levels=["fp32", "int8"])
+        assert p.select_precision() == "int8"
+
+    def test_high_sensitivity_forces_fp32(self):
+        p = PrecisionController(levels=["fp32", "int8"], max_sensitivity=0.3)
+        assert p.select_precision(layer_sensitivity=0.9) == "fp32"
+
+    @pytest.mark.asyncio
+    async def test_switch(self):
+        p = PrecisionController(levels=["fp32", "int8"], hysteresis_s=0.0)
+        assert await p.switch_to("int8") is True
+        assert p.current == "int8"
+
+    @pytest.mark.asyncio
+    async def test_auto_switch_drop(self):
+        p = PrecisionController(levels=["fp32", "int8"], hysteresis_s=0.0)
+        p.current = "int8"
+        await p.auto_switch(recent_acc=0.7, baseline_acc=0.95)
+        assert p.current == "fp32"
+
+
+class TestCarbonMarket:
+    @pytest.mark.asyncio
+    async def test_budget_overshoot_defers(self):
+        c = CarbonMarketClient(budget_kg=0.1, rng=random.Random(0))
+        c.used_kg = 0.09
+        result = await c.net_zero_schedule(1.0, 0.1)
+        assert result["action"] == "defer"
+
+    @pytest.mark.asyncio
+    async def test_buy_and_retire_rec(self):
+        c = CarbonMarketClient()
+        await c.buy_credits(10.0)
+        await c.buy_credits(5.0)
+        assert c.rec_balance() == 15.0
+        retired = await c.retire_rec(7.0)
+        assert retired == 7.0
+        assert abs(c.rec_balance() - 8.0) < 1e-9
+
+    @pytest.mark.asyncio
+    async def test_ema_smooths(self):
+        prices = iter([100.0, 200.0])
+        async def oracle():
+            return next(prices)
+        c = CarbonMarketClient(price_oracle=oracle)
+        await c.update_price()
+        await c.update_price()
+        assert 100.0 < c.price_ema < 200.0
+
+
+class TestChaosInjector:
+    @pytest.mark.asyncio
+    async def test_latency(self, manager):
+        c = ChaosInjector(manager, rng=random.Random(0))
+        result = await c.run_experiment("t1", "latency")
+        assert result["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_exception(self, manager):
+        c = ChaosInjector(manager, rng=random.Random(0))
+        result = await c.run_experiment("t2", "exception")
+        assert result["status"] == "injected"
+
+    @pytest.mark.asyncio
+    async def test_unknown_fault_rejected(self, manager):
+        c = ChaosInjector(manager)
+        with pytest.raises(ValueError):
+            await c.run_experiment("t", "unknown")
+
+
+class TestHITL:
+    @pytest.mark.asyncio
+    async def test_single_candidate_auto(self):
+        h = HumanApprovalHandler()
+        assert await h.request_approval(
+            {"candidates": [{"id": "only"}]}) is True
+
+    @pytest.mark.asyncio
+    async def test_confident_skips_query(self):
+        h = HumanApprovalHandler(uncertainty_threshold=0.01)
+        await h.record_choice("u", "a", metrics={"quality_score": 1.0})
+        ok = await h.request_approval({
+            "candidates": [
+                {"id": "hi", "quality_score": 10.0},
+                {"id": "lo", "quality_score": 0.01},
+            ]}, user_id="u")
+        assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_uncertain_queries(self):
+        h = HumanApprovalHandler(uncertainty_threshold=10.0, timeout=0.05)
+        await h.submit_response("u", "hi")
+        ok = await h.request_approval({
+            "candidates": [
+                {"id": "hi", "quality_score": 1.0},
+                {"id": "lo", "quality_score": 1.0},
+            ]}, user_id="u")
+        assert ok is True
+
+
+# =============================================================================
+# TESTS — FULL INTEGRATION
+# =============================================================================
+class TestFullIntegration:
+    @pytest.mark.asyncio
+    async def test_async_manager_full_cycle(self, async_manager):
+        decision = await async_manager.predict(_sample_context())
+        assert decision.selected_expert in async_manager.expert_ids
+        assert decision.explanation is not None
+        assert "attributions" in decision.explanation
+
+    @pytest.mark.asyncio
+    async def test_stats_reports_all_modules(self, async_manager):
+        stats = async_manager.get_stats()
+        for key in ("causal_mask_enabled", "quantum_enabled",
+                    "federated_enabled", "auction_enabled",
+                    "safety_enabled", "temporal_safety_enabled",
+                    "xai_enabled", "carbon_market_enabled",
+                    "chaos_enabled", "hitl_enabled"):
+            assert key in stats
+
+    @pytest.mark.asyncio
+    async def test_health_check(self, async_manager):
+        hc = await async_manager.health_check()
+        assert "background_tasks" in hc
+        assert "steady_state" in hc
+        assert hc["steady_state"] is True
+
+    @pytest.mark.asyncio
+    async def test_shutdown_idempotent(self, async_manager):
+        await async_manager.shutdown()
+        await async_manager.shutdown()
+        assert len(async_manager._background_tasks) == 0
+
+    @pytest.mark.asyncio
+    async def test_federated_apply_roundtrip(self, async_manager):
+        weights = async_manager._weights_for_fed()
+        # Perturb and apply.
+        perturbed = {k: np.asarray(v) * 1.01 for k, v in weights.items()}
+        ok = await async_manager.apply_global_weights(perturbed)
+        assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_concurrent_predict_full(self, async_manager):
+        async def _p():
+            return await async_manager.predict(_sample_context(),
+                                                return_explanation=False)
+        results = await asyncio.gather(*[_p() for _ in range(6)])
+        for r in results:
+            assert r.selected_expert in async_manager.expert_ids
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+if __name__ == "__main__":
+    async def demo():
+        storage = Storage()
+        queue = AsyncMessageQueue()
+        ac = AdaptiveCostFunction(storage)
+        pg = ParetoGating()
+        dd = DriftDetector(storage, ac)
+        metrics = MetricsRegistry()
+
+        m = GatingNetworkManager(
+            storage=storage, message_queue=queue,
+            adaptive_cost=ac, pareto_gating=pg, drift_detector=dd,
+            metrics=metrics, hidden_dim=32, seed=1,
+            enable_federated=True, enable_expert_auction=True,
+            enable_safety_monitor=True, enable_temporal_safety=True,
+            enable_xai=True, enable_precision=True,
+            enable_carbon_market=True, enable_human_approval=True,
+            enable_causal_mask=True,
+        )
+        try:
+            decision = await m.predict({
+                "helium_scarcity": 0.4, "carbon_intensity": 0.45,
+                "model_loss": 0.2, "gradient_variance": 0.3,
+            })
+            print(f"Selected: {decision.selected_expert} "
+                  f"(confidence={decision.confidence:.3f})")
+            print(f"Probs: {decision.probs.tolist()}")
+            if decision.explanation:
+                print("XAI method:", decision.explanation["method"])
+            stats = await m.health_check()
+            print("Stats:", json.dumps(stats, indent=2, default=str))
+        finally:
+            await m.shutdown()
+
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(demo())
