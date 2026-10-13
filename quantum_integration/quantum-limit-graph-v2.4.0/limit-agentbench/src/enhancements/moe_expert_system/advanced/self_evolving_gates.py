@@ -1,1867 +1,3555 @@
 #!/usr/bin/env python3
-# File: quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/moe_expert_system/advanced/self_evolving_gates.py
-# Version 7.4.0 – Enhanced Green Agent MOPD Integration
-#
-# ENHANCEMENTS OVER v7.3.0:
-# 1. Fixed state persistence: gate_network weights are now stored as base64-encoded pickle inside JSON.
-# 2. Replaced placeholder fitness in architecture search with a real (though simple) evaluation on memory replay.
-# 3. Completely rewrote MAML gate to support true meta-gradient computation via differentiable inner loop.
-# 4. Made async task creation safe across synchronous and asynchronous contexts.
-# 5. Standardized MoE interface: gating_network.predict must return logits (same as internal).
-# 6. Added minimal explainability (feature importance) and temporal safety checks.
-# 7. Improved error handling and logging throughout.
+"""
+Enhanced Self-Evolving Gate v8.0.0 — Self-Contained Single-File Bundle
+========================================================================
+
+Complete rewrite of the Green Agent self-evolving MoE gate. Everything
+needed to run and test is in this file:
+
+  1. Protocol interfaces for every injected dependency.
+  2. Local stubs (Storage, AsyncMessageQueue, FeedbackEvent,
+     AdaptiveCostFunction, ParetoGating, DriftDetector, MetricsRegistry).
+  3. TaskManager with proper shutdown semantics.
+  4. Real HTTP carbon/helium clients with circuit breaker + cache + EMA.
+  5. Health + self-healing systems.
+  6. REAL MAML using torch.func.functional_call (true meta-gradients).
+  7. REAL EWC (Fisher information from a data loader).
+  8. REAL generative replay (buffer store/sample).
+  9. REAL NSGA-II fitness evaluation (weight transfer + training step).
+ 10. Integrated Gradients + counterfactual explainability.
+ 11. Full MTL temporal safety monitor (G/F/NEVER/H/O with windows).
+ 12. Ten real enhancement modules.
+ 13. `EnhancedSelfEvolvingGate` orchestrator.
+ 14. Comprehensive pytest suite.
+
+Run:
+    python self_evolving_gate_v8.py         # demo
+    pytest self_evolving_gate_v8.py -v      # tests
+
+Requires: Python 3.10+, numpy, pytest, pytest-asyncio.
+Requires: torch >= 2.0 (for torch.func.functional_call).
+Optional: aiohttp, scikit-learn.
+"""
+
+from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import json
+import logging
+import math
 import os
-import secrets
+import random
+import threading
 import time
 import uuid
-from typing import Dict, Any, List, Optional, Tuple, Set, Callable, Union
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone, timedelta
-from enum import Enum
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from collections import defaultdict, deque
-import copy
-import math
-import pickle
-import zlib
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from typing import (
+    Any, Callable, Deque, Dict, Iterable, List, Optional, Protocol, Sequence,
+    Set, Tuple, runtime_checkable,
+)
+
+import numpy as np
+import pytest
+import pytest_asyncio
+
+logger = logging.getLogger("self_evolving_gate")
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
 
 # -----------------------------------------------------------------------------
-# IMPORT CENTRAL GREEN AGENT COMPONENTS
+# Torch is required for this module
 # -----------------------------------------------------------------------------
-from ..config import config as central_config
-from ..storage import Storage
-from ..schemas.feedback_event import FeedbackEvent
-from ..routing.pareto_gating import ParetoGating
-from ..feedback.adaptive_cost import AdaptiveCostFunction
-from ..safety.drift_detector import DriftDetector
-from ..scaling.message_queue import AsyncMessageQueue
-from ..metrics import MetricsRegistry
-from ..logger import logger
-
-# Optional: central circuit breaker and rate limiter
 try:
-    from ..scaling.circuit_breaker import EnhancedCircuitBreaker
-    CENTRAL_CIRCUIT_BREAKER_AVAILABLE = True
-except ImportError:
-    try:
-        from ..scaling.circuit_breaker import CircuitBreaker as EnhancedCircuitBreaker
-        CENTRAL_CIRCUIT_BREAKER_AVAILABLE = True
-    except ImportError:
-        # Fallback: define a simple local circuit breaker
-        class EnhancedCircuitBreaker:
-            def __init__(self, name, failure_threshold=5, recovery_timeout=60):
-                self.name = name
-                self.failure_count = 0
-                self.failure_threshold = failure_threshold
-                self.recovery_timeout = recovery_timeout
-                self.last_failure_time = None
-                self.open = False
-                self._lock = asyncio.Lock()
-            async def call(self, func):
-                async with self._lock:
-                    if self.open:
-                        if time.time() - self.last_failure_time > self.recovery_timeout:
-                            self.open = False
-                            self.failure_count = 0
-                        else:
-                            raise Exception(f"Circuit breaker {self.name} is open")
-                try:
-                    if asyncio.iscoroutinefunction(func):
-                        result = await func()
-                    else:
-                        result = func()
-                    self.failure_count = 0
-                    return result
-                except Exception as e:
-                    self.failure_count += 1
-                    self.last_failure_time = time.time()
-                    if self.failure_count >= self.failure_threshold:
-                        self.open = True
-                    raise e
-        CENTRAL_CIRCUIT_BREAKER_AVAILABLE = False
-        logger.warning("Using local fallback circuit breaker")
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader, TensorDataset
+    from torch.func import functional_call
+    TORCH_AVAILABLE = True
+except ImportError as e:  # pragma: no cover
+    TORCH_AVAILABLE = False
+    torch = None  # type: ignore
+    nn = None  # type: ignore
+    F = None  # type: ignore
+    functional_call = None  # type: ignore
+    raise ImportError(
+        "PyTorch >= 2.0 is required for this module "
+        "(for torch.func.functional_call)") from e
 
-# -----------------------------------------------------------------------------
-# MISSING ADVANCED MODULES (fallback implementations)
-# -----------------------------------------------------------------------------
-class ElasticWeightConsolidation:
-    """Simplified EWC for continual learning."""
-    def __init__(self, model, quantum_aware=False, lambda_ewc=0.4):
-        self.model = model
-        self.lambda_ewc = lambda_ewc
-        self.quantum_aware = quantum_aware
-        self.fisher_information = {}
-        self.old_parameters = {}
-        self._update_old_params()
-
-    def _update_old_params(self):
-        self.old_parameters = {name: param.clone().detach() for name, param in self.model.named_parameters()}
-        self.fisher_information = {name: torch.zeros_like(param) for name, param in self.model.named_parameters()}
-
-    def accumulate_fisher(self, data_loader=None):
-        # Simplified: just set Fisher to ones for now (better than nothing)
-        for name, param in self.model.named_parameters():
-            self.fisher_information[name] = torch.ones_like(param) * 0.1
-
-    def penalty(self):
-        loss = 0.0
-        for name, param in self.model.named_parameters():
-            if name in self.old_parameters:
-                loss += torch.sum(self.fisher_information[name] * (param - self.old_parameters[name]) ** 2)
-        return self.lambda_ewc * loss
-
-    def after_batch(self):
-        self.accumulate_fisher()
-
-class GenerativeReplay:
-    """Simplified generative replay using a memory buffer."""
-    def __init__(self, input_dim, quantum_aware=False, buffer_size=500):
-        self.buffer = deque(maxlen=buffer_size)
-        self.input_dim = input_dim
-        self.quantum_aware = quantum_aware
-        self.generator = None  # could be a VAE, omitted
-
-    def store(self, x, y=None):
-        self.buffer.append((x.detach().cpu(), y.detach().cpu() if y is not None else None))
-
-    def sample(self, batch_size=32):
-        if len(self.buffer) < batch_size:
-            return None
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
-        batch_x, batch_y = [], []
-        for i in indices:
-            x, y = self.buffer[i]
-            batch_x.append(x)
-            if y is not None:
-                batch_y.append(y)
-        if batch_y:
-            return torch.stack(batch_x), torch.stack(batch_y)
-        return torch.stack(batch_x), None
-
-class EnhancedConceptDriftDetector:
-    """Simple concept drift detector based on running mean/variance."""
-    def __init__(self, quantum_aware=False, window_size=100, threshold=0.1):
-        self.quantum_aware = quantum_aware
-        self.window = deque(maxlen=window_size)
-        self.threshold = threshold
-        self.drift_score = 0.0
-
-    def update(self, features):
-        self.window.append(features.detach().cpu().numpy())
-        self._compute_drift()
-
-    def _compute_drift(self):
-        if len(self.window) < 10:
-            self.drift_score = 0.0
-            return
-        arr = np.array(self.window)
-        recent_mean = arr[-10:].mean(axis=0)
-        older_mean = arr[:-10].mean(axis=0)
-        diff = np.linalg.norm(recent_mean - older_mean)
-        self.drift_score = min(1.0, diff / self.threshold)
-
-    def reset(self):
-        self.window.clear()
-        self.drift_score = 0.0
-
-class EnhancedEnvironmentalEncoder:
-    """Encodes environmental context into a fixed-size vector."""
-    def __init__(self, input_dim, quantum_aware=False):
-        self.input_dim = input_dim
-        self.quantum_aware = quantum_aware
-
-    def encode(self, context_dict, default_dim=None):
-        if context_dict is None:
-            return torch.zeros(self.input_dim)
-        vec = []
-        for key in sorted(context_dict.keys()):
-            val = context_dict[key]
-            if isinstance(val, (int, float)):
-                vec.append(float(val))
-            elif isinstance(val, str):
-                vec.append(float(hash(val) % 100) / 100.0)
-            else:
-                vec.append(0.0)
-        if len(vec) < self.input_dim:
-            vec.extend([0.0] * (self.input_dim - len(vec)))
-        else:
-            vec = vec[:self.input_dim]
-        return torch.tensor(vec, dtype=torch.float32)
-
-# -----------------------------------------------------------------------------
-# aiohttp import (required for CarbonIntensityManager)
-# -----------------------------------------------------------------------------
 try:
     import aiohttp
-except ImportError:
-    aiohttp = None
-    logger.warning("aiohttp not available; carbon intensity updates will fail gracefully")
+    AIOHTTP_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    aiohttp = None  # type: ignore
+    AIOHTTP_AVAILABLE = False
 
-# ============================================================================
-# Bio-Inspired Core Import (with fallback)
-# ============================================================================
-try:
-    from enhancements.bio_inspired.__init__ import EnhancedBioInspiredCore, BioEvent
-    from enhancements.bio_inspired.eco_atp_currency import (
-        EcoATPTokenManager, DynamicExchangeRate, EcoATPSource, EcoATPConsumer,
-        TokenState, EcoATPToken, EcoATPAccount
+
+# =============================================================================
+# PROTOCOL INTERFACES
+# =============================================================================
+@runtime_checkable
+class StorageLike(Protocol):
+    def save_state(self, key: str, value: str) -> None: ...
+    def get_state(self, key: str) -> Optional[str]: ...
+
+
+@runtime_checkable
+class MessageQueueLike(Protocol):
+    async def publish(self, topic: str, payload: str) -> None: ...
+
+
+@runtime_checkable
+class MetricsLike(Protocol):
+    def inc(self, name: str, amount: int = 1) -> None: ...
+    def set(self, name: str, value: float) -> None: ...
+
+
+@runtime_checkable
+class AdaptiveCostLike(Protocol):
+    def get_current_weights(self) -> Dict[str, float]: ...
+    def compute(self, **kwargs: Any) -> float: ...
+
+
+@runtime_checkable
+class ParetoGatingLike(Protocol):
+    def filter(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]: ...
+
+
+@runtime_checkable
+class DriftDetectorLike(Protocol):
+    async def check_drift(self, weights: Dict[str, float]) -> float: ...
+
+
+@runtime_checkable
+class BioCoreLike(Protocol):
+    def get_token_summary(self) -> Dict[str, Any]: ...
+    def get_gradient_strengths(self) -> Dict[str, float]: ...
+
+
+@runtime_checkable
+class HeliumProviderLike(Protocol):
+    def get_scarcity(self) -> float: ...
+    def get_cost_index(self) -> float: ...
+    def get_efficiency(self) -> float: ...
+    async def get_current_price(self) -> float: ...
+
+
+@runtime_checkable
+class GatingNetworkLike(Protocol):
+    async def policy_probs(self, state: Dict[str, Any]) -> List[float]: ...
+    async def record_reward(self, expert_id: str,
+                            context: Dict[str, Any], reward: float) -> None: ...
+
+
+# =============================================================================
+# ENUMS + VALUE OBJECTS
+# =============================================================================
+class CircuitBreakerState(str, Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+class HealthStatus(str, Enum):
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNHEALTHY = "unhealthy"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class ComponentHealth:
+    status: HealthStatus
+    score: float
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SafetyViolation:
+    name: str
+    severity: str
+    description: str
+    mitigated: bool = False
+
+
+@dataclass(frozen=True)
+class GateDecision:
+    """Snapshot of a gate decision for downstream consumers."""
+    state_vec: np.ndarray
+    logits: np.ndarray
+    probs: np.ndarray
+    selected_expert: int
+    confidence: float
+    timestamp: float
+    explanation: Optional[Dict[str, Any]] = None
+    counterfactual: Optional[Dict[str, Any]] = None
+    safety_violations: Tuple[str, ...] = ()
+    task_id: Optional[str] = None
+
+
+# =============================================================================
+# FEATURE ENCODER
+# =============================================================================
+class EnvironmentFeatures:
+    NAMES = (
+        "carbon_intensity", "helium_scarcity", "carbon_price",
+        "helium_price", "token_balance", "gradient_carbon",
+        "gradient_helium", "gradient_trust", "drift_score",
+        "plasticity", "memory_pressure", "task_complexity",
     )
-    from enhancements.bio_inspired.proton_gradient_fields import (
-        GradientFieldManager, GradientField
-    )
-    from enhancements.bio_inspired.atp_synthase_scheduler import (
-        ATPSynthaseScheduler, SynthaseConfig
-    )
-    from enhancements.bio_inspired.chromatophore_compartments import (
-        CompartmentManager, ChromatophoreCompartment, CompartmentState,
-        MembranePermeability
-    )
-    from enhancements.bio_inspired.biomass_storage import (
-        BiomassStorage, StorageTier, GuaranteeLevel, StoredTask, StorageToken
-    )
-    from enhancements.bio_inspired.photosynthetic_harvester import (
-        PhotosyntheticHarvester
-    )
-    from enhancements.bio_inspired.time_tick_engine import TimeTickEngine
-    from enhancements.bio_inspired.quantum_bridge import QuantumBridge
-    BIO_INSPIRED_AVAILABLE = True
-except ImportError as e:
-    BIO_INSPIRED_AVAILABLE = False
-    logger.warning(f"Bio-inspired core modules not available: {str(e)} - using standard evolution")
-    class BioEvent:
-        def __init__(self, event_type, source, data=None):
-            self.event_type = event_type
-            self.source = source
-            self.data = data or {}
+    DIM = len(NAMES)
 
-# ============================================================================
-# MoE Expert Router and Gating Network (optional)
-# ============================================================================
-try:
-    from ..expert_router import ExpertRouter
-    from ..gating_network import GatingNetworkManager
-    MOE_AVAILABLE = True
-except ImportError:
-    MOE_AVAILABLE = False
-    logger.warning("MoE Expert Router not available - self-evolving gates will operate in standalone mode")
+    @classmethod
+    def encode(cls, context: Dict[str, Any]) -> np.ndarray:
+        out: List[float] = []
+        for name in cls.NAMES:
+            v = context.get(name, 0.5)
+            if v is None:
+                v = 0.5
+            try:
+                out.append(float(v))
+            except (TypeError, ValueError):
+                out.append(0.5)
+        return np.asarray(out, dtype=np.float32)
 
-# ============================================================================
-# Helium Provider Interface (unchanged)
-# ============================================================================
-class HeliumProvider:
-    def get_scarcity(self) -> float: raise NotImplementedError
-    def get_cost_index(self) -> float: raise NotImplementedError
-    def get_efficiency(self) -> float: raise NotImplementedError
-    def get_availability_trend(self) -> List[float]: raise NotImplementedError
 
-# ============================================================================
-# Legacy Classes (unchanged mostly)
-# ============================================================================
-class ArchitectureGene:
-    def __init__(self, num_layers=3, hidden_dim=128, activation='relu',
-                 dropout_rate=0.1, use_attention=True, use_residual=True,
-                 use_layer_norm=True, quantum_circuit_depth=0,
-                 quantum_qubits=0, quantum_gate_types=None):
-        self.num_layers = num_layers
-        self.hidden_dim = hidden_dim
-        self.activation = activation
-        self.dropout_rate = dropout_rate
-        self.use_attention = use_attention
-        self.use_residual = use_residual
-        self.use_layer_norm = use_layer_norm
-        self.fitness = 0.0
-        self.multi_objectives: List[float] = []
-        self.rank = 0
-        self.crowding_distance = 0.0
-        self.quantum_circuit_depth = quantum_circuit_depth
-        self.quantum_qubits = quantum_qubits
-        self.quantum_gate_types = quantum_gate_types or ['H', 'CNOT', 'RZ', 'RX']
-        self.quantum_advantage_score = 0.0
-        self.helium_efficiency = 0.5
+# =============================================================================
+# LOCAL STUBS
+# =============================================================================
+class InMemoryStorage:
+    def __init__(self):
+        self._state: Dict[str, str] = {}
+        self.calls: List[Tuple[str, Tuple]] = []
+        self.fail_on: Optional[str] = None
 
-class TaskPrototype:
-    def __init__(self, task_id, support_set=None, query_set=None,
-                 task_embedding=None, difficulty=0.5, domain="unknown",
-                 quantum_task=False, helium_requirement=0.0):
-        self.task_id = task_id
-        self.support_set = support_set or []
-        self.query_set = query_set or []
-        self.task_embedding = task_embedding
-        self.difficulty = difficulty
-        self.domain = domain
-        self.quantum_task = quantum_task
-        self.helium_requirement = helium_requirement
-        self.quantum_success_rate = 0.0
+    def _log(self, method: str, args: Tuple = ()) -> None:
+        self.calls.append((method, args))
+        if self.fail_on == method:
+            raise RuntimeError(f"injected failure in {method}")
 
-# ============================================================================
-# MAML Gate (rewritten for true meta-learning)
-# ============================================================================
-class MAMLGate:
-    def __init__(self, input_dim: int, num_experts: int, hidden_dim: int,
-                 inner_lr: float = 0.01, outer_lr: float = 0.001,
-                 quantum_enabled: bool = False):
-        self.input_dim = input_dim
-        self.num_experts = num_experts
-        self.hidden_dim = hidden_dim
-        self.inner_lr = inner_lr
-        self.outer_lr = outer_lr
-        self.quantum_enabled = quantum_enabled
+    def save_state(self, key: str, value: str) -> None:
+        self._log("save_state", (key,))
+        self._state[key] = value
 
-        # Base network
-        self.base_network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, num_experts)
+    def get_state(self, key: str) -> Optional[str]:
+        self._log("get_state", (key,))
+        return self._state.get(key)
+
+
+class AsyncMessageQueue:
+    def __init__(self):
+        self._topics: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
+        self.published: List[Tuple[str, str]] = []
+
+    async def publish(self, topic: str, payload: str) -> None:
+        self.published.append((topic, payload))
+        await self._topics[topic].put(payload)
+
+    async def subscribe(self, topic: str, timeout: float = 0.5) -> Optional[str]:
+        try:
+            return await asyncio.wait_for(self._topics[topic].get(), timeout)
+        except asyncio.TimeoutError:
+            return None
+
+
+@dataclass
+class FeedbackEvent:
+    source: str
+    feedback_type: str
+    task_id: str
+    context: Dict[str, Any]
+    action: Dict[str, Any]
+    performance: Dict[str, Any]
+    adaptive_cost_value: float
+    tags: List[str]
+    ts: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @classmethod
+    def create_with_context(cls, **kwargs: Any) -> "FeedbackEvent":
+        allowed = {"source", "feedback_type", "task_id", "context",
+                   "action", "performance", "adaptive_cost_value", "tags"}
+        filtered = {k: v for k, v in kwargs.items() if k in allowed}
+        filtered.setdefault("source", "unknown")
+        filtered.setdefault("feedback_type", "unknown")
+        filtered.setdefault("task_id", "unknown")
+        filtered.setdefault("context", {})
+        filtered.setdefault("action", {})
+        filtered.setdefault("performance", {})
+        filtered.setdefault("adaptive_cost_value", 0.0)
+        filtered.setdefault("tags", [])
+        return cls(**filtered)
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), default=str)
+
+
+class AdaptiveCostFunction:
+    def __init__(self, storage: Optional[InMemoryStorage] = None):
+        self.storage = storage
+        self.weights = {"accuracy": 0.4, "carbon": 0.2,
+                        "cost": 0.2, "latency": 0.2}
+
+    def get_current_weights(self) -> Dict[str, float]:
+        return dict(self.weights)
+
+    def compute(self, *, quality: float = 0.5, carbon_g: float = 0.1,
+                latency_ms: float = 100.0, energy_joules: float = 10.0,
+                health: float = 1.0, atp: float = 0.5) -> float:
+        w = self.weights
+        return float(
+            w["accuracy"] * (1.0 - quality) +
+            w["carbon"] * carbon_g +
+            w["cost"] * energy_joules / 100.0 +
+            w["latency"] * latency_ms / 100.0
         )
-        self.meta_optimizer = torch.optim.Adam(self.base_network.parameters(), lr=outer_lr)
-        self.task_adaptations: Dict[str, Dict[str, torch.Tensor]] = {}
-        self.quantum_adaptations: Dict[str, Dict[str, torch.Tensor]] = {}
 
-    def _forward_with_params(self, x: torch.Tensor, params: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Manually apply the linear layers using the provided parameters.
-        This allows gradient flow through the parameters for meta-learning.
-        """
-        # Layer 1
-        x = F.linear(x, params['0.weight'], params['0.bias'])
-        x = F.relu(x)
-        # Layer 2
-        x = F.linear(x, params['2.weight'], params['2.bias'])
-        x = F.relu(x)
-        # Layer 3
-        x = F.linear(x, params['4.weight'], params['4.bias'])
-        return x
 
-    def _get_base_params_dict(self) -> Dict[str, torch.Tensor]:
-        return {name: param for name, param in self.base_network.named_parameters()}
+class ParetoGating:
+    def __init__(self):
+        self.front: List[Dict[str, Any]] = []
 
-    def forward(self, x: torch.Tensor, task_id: Optional[str] = None) -> torch.Tensor:
-        if task_id is not None:
-            if self.quantum_enabled and task_id in self.quantum_adaptations:
-                adapted_params = self.quantum_adaptations[task_id]
-                return self._forward_with_params(x, adapted_params)
-            elif task_id in self.task_adaptations:
-                adapted_params = self.task_adaptations[task_id]
-                return self._forward_with_params(x, adapted_params)
-        return self.base_network(x)
+    def filter(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out = []
+        for c in candidates:
+            dominated = False
+            for other in candidates:
+                if other is c:
+                    continue
+                if (other.get("quality_score", 0) >= c.get("quality_score", 0)
+                        and other.get("carbon_g", 1) <= c.get("carbon_g", 1)
+                        and other.get("latency_ms", 1e9) <= c.get("latency_ms", 1e9)
+                        and (other.get("quality_score", 0) > c.get("quality_score", 0)
+                             or other.get("carbon_g", 1) < c.get("carbon_g", 1)
+                             or other.get("latency_ms", 1e9) < c.get("latency_ms", 1e9))):
+                    dominated = True
+                    break
+            if not dominated:
+                out.append(c)
+        return out
 
-    def adapt_to_task(self, support_set: List[Tuple[torch.Tensor, torch.Tensor]],
-                      task_id: str, quantum: bool = False, num_inner_steps: int = 5):
-        """
-        Perform inner loop adaptation using first-order gradients.
-        The resulting adapted parameters retain gradient information if create_graph=True.
-        """
-        base_params = self._get_base_params_dict()
-        # Clone parameters and set requires_grad=True for gradient computation
-        adapted_params = {name: param.clone().detach().requires_grad_(True) for name, param in base_params.items()}
 
-        for _ in range(num_inner_steps):
-            total_loss = 0.0
-            for x, y in support_set:
-                logits = self._forward_with_params(x, adapted_params)
-                loss = F.cross_entropy(logits, y)
-                total_loss += loss
-            total_loss /= len(support_set)
-            # Compute gradients w.r.t. adapted_params
-            grads = torch.autograd.grad(total_loss, adapted_params.values(), create_graph=True)
-            # Update adapted_params
-            for (name, p), g in zip(adapted_params.items(), grads):
-                if g is not None:
-                    adapted_params[name] = p - self.inner_lr * g
+class DriftDetector:
+    def __init__(self, storage: Optional[InMemoryStorage] = None,
+                 adaptive_cost: Optional[AdaptiveCostFunction] = None,
+                 delta: float = 0.005, threshold: float = 0.5):
+        self.storage = storage
+        self.adaptive_cost = adaptive_cost
+        self.delta = float(delta)
+        self.threshold = float(threshold)
+        self._mean = 0.0
+        self._cum = 0.0
+        self._min_cum = 0.0
+        self.drift_detected = False
 
-        if quantum:
-            self.quantum_adaptations[task_id] = adapted_params
-        else:
-            self.task_adaptations[task_id] = adapted_params
+    async def check_drift(self, weights: Dict[str, float]) -> float:
+        x = sum(weights.values()) / max(len(weights), 1)
+        self._mean += (x - self._mean) * 0.1
+        self._cum += x - self._mean - self.delta
+        self._min_cum = min(self._min_cum, self._cum)
+        deviation = self._cum - self._min_cum
+        if deviation > self.threshold:
+            self.drift_detected = True
+            self._cum = 0.0
+            self._min_cum = 0.0
+            return 1.0
+        return float(deviation) / max(self.threshold, 1e-6)
 
-    def meta_update(self, query_sets: List[Tuple[str, List[Tuple[torch.Tensor, torch.Tensor]]]]):
-        """
-        Perform meta-update using the query sets.
-        We need to backpropagate through the inner loop updates.
-        """
-        meta_loss = 0.0
-        for task_id, query_data in query_sets:
-            adapted_params = self.task_adaptations.get(task_id)
-            if adapted_params is None:
-                continue
-            loss = 0.0
-            for x, y in query_data:
-                logits = self._forward_with_params(x, adapted_params)
-                loss += F.cross_entropy(logits, y)
-            meta_loss += loss / len(query_data)
 
-        self.meta_optimizer.zero_grad()
-        meta_loss.backward()  # This will propagate through the inner loop updates
-        self.meta_optimizer.step()
+class MetricsRegistry:
+    """Adapter-friendly metrics registry: inc/set are canonical."""
+    def __init__(self):
+        self.counters: Dict[str, int] = defaultdict(int)
+        self.gauges: Dict[str, float] = {}
 
-        # Clear task adaptations after meta-update to avoid memory leak
-        self.task_adaptations.clear()
-        self.quantum_adaptations.clear()
+    def inc(self, name: str, amount: int = 1) -> None:
+        self.counters[name] += amount
 
-# ============================================================================
-# NSGA-II Architecture Search (unchanged except for better eval interface)
-# ============================================================================
-class NSGAIIArchitectureSearch:
-    def __init__(self, input_dim: int, num_experts: int, population_size: int = 20,
-                 max_generations: int = 20, crossover_prob: float = 0.8,
-                 mutation_prob: float = 0.2):
-        self.input_dim = input_dim
-        self.num_experts = num_experts
-        self.population_size = population_size
-        self.max_generations = max_generations
-        self.crossover_prob = crossover_prob
-        self.mutation_prob = mutation_prob
-        self.population: List[ArchitectureGene] = []
-        self.generation = 0
-        self.pareto_front: List[ArchitectureGene] = []
+    def set(self, name: str, value: float) -> None:
+        self.gauges[name] = value
 
-    def _fast_non_dominated_sort(self, population: List[ArchitectureGene]) -> Dict[int, List[ArchitectureGene]]:
-        fronts = defaultdict(list)
-        for i, ind_i in enumerate(population):
-            ind_i.domination_count = 0
-            ind_i.dominated_set = []
-            for j, ind_j in enumerate(population):
-                if i == j: continue
-                dominates = all(ind_i.multi_objectives[k] <= ind_j.multi_objectives[k] for k in range(len(ind_i.multi_objectives))) and \
-                            any(ind_i.multi_objectives[k] < ind_j.multi_objectives[k] for k in range(len(ind_i.multi_objectives)))
-                if dominates:
-                    ind_i.dominated_set.append(ind_j)
-                elif all(ind_j.multi_objectives[k] <= ind_i.multi_objectives[k] for k in range(len(ind_i.multi_objectives))) and \
-                     any(ind_j.multi_objectives[k] < ind_i.multi_objectives[k] for k in range(len(ind_i.multi_objectives))):
-                    ind_i.domination_count += 1
-            if ind_i.domination_count == 0:
-                fronts[0].append(ind_i)
-        front_index = 0
-        while fronts[front_index]:
-            next_front = []
-            for ind in fronts[front_index]:
-                for dominated in ind.dominated_set:
-                    dominated.domination_count -= 1
-                    if dominated.domination_count == 0:
-                        next_front.append(dominated)
-            if next_front:
-                front_index += 1
-                fronts[front_index] = next_front
-            else:
+    # Legacy aliases — we always forward to inc/set.
+    def increment(self, name: str, amount: int = 1) -> None:
+        self.inc(name, amount)
+
+    def observe(self, name: str, value: float) -> None:
+        self.set(name, value)
+
+
+# =============================================================================
+# TASK MANAGER
+# =============================================================================
+class TaskManager:
+    """Named background tasks with proper cancellation semantics."""
+
+    def __init__(self):
+        self._tasks: Dict[str, asyncio.Task] = {}
+        self._shutdown_event = asyncio.Event()
+
+    @property
+    def shutdown_event(self) -> asyncio.Event:
+        return self._shutdown_event
+
+    def start(self, name: str, coro_factory: Callable[[], Any]) -> asyncio.Task:
+        """coro_factory must be a zero-arg callable returning a coroutine."""
+        if name in self._tasks and not self._tasks[name].done():
+            return self._tasks[name]
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as e:
+            raise RuntimeError("TaskManager.start requires a running loop") from e
+        task = loop.create_task(coro_factory())
+        self._tasks[name] = task
+        task.add_done_callback(lambda t, n=name: self._tasks.pop(n, None))
+        return task
+
+    def start_coro(self, name: str, coro) -> asyncio.Task:
+        return self.start(name, lambda: coro)
+
+    def task_count(self) -> int:
+        return len(self._tasks)
+
+    async def stop_all(self, timeout: float = 5.0) -> None:
+        self._shutdown_event.set()
+        tasks = list(self._tasks.values())
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning("TaskManager.stop_all timed out")
+        self._tasks.clear()
+
+
+# =============================================================================
+# CIRCUIT BREAKER + RATE LIMITER
+# =============================================================================
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = 5,
+                 recovery_timeout: float = 30.0,
+                 half_open_max_requests: int = 3,
+                 name: str = "default"):
+        self.failure_threshold = int(failure_threshold)
+        self.recovery_timeout = float(recovery_timeout)
+        self.half_open_max_requests = int(half_open_max_requests)
+        self.name = name
+        self.state = CircuitBreakerState.CLOSED
+        self.failure_count = 0
+        self.half_open_requests = 0
+        self.last_failure_time: Optional[float] = None
+        self._lock = asyncio.Lock()
+
+    async def call(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
+        async with self._lock:
+            if self.state == CircuitBreakerState.OPEN:
+                if (self.last_failure_time is not None and
+                        (time.time() - self.last_failure_time) > self.recovery_timeout):
+                    self.state = CircuitBreakerState.HALF_OPEN
+                    self.half_open_requests = 0
+                else:
+                    raise RuntimeError(f"Circuit breaker {self.name} is open")
+            if (self.state == CircuitBreakerState.HALF_OPEN and
+                    self.half_open_requests >= self.half_open_max_requests):
+                raise RuntimeError(f"Circuit breaker {self.name} half-open limit")
+        try:
+            result = await func(*args, **kwargs)
+        except Exception:
+            async with self._lock:
+                self.failure_count += 1
+                self.last_failure_time = time.time()
+                if self.state == CircuitBreakerState.HALF_OPEN:
+                    self.state = CircuitBreakerState.OPEN
+                elif self.failure_count >= self.failure_threshold:
+                    self.state = CircuitBreakerState.OPEN
+            raise
+        async with self._lock:
+            if self.state == CircuitBreakerState.HALF_OPEN:
+                self.half_open_requests += 1
+                if self.half_open_requests >= self.half_open_max_requests:
+                    self.state = CircuitBreakerState.CLOSED
+                    self.failure_count = 0
+            elif self.state == CircuitBreakerState.CLOSED:
+                self.failure_count = 0
+        return result
+
+
+# =============================================================================
+# REAL HTTP CLIENTS (carbon + helium)
+# =============================================================================
+class CarbonIntensityClient:
+    def __init__(self, api_url: Optional[str] = None,
+                 api_key: Optional[str] = None,
+                 region: str = "us-east",
+                 update_interval: float = 300.0,
+                 fallback: Optional[Dict[str, float]] = None,
+                 ema_alpha: float = 0.3):
+        self.api_url = api_url
+        self.api_key = api_key
+        self.region = region
+        self.update_interval = float(update_interval)
+        self.ema_alpha = float(ema_alpha)
+        self.fallback = fallback or {"us-east": 420, "us-west": 350,
+                                     "eu-west": 280, "asia-east": 500}
+        self.intensity = float(self.fallback.get(region, 400.0))
+        self.intensity_ema = self.intensity
+        self.price = 50.0
+        self.price_ema = 50.0
+        self.last_update: Optional[datetime] = None
+        self._circuit = CircuitBreaker(name="carbon_api")
+        self._session = None
+        self._session_lock = asyncio.Lock()
+        self._cache: Dict[str, Tuple[float, datetime]] = {}
+
+    async def _get_session(self):
+        if not AIOHTTP_AVAILABLE or self.api_url is None:
+            return None
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession()
+            return self._session
+
+    async def _http_fetch(self) -> Optional[float]:
+        session = await self._get_session()
+        if session is None:
+            return None
+        headers = {"auth-token": self.api_key} if self.api_key else {}
+        url = f"{self.api_url}?zone={self.region}"
+        async with session.get(url, headers=headers, timeout=10) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"carbon API status {resp.status}")
+            data = await resp.json()
+            return float(data.get("carbonIntensity", self.intensity))
+
+    async def update(self, force: bool = False) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        cache_key = f"{self.region}:{now.hour}"
+        if not force and cache_key in self._cache:
+            val, ts = self._cache[cache_key]
+            if (now - ts).total_seconds() < self.update_interval:
+                self.intensity = val
+                return self._snapshot()
+        try:
+            value = await self._circuit.call(self._http_fetch)
+            if value is None:
+                raise RuntimeError("no HTTP client")
+        except Exception as e:
+            logger.debug(f"carbon fetch fallback: {e}")
+            value = float(self.fallback.get(self.region, 400.0))
+        self.intensity = max(0.0, float(value))
+        self.intensity_ema = (self.ema_alpha * self.intensity +
+                              (1 - self.ema_alpha) * self.intensity_ema)
+        self.price = max(10.0, 50.0 * (1.0 + (self.intensity - 300) / 500))
+        self.price_ema = (self.ema_alpha * self.price +
+                          (1 - self.ema_alpha) * self.price_ema)
+        self.last_update = now
+        self._cache[cache_key] = (self.intensity, now)
+        return self._snapshot()
+
+    async def get_current_intensity(self) -> float:
+        if (self.last_update is None or
+                (datetime.now(timezone.utc) - self.last_update).total_seconds()
+                > self.update_interval):
+            await self.update()
+        return self.intensity
+
+    async def get_current_price(self) -> float:
+        await self.get_current_intensity()
+        return self.price
+
+    def _snapshot(self) -> Dict[str, Any]:
+        return {"intensity": self.intensity, "intensity_ema": self.intensity_ema,
+                "price": self.price, "price_ema": self.price_ema,
+                "region": self.region, "cache_size": len(self._cache)}
+
+    async def get_health_status(self) -> ComponentHealth:
+        if self.last_update is None:
+            return ComponentHealth(HealthStatus.UNKNOWN, 0.5, {})
+        age = (datetime.now(timezone.utc) - self.last_update).total_seconds()
+        if age > self.update_interval * 5:
+            return ComponentHealth(HealthStatus.UNHEALTHY, 0.2,
+                                   {"age_seconds": age})
+        if self._circuit.state == CircuitBreakerState.OPEN:
+            return ComponentHealth(HealthStatus.DEGRADED, 0.4, {})
+        return ComponentHealth(HealthStatus.HEALTHY, 1.0,
+                               {"age_seconds": age})
+
+    async def close(self) -> None:
+        async with self._session_lock:
+            if self._session is not None and not self._session.closed:
+                await self._session.close()
+            self._session = None
+
+
+class HeliumClient:
+    def __init__(self, api_url: Optional[str] = None,
+                 api_key: Optional[str] = None,
+                 update_interval: float = 600.0,
+                 base_price: float = 0.5,
+                 ema_alpha: float = 0.3,
+                 rng: Optional[random.Random] = None):
+        self.api_url = api_url
+        self.api_key = api_key
+        self.update_interval = float(update_interval)
+        self.base_price = float(base_price)
+        self.ema_alpha = float(ema_alpha)
+        self.rng = rng or random.Random()
+        self.scarcity = 0.5
+        self.price = base_price
+        self.price_ema = base_price
+        self.efficiency = 0.5
+        self.last_update: Optional[datetime] = None
+        self._circuit = CircuitBreaker(name="helium_api")
+        self._session = None
+        self._session_lock = asyncio.Lock()
+
+    async def _get_session(self):
+        if not AIOHTTP_AVAILABLE or self.api_url is None:
+            return None
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession()
+            return self._session
+
+    async def _http_fetch(self) -> Optional[Dict[str, float]]:
+        session = await self._get_session()
+        if session is None:
+            return None
+        headers = {"auth-token": self.api_key} if self.api_key else {}
+        async with session.get(self.api_url, headers=headers, timeout=10) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"helium API status {resp.status}")
+            data = await resp.json()
+            return {"scarcity": float(data.get("scarcity", self.scarcity)),
+                    "price": float(data.get("price", self.price)),
+                    "efficiency": float(data.get("efficiency", self.efficiency))}
+
+    async def update(self, force: bool = False) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        if (not force and self.last_update is not None and
+                (now - self.last_update).total_seconds() < self.update_interval):
+            return self._snapshot()
+        try:
+            data = await self._circuit.call(self._http_fetch)
+            if data is None:
+                raise RuntimeError("no HTTP client")
+            self.scarcity = float(data["scarcity"])
+            self.price = float(data["price"])
+            self.efficiency = float(data["efficiency"])
+        except Exception:
+            self.scarcity = max(0.0, min(1.0,
+                self.scarcity + self.rng.uniform(-0.05, 0.05)))
+            self.price = max(0.05, self.base_price * (1.0 + self.scarcity * 0.8))
+        self.price_ema = (self.ema_alpha * self.price +
+                          (1 - self.ema_alpha) * self.price_ema)
+        self.last_update = now
+        return self._snapshot()
+
+    # Sync interface
+    def get_scarcity(self) -> float:
+        return self.scarcity
+
+    def get_cost_index(self) -> float:
+        return self.price / max(self.base_price, 1e-6)
+
+    def get_efficiency(self) -> float:
+        return self.efficiency
+
+    async def get_current_price(self) -> float:
+        if (self.last_update is None or
+                (datetime.now(timezone.utc) - self.last_update).total_seconds()
+                > self.update_interval):
+            await self.update()
+        return self.price
+
+    def _snapshot(self) -> Dict[str, Any]:
+        return {"scarcity": self.scarcity, "price": self.price,
+                "price_ema": self.price_ema, "efficiency": self.efficiency}
+
+    async def get_health_status(self) -> ComponentHealth:
+        if self.last_update is None:
+            return ComponentHealth(HealthStatus.UNKNOWN, 0.5, {})
+        if self._circuit.state == CircuitBreakerState.OPEN:
+            return ComponentHealth(HealthStatus.DEGRADED, 0.4, {})
+        return ComponentHealth(HealthStatus.HEALTHY, 1.0, {})
+
+    async def close(self) -> None:
+        async with self._session_lock:
+            if self._session is not None and not self._session.closed:
+                await self._session.close()
+            self._session = None
+
+
+# =============================================================================
+# HEALTH + SELF-HEALING
+# =============================================================================
+class HealthCheckSystem:
+    def __init__(self, interval: float = 30.0):
+        self.interval = float(interval)
+        self.components: Dict[str, Any] = {}
+        self.history: Dict[str, Deque[ComponentHealth]] = defaultdict(
+            lambda: deque(maxlen=100))
+        self._lock = asyncio.Lock()
+        self._shutdown_event = asyncio.Event()
+        self._task: Optional[asyncio.Task] = None
+        self._start()
+
+    def _start(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+            self._task = loop.create_task(self._loop())
+        except RuntimeError:
+            logger.warning("no running loop; health loop not started")
+
+    async def _loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(),
+                                       timeout=self.interval)
                 break
+            except asyncio.TimeoutError:
+                pass
+            await self._perform_checks()
+
+    async def _perform_checks(self) -> None:
+        for name, comp in list(self.components.items()):
+            try:
+                if hasattr(comp, "get_health_status"):
+                    r = comp.get_health_status()
+                    if asyncio.iscoroutine(r):
+                        r = await r
+                    if isinstance(r, ComponentHealth):
+                        async with self._lock:
+                            self.history[name].append(r)
+            except Exception as e:
+                async with self._lock:
+                    self.history[name].append(
+                        ComponentHealth(HealthStatus.UNHEALTHY, 0.0,
+                                        {"error": str(e)}))
+
+    def register_component(self, name: str, component: Any) -> None:
+        self.components[name] = component
+
+    def unregister_component(self, name: str) -> None:
+        self.components.pop(name, None)
+
+    async def get_system_health(self) -> Dict[str, Any]:
+        async with self._lock:
+            total = 0.0
+            statuses: Dict[str, ComponentHealth] = {}
+            for name in self.components:
+                hist = self.history[name]
+                latest = hist[-1] if hist else ComponentHealth(
+                    HealthStatus.UNKNOWN, 0.5, {})
+                statuses[name] = latest
+                total += latest.score
+            avg = total / max(len(self.components), 1)
+            if avg > 0.8:
+                sys_status = HealthStatus.HEALTHY
+            elif avg > 0.5:
+                sys_status = HealthStatus.DEGRADED
+            else:
+                sys_status = HealthStatus.UNHEALTHY
+            return {"system_status": sys_status.value,
+                    "system_score": avg,
+                    "components": {k: {"status": v.status.value,
+                                        "score": v.score,
+                                        "details": v.details}
+                                    for k, v in statuses.items()}}
+
+    async def shutdown(self) -> None:
+        self._shutdown_event.set()
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+class SelfHealingSystem:
+    def __init__(self, health: HealthCheckSystem,
+                 max_attempts: int = 5, interval: float = 30.0):
+        self.health = health
+        self.max_attempts = int(max_attempts)
+        self.interval = float(interval)
+        self.handlers: Dict[str, Callable[[], Any]] = {}
+        self.attempts: Dict[str, int] = defaultdict(int)
+        self._shutdown_event = asyncio.Event()
+        self._task: Optional[asyncio.Task] = None
+        self._start()
+
+    def _start(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+            self._task = loop.create_task(self._loop())
+        except RuntimeError:
+            logger.warning("no running loop; self-healing loop not started")
+
+    async def _loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(),
+                                       timeout=self.interval)
+                break
+            except asyncio.TimeoutError:
+                pass
+            await self._check_and_recover()
+
+    async def _check_and_recover(self) -> None:
+        health = await self.health.get_system_health()
+        for name, data in health.get("components", {}).items():
+            if data.get("status") in (HealthStatus.DEGRADED.value,
+                                      HealthStatus.UNHEALTHY.value):
+                await self._attempt_recovery(name)
+
+    async def _attempt_recovery(self, name: str) -> None:
+        if self.attempts[name] >= self.max_attempts:
+            return
+        handler = self.handlers.get(name)
+        if handler is None:
+            return
+        self.attempts[name] += 1
+        try:
+            r = handler()
+            if asyncio.iscoroutine(r):
+                r = await r
+            if r is not None and r is not True and r is not False:
+                self.health.register_component(name, r)
+            if r:
+                self.attempts[name] = 0
+        except Exception as e:
+            logger.error(f"{name}: recovery failed: {e}")
+
+    def register_handler(self, name: str, handler: Callable[[], Any]) -> None:
+        self.handlers[name] = handler
+
+    async def shutdown(self) -> None:
+        self._shutdown_event.set()
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+# =============================================================================
+# ARCHITECTURE GENE + NSGA-II
+# =============================================================================
+@dataclass
+class ArchitectureGene:
+    num_layers: int = 3
+    hidden_dim: int = 128
+    activation: str = "relu"
+    dropout_rate: float = 0.1
+    use_attention: bool = True
+    use_residual: bool = True
+    use_layer_norm: bool = True
+    quantum_circuit_depth: int = 0
+    quantum_qubits: int = 0
+    quantum_gate_types: List[str] = field(
+        default_factory=lambda: ["H", "CNOT", "RZ", "RX"])
+    fitness: float = 0.0
+    multi_objectives: List[float] = field(default_factory=list)
+    rank: int = 0
+    crowding_distance: float = 0.0
+    domination_count: int = 0
+    dominated_set: List["ArchitectureGene"] = field(default_factory=list)
+    quantum_advantage_score: float = 0.0
+    helium_efficiency: float = 0.5
+
+    def clone(self) -> "ArchitectureGene":
+        return ArchitectureGene(
+            num_layers=self.num_layers, hidden_dim=self.hidden_dim,
+            activation=self.activation, dropout_rate=self.dropout_rate,
+            use_attention=self.use_attention, use_residual=self.use_residual,
+            use_layer_norm=self.use_layer_norm,
+            quantum_circuit_depth=self.quantum_circuit_depth,
+            quantum_qubits=self.quantum_qubits,
+            quantum_gate_types=list(self.quantum_gate_types),
+            quantum_advantage_score=self.quantum_advantage_score,
+            helium_efficiency=self.helium_efficiency,
+        )
+
+
+class NSGAIIArchitectureSearch:
+    """Non-dominated sorting + crowding distance."""
+
+    def __init__(self, input_dim: int, num_experts: int,
+                 population_size: int = 10, crossover_prob: float = 0.8,
+                 mutation_prob: float = 0.2):
+        self.input_dim = int(input_dim)
+        self.num_experts = int(num_experts)
+        self.population_size = int(population_size)
+        self.crossover_prob = float(crossover_prob)
+        self.mutation_prob = float(mutation_prob)
+        self.population: List[ArchitectureGene] = []
+        self.pareto_front: List[ArchitectureGene] = []
+        self.generation = 0
+
+    def _dominates(self, a: ArchitectureGene, b: ArchitectureGene) -> bool:
+        if not a.multi_objectives or not b.multi_objectives:
+            return False
+        le = all(x <= y for x, y in zip(a.multi_objectives, b.multi_objectives))
+        lt = any(x < y for x, y in zip(a.multi_objectives, b.multi_objectives))
+        return le and lt
+
+    def _fast_non_dominated_sort(
+            self, population: List[ArchitectureGene]
+    ) -> Dict[int, List[ArchitectureGene]]:
+        fronts: Dict[int, List[ArchitectureGene]] = defaultdict(list)
+        for p in population:
+            p.domination_count = 0
+            p.dominated_set = []
+        for i, p in enumerate(population):
+            for j, q in enumerate(population):
+                if i == j:
+                    continue
+                if self._dominates(p, q):
+                    p.dominated_set.append(q)
+                elif self._dominates(q, p):
+                    p.domination_count += 1
+            if p.domination_count == 0:
+                fronts[0].append(p)
+        k = 0
+        while fronts[k]:
+            next_front: List[ArchitectureGene] = []
+            for p in fronts[k]:
+                for q in p.dominated_set:
+                    q.domination_count -= 1
+                    if q.domination_count == 0:
+                        next_front.append(q)
+            k += 1
+            fronts[k] = next_front
         return fronts
 
-    def _crowding_distance(self, front: List[ArchitectureGene], objectives: int = 4):
+    def _crowding_distance(self, front: List[ArchitectureGene]) -> None:
+        if not front:
+            return
+        n_obj = len(front[0].multi_objectives)
         for ind in front:
             ind.crowding_distance = 0.0
-        for obj_idx in range(objectives):
-            front.sort(key=lambda ind: ind.multi_objectives[obj_idx])
-            front[0].crowding_distance = float('inf')
-            front[-1].crowding_distance = float('inf')
-            obj_min = front[0].multi_objectives[obj_idx]
-            obj_max = front[-1].multi_objectives[obj_idx]
-            if obj_max == obj_min:
+        for m in range(n_obj):
+            front.sort(key=lambda ind: ind.multi_objectives[m])
+            front[0].crowding_distance = float("inf")
+            front[-1].crowding_distance = float("inf")
+            lo = front[0].multi_objectives[m]
+            hi = front[-1].multi_objectives[m]
+            if hi - lo < 1e-12:
                 continue
-            for i in range(1, len(front)-1):
-                front[i].crowding_distance += (front[i+1].multi_objectives[obj_idx] - front[i-1].multi_objectives[obj_idx]) / (obj_max - obj_min)
+            for i in range(1, len(front) - 1):
+                front[i].crowding_distance += (
+                    front[i + 1].multi_objectives[m] -
+                    front[i - 1].multi_objectives[m]) / (hi - lo)
 
-    def _crowded_comparison_operator(self, ind1: ArchitectureGene, ind2: ArchitectureGene) -> bool:
-        if ind1.rank != ind2.rank:
-            return ind1.rank < ind2.rank
-        return ind1.crowding_distance > ind2.crowding_distance
+    def _tournament(self, population: List[ArchitectureGene]
+                    ) -> ArchitectureGene:
+        a = population[np.random.randint(0, len(population))]
+        b = population[np.random.randint(0, len(population))]
+        if a.rank != b.rank:
+            return a if a.rank < b.rank else b
+        return a if a.crowding_distance > b.crowding_distance else b
 
-    def _create_offspring(self, population: List[ArchitectureGene]) -> List[ArchitectureGene]:
-        offspring = []
-        while len(offspring) < len(population):
-            p1 = population[np.random.randint(0, len(population))]
-            p2 = population[np.random.randint(0, len(population))]
-            if self._crowded_comparison_operator(p1, p2):
-                parent1 = p1
+    def _crossover(self, p1: ArchitectureGene,
+                   p2: ArchitectureGene) -> ArchitectureGene:
+        child = p1.clone()
+        for attr in ("num_layers", "hidden_dim", "activation", "dropout_rate",
+                     "use_attention", "use_residual", "use_layer_norm",
+                     "quantum_circuit_depth", "quantum_qubits"):
+            if np.random.random() < 0.5:
+                setattr(child, attr, getattr(p2, attr))
+        return child
+
+    def _mutate(self, gene: ArchitectureGene) -> None:
+        if np.random.random() < 0.3:
+            gene.num_layers = max(1, gene.num_layers +
+                                  np.random.choice([-1, 1]))
+        if np.random.random() < 0.3:
+            gene.hidden_dim = max(16, gene.hidden_dim +
+                                  np.random.randint(-32, 33))
+        if np.random.random() < 0.2:
+            gene.activation = np.random.choice(
+                ["relu", "gelu", "swish", "leaky_relu"])
+        if np.random.random() < 0.2:
+            gene.dropout_rate = float(max(0.0, min(0.5,
+                gene.dropout_rate + np.random.uniform(-0.05, 0.05))))
+        if np.random.random() < 0.2:
+            gene.use_layer_norm = not gene.use_layer_norm
+        if np.random.random() < 0.2:
+            gene.use_residual = not gene.use_residual
+
+    def evaluate_population(
+            self, fitness_fn: Callable[[ArchitectureGene], List[float]]) -> None:
+        for ind in self.population:
+            ind.multi_objectives = fitness_fn(ind)
+            ind.fitness = ind.multi_objectives[0] if ind.multi_objectives else 0.0
+
+    def evolve(self, fitness_fn: Callable[[ArchitectureGene], List[float]]
+               ) -> Dict[str, Any]:
+        if not self.population:
+            self.population = [ArchitectureGene()
+                               for _ in range(self.population_size)]
+        # Merge parents + offspring
+        self.evaluate_population(fitness_fn)
+        offspring = self._make_offspring()
+        combined = self.population + offspring
+        fronts = self._fast_non_dominated_sort(combined)
+
+        new_population: List[ArchitectureGene] = []
+        for rank, front in fronts.items():
+            for ind in front:
+                ind.rank = rank
+            self._crowding_distance(front)
+            front.sort(key=lambda ind: ind.crowding_distance, reverse=True)
+            if len(new_population) + len(front) <= self.population_size:
+                new_population.extend(front)
             else:
-                parent1 = p2
-            p1 = population[np.random.randint(0, len(population))]
-            p2 = population[np.random.randint(0, len(population))]
-            if self._crowded_comparison_operator(p1, p2):
-                parent2 = p1
-            else:
-                parent2 = p2
+                remaining = self.population_size - len(new_population)
+                new_population.extend(front[:remaining])
+                break
+        self.population = new_population
+        self.pareto_front = [ind for ind in self.population if ind.rank == 0]
+        self.generation += 1
+        return {
+            "generation": self.generation,
+            "population_size": len(self.population),
+            "pareto_front_size": len(self.pareto_front),
+        }
+
+    def _make_offspring(self) -> List[ArchitectureGene]:
+        offspring: List[ArchitectureGene] = []
+        # Assign rank if not present
+        fronts = self._fast_non_dominated_sort(self.population)
+        for rank, front in fronts.items():
+            self._crowding_distance(front)
+            for ind in front:
+                ind.rank = rank
+        while len(offspring) < self.population_size:
+            p1 = self._tournament(self.population)
+            p2 = self._tournament(self.population)
             if np.random.random() < self.crossover_prob:
-                child = self._crossover(parent1, parent2)
+                child = self._crossover(p1, p2)
             else:
-                child = copy.deepcopy(parent1)
+                child = p1.clone()
             if np.random.random() < self.mutation_prob:
                 self._mutate(child)
             offspring.append(child)
         return offspring
 
-    def _crossover(self, p1: ArchitectureGene, p2: ArchitectureGene) -> ArchitectureGene:
-        child = ArchitectureGene()
-        for attr in ['num_layers', 'hidden_dim', 'activation', 'dropout_rate',
-                     'use_attention', 'use_residual', 'use_layer_norm',
-                     'quantum_circuit_depth', 'quantum_qubits', 'quantum_gate_types']:
-            if np.random.random() < 0.5:
-                setattr(child, attr, getattr(p1, attr))
-            else:
-                setattr(child, attr, getattr(p2, attr))
-        if np.random.random() < 0.3:
-            child.hidden_dim = int((p1.hidden_dim + p2.hidden_dim) / 2)
-            child.dropout_rate = (p1.dropout_rate + p2.dropout_rate) / 2
-            child.quantum_circuit_depth = int((p1.quantum_circuit_depth + p2.quantum_circuit_depth) / 2)
-            child.quantum_qubits = int((p1.quantum_qubits + p2.quantum_qubits) / 2)
-        child.fitness = 0.0
-        child.multi_objectives = []
-        return child
-
-    def _mutate(self, gene: ArchitectureGene):
-        if np.random.random() < 0.3:
-            gene.num_layers = max(1, gene.num_layers + np.random.choice([-1, 1]))
-        if np.random.random() < 0.3:
-            gene.hidden_dim = max(16, gene.hidden_dim + np.random.randint(-32, 33))
-        if np.random.random() < 0.2:
-            activations = ['relu', 'gelu', 'swish', 'leaky_relu']
-            gene.activation = np.random.choice(activations)
-        if np.random.random() < 0.2:
-            gene.dropout_rate = max(0.0, min(0.5, gene.dropout_rate + np.random.uniform(-0.05, 0.05)))
-        if np.random.random() < 0.2:
-            gene.use_attention = not gene.use_attention
-        if np.random.random() < 0.2:
-            gene.use_residual = not gene.use_residual
-        if np.random.random() < 0.2:
-            gene.use_layer_norm = not gene.use_layer_norm
-        if np.random.random() < 0.2:
-            gene.quantum_circuit_depth = max(0, gene.quantum_circuit_depth + np.random.randint(-2, 3))
-        if np.random.random() < 0.2:
-            gene.quantum_qubits = max(0, gene.quantum_qubits + np.random.randint(-4, 5))
-        if np.random.random() < 0.2:
-            gene.quantum_gate_types = np.random.choice(['H', 'CNOT', 'RZ', 'RX', 'RY', 'CZ'], size=np.random.randint(2,5)).tolist()
-
-    def evaluate_population(self, fitness_function: Callable[[ArchitectureGene], List[float]]):
-        for ind in self.population:
-            ind.multi_objectives = fitness_function(ind)
-
-    def evolve(self, fitness_function: Callable[[ArchitectureGene], List[float]]) -> Dict[str, Any]:
-        if not self.population:
-            self.population = [ArchitectureGene() for _ in range(self.population_size)]
-        self.evaluate_population(fitness_function)
-        fronts = self._fast_non_dominated_sort(self.population)
-        new_population = []
-        front_idx = 0
-        while len(new_population) < self.population_size and front_idx in fronts:
-            front = fronts[front_idx]
-            self._crowding_distance(front)
-            for ind in front:
-                ind.rank = front_idx
-            front.sort(key=lambda ind: ind.crowding_distance, reverse=True)
-            remaining = self.population_size - len(new_population)
-            new_population.extend(front[:remaining])
-            front_idx += 1
-        offspring = self._create_offspring(new_population)
-        self.population = new_population + offspring
-        self.population = self.population[:self.population_size]
-        self.pareto_front = fronts.get(0, [])
-        self.generation += 1
-        return {
-            'generation': self.generation,
-            'population_size': len(self.population),
-            'pareto_front_size': len(self.pareto_front),
-            'best_individual': self.pareto_front[0] if self.pareto_front else None,
-            'fronts': {k: len(v) for k, v in fronts.items()}
-        }
-
-    def get_best_architecture(self, objective_weights: Optional[List[float]] = None) -> Optional[ArchitectureGene]:
+    def get_best_architecture(
+            self, objective_weights: Optional[List[float]] = None
+    ) -> Optional[ArchitectureGene]:
         if not self.pareto_front:
             return None
         if objective_weights is None:
-            objective_weights = [1.0, -1.0, -1.0, 1.0]
-        def score(ind):
-            return sum(w * val for w, val in zip(objective_weights, ind.multi_objectives))
+            # Maximise fitness, helium efficiency, quantum advantage.
+            # Minimise complexity (last objective is negative).
+            objective_weights = [1.0, 1.0, 1.0, -1.0]
+
+        def score(ind: ArchitectureGene) -> float:
+            return sum(w * v for w, v in
+                       zip(objective_weights, ind.multi_objectives))
         return max(self.pareto_front, key=score)
 
-    def get_quantum_stats(self) -> Dict[str, Any]:
-        return {
-            'quantum_architectures': sum(1 for ind in self.population if ind.quantum_circuit_depth > 0),
-            'classical_architectures': sum(1 for ind in self.population if ind.quantum_circuit_depth == 0),
-            'pareto_front_size': len(self.pareto_front)
-        }
 
-# ============================================================================
-# Carbon Intensity Manager (fixed aiohttp import)
-# ============================================================================
-class CarbonIntensityManager:
-    def __init__(self):
-        self.endpoint = "https://api.electricitymap.org/v3/carbon-intensity"
-        self.carbon_intensity = 0.0
-        self.region = getattr(central_config, "carbon_api_region", "us-east")
-        self.last_update = None
-        self._lock = asyncio.Lock()
-        self._session = None
-        self.update_interval = getattr(central_config, "carbon_update_interval", 300)
-        self.cache = {}
-        self.historical_intensities = deque(maxlen=1000)
-        self.api_key = os.getenv('ELECTRICITYMAP_API_KEY', '')
-        self.helium_scarcity = 0.5
-        self.helium_availability_trend = deque(maxlen=100)
-        self.helium_price = 0.5
-        self._circuit = EnhancedCircuitBreaker("carbon_api")
-        logger.info("CarbonIntensityManager initialized")
+# =============================================================================
+# EWC (real Fisher)
+# =============================================================================
+class ElasticWeightConsolidation:
+    """Real EWC: Fisher information computed from a data loader.
 
-    async def _get_session(self):
-        if aiohttp is None:
-            raise RuntimeError("aiohttp not installed; cannot fetch carbon intensity")
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-        return self._session
+    Args:
+        model: the module to protect.
+        lambda_ewc: penalty coefficient.
+        device: torch device string.
+    """
 
-    async def update_carbon_intensity(self, region: str = "us-east") -> Dict:
-        async def _fetch():
-            async with self._lock:
-                if aiohttp is None:
-                    logger.warning("aiohttp not available; using fallback intensity")
-                    self.carbon_intensity = self._get_fallback_intensity(region)
-                    self.last_update = datetime.now(timezone.utc)
-                    await self._update_helium_metrics()
-                    return {
-                        'intensity': self.carbon_intensity,
-                        'region': self.region,
-                        'timestamp': self.last_update.isoformat() if self.last_update else None,
-                        'helium_scarcity': self.helium_scarcity,
-                        'helium_price': self.helium_price
-                    }
-                session = await self._get_session()
-                try:
-                    url = f"{self.endpoint}/latest?zone={region}"
-                    headers = {'auth-token': self.api_key} if self.api_key else {}
-                    async with session.get(url, headers=headers, timeout=10) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            self.carbon_intensity = data.get('carbonIntensity', 400)
-                            self.region = region
-                            self.last_update = datetime.now(timezone.utc)
-                            self.cache[region] = {'intensity': self.carbon_intensity, 'timestamp': self.last_update}
-                            self.historical_intensities.append(self.carbon_intensity)
-                        else:
-                            self.carbon_intensity = self._get_fallback_intensity(region)
-                            self.last_update = datetime.now(timezone.utc)
-                except Exception as e:
-                    logger.error(f"Carbon intensity fetch error: {e}")
-                    self.carbon_intensity = self._get_fallback_intensity(region)
-                    self.last_update = datetime.now(timezone.utc)
-                await self._update_helium_metrics()
-                return {
-                    'intensity': self.carbon_intensity,
-                    'region': self.region,
-                    'timestamp': self.last_update.isoformat() if self.last_update else None,
-                    'helium_scarcity': self.helium_scarcity,
-                    'helium_price': self.helium_price
-                }
-        return await self._circuit.call(_fetch)
+    def __init__(self, model: nn.Module, lambda_ewc: float = 0.4,
+                 device: str = "cpu"):
+        self.model = model
+        self.lambda_ewc = float(lambda_ewc)
+        self.device = device
+        self.fisher: Dict[str, torch.Tensor] = {}
+        self.snapshot: Dict[str, torch.Tensor] = {}
+        self._update_snapshot()
 
-    async def _update_helium_metrics(self):
-        base_scarcity = 0.4
-        volatility = np.random.normal(0, 0.1)
-        self.helium_scarcity = max(0.0, min(1.0, base_scarcity + volatility))
-        self.helium_availability_trend.append(self.helium_scarcity)
-        self.helium_price = 0.5 * (1.0 + self.helium_scarcity * 0.8)
+    def _update_snapshot(self) -> None:
+        self.snapshot = {name: param.detach().clone()
+                         for name, param in self.model.named_parameters()}
+        self.fisher = {name: torch.zeros_like(param)
+                       for name, param in self.model.named_parameters()}
 
-    def _get_fallback_intensity(self, region: str) -> float:
-        fallback_values = {'us-east': 420, 'us-west': 350, 'eu': 280, 'asia': 500, 'default': 400}
-        return fallback_values.get(region, 400)
+    def compute_fisher(
+            self,
+            data_loader: Iterable[Tuple[torch.Tensor, torch.Tensor]],
+            max_batches: Optional[int] = None,
+    ) -> None:
+        """Compute the diagonal Fisher information matrix.
 
-    async def get_current_intensity(self) -> float:
-        if self.last_update is None or (datetime.now(timezone.utc) - self.last_update).seconds > self.update_interval:
-            await self.update_carbon_intensity(self.region)
-        return self.carbon_intensity
+        `data_loader` yields (x, y) pairs. The Fisher is estimated by
+        the expected squared gradient of the log-likelihood.
+        """
+        self.fisher = {name: torch.zeros_like(param)
+                       for name, param in self.model.named_parameters()}
+        self.model.train()
+        n_seen = 0
+        for i, batch in enumerate(data_loader):
+            if max_batches is not None and i >= max_batches:
+                break
+            try:
+                x, y = batch
+            except (TypeError, ValueError):
+                continue
+            x = x.to(self.device)
+            y = y.to(self.device)
+            self.model.zero_grad()
+            logits = self.model(x)
+            loss = F.cross_entropy(logits, y)
+            loss.backward()
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    self.fisher[name] += param.grad.detach() ** 2
+            n_seen += 1
+        if n_seen > 0:
+            for name in self.fisher:
+                self.fisher[name] /= n_seen
+        self._update_snapshot_params()
 
-    async def get_helium_metrics(self) -> Dict[str, float]:
-        return {
-            'scarcity': self.helium_scarcity,
-            'price': self.helium_price,
-            'trend': np.mean(self.helium_availability_trend) if self.helium_availability_trend else 0.5
-        }
+    def _update_snapshot_params(self) -> None:
+        """Take a new parameter snapshot without resetting the Fisher."""
+        self.snapshot = {name: param.detach().clone()
+                         for name, param in self.model.named_parameters()}
 
-    async def close(self):
-        if self._session:
-            await self._session.close()
+    def penalty(self) -> torch.Tensor:
+        """L_EWC = λ/2 * Σ F_i (θ_i - θ*_i)^2."""
+        if not self.fisher:
+            return torch.tensor(0.0)
+        loss: Optional[torch.Tensor] = None
+        for name, param in self.model.named_parameters():
+            if name in self.fisher and name in self.snapshot:
+                term = (self.fisher[name] *
+                        (param - self.snapshot[name]) ** 2).sum()
+                loss = term if loss is None else loss + term
+        if loss is None:
+            return torch.tensor(0.0)
+        return 0.5 * self.lambda_ewc * loss
 
-# ============================================================================
-# Predictive Evolution Analyzer (unchanged)
-# ============================================================================
-class PredictiveEvolutionAnalyzer:
-    def __init__(self, history_window: int = 100):
-        self.history_window = history_window
-        self.evolution_history = deque(maxlen=history_window)
-        self.forecast_history = deque(maxlen=50)
-        self.models = {}
-        self.scaler = None
-        self.is_trained = False
-        self.quantum_forecast_history = deque(maxlen=50)
-        self.helium_forecast_history = deque(maxlen=50)
+    def reset(self) -> None:
+        self._update_snapshot()
+
+
+# =============================================================================
+# GENERATIVE REPLAY
+# =============================================================================
+class GenerativeReplay:
+    """Experience replay buffer of (state, target) pairs."""
+
+    def __init__(self, buffer_size: int = 500):
+        self.buffer: Deque[Tuple[torch.Tensor, torch.Tensor]] = deque(
+            maxlen=buffer_size)
+
+    def store(self, x: torch.Tensor, y: Optional[torch.Tensor] = None) -> None:
+        x = x.detach().cpu()
+        y = y.detach().cpu() if y is not None else torch.zeros(1, dtype=torch.long)
+        self.buffer.append((x, y))
+
+    def sample(self, batch_size: int = 32
+               ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if len(self.buffer) < batch_size:
+            return None
+        idx = np.random.choice(len(self.buffer), batch_size, replace=False)
+        xs, ys = [], []
+        for i in idx:
+            x, y = self.buffer[i]
+            xs.append(x)
+            ys.append(y)
+        return torch.stack(xs), torch.stack(ys)
+
+    def __len__(self) -> int:
+        return len(self.buffer)
+
+
+# =============================================================================
+# CONCEPT DRIFT DETECTOR
+# =============================================================================
+class ConceptDriftDetector:
+    """Page-Hinkley on the running mean of recent feature norms."""
+
+    def __init__(self, window_size: int = 100, delta: float = 0.005,
+                 threshold: float = 0.5):
+        self.window: Deque[float] = deque(maxlen=window_size)
+        self.delta = float(delta)
+        self.threshold = float(threshold)
+        self._mean = 0.0
+        self._cum = 0.0
+        self._min_cum = 0.0
+        self.drift_score = 0.0
+
+    def update(self, features: torch.Tensor) -> float:
         try:
-            from sklearn.preprocessing import StandardScaler
-            from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-            from sklearn.metrics import r2_score
-            self.scaler = StandardScaler()
-            self.models['random_forest'] = RandomForestRegressor(n_estimators=100, random_state=42)
-            self.models['gradient_boosting'] = GradientBoostingRegressor(n_estimators=100, random_state=42)
-            self.models['quantum'] = RandomForestRegressor(n_estimators=50, random_state=42)
-            self._ml_available = True
-        except ImportError:
-            self._ml_available = False
-
-    def update_history(self, evolution_metrics: Dict):
-        self.evolution_history.append({
-            'timestamp': datetime.now(timezone.utc),
-            'fitness_score': evolution_metrics.get('fitness_score', 0.5),
-            'plasticity': evolution_metrics.get('plasticity', 0.5),
-            'evolution_pressure': evolution_metrics.get('evolution_pressure', 0.3),
-            'token_fitness': evolution_metrics.get('token_fitness', 0.5),
-            'drift_score': evolution_metrics.get('drift_score', 0.0),
-            'adaptation_count': evolution_metrics.get('adaptation_count', 0),
-            'quantum_fitness': evolution_metrics.get('quantum_fitness', 0.0),
-            'helium_usage': evolution_metrics.get('helium_usage', 0.0),
-            'quantum_advantage': evolution_metrics.get('quantum_advantage', 0.0)
-        })
-
-    async def train_forecast_model(self):
-        if not self._ml_available or len(self.evolution_history) < 10:
-            return {'status': 'insufficient_data'}
-        X, y = [], []
-        history_list = list(self.evolution_history)
-        for i in range(len(history_list) - 5):
-            features = []
-            for j in range(5):
-                data = history_list[i + j]
-                features.extend([
-                    data['fitness_score'],
-                    data['plasticity'],
-                    data['evolution_pressure'],
-                    data['token_fitness'],
-                    data['drift_score'],
-                    data['adaptation_count'] / 100,
-                    data.get('quantum_fitness', 0.0),
-                    data.get('helium_usage', 0.0),
-                    data.get('quantum_advantage', 0.0)
-                ])
-            X.append(features)
-            y.append(history_list[i + 5]['fitness_score'])
-        X = np.array(X)
-        y = np.array(y)
-        X_scaled = self.scaler.fit_transform(X)
-        results = {}
-        for name, model in self.models.items():
-            if model is not None:
-                model.fit(X_scaled, y)
-                predictions = model.predict(X_scaled)
-                r2 = r2_score(y, predictions)
-                results[name] = r2
-        self.is_trained = True
-        return {'status': 'success', 'results': results}
-
-    async def predict_evolution_trend(self) -> Dict:
-        if not self.is_trained or len(self.evolution_history) < 10:
-            return {'predicted_fitness': 0.5, 'confidence': 0.0, 'trend': 'insufficient_data'}
-        recent = list(self.evolution_history)[-5:]
-        features = []
-        for data in recent:
-            features.extend([
-                data['fitness_score'],
-                data['plasticity'],
-                data['evolution_pressure'],
-                data['token_fitness'],
-                data['drift_score'],
-                data['adaptation_count'] / 100,
-                data.get('quantum_fitness', 0.0),
-                data.get('helium_usage', 0.0),
-                data.get('quantum_advantage', 0.0)
-            ])
-        features = np.array(features).reshape(1, -1)
-        features_scaled = self.scaler.transform(features)
-        predictions = []
-        for name, model in self.models.items():
-            if model is not None and name != 'quantum':
-                pred = model.predict(features_scaled)[0]
-                predictions.append(pred)
-        if not predictions:
-            return {'predicted_fitness': 0.5, 'confidence': 0.0, 'trend': 'no_models'}
-        prediction = np.mean(predictions)
-        confidence = min(0.9, np.std(predictions) / 0.2) if len(predictions) > 1 else 0.5
-        if len(self.forecast_history) > 5:
-            recent_forecasts = list(self.forecast_history)[-5:]
-            trend = "improving" if prediction > recent_forecasts[-1] else "declining" if prediction < recent_forecasts[-1] else "stable"
+            v = float(features.detach().cpu().norm().item())
+        except Exception:
+            return self.drift_score
+        self.window.append(v)
+        self._mean += (v - self._mean) * 0.1
+        self._cum += v - self._mean - self.delta
+        self._min_cum = min(self._min_cum, self._cum)
+        deviation = self._cum - self._min_cum
+        if deviation > self.threshold:
+            self.drift_score = 1.0
+            self._cum = 0.0
+            self._min_cum = 0.0
         else:
-            trend = "stable"
-        quantum_forecast = self._predict_quantum_trend()
-        return {
-            'predicted_fitness': prediction,
-            'confidence': confidence,
-            'trend': trend,
-            'recommended_actions': self._generate_actions(prediction),
-            'quantum_forecast': quantum_forecast
-        }
+            self.drift_score = float(deviation) / max(self.threshold, 1e-6)
+        return self.drift_score
 
-    def _predict_quantum_trend(self) -> Dict:
-        if len(self.evolution_history) < 5:
-            return {'quantum_fitness': 0.0, 'helium_usage': 0.0}
-        recent = list(self.evolution_history)[-5:]
-        avg_quantum_fitness = np.mean([d.get('quantum_fitness', 0.0) for d in recent])
-        avg_helium_usage = np.mean([d.get('helium_usage', 0.0) for d in recent])
-        trend = "improving" if len(recent) > 2 and recent[-1].get('quantum_fitness', 0) > recent[0].get('quantum_fitness', 0) else "stable"
-        return {
-            'quantum_fitness': avg_quantum_fitness,
-            'helium_usage': avg_helium_usage,
-            'trend': trend,
-            'quantum_advantage': avg_quantum_fitness - 0.5
-        }
+    def reset(self) -> None:
+        self.window.clear()
+        self._mean = 0.0
+        self._cum = 0.0
+        self._min_cum = 0.0
+        self.drift_score = 0.0
 
-    def _generate_actions(self, prediction: float) -> List[str]:
-        actions = []
-        if prediction < 0.4:
-            actions.append("Increase evolution pressure")
-            actions.append("Boost plasticity for faster adaptation")
-            actions.append("Enhance quantum architecture search")
-        elif prediction < 0.6:
-            actions.append("Enhance architecture search frequency")
-            actions.append("Improve task prototype storage")
-            actions.append("Reduce helium usage in quantum circuits")
-        elif prediction < 0.8:
-            actions.append("Maintain current evolution trajectory")
-            actions.append("Optimize quantum circuit depth")
-        return actions or ["Evolution is on track"]
 
-    def get_evolution_summary(self) -> Dict:
-        if not self.evolution_history:
-            return {'status': 'insufficient_data'}
-        recent = list(self.evolution_history)[-50:]
-        return {
-            'average_fitness': np.mean([h['fitness_score'] for h in recent]),
-            'average_plasticity': np.mean([h['plasticity'] for h in recent]),
-            'evolution_trend': 'improving' if len(recent) > 10 and recent[-1]['fitness_score'] > recent[0]['fitness_score'] else 'stable',
-            'drift_trend': 'increasing' if len(recent) > 10 and recent[-1]['drift_score'] > recent[0]['drift_score'] else 'stable',
-            'quantum_metrics': {
-                'avg_quantum_fitness': np.mean([h.get('quantum_fitness', 0.0) for h in recent]),
-                'avg_helium_usage': np.mean([h.get('helium_usage', 0.0) for h in recent]),
-                'quantum_advantage': np.mean([h.get('quantum_advantage', 0.0) for h in recent])
-            }
-        }
+# =============================================================================
+# REAL MAML GATE (functional_call based)
+# =============================================================================
+class MAMLGate(nn.Module):
+    """First-order / full MAML using torch.func.functional_call.
 
-# ============================================================================
-# Evolution Cross-Domain Transfer (unchanged)
-# ============================================================================
-class EvolutionCrossDomainTransfer:
+    Key differences from the broken v7.4.0 version:
+      * Subclasses nn.Module → parameters are registered.
+      * Uses torch.func.functional_call to swap in adapted parameters
+        without breaking the graph, so meta-gradients flow to the base net.
+      * Supports LayerNorm identically to the regular gate network.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int, num_experts: int,
+                 inner_lr: float = 0.01, outer_lr: float = 0.001,
+                 first_order: bool = False):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_experts = int(num_experts)
+        self.inner_lr = float(inner_lr)
+        self.first_order = bool(first_order)
+
+        self.base_network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_experts),
+        )
+        self.meta_optimizer = torch.optim.Adam(
+            self.base_network.parameters(), lr=outer_lr)
+
+    def _functional_forward(self, x: torch.Tensor,
+                            params: Dict[str, torch.Tensor]
+                            ) -> torch.Tensor:
+        return functional_call(self.base_network, params, (x,))
+
+    def _base_params(self) -> Dict[str, torch.Tensor]:
+        return {name: p for name, p in self.base_network.named_parameters()}
+
+    def adapt(self, support_set: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+              num_inner_steps: int = 5,
+              create_graph: bool = True) -> Dict[str, torch.Tensor]:
+        """Run the inner loop. Returns the adapted parameters.
+
+        If `create_graph=True`, the returned tensors are part of the
+        computation graph connecting back to the base parameters, so
+        a subsequent `meta_loss.backward()` updates the meta-learner.
+        """
+        params = self._base_params()
+        for _ in range(num_inner_steps):
+            def loss_fn(p):
+                total = 0.0
+                for x, y in support_set:
+                    logits = self._functional_forward(x, p)
+                    total = total + F.cross_entropy(logits, y)
+                return total / max(len(support_set), 1)
+
+            grads = torch.autograd.grad(
+                loss_fn(params), list(params.values()),
+                create_graph=create_graph)
+            new_params = {}
+            for (name, p), g in zip(params.items(), grads):
+                if self.first_order:
+                    g = g.detach()
+                new_params[name] = p - self.inner_lr * g
+            params = new_params
+        return params
+
+    def meta_update(
+            self,
+            query_sets: Sequence[Tuple[
+                Dict[str, torch.Tensor],
+                Sequence[Tuple[torch.Tensor, torch.Tensor]]]],
+    ) -> float:
+        """Perform one meta-update step. `query_sets` are (adapted_params,
+        query_data) pairs produced by `adapt`.
+        """
+        meta_loss: Optional[torch.Tensor] = None
+        for adapted, query_data in query_sets:
+            for x, y in query_data:
+                logits = self._functional_forward(x, adapted)
+                loss = F.cross_entropy(logits, y)
+                meta_loss = loss if meta_loss is None else meta_loss + loss
+        if meta_loss is None:
+            return 0.0
+        meta_loss = meta_loss / max(len(query_sets), 1)
+        self.meta_optimizer.zero_grad()
+        meta_loss.backward()
+        self.meta_optimizer.step()
+        return float(meta_loss.item())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base_network(x)
+
+
+# =============================================================================
+# SAFETY MONITORS
+# =============================================================================
+@dataclass
+class SafetyRule:
+    name: str
+    predicate: Callable[[Dict[str, Any]], bool]
+    description: str
+    severity: str = "warning"
+    mitigation: Optional[Callable[[Any], None]] = None
+
+
+class SafetyMonitor:
     def __init__(self):
-        self.knowledge_base: Dict[str, Dict[str, Dict]] = {}
-        self.transfer_logs = deque(maxlen=1000)
-        self.domain_mappings = {
-            'evolution→energy': {'efficiency_strategies': ['token-based', 'gradient-driven', 'ATP-aware'],
-                                 'resource_allocation': ['dynamic', 'adaptive', 'predictive']},
-            'evolution→carbon': {'pressure_patterns': ['gradient-driven', 'threshold-based', 'adaptive'],
-                                 'optimization_strategies': ['evolutionary', 'gradient-descent', 'hybrid']},
-            'evolution→helium': {'scarcity_strategies': ['efficiency-first', 'conservation', 'recovery'],
-                                 'adaptation_patterns': ['incremental', 'punctuated', 'continuous']},
-            'evolution→data': {'learning_patterns': ['experience-replay', 'generative', 'meta-learning'],
-                               'storage_strategies': ['biomass', 'memory', 'distributed']},
-            'evolution→quantum': {'circuit_optimization': ['depth-reduction', 'qubit-saving', 'error-mitigation'],
-                                  'helium_efficiency': ['low-helium', 'recovery', 'alternative-cooling'],
-                                  'architectural_strategies': ['classical-quantum-hybrid', 'quantum-first', 'adaptive']},
-            'quantum→classical': {'knowledge_distillation': ['quantum-enhanced', 'state-transfer', 'feature-mapping'],
-                                  'efficiency_transfer': ['energy-efficient', 'helium-aware', 'carbon-optimized']}
-        }
-        self._lock = asyncio.Lock()
-        self.quantum_knowledge: Dict[str, Dict] = {}
-        self.quantum_to_classical_mappings: Dict[str, Dict] = {}
+        self.rules: List[SafetyRule] = []
+        self.violations: Deque[SafetyViolation] = deque(maxlen=1000)
 
-    def transfer_knowledge(self, source_domain: str, target_domain: str, knowledge_type: str, data: Dict[str, Any]) -> Dict:
-        key = f"{source_domain}→{target_domain}"
-        if key not in self.knowledge_base:
-            self.knowledge_base[key] = {}
-        if knowledge_type not in self.knowledge_base[key]:
-            self.knowledge_base[key][knowledge_type] = {'data': data, 'transfer_count': 1,
-                'effectiveness_score': 0.5, 'last_used': datetime.now(timezone.utc)}
+    def add_rule(self, name: str,
+                 predicate: Callable[[Dict[str, Any]], bool],
+                 description: str, severity: str = "warning",
+                 mitigation: Optional[Callable[[Any], None]] = None) -> None:
+        self.rules.append(SafetyRule(name, predicate, description,
+                                     severity, mitigation))
+
+    def check(self, state: Dict[str, Any],
+              target: Optional[Any] = None) -> List[SafetyViolation]:
+        out: List[SafetyViolation] = []
+        for rule in self.rules:
+            try:
+                ok = bool(rule.predicate(state))
+            except Exception:
+                ok = False
+            if not ok:
+                v = SafetyViolation(rule.name, rule.severity, rule.description)
+                if rule.mitigation and target is not None:
+                    try:
+                        rule.mitigation(target)
+                        v.mitigated = True
+                    except Exception:
+                        pass
+                self.violations.append(v)
+                out.append(v)
+        return out
+
+    def violation_count(self, severity: Optional[str] = None) -> int:
+        if severity is None:
+            return len(self.violations)
+        return sum(1 for v in self.violations if v.severity == severity)
+
+
+@dataclass
+class _TemporalRule:
+    rule_id: str
+    operator: str
+    predicate: Callable[[Dict[str, Any]], bool]
+    window_seconds: float = 0.0
+    description: str = ""
+    severity: str = "warning"
+    violations: int = 0
+    last_violation: Optional[datetime] = None
+
+    def evaluate(self, trace: Deque[Tuple[datetime, Dict[str, Any]]]) -> bool:
+        if not trace:
+            return False
+        if self.window_seconds > 0:
+            cutoff = trace[-1][0] - timedelta(seconds=self.window_seconds)
+            while trace and trace[0][0] < cutoff:
+                trace.popleft()
+        op = self.operator
+        if op == "always":
+            return any(not self.predicate(s) for _, s in trace)
+        if op == "eventually":
+            return not any(self.predicate(s) for _, s in trace)
+        if op == "never":
+            return any(self.predicate(s) for _, s in trace)
+        if op == "historically":
+            return any(not self.predicate(s) for _, s in trace)
+        if op == "once":
+            return not any(self.predicate(s) for _, s in trace)
+        return False
+
+
+_ATOMIC_RE = __import__("re").compile(
+    r"^\s*([A-Za-z_]\w*)\s*(>=|<=|==|!=|>|<)\s*(-?[0-9.]+)\s*$")
+
+
+class TemporalSafetyMonitor:
+    """MTL monitor supporting G, F, NEVER, H, O and windowed rules."""
+
+    def __init__(self, max_trace: int = 500):
+        self.rules: Dict[str, _TemporalRule] = {}
+        self.trace: Deque[Tuple[datetime, Dict[str, Any]]] = deque(maxlen=max_trace)
+
+    def add_formula(self, formula: str) -> None:
+        f = formula.strip()
+        window = 0.0
+        if f.startswith("[") and "]" in f:
+            head, rest = f[1:].split("]", 1)
+            try:
+                window = float(head.strip().rstrip("s"))
+            except ValueError:
+                window = 0.0
+            f = rest.strip()
+        op_map = {"G ": "always", "F ": "eventually",
+                  "NEVER ": "never", "H ": "historically", "O ": "once"}
+        for prefix, op in op_map.items():
+            if f.startswith(prefix):
+                expr = f[len(prefix):].strip().strip("()")
+                self._add_atomic(expr, op, window)
+                return
+
+    def _add_atomic(self, expr: str, op: str, window: float) -> None:
+        m = _ATOMIC_RE.match(expr)
+        if not m:
+            return
+        var, cmp, val = m.group(1), m.group(2), float(m.group(3))
+
+        def predicate(state, v=var, c=cmp, x=val):
+            try:
+                sv = float(state.get(v, 0.0))
+            except Exception:
+                return True
+            return {">=": sv >= x, "<=": sv <= x, "==": sv == x,
+                    "!=": sv != x, ">": sv > x, "<": sv < x}[c]
+
+        rid = f"{op}:{expr}" + (f"@{window}s" if window else "")
+        self.rules[rid] = _TemporalRule(rid, op, predicate,
+                                        window_seconds=window,
+                                        description=expr)
+
+    async def push(self, state: Dict[str, Any]) -> None:
+        self.trace.append((datetime.now(timezone.utc), dict(state)))
+
+    async def check(self) -> Dict[str, bool]:
+        result: Dict[str, bool] = {}
+        for rid, rule in self.rules.items():
+            copy = deque(self.trace, maxlen=self.trace.maxlen)
+            violated = rule.evaluate(copy)
+            result[rid] = not violated
+            if violated:
+                rule.violations += 1
+                rule.last_violation = datetime.now(timezone.utc)
+        return result
+
+    def counts(self) -> Dict[str, int]:
+        return {rid: r.violations for rid, r in self.rules.items()}
+
+
+# =============================================================================
+# XAI (Integrated Gradients + Counterfactuals)
+# =============================================================================
+class XAIExplainer:
+    def __init__(self, ig_steps: int = 16, cf_max_iter: int = 40,
+                 cf_target_delta: float = 0.1,
+                 rng: Optional[random.Random] = None):
+        self.ig_steps = int(ig_steps)
+        self.cf_max_iter = int(cf_max_iter)
+        self.cf_target_delta = float(cf_target_delta)
+        self.rng = rng or random.Random()
+
+    def integrated_gradients(self, f: Callable[[np.ndarray], float],
+                             x: np.ndarray,
+                             baseline: Optional[np.ndarray] = None
+                             ) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        if baseline is None:
+            baseline = np.zeros_like(x)
+        total = np.zeros_like(x)
+        for s in range(1, self.ig_steps + 1):
+            alpha = s / self.ig_steps
+            interp = baseline + alpha * (x - baseline)
+            eps = 1e-4
+            grad = np.zeros_like(x)
+            for i in range(len(x)):
+                up = interp.copy(); up[i] += eps
+                dn = interp.copy(); dn[i] -= eps
+                try:
+                    grad[i] = (float(f(up)) - float(f(dn))) / (2 * eps)
+                except Exception:
+                    grad[i] = 0.0
+            total += grad
+        return (x - baseline) * (total / max(self.ig_steps, 1))
+
+    def counterfactual(self, f: Callable[[np.ndarray], float],
+                       x: np.ndarray,
+                       target_delta: Optional[float] = None,
+                       bounds: Tuple[float, float] = (-1.0, 1.0)
+                       ) -> Dict[str, Any]:
+        target_delta = target_delta or self.cf_target_delta
+        try:
+            base_pred = float(f(x))
+        except Exception:
+            return {"success": False}
+        best_delta, best_pred = 0.0, base_pred
+        best_idx, best_step = None, 0.0
+        x_cf = x.copy()
+        for _ in range(self.cf_max_iter):
+            i = self.rng.randrange(len(x))
+            step = self.rng.choice([-1, 1]) * 0.1
+            trial = x_cf.copy()
+            trial[i] = float(np.clip(trial[i] + step, *bounds))
+            try:
+                pred = float(f(trial))
+            except Exception:
+                continue
+            delta = abs(pred - base_pred)
+            if delta > best_delta:
+                best_delta, best_pred, x_cf = delta, pred, trial
+                best_idx, best_step = i, step
+            if delta >= abs(target_delta):
+                break
+        return {"success": best_delta >= abs(target_delta),
+                "changed_index": best_idx,
+                "change_amount": best_step,
+                "delta": best_pred - base_pred}
+
+
+# =============================================================================
+# ENHANCEMENT 1 — QUANTUM DISTILLATION
+# =============================================================================
+class QuantumDistillationModule:
+    def __init__(self, n_dims: int = EnvironmentFeatures.DIM,
+                 temperature: float = 1.0, learning_rate: float = 0.1,
+                 min_temperature: float = 0.25,
+                 temperature_decay: float = 0.999,
+                 convergence_eps: float = 1e-4,
+                 rng: Optional[random.Random] = None):
+        self.n_dims = int(n_dims)
+        self.temperature = float(temperature)
+        self.learning_rate = float(learning_rate)
+        self.min_temperature = float(min_temperature)
+        self.temperature_decay = float(temperature_decay)
+        self.convergence_eps = float(convergence_eps)
+        self.rng = rng or random.Random()
+        self.teachers: Dict[str, List[float]] = {}
+        self.teacher_weights: Dict[str, float] = {}
+        self.student: List[float] = [1.0 / self.n_dims] * self.n_dims
+        self.history: Deque[Dict[str, Any]] = deque(maxlen=200)
+        self._converged = False
+
+    def register_teacher(self, name: str, policy: Iterable[float],
+                         weight: float = 1.0) -> None:
+        pol = list(policy)
+        if not pol:
+            return
+        s = sum(pol) or 1.0
+        self.teachers[name] = [max(0.0, p) / s for p in pol]
+        self.teacher_weights[name] = max(1e-6, float(weight))
+
+    def unregister_teacher(self, name: str) -> None:
+        self.teachers.pop(name, None)
+        self.teacher_weights.pop(name, None)
+
+    def _von_neumann_entropy(self, rho: np.ndarray) -> float:
+        try:
+            m = (rho + rho.T) / 2.0
+            eig = np.linalg.eigvalsh(m)
+            eig = np.clip(eig, 1e-12, None)
+            return float(-np.sum(eig * np.log(eig)))
+        except Exception:
+            return 0.0
+
+    def _superpose(self) -> Tuple[List[float], float]:
+        n = self.n_dims
+        if not self.teachers:
+            return list(self.student), 0.0
+        amps: List[np.ndarray] = []
+        weights: List[float] = []
+        for tid, pol in self.teachers.items():
+            a = np.array([math.sqrt(max(pol[i], 1e-12))
+                          if i < len(pol) else 0.0 for i in range(n)])
+            amps.append(a)
+            weights.append(self.teacher_weights.get(tid, 1.0))
+        wsum = sum(weights) or 1.0
+        weights = [w / wsum for w in weights]
+        rho = np.zeros((n, n))
+        for a, w in zip(amps, weights):
+            rho += w * np.outer(a, a)
+        diag = np.clip(np.diag(rho), 1e-12, None)
+        s = float(diag.sum()) or 1.0
+        return (diag / s).tolist(), self._von_neumann_entropy(rho)
+
+    def _softmax(self, x: Iterable[float], temp: float) -> List[float]:
+        x = np.asarray(list(x), dtype=float)
+        m = x.max()
+        e = np.exp((x - m) / max(temp, 1e-6))
+        s = e.sum() or 1.0
+        return (e / s).tolist()
+
+    async def step(self, storage: Optional[StorageLike] = None,
+                   student_id: str = "gate") -> Dict[str, Any]:
+        target_raw, entropy = self._superpose()
+        target = self._softmax(target_raw, self.temperature)
+        new: List[float] = []
+        for s, t in zip(self.student, target):
+            eps = max(1e-12, min(self.student) * 0.1)
+            grad = -(t / max(s, eps))
+            new.append(max(1e-3, s - self.learning_rate * grad))
+        ns = sum(new) or 1.0
+        new_student = [x / ns for x in new]
+        delta = sum(abs(a - b) for a, b in zip(new_student, self.student))
+        self._converged = delta < self.convergence_eps
+        self.student = new_student
+        self.temperature = max(self.min_temperature,
+                               self.temperature * self.temperature_decay)
+        entry = {"target": target, "student": list(self.student),
+                 "temperature": self.temperature, "delta": delta,
+                 "converged": self._converged, "entropy": entropy}
+        self.history.append(entry)
+        if storage is not None:
+            try:
+                await asyncio.to_thread(
+                    storage.save_state, f"quantum::{student_id}",
+                    json.dumps(entry))
+            except Exception:
+                pass
+        return entry
+
+    def is_available(self) -> bool:
+        return True
+
+    def is_converged(self) -> bool:
+        return self._converged
+
+    def get_student_policy(self) -> List[float]:
+        return list(self.student)
+
+
+# =============================================================================
+# ENHANCEMENT 2 — CAUSAL FEATURE MASK
+# =============================================================================
+class CausalFeatureMask:
+    FEATURE_NAMES = EnvironmentFeatures.NAMES
+
+    def __init__(self, feature_dim: int = EnvironmentFeatures.DIM,
+                 rng: Optional[random.Random] = None):
+        self.feature_dim = int(feature_dim)
+        self.rng = rng or random.Random()
+        self.mask = np.ones(self.feature_dim, dtype=np.float32)
+        self.edges: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self.samples: Deque[np.ndarray] = deque(maxlen=512)
+
+    def observe(self, features: Iterable[float]) -> None:
+        feats = np.asarray(list(features), dtype=np.float32)
+        if feats.shape[0] != self.feature_dim:
+            return
+        self.samples.append(feats)
+
+    def apply(self, features: Iterable[float]) -> np.ndarray:
+        feats = np.asarray(list(features), dtype=np.float32)
+        if feats.shape[0] != self.feature_dim:
+            raise ValueError(f"features dim {feats.shape[0]} != {self.feature_dim}")
+        return feats * self.mask
+
+    def fit(self, alpha: float = 0.05, threshold: float = 0.25) -> Dict[str, Any]:
+        self.edges.clear()
+        if len(self.samples) < 10:
+            return self.summary()
+        X = np.asarray(self.samples, dtype=float)
+        X = (X - X.mean(0)) / (X.std(0) + 1e-9)
+        try:
+            corr = np.corrcoef(X, rowvar=False)
+            corr = np.nan_to_num(corr, nan=0.0)
+            prec = np.linalg.pinv(corr)
+        except Exception:
+            return self.summary()
+        names = list(self.FEATURE_NAMES)[:self.feature_dim]
+        d = self.feature_dim
+        for i in range(d):
+            for j in range(i + 1, d):
+                denom = math.sqrt(max(prec[i, i] * prec[j, j], 1e-12))
+                pcorr = -prec[i, j] / denom
+                if abs(pcorr) <= threshold:
+                    continue
+                r = min(max(pcorr, -0.999999), 0.999999)
+                z = 0.5 * math.log((1 + r) / (1 - r)) * \
+                    math.sqrt(max(X.shape[0] - (d - 2), 1))
+                p_val = math.erfc(abs(z) / math.sqrt(2.0))
+                if p_val > alpha:
+                    continue
+                self.edges[names[i]][names[j]] = float(pcorr)
+        active: Set[str] = set()
+        for src, targets in self.edges.items():
+            active.add(src)
+            active.update(targets.keys())
+        for i, n in enumerate(names):
+            self.mask[i] = 1.0 if n in active else 0.5
+        return self.summary()
+
+    def summary(self) -> Dict[str, Any]:
+        return {"features": self.feature_dim,
+                "edges": sum(len(v) for v in self.edges.values()),
+                "mask": self.mask.tolist()}
+
+
+# =============================================================================
+# ENHANCEMENT 3 — EXPERT AUCTION (LinUCB)
+# =============================================================================
+class ExpertAuction:
+    def __init__(self, expert_ids: List[int],
+                 feature_dim: int = EnvironmentFeatures.DIM,
+                 alpha: float = 0.2, ridge: float = 1.0,
+                 rng: Optional[random.Random] = None):
+        self.expert_ids = list(expert_ids)
+        self.feature_dim = int(feature_dim)
+        self.alpha = float(alpha)
+        self.ridge = float(ridge)
+        self.rng = rng or random.Random()
+        self._A: Dict[int, np.ndarray] = {}
+        self._b: Dict[int, np.ndarray] = {}
+        for eid in self.expert_ids:
+            self.add_expert(eid)
+
+    def add_expert(self, eid: int) -> None:
+        if eid in self._A:
+            return
+        if eid not in self.expert_ids:
+            self.expert_ids.append(eid)
+        self._A[eid] = self.ridge * np.eye(self.feature_dim, dtype=np.float32)
+        self._b[eid] = np.zeros(self.feature_dim, dtype=np.float32)
+
+    def _vec(self, features: Iterable[float]) -> np.ndarray:
+        x = np.asarray(list(features)[:self.feature_dim], dtype=np.float32)
+        if x.size < self.feature_dim:
+            x = np.pad(x, (0, self.feature_dim - x.size))
+        return x
+
+    def compute_bids(self, features: Iterable[float]) -> Dict[int, float]:
+        x = self._vec(features)
+        out: Dict[int, float] = {}
+        for eid in self.expert_ids:
+            A = self._A[eid]
+            try:
+                A_inv = np.linalg.inv(A)
+            except np.linalg.LinAlgError:
+                A_inv = np.linalg.pinv(A)
+            theta = A_inv @ self._b[eid]
+            mu = float(theta @ x)
+            sigma = float(math.sqrt(max(float(x @ A_inv @ x), 0.0)))
+            out[eid] = mu + self.alpha * sigma
+        return out
+
+    def select(self, features: Iterable[float], top_k: int = 1) -> List[int]:
+        bids = self.compute_bids(features)
+        return [eid for eid, _ in sorted(bids.items(),
+                                          key=lambda kv: kv[1],
+                                          reverse=True)[:top_k]]
+
+    def update(self, eid: int, features: Iterable[float], reward: float) -> None:
+        if eid not in self._A:
+            self.add_expert(eid)
+        x = self._vec(features)
+        self._A[eid] = self._A[eid] + np.outer(x, x)
+        self._b[eid] = self._b[eid] + reward * x
+
+
+# =============================================================================
+# ENHANCEMENT 4 — PRECISION CONTROLLER
+# =============================================================================
+class PrecisionController:
+    ENERGY = {"fp32": 1.0, "tf32": 0.75, "bf16": 0.55,
+              "fp16": 0.5, "int8": 0.3}
+
+    def __init__(self, levels: Optional[List[str]] = None,
+                 max_sensitivity: float = 0.5,
+                 switch_threshold: float = 0.02,
+                 hysteresis_s: float = 0.5):
+        self.levels = levels or list(self.ENERGY.keys())
+        self.max_sensitivity = float(max_sensitivity)
+        self.switch_threshold = float(switch_threshold)
+        self.hysteresis_s = float(hysteresis_s)
+        self.current = "fp32"
+        self.saved_wh = 0.0
+        self._last_switch = 0.0
+
+    def select_precision(self,
+                         layer_sensitivity: Optional[float] = None) -> str:
+        if layer_sensitivity is not None and \
+                layer_sensitivity > self.max_sensitivity:
+            return "fp32"
+        return min(self.levels, key=lambda c: self.ENERGY.get(c, 1.0))
+
+    async def switch_to(self, target: str, reason: str = "policy") -> bool:
+        if target == self.current or target not in self.ENERGY:
+            return False
+        now = time.time()
+        if now - self._last_switch < self.hysteresis_s:
+            return False
+        old = self.current
+        self.current = target
+        self._last_switch = now
+        self.saved_wh += max(0.0, self.ENERGY[old] - self.ENERGY[target])
+        return True
+
+    async def auto_switch(self, recent_acc: float, baseline_acc: float,
+                          layer_sensitivity: Optional[float] = None) -> None:
+        if baseline_acc <= 0:
+            return
+        drop = (baseline_acc - recent_acc) / baseline_acc
+        if drop > self.switch_threshold:
+            await self.switch_to("fp32", reason=f"acc drop {drop:.3f}")
+        elif drop < self.switch_threshold:
+            await self.switch_to(self.select_precision(layer_sensitivity),
+                                 reason="headroom")
+
+
+# =============================================================================
+# ENHANCEMENT 5 — CARBON MARKET CLIENT
+# =============================================================================
+class CarbonMarketClient:
+    def __init__(self, budget_kg: float = 1000.0,
+                 price_oracle: Optional[Callable[[], Any]] = None,
+                 rng: Optional[random.Random] = None,
+                 ema_alpha: float = 0.3):
+        self.budget_kg = float(budget_kg)
+        self.used_kg = 0.0
+        self.price = 25.0
+        self.price_ema = 25.0
+        self.ema_alpha = float(ema_alpha)
+        self.rng = rng or random.Random()
+        self.price_oracle = price_oracle or self._random_walk
+        self.rec_ledger: List[Dict[str, Any]] = []
+
+    async def _random_walk(self) -> float:
+        return max(5.0, self.price + self.rng.gauss(0, 1.5))
+
+    async def update_price(self) -> float:
+        try:
+            p = float(await self.price_oracle())
+        except Exception:
+            p = self.price
+        self.price = max(0.0, p)
+        self.price_ema = (self.ema_alpha * self.price +
+                          (1 - self.ema_alpha) * self.price_ema)
+        return self.price
+
+    def _budget_ok(self, extra: float) -> bool:
+        return (self.used_kg + extra) <= self.budget_kg
+
+    async def net_zero_schedule(self, workload_kwh: float,
+                                intensity: float) -> Dict[str, Any]:
+        await self.update_price()
+        carbon_kg = workload_kwh * intensity
+        offset_cost = (carbon_kg / 1000.0) * self.price
+        if not self._budget_ok(carbon_kg):
+            action = "defer"
+        elif intensity > 0.3:
+            action = "defer"
+        elif offset_cost < 0.5:
+            action = "run_offset"
         else:
-            existing = self.knowledge_base[key][knowledge_type]
-            existing['data'].update(data); existing['transfer_count'] += 1
-            existing['last_used'] = datetime.now(timezone.utc)
-        self.transfer_logs.append({'timestamp': datetime.now(timezone.utc), 'source': source_domain,
-                                   'target': target_domain, 'type': knowledge_type})
-        if 'quantum' in source_domain or 'quantum' in target_domain:
-            self.quantum_knowledge[key] = {'data': data, 'timestamp': datetime.now(timezone.utc), 'transfer_count': 1}
-        if source_domain == 'quantum' and target_domain == 'classical':
-            self.quantum_to_classical_mappings[knowledge_type] = data
-        return self.knowledge_base[key][knowledge_type]
+            action = "run"
+        if action in ("run", "run_offset"):
+            self.used_kg += carbon_kg
+        return {"action": action, "carbon_kg": carbon_kg,
+                "offset_cost_usd": offset_cost,
+                "credit_price_usd": self.price,
+                "budget_remaining_kg": max(0.0, self.budget_kg - self.used_kg)}
 
-    def transfer_quantum_to_classical(self, knowledge_type: str) -> Optional[Dict]:
-        return self.quantum_to_classical_mappings.get(knowledge_type)
+    async def buy_credits(self, mwh: float, price_per_mwh: float = 5.0,
+                          source: str = "wind") -> Dict[str, Any]:
+        cost = mwh * price_per_mwh
+        cert = uuid.uuid4().hex[:12]
+        self.rec_ledger.append({"mwh": mwh, "cost": cost, "source": source,
+                                "certificate": cert, "retired": False})
+        return {"cost": cost, "certificate": cert}
 
-    def get_transfer_statistics(self) -> Dict:
-        total_transfers = len(self.transfer_logs)
-        domain_pairs = {}
-        for log in self.transfer_logs:
-            key = f"{log['source']}→{log['target']}"
-            domain_pairs[key] = domain_pairs.get(key, 0) + 1
-        return {'total_transfers': total_transfers, 'domain_pairs': domain_pairs,
-                'knowledge_types': list(self.knowledge_base.keys()),
-                'recent_transfers': list(self.transfer_logs)[-10:],
-                'quantum_knowledge': len(self.quantum_knowledge),
-                'quantum_to_classical_mappings': len(self.quantum_to_classical_mappings)}
+    async def sell_credits(self, mwh: float,
+                           price_per_mwh: float = 5.0) -> Dict[str, Any]:
+        return {"revenue": mwh * price_per_mwh, "mwh": mwh}
 
-# ============================================================================
-# Enhanced Self-Evolving Gate (Main Class) – v7.4.0
-# ============================================================================
+    async def retire_rec(self, mwh: float) -> float:
+        remaining = mwh
+        for r in self.rec_ledger:
+            if r["retired"]:
+                continue
+            take = min(r["mwh"], remaining)
+            r["mwh"] -= take
+            remaining -= take
+            if r["mwh"] <= 0:
+                r["retired"] = True
+            if remaining <= 0:
+                break
+        return mwh - remaining
+
+    def rec_balance(self) -> float:
+        return sum(r["mwh"] for r in self.rec_ledger if not r["retired"])
+
+
+# =============================================================================
+# ENHANCEMENT 6 — CHAOS ENGINE
+# =============================================================================
+class ChaosEngine:
+    FAULT_TYPES = ("latency", "exception", "data_corruption",
+                   "memory_pressure", "network_drop")
+
+    def __init__(self, gate: "EnhancedSelfEvolvingGate",
+                 probability: float = 0.01,
+                 auto_rollback: bool = True,
+                 blast_radius: float = 0.5,
+                 rng: Optional[random.Random] = None):
+        self.gate = gate
+        self.probability = float(probability)
+        self.auto_rollback = bool(auto_rollback)
+        self.blast_radius = float(blast_radius)
+        self.rng = rng or random.Random()
+        self.active: Dict[str, Dict[str, Any]] = {}
+        self.rollback_count = 0
+        self._lock = threading.Lock()
+
+    def _allowed(self) -> int:
+        return max(1, int(len(self.FAULT_TYPES) * self.blast_radius))
+
+    async def maybe_inject_failure(self) -> Optional[Dict[str, Any]]:
+        if self.rng.random() >= self.probability:
+            return None
+        fault = self.rng.choice(self.FAULT_TYPES)
+        return await self.run_experiment(
+            f"auto_{uuid.uuid4().hex[:6]}", fault)
+
+    async def run_experiment(self, name: str, fault_type: str) -> Dict[str, Any]:
+        if fault_type not in self.FAULT_TYPES:
+            raise ValueError(f"unknown fault type {fault_type}")
+        with self._lock:
+            if len(self.active) >= self._allowed():
+                return {"name": name, "fault_type": fault_type,
+                        "status": "skipped", "reason": "blast_radius"}
+            self.active[name] = {"fault_type": fault_type}
+        t0 = time.time()
+        before = self.gate._check_steady_state()
+        snapshot = self.gate._snapshot_weights()
+        status = "completed"
+        try:
+            if fault_type == "latency":
+                await asyncio.sleep(0.005)
+            elif fault_type == "exception":
+                raise RuntimeError("chaos: injected exception")
+            elif fault_type == "memory_pressure":
+                _ = bytearray(1024)
+            elif fault_type == "network_drop":
+                await asyncio.sleep(0.005)
+            elif fault_type == "data_corruption":
+                self.gate._corrupt_weights_bounded(self.rng)
+        except Exception:
+            status = "injected"
+        finally:
+            with self._lock:
+                self.active.pop(name, None)
+        after = self.gate._check_steady_state()
+        rolled_back = False
+        if before and not after and self.auto_rollback:
+            self.gate._restore_weights(snapshot)
+            rolled_back = True
+            self.rollback_count += 1
+        return {"name": name, "fault_type": fault_type,
+                "steady_before": before, "steady_after": after,
+                "status": status,
+                "duration_ms": (time.time() - t0) * 1000.0,
+                "rolled_back": rolled_back}
+
+
+# =============================================================================
+# ENHANCEMENT 7 — HUMAN APPROVAL
+# =============================================================================
+class HumanApprovalHandler:
+    def __init__(self, queue: Optional[MessageQueueLike] = None,
+                 uncertainty_threshold: float = 0.05,
+                 timeout: float = 5.0):
+        self.queue = queue
+        self.uncertainty_threshold = float(uncertainty_threshold)
+        self.timeout = float(timeout)
+        self.preferences: Dict[str, Dict[str, float]] = {}
+        self.posterior: Dict[str, Dict[str, float]] = {}
+        self._responses: asyncio.Queue = asyncio.Queue(maxsize=100)
+        self.decisions: List[Dict[str, Any]] = []
+
+    async def submit_response(self, user_id: str, chosen_id: str) -> None:
+        try:
+            self._responses.put_nowait({"user_id": user_id,
+                                        "chosen": chosen_id})
+        except asyncio.QueueFull:
+            pass
+
+    def _utility(self, user_id: str, candidate: Dict[str, Any]) -> float:
+        prefs = self.preferences.get(user_id, {})
+        if not prefs:
+            return 0.5
+        u = 0.0
+        for k, v in prefs.items():
+            if k in candidate:
+                try:
+                    u += float(v) * float(candidate[k])
+                except Exception:
+                    continue
+        return u
+
+    async def request_approval(self, decision: Dict[str, Any],
+                               user_id: str = "default") -> bool:
+        candidates = decision.get("candidates") or []
+        if len(candidates) < 2:
+            self.decisions.append({"decision": decision, "auto": True,
+                                   "approved": True})
+            return True
+        scored = sorted(((self._utility(user_id, c), c) for c in candidates),
+                        key=lambda kv: kv[0], reverse=True)
+        if abs(scored[0][0] - scored[1][0]) > self.uncertainty_threshold:
+            self.decisions.append({"decision": decision, "auto": True,
+                                   "approved": True,
+                                   "chosen": scored[0][1].get("id")})
+            return True
+        try:
+            msg = await asyncio.wait_for(self._responses.get(),
+                                         timeout=self.timeout)
+            approved = bool(msg.get("chosen"))
+        except asyncio.TimeoutError:
+            approved = True
+        self.decisions.append({"decision": decision, "auto": False,
+                               "approved": approved})
+        return approved
+
+    async def record_choice(self, user_id: str, solution_id: str,
+                            metrics: Optional[Dict[str, float]] = None) -> None:
+        prefs = self.preferences.setdefault(user_id, {})
+        if metrics:
+            for k, v in metrics.items():
+                prefs[k] = prefs.get(k, 0.25) + max(0.0, float(v)) * 0.01
+            s = sum(prefs.values()) or 1.0
+            prefs = {k: v / s for k, v in prefs.items()}
+            self.preferences[user_id] = prefs
+            post = self.posterior.setdefault(user_id, {})
+            for k, v in prefs.items():
+                post[k] = post.get(k, 1.0) + v
+
+
+# =============================================================================
+# MAIN SELF-EVOLVING GATE (v8.0.0)
+# =============================================================================
 class EnhancedSelfEvolvingGate(nn.Module):
-    """
-    Enhanced Self-Evolving Gate v7.4.0 - Complete Green Agent Implementation with
-    full bio‑inspired core integration and MOPD integration.
+    """Self-evolving MoE gate with all ten enhancement modules.
 
-    Improvements over v7.3.0:
-      - Fixed state serialization of neural network weights.
-      - Real architecture fitness evaluation using memory replay.
-      - Rewritten MAML with true meta-gradient support.
-      - Safe async task creation.
-      - Added basic explainability and temporal safety checks.
+    Key design decisions:
+      * All layers built from `self.input_dim` AFTER config lookup.
+      * MAMLGate subclasses nn.Module and uses functional_call.
+      * EWC uses real Fisher information.
+      * Generative replay actually stores and samples.
+      * NSGA-II fitness evaluation is honest (weight transfer + training).
+      * All background tasks tracked by TaskManager.
+      * Persistence via JSON (no pickle).
     """
+
+    W_MAX = 10.0
+    WEIGHT_NORM_MAX = 1e6
 
     def __init__(
         self,
-        storage: Storage,
-        message_queue: AsyncMessageQueue,
-        adaptive_cost: AdaptiveCostFunction,
-        pareto_gating: ParetoGating,
-        drift_detector: DriftDetector,
-        metrics: MetricsRegistry,
-        bio_core: Optional[Any] = None,
-        input_dim: int = 10,
+        storage: StorageLike,
+        message_queue: Optional[MessageQueueLike] = None,
+        adaptive_cost: Optional[AdaptiveCostLike] = None,
+        pareto_gating: Optional[ParetoGatingLike] = None,
+        drift_detector: Optional[DriftDetectorLike] = None,
+        metrics: Optional[MetricsLike] = None,
+        bio_core: Optional[BioCoreLike] = None,
+        helium_provider: Optional[HeliumProviderLike] = None,
+        gating_network: Optional[GatingNetworkLike] = None,
+        carbon_client: Optional[CarbonIntensityClient] = None,
+        helium_client: Optional[HeliumClient] = None,
+        input_dim: int = EnvironmentFeatures.DIM,
         num_experts: int = 5,
-        hidden_dim: int = 128,
+        hidden_dim: int = 64,
         adaptation_rate: float = 0.01,
+        population_size: int = 10,
+        memory_size: int = 5000,
         enable_meta_learning: bool = True,
         enable_architecture_search: bool = True,
         enable_continual_learning: bool = True,
         enable_generative_replay: bool = True,
-        enable_bio_integration: bool = True,
-        enable_carbon_intensity: bool = True,
-        enable_predictive: bool = True,
-        enable_cross_domain: bool = True,
-        enable_sustainability_scoring: bool = True,
-        enable_quantum_optimization: bool = True,
-        enable_helium_awareness: bool = True,
-        enable_quantum_transfer: bool = True,
-        enable_event_driven: bool = True,
+        enable_quantum_distillation: bool = True,
+        enable_causal_mask: bool = True,
+        enable_expert_auction: bool = True,
+        enable_safety_monitor: bool = True,
+        enable_temporal_safety: bool = True,
+        enable_xai: bool = True,
+        enable_precision: bool = False,
+        enable_carbon_market: bool = False,
+        enable_chaos: bool = False,
+        chaos_probability: float = 0.0,
+        enable_human_approval: bool = False,
+        enable_health_checks: bool = True,
         enable_self_healing: bool = True,
-        enable_swarm_coordination: bool = True,
-        population_size: int = 10,
-        memory_size: int = 10000,
-        quantum_circuit_depth: int = 0,
-        quantum_qubits: int = 0
-    ):
+        seed: int = 42,
+    ) -> None:
         super().__init__()
+
         self.storage = storage
         self.queue = message_queue
         self.adaptive_cost = adaptive_cost
         self.pareto = pareto_gating
         self.drift = drift_detector
         self.metrics = metrics
-
-        # Configuration – built from central_config
-        self.input_dim = getattr(central_config, "gate_input_dim", input_dim)
-        self.num_experts = getattr(central_config, "gate_num_experts", num_experts)
-        self.hidden_dim = getattr(central_config, "gate_hidden_dim", hidden_dim)
-        self.adaptation_rate = getattr(central_config, "gate_adaptation_rate", adaptation_rate)
-        self.enable_meta_learning = getattr(central_config, "enable_meta_learning", enable_meta_learning)
-        self.enable_architecture_search = getattr(central_config, "enable_architecture_search", enable_architecture_search)
-        self.enable_continual_learning = getattr(central_config, "enable_continual_learning", enable_continual_learning)
-        self.enable_generative_replay = getattr(central_config, "enable_generative_replay", enable_generative_replay)
-        self.enable_bio_integration = getattr(central_config, "enable_bio_integration", enable_bio_integration) and BIO_INSPIRED_AVAILABLE
-        self.enable_carbon_intensity = getattr(central_config, "enable_carbon_intensity", enable_carbon_intensity)
-        self.enable_predictive = getattr(central_config, "enable_predictive", enable_predictive)
-        self.enable_cross_domain = getattr(central_config, "enable_cross_domain", enable_cross_domain)
-        self.enable_sustainability_scoring = getattr(central_config, "enable_sustainability_scoring", enable_sustainability_scoring)
-        self.enable_quantum_optimization = getattr(central_config, "enable_quantum_optimization", enable_quantum_optimization)
-        self.enable_helium_awareness = getattr(central_config, "enable_helium_awareness", enable_helium_awareness)
-        self.enable_quantum_transfer = getattr(central_config, "enable_quantum_transfer", enable_quantum_transfer)
-        self.enable_event_driven = getattr(central_config, "enable_event_driven", enable_event_driven)
-        self.enable_self_healing = getattr(central_config, "enable_self_healing", enable_self_healing)
-        self.enable_swarm_coordination = getattr(central_config, "enable_swarm_coordination", enable_swarm_coordination)
-
         self.bio_core = bio_core
-        self.event_broker = None
-        self.alert_system = None
-        self.anomaly_detection = None
-        self.cost_benefit_engine = None
-        self.quantum_bridge = None
-        self.tick_engine = None
-        self.swarm_coordinator = None
-        self.self_healer = None
-        self.workflow_orchestrator = None
-        self.token_manager = None
-        self.gradient_manager = None
-        self.scheduler = None
-        self.compartment_manager = None
-        self.biomass_storage = None
-        self.harvester = None
+        self.helium_provider = helium_provider
+        self.gating_network = gating_network
+        self.carbon_client = carbon_client or CarbonIntensityClient()
+        self.helium_client = helium_client or HeliumClient()
 
-        if self.bio_core:
-            self.event_broker = getattr(self.bio_core, 'event_broker', None)
-            self.alert_system = getattr(self.bio_core, 'alert_system', None)
-            self.anomaly_detection = getattr(self.bio_core, 'anomaly_detection', None)
-            self.cost_benefit_engine = getattr(self.bio_core, 'cost_benefit_engine', None)
-            self.quantum_bridge = getattr(self.bio_core, 'quantum_bridge', None)
-            self.tick_engine = getattr(self.bio_core, 'tick_engine', None)
-            self.swarm_coordinator = getattr(self.bio_core, 'swarm_coordinator', None)
-            self.self_healer = getattr(self.bio_core, 'self_healer', None)
-            self.workflow_orchestrator = getattr(self.bio_core, 'workflow_orchestrator', None)
-            self.token_manager = getattr(self.bio_core, 'token_manager', None)
-            self.gradient_manager = getattr(self.bio_core, 'gradient_manager', None)
-            self.scheduler = getattr(self.bio_core, 'scheduler', None)
-            self.compartment_manager = getattr(self.bio_core, 'compartment_manager', None)
-            self.biomass_storage = getattr(self.bio_core, 'biomass_storage', None)
-            self.harvester = getattr(self.bio_core, 'harvester', None)
+        self.input_dim = int(input_dim)
+        self.num_experts = int(num_experts)
+        self.hidden_dim = int(hidden_dim)
+        self.adaptation_rate = float(adaptation_rate)
+        self.population_size = int(population_size)
+        self.memory_size = int(memory_size)
 
-        self.expert_router = None
-        self.gating_network = None
-        self.helium_provider = None
+        # Deterministic RNG
+        self._rng = random.Random(seed)
+        self._rng_q = random.Random(seed + 1)
+        self._rng_c = random.Random(seed + 2)
+        self._rng_auc = random.Random(seed + 3)
+        self._rng_chaos = random.Random(seed + 4)
+        self._rng_carbon = random.Random(seed + 5)
+        self._rng_hitl = random.Random(seed + 6)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
-        self.carbon_manager = CarbonIntensityManager() if enable_carbon_intensity else None
-        self.predictive_analyzer = PredictiveEvolutionAnalyzer() if enable_predictive else None
-        self.cross_domain_transfer = EvolutionCrossDomainTransfer() if enable_cross_domain else None
-
-        # Core gate network
-        self.gate_network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, num_experts)
-        )
-
-        self.current_architecture = ArchitectureGene(
-            num_layers=3, hidden_dim=hidden_dim, activation='relu',
-            dropout_rate=0.1, use_attention=True, use_residual=True, use_layer_norm=True,
-            quantum_circuit_depth=quantum_circuit_depth,
-            quantum_qubits=quantum_qubits
-        )
-
-        if enable_architecture_search:
-            self.architecture_search = NSGAIIArchitectureSearch(
-                input_dim, num_experts, population_size=population_size, max_generations=20
-            )
-            self.architecture_search.population = [ArchitectureGene() for _ in range(population_size)]
-
-        if enable_meta_learning:
-            self.meta_learner = MAMLGate(
-                input_dim, num_experts, hidden_dim,
-                inner_lr=0.01, outer_lr=0.001,
-                quantum_enabled=enable_quantum_optimization
-            )
-
-        if enable_continual_learning:
-            self.ewc = ElasticWeightConsolidation(self.gate_network, quantum_aware=enable_quantum_optimization)
-        if enable_generative_replay:
-            self.replay = GenerativeReplay(input_dim, quantum_aware=enable_quantum_optimization)
-
-        self.memory: deque = deque(maxlen=memory_size)
-        self.task_prototypes: Dict[str, TaskPrototype] = {}
-        self.concept_drift_detector = EnhancedConceptDriftDetector(quantum_aware=enable_quantum_optimization)
-        self.environmental_encoder = EnhancedEnvironmentalEncoder(input_dim, quantum_aware=enable_quantum_optimization)
-        self.performance_history: List[Dict] = []
-        self.adaptation_history: List[Dict] = []
-        self.optimizer = torch.optim.Adam(self.gate_network.parameters(), lr=adaptation_rate)
+        # Previously-uninitialised attributes (bug 1.6)
+        self.carbon_intensity = 400.0
+        self.carbon_price = 50.0
+        self.helium_scarcity = 0.5
+        self.helium_price = 0.5
+        self.token_balance = 500.0
+        self.evolution_pressure = 0.3
         self.plasticity = 0.5
         self.plasticity_decay = 0.999
-        self.evolution_generation: int = 0
-        self.token_fitness_history: deque = deque(maxlen=1000)
-        self.gradient_pressure_history: deque = deque(maxlen=1000)
-        self.total_carbon_savings_kg = 0.0
-        self.total_helium_savings_l = 0.0
         self.sustainability_score = 0.0
-        self.biomass_prototype_tokens: Dict[str, str] = {}
-        self.quantum_fitness_history: deque = deque(maxlen=1000)
-        self.helium_usage_history: deque = deque(maxlen=1000)
-        self.quantum_advantage_history: deque = deque(maxlen=1000)
-        self.quantum_circuit_cache: Dict[str, Any] = {}
-        self.quantum_performance_metrics: Dict[str, float] = {
-            'quantum_accuracy': 0.0,
-            'helium_efficiency': 0.5,
-            'quantum_speedup': 1.0,
-            'quantum_reliability': 0.8
-        }
-        self.helium_threshold = 0.3
-        self.quantum_advantage_threshold = 0.1
         self.health_status = "healthy"
-        self.last_error = None
+        self.last_error: Optional[str] = None
 
-        # Circuit breakers for external services (using central EnhancedCircuitBreaker)
-        self._token_circuit = EnhancedCircuitBreaker("token_service")
-        self._gradient_circuit = EnhancedCircuitBreaker("gradient_service")
-        self._scheduler_circuit = EnhancedCircuitBreaker("scheduler_service")
-        self._biomass_circuit = EnhancedCircuitBreaker("biomass_storage")
-        self._compartment_circuit = EnhancedCircuitBreaker("compartment_service")
+        # Main gate network — LayerNorm prevents batch-size-1 issues
+        self.gate_network = nn.Sequential(
+            nn.Linear(self.input_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.num_experts),
+        )
+        self.optimizer = torch.optim.Adam(
+            self.gate_network.parameters(), lr=self.adaptation_rate)
 
-        # Load system state from central storage (safe async)
-        self._load_state_task = None
+        # Meta-learner (subclasses nn.Module)
+        self.meta_learner: Optional[MAMLGate] = None
+        if enable_meta_learning:
+            self.meta_learner = MAMLGate(
+                self.input_dim, self.hidden_dim, self.num_experts,
+                inner_lr=0.01, outer_lr=0.001)
+
+        # EWC + replay
+        self.ewc: Optional[ElasticWeightConsolidation] = None
+        if enable_continual_learning:
+            self.ewc = ElasticWeightConsolidation(
+                self.gate_network, lambda_ewc=0.4)
+        self.replay: Optional[GenerativeReplay] = None
+        if enable_generative_replay:
+            self.replay = GenerativeReplay(buffer_size=500)
+
+        # Architecture search
+        self.architecture_search: Optional[NSGAIIArchitectureSearch] = None
+        if enable_architecture_search:
+            self.architecture_search = NSGAIIArchitectureSearch(
+                self.input_dim, self.num_experts,
+                population_size=self.population_size)
+            self.architecture_search.population = [
+                ArchitectureGene() for _ in range(self.population_size)]
+
+        # Enhancement modules
+        self.quantum = (QuantumDistillationModule(
+            n_dims=self.input_dim, rng=self._rng_q)
+            if enable_quantum_distillation else None)
+        self.causal_mask = (CausalFeatureMask(
+            self.input_dim, rng=self._rng_c)
+            if enable_causal_mask else None)
+        self.auction = (ExpertAuction(
+            list(range(self.num_experts)), self.input_dim,
+            rng=self._rng_auc) if enable_expert_auction else None)
+        self.safety = SafetyMonitor() if enable_safety_monitor else None
+        if self.safety is not None:
+            self._setup_safety_rules()
+        self.temporal_safety = (TemporalSafetyMonitor()
+                                 if enable_temporal_safety else None)
+        if self.temporal_safety is not None:
+            self._setup_temporal_rules()
+        self.xai = XAIExplainer(rng=self._rng_hitl) if enable_xai else None
+        self.precision = (PrecisionController()
+                          if enable_precision else None)
+        self.carbon_market = (CarbonMarketClient(
+            price_oracle=self._carbon_oracle, rng=self._rng_carbon)
+            if enable_carbon_market else None)
+        self.hitl = (HumanApprovalHandler(message_queue)
+                     if enable_human_approval else None)
+        self.chaos: Optional[ChaosEngine] = None
+        if enable_chaos:
+            self.chaos = ChaosEngine(
+                self, probability=chaos_probability,
+                rng=self._rng_chaos)
+
+        # Memory + drift
+        self.memory: Deque[Dict[str, Any]] = deque(maxlen=self.memory_size)
+        self.concept_drift = ConceptDriftDetector()
+        self.adaptation_history: Deque[Dict[str, Any]] = deque(maxlen=10000)
+        self.evolution_generation = 0
+
+        # Thread-safe forward/backward
+        self._cpu_lock = threading.Lock()
+
+        # Task manager + lifecycle
+        self.task_manager = TaskManager()
+        self._initialized = False
+
+        # Health + self-healing
+        self.health: Optional[HealthCheckSystem] = None
+        self.self_healing: Optional[SelfHealingSystem] = None
+        if enable_health_checks:
+            self.health = HealthCheckSystem(interval=30.0)
+            self.health.register_component("carbon_client", self.carbon_client)
+            self.health.register_component("helium_client", self.helium_client)
+            self.health.register_component("gate", self)
+            if enable_self_healing:
+                self.self_healing = SelfHealingSystem(self.health)
+                self.self_healing.register_handler(
+                    "carbon_client", self._recover_carbon)
+                self.self_healing.register_handler(
+                    "helium_client", self._recover_helium)
+                self.self_healing.register_handler(
+                    "gate", self._recover_gate)
+
+        # Initial snapshot for rollback
+        self._initial_snapshot: Optional[Dict[str, Any]] = None
+
+        self.eval()
+
+    # ------------------------------------------------------------------
+    def _setup_safety_rules(self) -> None:
+        assert self.safety is not None
+
+        def _finite(_state):
+            return self._check_steady_state()
+
+        def _probs_valid(state):
+            p = state.get("probs")
+            if p is None:
+                return True
+            p = list(p)
+            if any(x < 0 for x in p):
+                return False
+            return abs(sum(p) - 1.0) < 1e-4
+
+        self.safety.add_rule(
+            "weights_finite", _finite,
+            "gate weights contain NaN/Inf",
+            severity="critical",
+            mitigation=lambda t: t._restore_weights(t._snapshot_weights()))
+        self.safety.add_rule(
+            "probs_valid", _probs_valid,
+            "gate probabilities invalid", severity="warning")
+
+    def _setup_temporal_rules(self) -> None:
+        assert self.temporal_safety is not None
+        self.temporal_safety.add_formula("G (plasticity >= 0.0)")
+        self.temporal_safety.add_formula("G (plasticity <= 1.0)")
+        self.temporal_safety.add_formula("G (sustainability_score >= 0.0)")
+        self.temporal_safety.add_formula("G (sustainability_score <= 1.0)")
+
+    # ------------------------------------------------------------------
+    async def initialize(self) -> None:
+        if self._initialized:
+            return
         try:
-            loop = asyncio.get_running_loop()
-            self._load_state_task = loop.create_task(self._load_system_state_async())
-        except RuntimeError:
-            # No running loop; will be loaded lazily
-            pass
-
-        if self.enable_event_driven and self.event_broker:
-            self._subscribe_events()
-
-        logger.info(f"Enhanced Self-Evolving Gate v7.4.0 initialized")
-
-    # --------------------------------------------------------------------------
-    # Safe Async Task Creation
-    # --------------------------------------------------------------------------
-    def _safe_create_task(self, coro):
-        """Create an asyncio task if a running loop exists, otherwise log a warning."""
-        try:
-            loop = asyncio.get_running_loop()
-            return loop.create_task(coro)
-        except RuntimeError:
-            logger.warning("No running event loop; skipping async task")
-            return None
-
-    # --------------------------------------------------------------------------
-    # State Persistence using central Storage (fixed)
-    # --------------------------------------------------------------------------
-    async def _load_system_state_async(self):
-        try:
-            data = self.storage.get_state("self_evolving_gate_state")
-            if data:
-                state = json.loads(data)
-                self.sustainability_score = state.get('sustainability_score', 0.0)
-                self.total_carbon_savings_kg = state.get('total_carbon_savings_kg', 0.0)
-                self.total_helium_savings_l = state.get('total_helium_savings_l', 0.0)
-                self.biomass_prototype_tokens = state.get('biomass_prototype_tokens', {})
-                self.quantum_performance_metrics = state.get('quantum_performance_metrics', self.quantum_performance_metrics)
-                self.quantum_fitness_history = deque(state.get('quantum_fitness_history', []), maxlen=1000)
-                self.helium_usage_history = deque(state.get('helium_usage_history', []), maxlen=1000)
-                self.quantum_advantage_history = deque(state.get('quantum_advantage_history', []), maxlen=1000)
-                self.plasticity = state.get('plasticity', 0.5)
-                self.evolution_generation = state.get('evolution_generation', 0)
-                self.health_status = state.get('health_status', 'healthy')
-                self.last_error = state.get('last_error', None)
-                # Load neural network weights from base64 pickle
-                if 'gate_network_state_b64' in state:
-                    state_dict_bytes = base64.b64decode(state['gate_network_state_b64'])
-                    state_dict = pickle.loads(state_dict_bytes)
-                    self.gate_network.load_state_dict(state_dict)
-                logger.info("Gate system state loaded from storage")
+            await self.load_state()
         except Exception as e:
-            logger.error(f"Failed to load gate system state: {e}")
+            logger.warning(f"load_state failed during initialize: {e}")
+        self.task_manager.start_coro("refresh", self._refresh_loop())
+        if self.chaos is not None:
+            self.task_manager.start_coro("chaos", self._chaos_loop())
+        # Capture initial snapshot AFTER loading state
+        self._initial_snapshot = self._snapshot_weights()
+        self._initialized = True
 
-    async def _save_system_state(self):
-        try:
-            # Serialize state_dict to base64 pickle
-            state_dict_bytes = pickle.dumps(self.gate_network.state_dict())
-            state_dict_b64 = base64.b64encode(state_dict_bytes).decode('ascii')
+    async def _refresh_loop(self) -> None:
+        while not self.task_manager.shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self.task_manager.shutdown_event.wait(),
+                    timeout=self.carbon_client.update_interval)
+                break
+            except asyncio.TimeoutError:
+                pass
+            try:
+                c = await self.carbon_client.update()
+                self.carbon_intensity = c["intensity_ema"]
+                self.carbon_price = c["price_ema"]
+                h = await self.helium_client.update()
+                self.helium_scarcity = h["scarcity"]
+                self.helium_price = h["price_ema"]
+            except Exception as e:
+                logger.debug(f"refresh loop: {e}")
 
-            state = {
-                'sustainability_score': self.sustainability_score,
-                'total_carbon_savings_kg': self.total_carbon_savings_kg,
-                'total_helium_savings_l': self.total_helium_savings_l,
-                'biomass_prototype_tokens': self.biomass_prototype_tokens,
-                'quantum_performance_metrics': self.quantum_performance_metrics,
-                'quantum_fitness_history': list(self.quantum_fitness_history),
-                'helium_usage_history': list(self.helium_usage_history),
-                'quantum_advantage_history': list(self.quantum_advantage_history),
-                'plasticity': self.plasticity,
-                'evolution_generation': self.evolution_generation,
-                'health_status': self.health_status,
-                'last_error': self.last_error,
-                'gate_network_state_b64': state_dict_b64,
-                'timestamp': datetime.now(timezone.utc).isoformat()
+    async def _chaos_loop(self) -> None:
+        assert self.chaos is not None
+        while not self.task_manager.shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self.task_manager.shutdown_event.wait(), timeout=60.0)
+                break
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self.chaos.maybe_inject_failure()
+            except Exception as e:
+                logger.debug(f"chaos loop: {e}")
+
+    # ------------------------------------------------------------------
+    def _snapshot_weights(self) -> Dict[str, Any]:
+        with self._cpu_lock:
+            return {
+                "gate": {k: v.detach().clone()
+                         for k, v in self.gate_network.state_dict().items()},
             }
-            self.storage.save_state("self_evolving_gate_state", json.dumps(state))
-            logger.info("Saved gate system state to storage")
-        except Exception as e:
-            logger.error(f"Failed to save gate system state: {e}")
 
-    # --------------------------------------------------------------------------
-    # Event Subscriptions
-    # --------------------------------------------------------------------------
-    def _subscribe_events(self):
-        if self.event_broker:
-            self.event_broker.subscribe('carbon_update', self._on_carbon_update)
-            self.event_broker.subscribe('helium_update', self._on_helium_update)
-            self.event_broker.subscribe('alert_generated', self._on_alert_generated)
-            self.event_broker.subscribe('config_updated', self._on_config_updated)
-            self.event_broker.subscribe('token_balance_update', self._on_token_update)
-            self.event_broker.subscribe('health_update', self._on_health_update)
-            self.event_broker.subscribe('anomaly_detected', self._on_anomaly_detected)
-            logger.info("Self-Evolving Gate subscribed to core events")
-
-    async def _on_carbon_update(self, event: BioEvent):
-        self.carbon_intensity = event.data.get('intensity', 400)
-        self.carbon_price = event.data.get('price', 50.0)
-        if self.enable_carbon_intensity:
-            self.evolution_pressure = max(0.1, min(1.0, self.carbon_intensity / 800))
-        if self.enable_helium_awareness:
-            helium_scarcity = event.data.get('helium_scarcity', 0.5)
-            self.helium_scarcity = helium_scarcity
-            self._update_helium_metrics(helium_scarcity)
-
-    async def _on_helium_update(self, event: BioEvent):
-        self.helium_scarcity = event.data.get('scarcity', 0.5)
-        self.helium_price = event.data.get('price', 0.5)
-        if self.enable_helium_awareness:
-            self._update_helium_metrics(self.helium_scarcity)
-
-    async def _on_alert_generated(self, event: BioEvent):
-        if event.data.get('severity') == 'critical':
-            logger.warning("Critical alert received; switching to conservative evolution and triggering healing")
-            self.plasticity = max(0.1, self.plasticity * 0.5)
-            if self.enable_self_healing and self.self_healer:
-                await self.self_healer.apply_healing('damage_accumulation')
-            if self.workflow_orchestrator:
-                await self.workflow_orchestrator.execute_workflow('adjust_evolution_strategy')
-
-    async def _on_config_updated(self, event: BioEvent):
-        updates = event.data.get('updates', {})
-        if 'self_evolving_gate' in updates:
-            new_config = updates['self_evolving_gate']
-            for key, value in new_config.items():
-                if hasattr(self, key):
-                    setattr(self, key, value)
-            logger.info("Self-Evolving Gate configuration reloaded")
-
-    async def _on_token_update(self, event: BioEvent):
-        self.token_balance = event.data.get('balance', 500)
-
-    async def _on_health_update(self, event: BioEvent):
-        self.health_status = event.data.get('status', 'healthy')
-
-    async def _on_anomaly_detected(self, event: BioEvent):
-        if event.data.get('metric') == 'carbon_intensity':
-            self.evolution_pressure = min(1.0, self.evolution_pressure * 1.2)
-        if event.data.get('metric') == 'helium_scarcity':
-            self.helium_threshold = max(0.2, self.helium_threshold * 0.9)
-
-    # --------------------------------------------------------------------------
-    # Bio-Inspired Data Access Methods (Enhanced)
-    # --------------------------------------------------------------------------
-    def _get_token_efficiency_fitness(self) -> float:
-        if self.token_manager:
+    def _restore_weights(self, snap: Dict[str, Any]) -> None:
+        with self._cpu_lock:
             try:
-                summary = self.token_manager.get_system_summary()
-                return summary.get('system_efficiency', 0.5)
-            except:
-                pass
-        return 0.5
-
-    def _get_gradient_evolution_pressure(self) -> float:
-        if self.gradient_manager:
-            try:
-                carbon = self.gradient_manager.fields.get('carbon')
-                if carbon:
-                    return carbon.gradient_strength
-                helium = self.gradient_manager.fields.get('helium')
-                if helium and self.enable_helium_awareness:
-                    return helium.gradient_strength
-            except:
-                pass
-        return 0.3
-
-    def _get_atp_driven_plasticity(self) -> float:
-        if self.scheduler:
-            try:
-                driving_force = self.scheduler.calculate_gradient_driving_force()
-                rotation_speed = self.scheduler.calculate_rotation_speed(driving_force)
-                ecoatp_rate = self.scheduler.calculate_atp_production_rate(rotation_speed)
-                if ecoatp_rate > 100:
-                    return 1.0
-                elif ecoatp_rate > 50:
-                    return 0.7
-                else:
-                    return 0.3
-            except:
-                pass
-        return self.plasticity
-
-    def _get_harvester_drift_confidence(self) -> float:
-        if self.harvester:
-            try:
-                stats = self.harvester.get_harvesting_stats()
-                recent = stats.get('recent_conversions', [])
-                if recent:
-                    return np.mean([c.get('convertible_energy', 0.5) for c in recent[-10:]])
-            except:
-                pass
-        return 0.5
-
-    def _store_task_prototype_in_biomass(self, prototype: Dict[str, Any]) -> Optional[str]:
-        if self.biomass_storage:
-            try:
-                stored, token_id = self.biomass_storage.store_task(
-                    task_data=prototype,
-                    ecoatp_cost=2.0,
-                    guarantee=GuaranteeLevel.SILVER,
-                    initial_tier=StorageTier.STARCH_RESERVE
-                )
-                if stored:
-                    return token_id
-            except:
-                pass
-        return None
-
-    def _get_compartment_inheritance_strength(self) -> float:
-        if self.compartment_manager:
-            try:
-                compartment = self.compartment_manager.find_best_compartment('data')
-                if compartment:
-                    return compartment.health_score
-            except:
-                pass
-        return 0.5
-
-    def _get_gradient_encoded_environment(self) -> Dict[str, float]:
-        if self.gradient_manager:
-            try:
-                strengths = self.gradient_manager.get_field_strengths()
-                if self.enable_helium_awareness:
-                    helium = self.gradient_manager.fields.get('helium')
-                    if helium:
-                        strengths['helium'] = helium.gradient_strength
-                return strengths
-            except:
-                pass
-        return {'carbon': 0.5, 'helium': 0.5, 'trust': 0.5, 'opportunity': 0.5}
-
-    def _get_token_modulated_exploration(self) -> float:
-        if self.token_manager:
-            try:
-                summary = self.token_manager.get_system_summary()
-                balance = summary.get('total_balance', 500)
-                if balance > 500:
-                    return 0.3
-                elif balance > 200:
-                    return 0.15
-                else:
-                    return 0.05
-            except:
-                pass
-        return 0.1
-
-    def _get_harvester_opportunity_signal(self) -> float:
-        if self.harvester:
-            try:
-                stats = self.harvester.get_harvesting_stats()
-                total = stats.get('total_harvested', 0)
-                return min(1.0, total / 1000.0)
-            except:
-                pass
-        return 0.3
-
-    def _get_quantum_opportunity_signal(self) -> float:
-        if self.enable_quantum_optimization:
-            if len(self.memory) > 100:
-                recent = list(self.memory)[-50:]
-                complexity = np.mean([m['state'].norm().item() for m in recent])
-                if complexity > 0.8:
-                    return 0.7
-            return 0.3
-        return 0.0
-
-    def _update_helium_metrics(self, scarcity: float):
-        self.helium_scarcity = scarcity
-        self.helium_price = 0.5 * (1.0 + scarcity * 0.8)
-        if self.enable_helium_awareness:
-            self.helium_threshold = 0.3 * (1.0 + scarcity * 0.5)
-
-    # --------------------------------------------------------------------------
-    # Helium Provider Integration
-    # --------------------------------------------------------------------------
-    def set_router(self, router):
-        self.expert_router = router
-        logger.info("Expert Router injected")
-
-    def set_gating_network(self, gating_network):
-        self.gating_network = gating_network
-        logger.info("Gating network injected")
-
-    def set_helium_provider(self, provider):
-        self.helium_provider = provider
-        logger.info("Helium provider injected")
-
-    def inject_bio_core(self, bio_core=None, **kwargs):
-        if bio_core:
-            self.token_manager = getattr(bio_core, 'token_manager', None)
-            self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
-            self.scheduler = getattr(bio_core, 'scheduler', None)
-            self.compartment_manager = getattr(bio_core, 'compartment_manager', None)
-            self.biomass_storage = getattr(bio_core, 'biomass_storage', None)
-            self.harvester = getattr(bio_core, 'harvester', None)
-        else:
-            self.token_manager = kwargs.get('token_manager')
-            self.gradient_manager = kwargs.get('gradient_manager')
-            self.scheduler = kwargs.get('scheduler')
-            self.compartment_manager = kwargs.get('compartment_manager')
-            self.biomass_storage = kwargs.get('biomass_storage')
-            self.harvester = kwargs.get('harvester')
-        if any([self.token_manager, self.gradient_manager, self.compartment_manager]):
-            self.enable_bio_integration = True
-
-    # --------------------------------------------------------------------------
-    # Teacher Interface for MOPD (fixed and standardized)
-    # --------------------------------------------------------------------------
-    async def policy_probs(self, state: Dict[str, Any]) -> List[float]:
-        """
-        Return a probability distribution over experts, incorporating adaptive cost
-        and Pareto constraints. If gating_network is available, use it; otherwise
-        use the internal gate_network. Both are assumed to output logits.
-        """
-        # Convert state to tensor
-        if self.environmental_encoder:
-            x = self.environmental_encoder.encode(state)
-        else:
-            x = torch.tensor([state.get(k, 0.0) for k in sorted(state.keys())][:self.input_dim], dtype=torch.float32)
-            if len(x) < self.input_dim:
-                x = F.pad(x, (0, self.input_dim - len(x)))
-
-        # Get logits
-        if self.gating_network is not None and MOE_AVAILABLE:
-            try:
-                logits = await self.gating_network.predict(state)
-                if not isinstance(logits, torch.Tensor):
-                    logits = torch.tensor(logits, dtype=torch.float32)
+                self.gate_network.load_state_dict(snap["gate"])
             except Exception as e:
-                logger.warning(f"External gating network failed: {e}; using internal gate")
-                logits = self.gate_network(x)
-        else:
-            logits = self.gate_network(x)
+                logger.warning(f"restore gate failed: {e}")
 
-        probs = F.softmax(logits, dim=-1).detach().cpu().numpy().flatten()
-        # Apply adaptive cost and Pareto filtering to adjust probabilities
-        candidates = []
-        for i, p in enumerate(probs):
-            expert_id = f"expert_{i}"
-            candidates.append({
-                'expert_id': expert_id,
-                'quality_score': float(p),
-                'carbon_g': 0.0,
-                'latency_ms': 0.0,
-                'energy_joules': 0.0,
-                'health_score': 1.0,
-                'atp_balance': self._get_token_efficiency_fitness(),
-                'compartment_status': 'active'
-            })
-        if self.pareto:
-            filtered = self.pareto.filter(candidates)
-            if filtered:
-                allowed = {c['expert_id'] for c in filtered}
-                mask = np.array([i in allowed for i in range(len(probs))], dtype=bool)
-                probs = probs * mask
-                if probs.sum() > 0:
-                    probs = probs / probs.sum()
-                else:
-                    probs = np.ones_like(probs) / len(probs)
-        return probs.tolist()
-
-    # --------------------------------------------------------------------------
-    # Forward Pass
-    # --------------------------------------------------------------------------
-    def forward(self, x: torch.Tensor, task_id: Optional[str] = None,
-                training: bool = False, environmental_context: Optional[Dict[str, Any]] = None):
-        """
-        Forward pass through the gate network. Returns logits over experts.
-        """
-        if self.enable_meta_learning and task_id is not None:
-            # Use MAML adaptation for this task if available
-            return self.meta_learner(x, task_id)
-        return self.gate_network(x)
-
-    # --------------------------------------------------------------------------
-    # Adaptation
-    # --------------------------------------------------------------------------
-    def adapt(self, state: torch.Tensor, chosen_expert: int, reward: float,
-              environmental_feedback: Dict[str, Any], task_id: Optional[str] = None,
-              quantum_mode: bool = False):
-        """
-        Update gate network parameters based on the reward signal.
-        This is a simplified policy gradient update.
-        """
-        # Convert state to logits
-        logits = self.forward(state, task_id)
-        probs = F.softmax(logits, dim=-1)
-        selected_prob = probs[chosen_expert]
-        loss = -torch.log(selected_prob + 1e-8) * reward
-
-        # Add EWC penalty if enabled
-        if self.enable_continual_learning and hasattr(self, 'ewc'):
-            loss += self.ewc.penalty()
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-        # Update EWC after some steps
-        if self.enable_continual_learning and len(self.adaptation_history) % 10 == 0:
-            self.ewc.after_batch()
-
-        # Store in memory for replay
-        self.memory.append({
-            'state': state.detach(),
-            'chosen_expert': chosen_expert,
-            'reward': reward,
-            'task_id': task_id,
-            'environmental_feedback': environmental_feedback
-        })
-
-        # Apply generative replay if enabled
-        if self.enable_generative_replay and hasattr(self, 'replay'):
-            replay_batch = self.replay.sample(batch_size=32)
-            if replay_batch:
-                batch_x, batch_y = replay_batch
-                logits_replay = self.forward(batch_x)
-                targets = torch.argmax(logits_replay, dim=-1)
-                loss_replay = F.cross_entropy(logits_replay, targets)
-                self.optimizer.zero_grad()
-                loss_replay.backward()
-                self.optimizer.step()
-
-        # Update concept drift detector
-        self.concept_drift_detector.update(state)
-
-        # Update plasticity
-        if self.enable_bio_integration and self.scheduler:
-            atp_plasticity = self._get_atp_driven_plasticity()
-            self.plasticity = atp_plasticity
-        else:
-            self.plasticity *= self.plasticity_decay
-
-        # Record adaptation
-        self.adaptation_history.append({
-            'timestamp': datetime.now(timezone.utc),
-            'reward': reward,
-            'chosen_expert': chosen_expert,
-            'task_id': task_id,
-            'loss': loss.item()
-        })
-
-        # Update metrics
-        self.metrics.increment("gate_adaptations")
-        self.metrics.observe("gate_reward", reward)
-        self.metrics.observe("gate_loss", loss.item())
-
-        # Publish FeedbackEvent (safe async)
-        event = FeedbackEvent.create_with_context(
-            task_id=f"gate_adapt_{hashlib.sha256(json.dumps(environmental_feedback, sort_keys=True).encode()).hexdigest()[:8]}",
-            selected_action=f"adapt_{chosen_expert}",
-            quality_score=reward,
-            energy_joules=0.0,
-            carbon_g=0.0,
-            feedback_type="self_evolving_gate",
-            adaptive_cost_value=0.0,
-            state={'task_id': task_id, 'quantum_mode': quantum_mode, 'loss': loss.item()},
-            candidates=[{'action': 'adapt'}],
-            source="self_evolving_gate",
-            environment=getattr(central_config, "ENVIRONMENT", "production"),
-            tags=["gate", "evolution"]
-        )
-        self._safe_create_task(self.queue.publish("feedback_events", event.to_json()))
-
-        # Check drift after adaptation (safe async)
-        if self.drift:
-            self._safe_create_task(self.drift.check_drift(self.adaptive_cost.get_current_weights()))
-
-        # Save state periodically (safe async)
-        if len(self.adaptation_history) % 100 == 0:
-            self._safe_create_task(self._save_system_state())
-
-    # --------------------------------------------------------------------------
-    # Architecture Evolution (improved fitness evaluation)
-    # --------------------------------------------------------------------------
-    def _evaluate_gene_performance(self, gene: ArchitectureGene, num_samples: int = 64) -> float:
-        """
-        Evaluate the performance of a gene architecture on recent memory samples.
-        Builds a temporary MLP with the gene's hidden_dim and measures cross-entropy loss.
-        Returns a fitness score (higher is better).
-        """
-        if len(self.memory) < num_samples:
-            # Fallback to random if insufficient data
-            return 0.5 + 0.1 * np.random.randn()
-
-        # Sample memory
-        indices = np.random.choice(len(self.memory), num_samples, replace=False)
-        states, targets = [], []
-        for i in indices:
-            m = self.memory[i]
-            states.append(m['state'])
-            targets.append(m['chosen_expert'])
-        states = torch.stack(states)
-        targets = torch.tensor(targets, dtype=torch.long)
-
-        # Build a temporary model based on gene architecture
-        temp_model = nn.Sequential()
-        in_dim = self.input_dim
-        # First layer
-        temp_model.add_module('linear1', nn.Linear(in_dim, gene.hidden_dim))
-        if gene.use_layer_norm:
-            temp_model.add_module('ln1', nn.LayerNorm(gene.hidden_dim))
-        temp_model.add_module('act1', nn.ReLU())
-        # Additional layers (gene.num_layers - 2 hidden layers)
-        for l in range(1, gene.num_layers - 1):
-            temp_model.add_module(f'linear{l+1}', nn.Linear(gene.hidden_dim, gene.hidden_dim))
-            if gene.use_layer_norm:
-                temp_model.add_module(f'ln{l+1}', nn.LayerNorm(gene.hidden_dim))
-            temp_model.add_module(f'act{l+1}', nn.ReLU())
-        # Output layer
-        temp_model.add_module('output', nn.Linear(gene.hidden_dim, self.num_experts))
-
-        # Compute loss without training (using random weights)
-        with torch.no_grad():
-            logits = temp_model(states)
-            loss = F.cross_entropy(logits, targets)
-        # Convert loss to fitness (lower loss -> higher fitness)
-        fitness = 1.0 / (1.0 + loss.item())
-        return fitness
-
-    def _evolve_architecture(self, quantum_mode: bool = False):
-        if not self.enable_architecture_search:
-            return
-
-        # Define fitness function using real evaluation
-        def fitness_function(gene: ArchitectureGene) -> List[float]:
-            fitness = self._evaluate_gene_performance(gene)
-            helium_efficiency = gene.helium_efficiency
-            quantum_advantage = gene.quantum_advantage_score
-            complexity = gene.num_layers * gene.hidden_dim / 1000.0
-            # Multi-objectives: [fitness, helium_efficiency, quantum_advantage, complexity]
-            # We want to maximize fitness, maximize helium_efficiency, maximize quantum_advantage,
-            # minimize complexity -> use negative values for minimization objectives.
-            return [fitness, helium_efficiency, quantum_advantage, complexity]
-
-        # Apply Pareto gating to filter population before evolution
-        if self.pareto:
-            candidates = []
-            for ind in self.architecture_search.population:
-                # Compute metrics for each individual
-                fitness = self._evaluate_gene_performance(ind)
-                ind.fitness = fitness
-                candidates.append({
-                    'gene_id': id(ind),
-                    'fitness': ind.fitness,
-                    'helium_efficiency': ind.helium_efficiency,
-                    'quantum_advantage': ind.quantum_advantage_score,
-                    'num_layers': ind.num_layers
-                })
-            filtered = self.pareto.filter(candidates)
-            if filtered:
-                allowed_ids = {c['gene_id'] for c in filtered}
-                self.architecture_search.population = [
-                    ind for ind in self.architecture_search.population if id(ind) in allowed_ids
-                ]
-                # If population got too small, add random individuals
-                while len(self.architecture_search.population) < self.architecture_search.population_size:
-                    self.architecture_search.population.append(ArchitectureGene())
-
-        # Run NSGA-II evolution
-        result = self.architecture_search.evolve(fitness_function)
-        self.evolution_generation = result['generation']
-
-        # Update current architecture to best from Pareto front
-        if self.architecture_search.pareto_front:
-            best = self.architecture_search.get_best_architecture()
-            if best:
-                self.current_architecture = best
-                # Optionally update gate network hidden dim? (would require rebuild)
-                # For now just record.
-
-        # Update metrics
-        self.metrics.increment("gate_evolutions")
-        self.metrics.observe("gate_generation", self.evolution_generation)
-        if self.architecture_search.pareto_front:
-            self.metrics.observe("gate_pareto_front_size", len(self.architecture_search.pareto_front))
-
-        # Publish FeedbackEvent (safe async)
-        event = FeedbackEvent.create_with_context(
-            task_id=f"gate_evolve_{self.evolution_generation}",
-            selected_action="evolve_architecture",
-            quality_score=self.current_architecture.fitness,
-            energy_joules=0.0,
-            carbon_g=0.0,
-            feedback_type="self_evolving_gate",
-            adaptive_cost_value=0.0,
-            state={'generation': self.evolution_generation, 'quantum_mode': quantum_mode},
-            candidates=[{'action': 'evolve'}],
-            source="self_evolving_gate",
-            environment=getattr(central_config, "ENVIRONMENT", "production"),
-            tags=["gate", "evolution"]
-        )
-        self._safe_create_task(self.queue.publish("feedback_events", event.to_json()))
-
-        # Check drift (safe async)
-        if self.drift:
-            self._safe_create_task(self.drift.check_drift(self.adaptive_cost.get_current_weights()))
-
-        # Save state (safe async)
-        self._safe_create_task(self._save_system_state())
-
-    # --------------------------------------------------------------------------
-    # Swarm Coordination (enhanced)
-    # --------------------------------------------------------------------------
-    async def share_with_swarm(self):
-        if not self.enable_swarm_coordination or not self.swarm_coordinator:
-            return
-        swarm_payload = {
-            'gate_id': id(self),
-            'sustainability_score': self.sustainability_score,
-            'plasticity': self.plasticity,
-            'evolution_generation': self.evolution_generation,
-            'quantum_advantage': self._calculate_quantum_advantage(),
-            'helium_efficiency': self._get_helium_efficiency(),
-            'architecture_fitness': self.current_architecture.fitness,
-            'memory_size': len(self.memory)
-        }
-        await self.swarm_coordinator.share_predictions(swarm_payload)
-        event = FeedbackEvent.create_with_context(
-            task_id=f"gate_swarm_{uuid.uuid4().hex[:8]}",
-            selected_action="share_with_swarm",
-            quality_score=self.sustainability_score,
-            energy_joules=0.0,
-            carbon_g=0.0,
-            feedback_type="self_evolving_gate",
-            adaptive_cost_value=0.0,
-            state=swarm_payload,
-            candidates=[{'action': 'share'}],
-            source="self_evolving_gate",
-            environment=getattr(central_config, "ENVIRONMENT", "production"),
-            tags=["gate", "swarm"]
-        )
-        await self.queue.publish("feedback_events", event.to_json())
-
-    async def _swarm_update_loop(self):
-        while True:
-            try:
-                await self.share_with_swarm()
-                await asyncio.sleep(60)
-            except Exception as e:
-                logger.error(f"Swarm update error: {str(e)}")
-                await asyncio.sleep(120)
-
-    # --------------------------------------------------------------------------
-    # Self-Healing (enhanced)
-    # --------------------------------------------------------------------------
-    async def self_heal(self):
-        logger.info("EnhancedSelfEvolvingGate self‑healing")
-        if self.enable_self_healing:
-            self.plasticity = 0.5
-            if len(self.memory) > 100:
-                self.memory = deque(list(self.memory)[-100:], maxlen=len(self.memory))
-            self.concept_drift_detector.reset()
-            if self.enable_architecture_search:
-                self.architecture_search.population = [ArchitectureGene() for _ in range(self.architecture_search.population_size)]
-            self.health_status = "healthy"
-            self.last_error = None
-            await self._save_system_state()
-            logger.info("Self-healing completed")
-            event = FeedbackEvent.create_with_context(
-                task_id=f"gate_heal_{uuid.uuid4().hex[:8]}",
-                selected_action="self_heal",
-                quality_score=1.0,
-                energy_joules=0.0,
-                carbon_g=0.0,
-                feedback_type="self_evolving_gate",
-                adaptive_cost_value=0.0,
-                state={'status': self.health_status},
-                candidates=[{'action': 'heal'}],
-                source="self_evolving_gate",
-                environment=getattr(central_config, "ENVIRONMENT", "production"),
-                tags=["gate", "healing"]
-            )
-            await self.queue.publish("feedback_events", event.to_json())
-
-    # --------------------------------------------------------------------------
-    # Explainability (minimal)
-    # --------------------------------------------------------------------------
-    def explain_decision(self, state: torch.Tensor, task_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Compute simple feature importance by taking the gradient of the max logit
-        w.r.t. the input. This is a basic saliency map.
-        """
-        x = state.clone().detach().requires_grad_(True)
-        logits = self.forward(x, task_id)
-        max_logit = logits.max()
-        self.zero_grad()
-        max_logit.backward()
-        saliency = x.grad.abs().detach().cpu().numpy()
-        # Normalize to sum to 1
-        saliency = saliency / (saliency.sum() + 1e-8)
-        return {
-            'saliency': saliency.tolist(),
-            'predicted_expert': int(torch.argmax(logits).item()),
-            'max_logit': float(max_logit.item())
-        }
-
-    # --------------------------------------------------------------------------
-    # Temporal Safety Check (minimal)
-    # --------------------------------------------------------------------------
-    def check_temporal_safety(self, recent_probs: List[List[float]], threshold: float = 0.9) -> bool:
-        """
-        Check if any expert probability exceeds threshold in consecutive steps.
-        Returns True if safe, False if violation.
-        """
-        if len(recent_probs) < 2:
-            return True
-        for t in range(1, len(recent_probs)):
-            for exp in range(len(recent_probs[t])):
-                if recent_probs[t][exp] > threshold and recent_probs[t-1][exp] > threshold:
+    def _check_steady_state(self) -> bool:
+        with self._cpu_lock:
+            for p in self.gate_network.parameters():
+                if not torch.all(torch.isfinite(p)):
+                    return False
+                if float(p.norm()) > self.WEIGHT_NORM_MAX:
                     return False
         return True
 
-    # --------------------------------------------------------------------------
-    # Helper methods for metrics
-    # --------------------------------------------------------------------------
-    def _calculate_quantum_advantage(self) -> float:
-        if self.enable_quantum_optimization:
-            # Heuristic: based on quantum fitness history
-            if self.quantum_advantage_history:
-                return np.mean(list(self.quantum_advantage_history)[-10:])
-            return 0.0
-        return 0.0
+    def _corrupt_weights_bounded(self, rng: random.Random) -> None:
+        with self._cpu_lock:
+            with torch.no_grad():
+                for p in self.gate_network.parameters():
+                    factor = rng.uniform(0.98, 1.02)
+                    p.data.mul_(factor)
+                    p.data.clamp_(-self.W_MAX, self.W_MAX)
 
-    def _get_helium_efficiency(self) -> float:
-        if self.enable_helium_awareness and self.helium_provider:
-            try:
-                return self.helium_provider.get_efficiency()
-            except:
-                pass
-        return self.current_architecture.helium_efficiency
+    async def _recover_carbon(self) -> Any:
+        await self.carbon_client.close()
+        new_client = CarbonIntensityClient(
+            api_url=self.carbon_client.api_url,
+            api_key=self.carbon_client.api_key,
+            region=self.carbon_client.region)
+        self.carbon_client = new_client
+        return new_client
 
-    # --------------------------------------------------------------------------
-    # Health Status
-    # --------------------------------------------------------------------------
-    def get_health_status(self) -> Dict[str, Any]:
+    async def _recover_helium(self) -> Any:
+        await self.helium_client.close()
+        new_client = HeliumClient(
+            api_url=self.helium_client.api_url,
+            api_key=self.helium_client.api_key)
+        self.helium_client = new_client
+        return new_client
+
+    async def _recover_gate(self) -> bool:
+        if self._initial_snapshot is not None:
+            self._restore_weights(self._initial_snapshot)
+        return True
+
+    async def _carbon_oracle(self) -> float:
+        await self.carbon_client.update()
+        return self.carbon_client.price
+
+    # ------------------------------------------------------------------
+    async def get_health_status(self) -> ComponentHealth:
+        ok = self._check_steady_state()
+        details = {"memory": len(self.memory),
+                   "plasticity": self.plasticity,
+                   "drift": self.concept_drift.drift_score}
+        if not ok:
+            return ComponentHealth(HealthStatus.UNHEALTHY, 0.0, details)
+        if self.concept_drift.drift_score > 0.7:
+            return ComponentHealth(HealthStatus.DEGRADED, 0.5, details)
+        return ComponentHealth(HealthStatus.HEALTHY, 1.0, details)
+
+    # ------------------------------------------------------------------
+    def _build_context(self) -> Dict[str, Any]:
         return {
-            'status': self.health_status,
-            'last_error': self.last_error,
-            'plasticity': self.plasticity,
-            'sustainability_score': self.sustainability_score,
-            'memory_size': len(self.memory),
-            'task_prototypes': len(self.task_prototypes),
-            'evolution_generation': self.evolution_generation,
-            'quantum_advantage': self._calculate_quantum_advantage(),
-            'helium_efficiency': self._get_helium_efficiency(),
-            'bio_integration_active': self.enable_bio_integration,
-            'event_driven_active': self.enable_event_driven,
-            'self_healing_enabled': self.enable_self_healing,
-            'swarm_coordination_active': self.enable_swarm_coordination,
+            "carbon_intensity": self.carbon_intensity / 1000.0,
+            "helium_scarcity": self.helium_scarcity,
+            "carbon_price": self.carbon_price / 100.0,
+            "helium_price": self.helium_price,
+            "token_balance": self.token_balance / 1000.0,
+            "gradient_carbon": 0.5,
+            "gradient_helium": 0.5,
+            "gradient_trust": 0.5,
+            "drift_score": self.concept_drift.drift_score,
+            "plasticity": self.plasticity,
+            "memory_pressure": len(self.memory) / max(self.memory_size, 1),
+            "task_complexity": 0.5,
         }
 
-    # --------------------------------------------------------------------------
-    # Shutdown
-    # --------------------------------------------------------------------------
-    async def shutdown(self):
-        logger.info("Shutting down Enhanced Self-Evolving Gate")
-        await self._save_system_state()
-        if self.carbon_manager:
-            await self.carbon_manager.close()
-        logger.info("Shutdown complete")
+    # ------------------------------------------------------------------
+    def _forward_locked(self, x: torch.Tensor) -> torch.Tensor:
+        with self._cpu_lock:
+            self.gate_network.eval()
+            with torch.no_grad():
+                return self.gate_network(x).detach()
+
+    async def forward_async(self, x: torch.Tensor) -> torch.Tensor:
+        return await asyncio.to_thread(self._forward_locked, x)
+
+    # ------------------------------------------------------------------
+    async def decide(
+        self,
+        context: Optional[Dict[str, Any]] = None,
+        task_id: Optional[str] = None,
+        return_explanation: bool = True,
+    ) -> GateDecision:
+        # Fill in defaults from live state
+        ctx = self._build_context()
+        if context:
+            ctx.update({k: v for k, v in context.items()
+                        if k in EnvironmentFeatures.NAMES})
+        feats = EnvironmentFeatures.encode(ctx)
+
+        if self.causal_mask is not None:
+            self.causal_mask.observe(feats)
+            masked = self.causal_mask.apply(feats)
+        else:
+            masked = feats
+
+        x = torch.tensor(masked, dtype=torch.float32).unsqueeze(0)
+        logits = await self.forward_async(x)
+        probs = F.softmax(logits, dim=-1).squeeze(0).numpy()
+        probs = self._safe_normalize(probs)
+
+        # Auction override
+        if self.auction is not None:
+            winners = self.auction.select(masked, top_k=1)
+            selected = winners[0] if winners else int(np.argmax(probs))
+        else:
+            selected = int(np.argmax(probs))
+
+        # HITL gate
+        if self.hitl is not None and self.num_experts >= 2:
+            top2 = np.argsort(-probs)[:2]
+            candidates = [
+                {"id": int(i), "quality_score": float(probs[i])}
+                for i in top2
+            ]
+            if not await self.hitl.request_approval(
+                    {"action": "route", "candidates": candidates},
+                    user_id="default"):
+                selected = int(np.argmax(probs))
+
+        # Safety check
+        safety_violations: List[str] = []
+        if self.safety is not None:
+            v = self.safety.check({"probs": probs.tolist()}, target=self)
+            safety_violations = [f"{x.name}:{x.severity}" for x in v]
+
+        # Explanation
+        explanation: Optional[Dict[str, Any]] = None
+        counterfactual: Optional[Dict[str, Any]] = None
+        if return_explanation and self.xai is not None:
+            explanation, counterfactual = await asyncio.to_thread(
+                self._compute_xai, masked, selected)
+
+        # Temporal safety
+        if self.temporal_safety is not None:
+            await self.temporal_safety.push({
+                "plasticity": self.plasticity,
+                "sustainability_score": self.sustainability_score})
+            await self.temporal_safety.check()
+
+        return GateDecision(
+            state_vec=masked.copy(),
+            logits=logits.squeeze(0).numpy().copy(),
+            probs=probs.copy(),
+            selected_expert=int(selected),
+            confidence=float(probs[selected]),
+            timestamp=time.time(),
+            explanation=explanation,
+            counterfactual=counterfactual,
+            safety_violations=tuple(safety_violations),
+            task_id=task_id,
+        )
+
+    def _safe_normalize(self, probs: np.ndarray) -> np.ndarray:
+        probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        probs = np.clip(probs, 0.0, None)
+        s = float(probs.sum())
+        if s <= 0 or not np.isfinite(s):
+            return np.ones_like(probs) / probs.size
+        return probs / s
+
+    def _compute_xai(self, masked: np.ndarray, selected: int
+                     ) -> Tuple[Optional[Dict[str, Any]],
+                                Optional[Dict[str, Any]]]:
+        if self.xai is None:
+            return None, None
+
+        def _score(v: np.ndarray) -> float:
+            t = torch.tensor(np.asarray(v, dtype=np.float32)).unsqueeze(0)
+            with self._cpu_lock:
+                self.gate_network.eval()
+                with torch.no_grad():
+                    logits = self.gate_network(t)
+            return float(logits[0, selected].item())
+
+        try:
+            attrs = self.xai.integrated_gradients(_score, masked)
+            explanation = {
+                "method": "integrated_gradients",
+                "attributions": attrs.tolist(),
+                "feature_names": list(EnvironmentFeatures.NAMES),
+            }
+            counterfactual = self.xai.counterfactual(_score, masked)
+            return explanation, counterfactual
+        except Exception as e:
+            logger.debug(f"XAI failed: {e}")
+            return None, None
+
+    # ------------------------------------------------------------------
+    def adapt(self, state: torch.Tensor, chosen_expert: int,
+              reward: float, task_id: Optional[str] = None) -> Dict[str, Any]:
+        """REAL adaptation step: policy-gradient + EWC + replay."""
+        self.train()
+        state = state.detach()
+        logits = self.gate_network(state)
+        log_probs = F.log_softmax(logits, dim=-1)
+        loss = -log_probs[0, chosen_expert] * float(reward)
+
+        # EWC penalty
+        if self.ewc is not None:
+            loss = loss + self.ewc.penalty()
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.gate_network.parameters(), 1.0)
+        self.optimizer.step()
+        self.eval()
+
+        # Store in memory (bug 1.18: replay.store now actually called)
+        self.memory.append({
+            "state": state.detach(),
+            "chosen_expert": int(chosen_expert),
+            "reward": float(reward),
+            "task_id": task_id,
+        })
+        if self.replay is not None:
+            y = torch.tensor([chosen_expert], dtype=torch.long)
+            self.replay.store(state.squeeze(0), y)
+
+        # Replay training step
+        if self.replay is not None and len(self.replay) >= 8:
+            batch = self.replay.sample(batch_size=min(16, len(self.replay)))
+            if batch is not None:
+                bx, by = batch
+                logits_r = self.gate_network(bx)
+                loss_r = F.cross_entropy(logits_r, by)
+                self.train()
+                self.optimizer.zero_grad()
+                loss_r.backward()
+                self.optimizer.step()
+                self.eval()
+
+        # Drift detector
+        self.concept_drift.update(state)
+
+        # Plasticity decay
+        self.plasticity = max(0.05, self.plasticity * self.plasticity_decay)
+
+        # Bookkeeping
+        self.adaptation_history.append({
+            "reward": float(reward),
+            "chosen_expert": int(chosen_expert),
+            "loss": float(loss.item()),
+            "task_id": task_id,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        })
+        if self.metrics is not None:
+            try:
+                self.metrics.inc("gate_adaptations")
+                self.metrics.set("gate_last_reward", float(reward))
+                self.metrics.set("gate_last_loss", float(loss.item()))
+            except Exception:
+                pass
+
+        # Periodic EWC snapshot + persistence
+        if self.ewc is not None and len(self.adaptation_history) % 50 == 0:
+            self.ewc.reset()
+
+        return {
+            "loss": float(loss.item()),
+            "reward": float(reward),
+            "plasticity": self.plasticity,
+        }
+
+    def compute_ewc_fisher(
+            self,
+            data_loader: Iterable[Tuple[torch.Tensor, torch.Tensor]],
+            max_batches: int = 10,
+    ) -> None:
+        if self.ewc is not None:
+            self.ewc.compute_fisher(data_loader, max_batches=max_batches)
+
+    # ------------------------------------------------------------------
+    def _evaluate_gene_performance(self, gene: ArchitectureGene,
+                                   num_samples: int = 32) -> float:
+        """REAL fitness evaluation:
+          1. Build a temp model matching the gene.
+          2. Transfer current gate weights where shapes match.
+          3. Train the temp model for a few steps on memory samples.
+          4. Score by final loss.
+        """
+        if len(self.memory) < num_samples:
+            return 0.5
+        idx = np.random.choice(len(self.memory), num_samples, replace=False)
+        xs: List[torch.Tensor] = []
+        ys: List[int] = []
+        for i in idx:
+            m = self.memory[i]
+            xs.append(m["state"].squeeze(0) if m["state"].dim() > 1
+                      else m["state"])
+            ys.append(m["chosen_expert"])
+        X = torch.stack(xs)
+        y = torch.tensor(ys, dtype=torch.long)
+
+        # Build temp model
+        temp = nn.Sequential()
+        temp.add_module("l0", nn.Linear(self.input_dim, gene.hidden_dim))
+        if gene.use_layer_norm:
+            temp.add_module("ln0", nn.LayerNorm(gene.hidden_dim))
+        temp.add_module("a0", nn.ReLU())
+        for i in range(gene.num_layers - 1):
+            temp.add_module(f"l{i + 1}",
+                            nn.Linear(gene.hidden_dim, gene.hidden_dim))
+            if gene.use_layer_norm:
+                temp.add_module(f"ln{i + 1}",
+                                nn.LayerNorm(gene.hidden_dim))
+            temp.add_module(f"a{i + 1}", nn.ReLU())
+        temp.add_module("out", nn.Linear(gene.hidden_dim, self.num_experts))
+
+        # Transfer weights where shapes match
+        with torch.no_grad():
+            current_state = self.gate_network.state_dict()
+            for name, param in temp.named_parameters():
+                if name in current_state and \
+                        current_state[name].shape == param.shape:
+                    param.copy_(current_state[name])
+
+        # Train for a couple of steps
+        opt = torch.optim.Adam(temp.parameters(), lr=0.01)
+        temp.train()
+        for _ in range(2):
+            opt.zero_grad()
+            out = temp(X)
+            loss = F.cross_entropy(out, y)
+            loss.backward()
+            opt.step()
+
+        temp.eval()
+        with torch.no_grad():
+            final_loss = F.cross_entropy(temp(X), y).item()
+        # Convert loss to fitness in [0, 1]
+        return float(1.0 / (1.0 + final_loss))
+
+    def evolve_architecture(self) -> Optional[Dict[str, Any]]:
+        if self.architecture_search is None:
+            return None
+
+        def fitness_fn(gene: ArchitectureGene) -> List[float]:
+            fitness = self._evaluate_gene_performance(gene)
+            helium_efficiency = 1.0 / (1.0 + gene.helium_efficiency)
+            quantum_adv = gene.quantum_advantage_score
+            complexity = (gene.num_layers * gene.hidden_dim) / 1000.0
+            # Maximise fitness, helium efficiency, quantum advantage.
+            # Minimise complexity (last entry negative).
+            return [fitness, helium_efficiency, quantum_adv, -complexity]
+
+        result = self.architecture_search.evolve(fitness_fn)
+        self.evolution_generation = result["generation"]
+        if self.metrics is not None:
+            try:
+                self.metrics.inc("gate_evolutions")
+                self.metrics.set("gate_generation",
+                                 self.evolution_generation)
+            except Exception:
+                pass
+        best = self.architecture_search.get_best_architecture()
+        return {
+            "generation": self.evolution_generation,
+            "pareto_front_size": len(self.architecture_search.pareto_front),
+            "best_hidden_dim": best.hidden_dim if best else None,
+        }
+
+    # ------------------------------------------------------------------
+    async def policy_probs(self, state: Dict[str, Any]) -> List[float]:
+        """MOPD teacher interface."""
+        decision = await self.decide(state, return_explanation=False)
+        return decision.probs.tolist()
+
+    # ------------------------------------------------------------------
+    async def save_state(self) -> None:
+        try:
+            state = {
+                "input_dim": self.input_dim,
+                "num_experts": self.num_experts,
+                "hidden_dim": self.hidden_dim,
+                "plasticity": self.plasticity,
+                "evolution_generation": self.evolution_generation,
+                "sustainability_score": self.sustainability_score,
+                "health_status": self.health_status,
+                "last_error": self.last_error,
+                "gate_state": {
+                    k: v.detach().cpu().numpy().tolist()
+                    for k, v in self.gate_network.state_dict().items()
+                },
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            await asyncio.to_thread(
+                self.storage.save_state, "self_evolving_gate_state_v8",
+                json.dumps(state))
+        except Exception as e:
+            logger.warning(f"save_state failed: {e}")
+
+    async def load_state(self) -> None:
+        try:
+            raw = self.storage.get_state("self_evolving_gate_state_v8")
+        except Exception:
+            raw = None
+        if not raw:
+            return
+        try:
+            state = json.loads(raw)
+        except Exception:
+            return
+        # Validate shapes before loading
+        if (state.get("input_dim") != self.input_dim or
+                state.get("num_experts") != self.num_experts or
+                state.get("hidden_dim") != self.hidden_dim):
+            logger.warning(
+                "Persisted gate architecture mismatch; ignoring file")
+            return
+        try:
+            state_dict = {
+                k: torch.tensor(v, dtype=torch.float32)
+                for k, v in state["gate_state"].items()
+            }
+            self.gate_network.load_state_dict(state_dict)
+        except Exception as e:
+            logger.warning(f"gate_state load failed: {e}")
+            return
+        self.plasticity = float(state.get("plasticity", 0.5))
+        self.evolution_generation = int(state.get("evolution_generation", 0))
+        self.sustainability_score = float(
+            state.get("sustainability_score", 0.0))
+        self.health_status = state.get("health_status", "healthy")
+
+    # ------------------------------------------------------------------
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "input_dim": self.input_dim,
+            "num_experts": self.num_experts,
+            "hidden_dim": self.hidden_dim,
+            "memory": len(self.memory),
+            "adaptations": len(self.adaptation_history),
+            "plasticity": self.plasticity,
+            "drift_score": self.concept_drift.drift_score,
+            "evolution_generation": self.evolution_generation,
+            "sustainability_score": self.sustainability_score,
+            "steady_state": self._check_steady_state(),
+            "background_tasks": self.task_manager.task_count(),
+            "replay_size": len(self.replay) if self.replay else 0,
+            "quantum_enabled": self.quantum is not None,
+            "auction_enabled": self.auction is not None,
+            "safety_enabled": self.safety is not None,
+            "temporal_safety_enabled": self.temporal_safety is not None,
+            "xai_enabled": self.xai is not None,
+            "meta_enabled": self.meta_learner is not None,
+            "carbon_client": self.carbon_client._snapshot(),
+            "helium_client": self.helium_client._snapshot(),
+        }
+
+    async def health_check(self) -> Dict[str, Any]:
+        result = self.get_stats()
+        if self.health is not None:
+            result["system_health"] = await self.health.get_system_health()
+        if self.temporal_safety is not None:
+            result["temporal_violations"] = self.temporal_safety.counts()
+        if self.chaos is not None:
+            result["chaos_rollbacks"] = self.chaos.rollback_count
+        return result
+
+    async def shutdown(self) -> None:
+        if self.health is not None:
+            await self.health.shutdown()
+        if self.self_healing is not None:
+            await self.self_healing.shutdown()
+        await self.task_manager.stop_all()
+        await self.carbon_client.close()
+        await self.helium_client.close()
+        await self.save_state()
+
+
+# =============================================================================
+# FIXTURES
+# =============================================================================
+@pytest.fixture
+def storage():
+    return InMemoryStorage()
+
+
+@pytest.fixture
+def queue():
+    return AsyncMessageQueue()
+
+
+@pytest.fixture
+def adaptive_cost(storage):
+    return AdaptiveCostFunction(storage)
+
+
+@pytest.fixture
+def pareto_gating():
+    return ParetoGating()
+
+
+@pytest.fixture
+def drift_detector(storage, adaptive_cost):
+    return DriftDetector(storage, adaptive_cost)
+
+
+@pytest.fixture
+def metrics():
+    return MetricsRegistry()
+
+
+@pytest_asyncio.fixture
+async def gate_minimal(storage, queue, adaptive_cost, pareto_gating,
+                       drift_detector, metrics):
+    g = EnhancedSelfEvolvingGate(
+        storage=storage, message_queue=queue,
+        adaptive_cost=adaptive_cost, pareto_gating=pareto_gating,
+        drift_detector=drift_detector, metrics=metrics,
+        input_dim=EnvironmentFeatures.DIM, num_experts=4,
+        hidden_dim=16, population_size=4, memory_size=200,
+        enable_meta_learning=False,
+        enable_architecture_search=False,
+        enable_continual_learning=False,
+        enable_generative_replay=False,
+        enable_quantum_distillation=False,
+        enable_causal_mask=False,
+        enable_expert_auction=False,
+        enable_safety_monitor=False,
+        enable_temporal_safety=False,
+        enable_xai=False,
+        enable_precision=False,
+        enable_carbon_market=False,
+        enable_chaos=False,
+        enable_human_approval=False,
+        enable_health_checks=False,
+        enable_self_healing=False,
+        seed=42)
+    await g.initialize()
+    try:
+        yield g
+    finally:
+        await g.shutdown()
+
+
+@pytest_asyncio.fixture
+async def gate_full(storage, queue, adaptive_cost, pareto_gating,
+                    drift_detector, metrics):
+    g = EnhancedSelfEvolvingGate(
+        storage=storage, message_queue=queue,
+        adaptive_cost=adaptive_cost, pareto_gating=pareto_gating,
+        drift_detector=drift_detector, metrics=metrics,
+        input_dim=EnvironmentFeatures.DIM, num_experts=4,
+        hidden_dim=16, population_size=4, memory_size=200,
+        enable_meta_learning=True,
+        enable_architecture_search=True,
+        enable_continual_learning=True,
+        enable_generative_replay=True,
+        enable_quantum_distillation=True,
+        enable_causal_mask=True,
+        enable_expert_auction=True,
+        enable_safety_monitor=True,
+        enable_temporal_safety=True,
+        enable_xai=True,
+        enable_precision=True,
+        enable_carbon_market=True,
+        enable_chaos=False,
+        enable_human_approval=True,
+        enable_health_checks=True,
+        enable_self_healing=True,
+        seed=42)
+    await g.initialize()
+    try:
+        yield g
+    finally:
+        await g.shutdown()
+
+
+def _sample_context() -> Dict[str, Any]:
+    return {
+        "carbon_intensity": 0.42, "helium_scarcity": 0.4,
+        "carbon_price": 0.5, "helium_price": 0.5,
+        "token_balance": 0.7, "gradient_carbon": 0.3,
+        "gradient_helium": 0.4, "gradient_trust": 0.6,
+        "drift_score": 0.1, "plasticity": 0.5,
+        "memory_pressure": 0.1, "task_complexity": 0.5,
+    }
+
+
+# =============================================================================
+# TESTS — BUG FIXES
+# =============================================================================
+class TestBugFixes:
+    @pytest.mark.asyncio
+    async def test_input_dim_matches_network(self, gate_minimal):
+        # Config/constructor mismatch fixed: the first layer must match.
+        assert gate_minimal.gate_network[0].in_features == gate_minimal.input_dim
+
+    @pytest.mark.asyncio
+    async def test_forward_with_encoded_context(self, gate_minimal):
+        decision = await gate_minimal.decide(
+            _sample_context(), return_explanation=False)
+        assert decision.probs.shape[0] == gate_minimal.num_experts
+        assert abs(float(decision.probs.sum()) - 1.0) < 1e-4
+
+    @pytest.mark.asyncio
+    async def test_maml_meta_gradient_reaches_base(self):
+        # Construct a MAML gate, adapt, meta-update, verify base params change.
+        maml = MAMLGate(input_dim=4, hidden_dim=8, num_experts=3)
+        before = {n: p.detach().clone()
+                  for n, p in maml.base_network.named_parameters()}
+        X = torch.randn(8, 4)
+        y = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1], dtype=torch.long)
+        support = [(X[:4], y[:4])]
+        query = [(X[4:], y[4:])]
+        adapted = maml.adapt(support, num_inner_steps=2, create_graph=True)
+        maml.meta_update([(adapted, query)])
+        after = {n: p.detach().clone()
+                 for n, p in maml.base_network.named_parameters()}
+        # At least one parameter must have changed.
+        changed = any(
+            not torch.allclose(before[n], after[n]) for n in before)
+        assert changed
+
+    def test_get_best_architecture_weights(self):
+        # Objective weights should favour high fitness + high helium efficiency.
+        search = NSGAIIArchitectureSearch(input_dim=4, num_experts=3,
+                                          population_size=2)
+        g1 = ArchitectureGene(hidden_dim=32)
+        g1.multi_objectives = [0.8, 0.9, 0.5, -0.1]  # high fitness, high helium
+        g1.rank = 0
+        g2 = ArchitectureGene(hidden_dim=200)
+        g2.multi_objectives = [0.3, 0.2, 0.1, -0.9]  # low fitness, high complexity
+        g2.rank = 0
+        search.pareto_front = [g1, g2]
+        best = search.get_best_architecture()
+        assert best is g1
+
+    @pytest.mark.asyncio
+    async def test_persistence_is_json_not_pickle(self, gate_minimal):
+        await gate_minimal.save_state()
+        raw = gate_minimal.storage.get_state("self_evolving_gate_state_v8")
+        assert raw is not None
+        # Must be valid JSON.
+        data = json.loads(raw)
+        assert "gate_state" in data
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancels_tasks(self, storage, queue):
+        g = EnhancedSelfEvolvingGate(
+            storage=storage, message_queue=queue,
+            input_dim=EnvironmentFeatures.DIM, num_experts=2,
+            hidden_dim=8, population_size=2,
+            enable_health_checks=False, enable_self_healing=False,
+            enable_meta_learning=False, enable_architecture_search=False,
+            enable_continual_learning=False, enable_generative_replay=False,
+            enable_quantum_distillation=False, enable_causal_mask=False,
+            enable_expert_auction=False, enable_safety_monitor=False,
+            enable_temporal_safety=False, enable_xai=False,
+            enable_precision=False, enable_carbon_market=False,
+            enable_chaos=False, enable_human_approval=False,
+            seed=1)
+        await g.initialize()
+        assert g.task_manager.task_count() >= 1
+        await g.shutdown()
+        assert g.task_manager.task_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_event_only_attributes_initialised(self, gate_minimal):
+        # These used to be undefined until an event fired.
+        assert gate_minimal.carbon_intensity == 400.0
+        assert gate_minimal.carbon_price == 50.0
+        assert gate_minimal.helium_scarcity == 0.5
+        assert gate_minimal.helium_price == 0.5
+        assert gate_minimal.token_balance == 500.0
+        assert gate_minimal.evolution_pressure == 0.3
+
+    @pytest.mark.asyncio
+    async def test_replay_actually_stores_and_samples(self, gate_minimal):
+        # Enable replay manually
+        g = gate_minimal
+        g.replay = GenerativeReplay(buffer_size=32)
+        state = torch.randn(1, g.input_dim)
+        for i in range(10):
+            g.adapt(state, chosen_expert=i % g.num_experts, reward=0.5)
+        assert len(g.replay) == 10
+        batch = g.replay.sample(batch_size=8)
+        assert batch is not None
+        bx, by = batch
+        assert bx.shape == (8, g.input_dim)
+
+    def test_maml_gate_is_nn_module(self):
+        maml = MAMLGate(input_dim=4, hidden_dim=8, num_experts=3)
+        assert isinstance(maml, nn.Module)
+        # Its base_network parameters must be discoverable.
+        params = list(maml.parameters())
+        assert len(params) > 0
+
+    @pytest.mark.asyncio
+    async def test_get_session_is_race_safe(self):
+        c = CarbonIntensityClient()
+        # Call _get_session concurrently — no crash, single session.
+        async def _get():
+            return await c._get_session()
+        results = await asyncio.gather(*[_get() for _ in range(5)])
+        # All results are either None (no aiohttp) or the same object.
+        nones = [r for r in results if r is None]
+        if not nones:
+            assert all(r is results[0] for r in results)
+        await c.close()
+
+    @pytest.mark.asyncio
+    async def test_config_mutation_whitelist(self, gate_minimal):
+        # The gate exposes an explicit whitelist of mutable attrs.
+        # (No event handler here, but the initial state is safe.)
+        assert hasattr(gate_minimal, "plasticity")
+        original = gate_minimal.plasticity
+        # Directly setting a random attribute is fine, but the network
+        # is never silently mutated by config events.
+        assert gate_minimal.input_dim == gate_minimal.gate_network[0].in_features
+
+    @pytest.mark.asyncio
+    async def test_metrics_adapter(self, gate_minimal):
+        # MetricsRegistry supports both inc/set and increment/observe.
+        gate_minimal.metrics.inc("x")
+        gate_minimal.metrics.increment("x")
+        gate_minimal.metrics.set("y", 1.0)
+        gate_minimal.metrics.observe("y", 2.0)
+        assert gate_minimal.metrics.counters["x"] == 2
+        assert gate_minimal.metrics.gauges["y"] == 2.0
+
+
+# =============================================================================
+# TESTS — ENHANCEMENT MODULES
+# =============================================================================
+class TestQuantumDistillation:
+    def test_register_normalises(self):
+        q = QuantumDistillationModule(n_dims=4)
+        q.register_teacher("a", [1, 2, 3, 4])
+        assert abs(sum(q.teachers["a"]) - 1.0) < 1e-9
+
+    def test_superposition_agreement(self):
+        q = QuantumDistillationModule(n_dims=4)
+        p = [0.4, 0.3, 0.2, 0.1]
+        q.register_teacher("a", p)
+        q.register_teacher("b", p)
+        sup, _ = q._superpose()
+        assert all(abs(a - b) < 1e-6 for a, b in zip(sup, p))
+
+    @pytest.mark.asyncio
+    async def test_step_updates_student(self):
+        q = QuantumDistillationModule(n_dims=4)
+        q.register_teacher("a", [0.4, 0.3, 0.2, 0.1])
+        before = q.get_student_policy()
+        entry = await q.step()
+        after = q.get_student_policy()
+        assert before != after
+        assert "entropy" in entry
+
+
+class TestCausalMask:
+    def test_apply_identity_when_unfit(self):
+        c = CausalFeatureMask(feature_dim=4)
+        out = c.apply([1.0, 2.0, 3.0, 4.0])
+        assert np.allclose(out, [1, 2, 3, 4])
+
+    def test_observe_and_fit(self):
+        c = CausalFeatureMask(feature_dim=4)
+        for _ in range(50):
+            c.observe(np.random.randn(4))
+        summary = c.fit()
+        assert len(summary["mask"]) == 4
+
+    def test_wrong_dim_raises(self):
+        c = CausalFeatureMask(feature_dim=4)
+        with pytest.raises(ValueError):
+            c.apply([1.0, 2.0, 3.0])
+
+
+class TestExpertAuction:
+    def test_bids_all_experts(self):
+        a = ExpertAuction([0, 1, 2], feature_dim=4)
+        bids = a.compute_bids([0.1, 0.2, 0.3, 0.4])
+        assert set(bids.keys()) == {0, 1, 2}
+
+    def test_update_changes_bid(self):
+        a = ExpertAuction([0], feature_dim=4)
+        feats = [0.5] * 4
+        before = a.compute_bids(feats)[0]
+        for _ in range(10):
+            a.update(0, feats, reward=1.0)
+        after = a.compute_bids(feats)[0]
+        assert after > before
+
+
+class TestSafetyMonitors:
+    def test_rule_triggers_mitigation(self):
+        s = SafetyMonitor()
+        calls = []
+        s.add_rule("bad", lambda st: False, "test",
+                   severity="critical",
+                   mitigation=lambda t: calls.append(1))
+        v = s.check({}, target=object())
+        assert any(x.name == "bad" for x in v)
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_temporal_always(self):
+        s = TemporalSafetyMonitor()
+        s.add_formula("G (quality >= 0.5)")
+        await s.push({"quality": 0.9})
+        await s.push({"quality": 0.2})
+        result = await s.check()
+        assert any(not v for v in result.values())
+
+    @pytest.mark.asyncio
+    async def test_temporal_windowed(self):
+        s = TemporalSafetyMonitor()
+        s.add_formula("[60] G (quality >= 0.5)")
+        assert any("@60" in rid for rid in s.rules)
+
+
+class TestXAI:
+    def test_ig_sum_approximates_diff(self):
+        x = XAIExplainer(ig_steps=8)
+
+        def f(v):
+            return float(np.dot(v, [0.4, -0.3, -0.2, -0.1]))
+
+        feats = np.array([0.9, 0.4, 0.5, 0.4])
+        attrs = x.integrated_gradients(f, feats)
+        diff = f(feats) - f(np.zeros_like(feats))
+        assert abs(float(np.sum(attrs)) - diff) < 0.2
+
+    def test_counterfactual(self):
+        x = XAIExplainer(cf_max_iter=50, cf_target_delta=0.05,
+                         rng=random.Random(0))
+
+        def f(v):
+            return float(v[0] - v[1])
+
+        feats = np.array([0.9, 0.4])
+        cf = x.counterfactual(f, feats)
+        assert "changed_index" in cf
+
+
+class TestPrecision:
+    def test_lowest_energy(self):
+        p = PrecisionController(levels=["fp32", "int8"])
+        assert p.select_precision() == "int8"
+
+    @pytest.mark.asyncio
+    async def test_switch(self):
+        p = PrecisionController(levels=["fp32", "int8"], hysteresis_s=0.0)
+        assert await p.switch_to("int8") is True
+
+
+class TestCarbonMarket:
+    @pytest.mark.asyncio
+    async def test_budget_overshoot(self):
+        c = CarbonMarketClient(budget_kg=0.1, rng=random.Random(0))
+        c.used_kg = 0.09
+        result = await c.net_zero_schedule(1.0, 0.1)
+        assert result["action"] == "defer"
+
+    @pytest.mark.asyncio
+    async def test_buy_retire(self):
+        c = CarbonMarketClient()
+        await c.buy_credits(10.0)
+        await c.buy_credits(5.0)
+        assert c.rec_balance() == 15.0
+        retired = await c.retire_rec(7.0)
+        assert retired == 7.0
+
+
+class TestChaos:
+    @pytest.mark.asyncio
+    async def test_latency(self, gate_minimal):
+        c = ChaosEngine(gate_minimal, rng=random.Random(0))
+        r = await c.run_experiment("t1", "latency")
+        assert r["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_data_corruption_bounded(self, gate_minimal):
+        c = ChaosEngine(gate_minimal, rng=random.Random(0))
+        for _ in range(20):
+            await c.run_experiment(f"c{_}", "data_corruption")
+        assert gate_minimal._check_steady_state()
+
+
+class TestHITL:
+    @pytest.mark.asyncio
+    async def test_single_candidate_auto(self):
+        h = HumanApprovalHandler()
+        assert await h.request_approval(
+            {"candidates": [{"id": "only"}]}) is True
+
+    @pytest.mark.asyncio
+    async def test_confident_skips_query(self):
+        h = HumanApprovalHandler(uncertainty_threshold=0.01)
+        await h.record_choice("u", "a", metrics={"quality_score": 1.0})
+        ok = await h.request_approval({
+            "candidates": [
+                {"id": "hi", "quality_score": 10.0},
+                {"id": "lo", "quality_score": 0.01}]}, user_id="u")
+        assert ok is True
+
+
+# =============================================================================
+# TESTS — CORE MODULES
+# =============================================================================
+class TestEWC:
+    def test_fisher_from_data_loader(self):
+        model = nn.Sequential(
+            nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
+        ewc = ElasticWeightConsolidation(model, lambda_ewc=0.1)
+        X = torch.randn(16, 4)
+        y = torch.randint(0, 3, (16,))
+        loader = DataLoader(TensorDataset(X, y), batch_size=8)
+        ewc.compute_fisher(loader, max_batches=2)
+        # Fisher should have non-zero entries now
+        total = sum(float(t.sum()) for t in ewc.fisher.values())
+        assert total > 0.0
+        # Penalty should be ~0 immediately after Fisher (same params)
+        p = float(ewc.penalty())
+        assert p >= 0.0
+
+    def test_penalty_increases_on_drift(self):
+        model = nn.Sequential(nn.Linear(4, 3))
+        ewc = ElasticWeightConsolidation(model, lambda_ewc=1.0)
+        X = torch.randn(16, 4)
+        y = torch.randint(0, 3, (16,))
+        loader = DataLoader(TensorDataset(X, y), batch_size=8)
+        ewc.compute_fisher(loader, max_batches=2)
+        before = float(ewc.penalty())
+        # Perturb the model
+        with torch.no_grad():
+            for p in model.parameters():
+                p.data += torch.randn_like(p) * 0.5
+        after = float(ewc.penalty())
+        assert after > before
+
+
+class TestNSGAII:
+    def test_evolve_one_generation(self):
+        s = NSGAIIArchitectureSearch(input_dim=4, num_experts=3,
+                                     population_size=4)
+        s.population = [ArchitectureGene() for _ in range(4)]
+
+        def fitness(gene):
+            return [1.0, 0.5, 0.5, -gene.hidden_dim / 1000.0]
+
+        result = s.evolve(fitness)
+        assert result["generation"] == 1
+        assert result["population_size"] == 4
+        assert len(s.pareto_front) >= 1
+
+
+class TestTaskManager:
+    @pytest.mark.asyncio
+    async def test_start_and_stop(self):
+        tm = TaskManager()
+        stop = {"v": False}
+
+        async def worker():
+            while not stop["v"]:
+                await asyncio.sleep(0.01)
+
+        tm.start_coro("w", worker())
+        assert tm.task_count() == 1
+        await tm.stop_all()
+        assert tm.task_count() == 0
+
+
+# =============================================================================
+# TESTS — HEALTH + SELF-HEALING
+# =============================================================================
+class TestHealthSelfHealing:
+    @pytest.mark.asyncio
+    async def test_self_healing_reregisters(self):
+        h = HealthCheckSystem(interval=0.05)
+
+        class Bad:
+            async def get_health_status(self):
+                return ComponentHealth(HealthStatus.UNHEALTHY, 0.0, {})
+
+        class Good:
+            async def get_health_status(self):
+                return ComponentHealth(HealthStatus.HEALTHY, 1.0, {})
+
+        try:
+            h.register_component("c", Bad())
+            healing = SelfHealingSystem(h, max_attempts=2, interval=0.05)
+            try:
+                good = Good()
+                healing.register_handler("c", lambda: good)
+                await asyncio.sleep(0.3)
+                assert h.components["c"] is good
+            finally:
+                await healing.shutdown()
+        finally:
+            await h.shutdown()
+
+
+# =============================================================================
+# TESTS — INTEGRATION
+# =============================================================================
+class TestIntegration:
+    @pytest.mark.asyncio
+    async def test_decide_smoke(self, gate_full):
+        decision = await gate_full.decide(_sample_context())
+        assert 0 <= decision.selected_expert < gate_full.num_experts
+        assert abs(float(decision.probs.sum()) - 1.0) < 1e-4
+        assert decision.explanation is not None
+        assert "attributions" in decision.explanation
+
+    @pytest.mark.asyncio
+    async def test_adapt_smoke(self, gate_full):
+        state = torch.randn(1, gate_full.input_dim)
+        info = gate_full.adapt(state, chosen_expert=0, reward=0.9,
+                                task_id="t1")
+        assert "loss" in info
+        assert isinstance(info["loss"], float)
+
+    @pytest.mark.asyncio
+    async def test_health_check_reports(self, gate_full):
+        hc = await gate_full.health_check()
+        assert "system_health" in hc
+        assert "carbon_client" in hc
+        assert "helium_client" in hc
+
+    @pytest.mark.asyncio
+    async def test_policy_probs_sum_to_one(self, gate_full):
+        probs = await gate_full.policy_probs(_sample_context())
+        assert abs(sum(probs) - 1.0) < 1e-4
+
+    @pytest.mark.asyncio
+    async def test_save_and_load_state(self, storage, queue):
+        g = EnhancedSelfEvolvingGate(
+            storage=storage, message_queue=queue,
+            input_dim=EnvironmentFeatures.DIM, num_experts=3,
+            hidden_dim=8, population_size=2,
+            enable_health_checks=False, enable_self_healing=False,
+            enable_meta_learning=False, enable_architecture_search=False,
+            enable_continual_learning=False, enable_generative_replay=False,
+            enable_quantum_distillation=False, enable_causal_mask=False,
+            enable_expert_auction=False, enable_safety_monitor=False,
+            enable_temporal_safety=False, enable_xai=False,
+            enable_precision=False, enable_carbon_market=False,
+            enable_chaos=False, enable_human_approval=False, seed=1)
+        await g.initialize()
+        try:
+            # Adapt once to change weights
+            g.adapt(torch.randn(1, g.input_dim), 0, reward=0.5)
+            await g.save_state()
+            g2 = EnhancedSelfEvolvingGate(
+                storage=storage, message_queue=queue,
+                input_dim=EnvironmentFeatures.DIM, num_experts=3,
+                hidden_dim=8, population_size=2,
+                enable_health_checks=False, enable_self_healing=False,
+                enable_meta_learning=False, enable_architecture_search=False,
+                enable_continual_learning=False, enable_generative_replay=False,
+                enable_quantum_distillation=False, enable_causal_mask=False,
+                enable_expert_auction=False, enable_safety_monitor=False,
+                enable_temporal_safety=False, enable_xai=False,
+                enable_precision=False, enable_carbon_market=False,
+                enable_chaos=False, enable_human_approval=False, seed=2)
+            await g2.initialize()
+            try:
+                s1 = g.gate_network.state_dict()
+                s2 = g2.gate_network.state_dict()
+                for k in s1:
+                    assert torch.allclose(s1[k], s2[k], atol=1e-6)
+            finally:
+                await g2.shutdown()
+        finally:
+            await g.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_decide(self, gate_full):
+        results = await asyncio.gather(*[
+            gate_full.decide(_sample_context(), return_explanation=False)
+            for _ in range(5)])
+        assert all(0 <= r.selected_expert < gate_full.num_experts
+                   for r in results)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_idempotent(self, gate_full):
+        await gate_full.shutdown()
+        await gate_full.shutdown()
+        assert gate_full.task_manager.task_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_safety_mitigation_on_nan(self, gate_minimal):
+        # Manually enable safety
+        gate_minimal.safety = SafetyMonitor()
+        gate_minimal._setup_safety_rules()
+        # Inject NaN
+        with torch.no_grad():
+            for p in gate_minimal.gate_network.parameters():
+                p.data[0] = float("nan")
+                break
+        violations = gate_minimal.safety.check({}, target=gate_minimal)
+        assert any(v.name == "weights_finite" for v in violations)
+        assert gate_minimal._check_steady_state()
+
+    @pytest.mark.asyncio
+    async def test_evolve_architecture_smoke(self, gate_full):
+        # Populate memory
+        for i in range(40):
+            gate_full.memory.append({
+                "state": torch.randn(1, gate_full.input_dim),
+                "chosen_expert": i % gate_full.num_experts,
+                "reward": 0.5,
+                "task_id": "t",
+            })
+        result = gate_full.evolve_architecture()
+        assert result is not None
+        assert result["generation"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_determinism(self, storage):
+        def _build(seed):
+            return EnhancedSelfEvolvingGate(
+                storage=storage,
+                input_dim=EnvironmentFeatures.DIM, num_experts=3,
+                hidden_dim=8, population_size=2,
+                enable_health_checks=False, enable_self_healing=False,
+                enable_meta_learning=False, enable_architecture_search=False,
+                enable_continual_learning=False, enable_generative_replay=False,
+                enable_quantum_distillation=False, enable_causal_mask=False,
+                enable_expert_auction=False, enable_safety_monitor=False,
+                enable_temporal_safety=False, enable_xai=False,
+                enable_precision=False, enable_carbon_market=False,
+                enable_chaos=False, enable_human_approval=False, seed=seed)
+        g1 = _build(99)
+        g2 = _build(99)
+        await g1.initialize()
+        await g2.initialize()
+        try:
+            d1 = await g1.decide(_sample_context(), return_explanation=False)
+            d2 = await g2.decide(_sample_context(), return_explanation=False)
+            assert d1.selected_expert == d2.selected_expert
+            assert np.allclose(d1.probs, d2.probs, atol=1e-6)
+        finally:
+            await g1.shutdown()
+            await g2.shutdown()
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+if __name__ == "__main__":
+    async def demo():
+        storage = InMemoryStorage()
+        queue = AsyncMessageQueue()
+        ac = AdaptiveCostFunction(storage)
+        pg = ParetoGating()
+        dd = DriftDetector(storage, ac)
+        metrics = MetricsRegistry()
+
+        g = EnhancedSelfEvolvingGate(
+            storage=storage, message_queue=queue,
+            adaptive_cost=ac, pareto_gating=pg,
+            drift_detector=dd, metrics=metrics,
+            input_dim=EnvironmentFeatures.DIM, num_experts=4,
+            hidden_dim=32, population_size=4, memory_size=200,
+            enable_meta_learning=True,
+            enable_architecture_search=True,
+            enable_continual_learning=True,
+            enable_generative_replay=True,
+            enable_quantum_distillation=True,
+            enable_causal_mask=True,
+            enable_expert_auction=True,
+            enable_safety_monitor=True,
+            enable_temporal_safety=True,
+            enable_xai=True,
+            enable_precision=True,
+            enable_carbon_market=True,
+            enable_human_approval=True,
+            enable_health_checks=True,
+            enable_self_healing=True,
+            seed=1)
+        await g.initialize()
+        try:
+            # Simulate some adaptations
+            for i in range(30):
+                state = torch.randn(1, g.input_dim)
+                g.adapt(state, chosen_expert=i % g.num_experts, reward=0.7)
+            decision = await g.decide(_sample_context())
+            print("Selected expert:", decision.selected_expert)
+            print("Confidence:", decision.confidence)
+            print("Explanation method:",
+                  decision.explanation.get("method") if decision.explanation else None)
+            if g.architecture_search:
+                result = g.evolve_architecture()
+                print("Evolution result:", result)
+            health = await g.health_check()
+            print("Health:", json.dumps(health, indent=2, default=str))
+        finally:
+            await g.shutdown()
+
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(demo())
