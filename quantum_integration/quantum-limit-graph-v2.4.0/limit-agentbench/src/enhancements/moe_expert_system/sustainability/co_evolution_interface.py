@@ -1,73 +1,347 @@
 #!/usr/bin/env python3
 """
-Enhanced Human-AI Co-Evolution Engine v5.2.0
-Modular, event‑driven, robust, MOPD‑aware, and now with:
-- Explainable AI (XAI) for MOPD plans
-- Temporal safety checks
-- Human‑in‑the‑loop approval
-- Chaos testing for resilience
-- Fixed event broker extraction and MOPD weight mapping
-- Consistent return type from generate_holistic_recommendations
+Enhanced Human-AI Co-Evolution Engine v6.0.0
+=============================================
+
+Complete, event-driven, MOPD-aware, XAI-enabled, safety-checked,
+approval-gated, chaos-tested, and observability-instrumented
+human-AI co-evolution engine.
+
+ENHANCEMENTS OVER v5.2.0:
+- Added missing `carbon_manager` attribute (injectable).
+- Deferred `asyncio.create_task` from `__init__` to `start()` / `wait_ready()`.
+- Renamed `_on_token_update` → `_on_token_balance_update`.
+- Removed dead code in `_on_helium_update`.
+- Added `MOPDConfig.__post_init__` (warn + normalise).
+- Added `MOPDPlan.objective_vector()` and `MOPD_HIGHER_IS_BETTER`.
+- Persistence: typed `TIMESTAMP_KEYS`, enum/datetime handling, threaded I/O.
+- Non-destructive chaos via `ChaosService` with save/restore.
+- Real human approval via `GovernanceLayer` (queue topic + audit trail).
+- Fixed `scalarised_score` stamping for all Pareto plans.
+- Fixed `share_with_swarm` non-deterministic hash → uuid.
+- Fixed `_on_anomaly_detected` compounding by deriving from baseline.
+- Added idempotency keys with LRU cache.
+- Added `ObservabilityHub` with Prometheus export.
+- Added `SafetyInvariant` with ALWAYS/EVENTUALLY semantics.
+- Added `wait_ready()` / `start()` / `shutdown()` lifecycle.
+- Added Protocols for all injected components.
+- Added dead-letter queue for swarm/feedback failures.
+- Removed unused imports; comprehensive type hints.
 """
 
+from __future__ import annotations
+
 import asyncio
-import logging
-import json
-import os
 import hashlib
+import json
+import logging
+import math
+import os
 import re
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional, Tuple, Deque, Callable
+import time
+import uuid
 from collections import defaultdict, deque
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from typing import (
+    Any, Awaitable, Callable, Deque, Dict, FrozenSet, List, Optional,
+    Protocol, Sequence, Set, Tuple, Union, runtime_checkable,
+)
+
 import numpy as np
-import zlib
+
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
+    aiohttp = None
 
 logger = logging.getLogger(__name__)
 
+
 # ============================================================================
-# Bio-Inspired Core Import (with fallback)
+# Named Constants
+# ============================================================================
+STATE_SCHEMA_VERSION = 6
+DEFAULT_CARBON_INTENSITY = 400.0
+CARBON_CRITICAL_THRESHOLD = 800.0
+HELIUM_CRITICAL_THRESHOLD = 0.9
+MAX_FEEDBACK_HISTORY = 1000
+MAX_PERFORMANCE_HISTORY = 1000
+MAX_MILESTONES = 100
+MAX_MOPD_PLANS = 10_000
+MAX_APPROVAL_AUDIT = 1000
+MAX_DEAD_LETTERS = 1000
+IDEMPOTENCY_CACHE_SIZE = 4096
+APPROVAL_DEFAULT_TIMEOUT = 60.0
+CHAOS_MAX_FAULTS_PER_RUN = 6
+MOPD_OBJECTIVE_NAMES: Tuple[str, ...] = (
+    'cost',
+    'impact',
+    'time_days',
+    'risk',
+    'historical_effectiveness',
+)
+# Canonical sign convention: every objective is internally "lower is better".
+MOPD_HIGHER_IS_BETTER: FrozenSet[str] = frozenset({
+    'impact',
+    'historical_effectiveness',
+})
+
+
+# ============================================================================
+# Serialization helper
+# ============================================================================
+def _to_serializable(obj: Any) -> Any:
+    """Recursively convert arbitrary objects to JSON-safe primitives."""
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, Enum):
+        return obj.value
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if hasattr(obj, 'to_dict') and callable(obj.to_dict):
+        return _to_serializable(obj.to_dict())
+    if isinstance(obj, dict):
+        return {
+            (k.value if isinstance(k, Enum) else str(k)): _to_serializable(v)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [_to_serializable(v) for v in obj]
+    if isinstance(obj, deque):
+        return [_to_serializable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if hasattr(obj, '__dict__'):
+        return _to_serializable(obj.__dict__)
+    return str(obj)
+
+
+# ============================================================================
+# Optional bio-inspired core
 # ============================================================================
 try:
-    from enhancements.bio_inspired.__init__ import EnhancedBioInspiredCore, BioEvent, CircuitBreaker
+    from enhancements.bio_inspired.__init__ import (  # type: ignore
+        EnhancedBioInspiredCore, BioEvent, CircuitBreaker,
+    )
     BIO_INSPIRED_AVAILABLE = True
 except ImportError:
     BIO_INSPIRED_AVAILABLE = False
-    class BioEvent:
-        def __init__(self, event_type, source, data=None):
+
+    class BioEvent:  # type: ignore
+        def __init__(self, event_type: str, source: str, data: Optional[Dict] = None):
             self.event_type = event_type
             self.source = source
             self.data = data or {}
-    class CircuitBreaker:
-        def __init__(self, name, failure_threshold=3, recovery_timeout=30.0):
+
+    class CircuitBreaker:  # type: ignore
+        def __init__(self, name: str, failure_threshold: int = 3,
+                     recovery_timeout: float = 30.0):
             self.name = name
             self.failure_threshold = failure_threshold
             self.recovery_timeout = recovery_timeout
             self._state = "closed"
             self._failure_count = 0
-            self._last_failure_time = None
+            self._last_failure_time: Optional[float] = None
             self._lock = asyncio.Lock()
-        async def call(self, func, *args, **kwargs):
-            return await func(*args, **kwargs)
+
+        async def call(self, func: Callable[..., Awaitable[Any]], *args: Any,
+                       **kwargs: Any) -> Any:
+            async with self._lock:
+                if self._state == "open":
+                    if (time.monotonic() - (self._last_failure_time or 0)) > self.recovery_timeout:
+                        self._state = "half-open"
+                    else:
+                        raise RuntimeError(f"Circuit {self.name} is open")
+            try:
+                result = await func(*args, **kwargs)
+                async with self._lock:
+                    if self._state == "half-open":
+                        self._state = "closed"
+                        self._failure_count = 0
+                return result
+            except Exception:
+                async with self._lock:
+                    self._failure_count += 1
+                    self._last_failure_time = time.monotonic()
+                    if self._failure_count >= self.failure_threshold:
+                        self._state = "open"
+                raise
+
 
 # ============================================================================
-# MoE imports (optional)
+# Optional MoE imports
 # ============================================================================
 try:
-    from ..expert_router import ExpertRouter
-    from ..gating_network import GatingNetworkManager
-    from ..advanced.self_evolving_gates import EnhancedSelfEvolvingGate
+    from ..expert_router import ExpertRouter  # type: ignore
+    from ..gating_network import GatingNetworkManager  # type: ignore
+    from ..advanced.self_evolving_gates import EnhancedSelfEvolvingGate  # type: ignore
     MOE_AVAILABLE = True
 except ImportError:
     MOE_AVAILABLE = False
+    ExpertRouter = None
+    GatingNetworkManager = None
+    EnhancedSelfEvolvingGate = None
 
-class HeliumProvider:
-    def get_scarcity(self) -> float: raise NotImplementedError
-    def get_cost_index(self) -> float: raise NotImplementedError
-    def get_efficiency(self) -> float: raise NotImplementedError
 
 # ============================================================================
-# Configuration with Sub‑Configs
+# Protocols
+# ============================================================================
+@runtime_checkable
+class BioCoreProtocol(Protocol):
+    event_broker: Any
+    self_healer: Any
+    workflow_orchestrator: Any
+    swarm_coordinator: Any
+    token_manager: Any
+    gradient_manager: Any
+
+
+@runtime_checkable
+class EventBrokerProtocol(Protocol):
+    def subscribe(self, event_type: str,
+                  handler: Callable[[Any], Awaitable[None]]) -> None: ...
+    def publish(self, topic: str, payload: Any) -> Any: ...
+
+
+@runtime_checkable
+class SwarmCoordinatorProtocol(Protocol):
+    async def share_predictions(self, payload: Dict[str, Any]) -> None: ...
+
+
+@runtime_checkable
+class SelfHealerProtocol(Protocol):
+    async def apply_healing(self, damage_type: str) -> Any: ...
+
+
+@runtime_checkable
+class WorkflowOrchestratorProtocol(Protocol):
+    async def execute_workflow(self, name: str) -> Any: ...
+
+
+@runtime_checkable
+class HeliumProviderProtocol(Protocol):
+    def get_scarcity(self) -> float: ...
+    def get_cost_index(self) -> float: ...
+    def get_efficiency(self) -> float: ...
+
+
+@runtime_checkable
+class CarbonManagerProtocol(Protocol):
+    async def get_current_intensity(self) -> float: ...
+    async def close(self) -> None: ...
+
+
+@runtime_checkable
+class QuantumBenchmarkProtocol(Protocol):
+    async def run_benchmark(self, task_name: str, task_input: Dict[str, Any]) -> Any: ...
+    async def get_benchmark_summary(self) -> Dict[str, Any]: ...
+
+
+@runtime_checkable
+class FFTMoEProtocol(Protocol):
+    async def get_fft_moe_status(self) -> Dict[str, Any]: ...
+    async def analyze_expert_specialization(self) -> Dict[str, Any]: ...
+
+
+@runtime_checkable
+class HeliumManagerProtocol(Protocol):
+    async def get_stats(self) -> Dict[str, Any]: ...
+    async def get_sustainability_forecast(self) -> Dict[str, Any]: ...
+
+
+@runtime_checkable
+class FederatedOrchestratorProtocol(Protocol):
+    async def get_status(self) -> Dict[str, Any]: ...
+
+
+@runtime_checkable
+class PredictiveAnalyzerProtocol(Protocol):
+    async def predict_federation_trend(self) -> Dict[str, Any]: ...
+
+
+# ============================================================================
+# Enums
+# ============================================================================
+class ApprovalStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+    TIMEOUT = "timeout"
+    AUTO_APPROVED = "auto_approved"
+
+
+class FaultType(str, Enum):
+    CARBON_SPIKE = "carbon_spike"
+    HELIUM_CRITICAL = "helium_critical"
+    QUANTUM_FAILURE = "quantum_failure"
+    MOE_FAILURE = "moe_failure"
+    FEDERATED_FAILURE = "federated_failure"
+    PREDICTIVE_FAILURE = "predictive_failure"
+    STORAGE_CORRUPTION = "storage_corruption"
+    EVENT_QUEUE_OVERFLOW = "event_queue_overflow"
+
+
+# ============================================================================
+# Observability Hub
+# ============================================================================
+class ObservabilityHub:
+    """Counters, gauges, histograms and structured logs with Prometheus export."""
+
+    def __init__(self) -> None:
+        self._counters: Dict[str, float] = defaultdict(float)
+        self._gauges: Dict[str, float] = {}
+        self._histograms: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=1000))
+        self._lock = asyncio.Lock()
+
+    def counter(self, name: str, value: float = 1.0, **labels: str) -> None:
+        self._counters[self._key(name, labels)] += float(value)
+
+    def gauge(self, name: str, value: float, **labels: str) -> None:
+        self._gauges[self._key(name, labels)] = float(value)
+
+    def histogram(self, name: str, value: float, **labels: str) -> None:
+        self._histograms[self._key(name, labels)].append(float(value))
+
+    @staticmethod
+    def _key(name: str, labels: Dict[str, str]) -> str:
+        if not labels:
+            return name
+        label_str = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+        return f"{name}{{{label_str}}}"
+
+    async def export_prometheus(self) -> str:
+        async with self._lock:
+            lines: List[str] = []
+            for key, value in self._counters.items():
+                base = key.split('{')[0]
+                lines.append(f"# TYPE {base} counter")
+                lines.append(f"{key} {value}")
+            for key, value in self._gauges.items():
+                base = key.split('{')[0]
+                lines.append(f"# TYPE {base} gauge")
+                lines.append(f"{key} {value}")
+            for key, values in self._histograms.items():
+                if not values:
+                    continue
+                base = key.split('{')[0]
+                lines.append(f"# TYPE {base} histogram")
+                lines.append(f"{base}_count {len(values)}")
+                lines.append(f"{base}_sum {sum(values)}")
+            return "\n".join(lines)
+
+    def log_event(self, level: int, event: str, **fields: Any) -> None:
+        payload = {"event": event, **fields}
+        logger.log(level, json.dumps(payload, default=str))
+
+
+# ============================================================================
+# Configuration with Sub-Configs
 # ============================================================================
 @dataclass
 class MOPDConfig:
@@ -76,7 +350,7 @@ class MOPDConfig:
     objective_weights: Dict[str, float] = field(default_factory=lambda: {
         'cost': 0.2,
         'impact': 0.3,
-        'time': 0.15,          # key for time objective
+        'time_days': 0.15,
         'risk': 0.15,
         'historical_effectiveness': 0.2,
     })
@@ -84,48 +358,67 @@ class MOPDConfig:
     enable_cost_benefit: bool = True
     enable_predictive: bool = True
     enable_quantum: bool = True
+    require_human_approval: bool = False
+    aggressive_threshold: float = 0.7
+
+    def __post_init__(self) -> None:
+        total = sum(self.objective_weights.values())
+        if total <= 0:
+            raise ValueError("Objective weights must sum to a positive value")
+        if abs(total - 1.0) > 1e-6:
+            logger.warning(f"MOPD weights sum to {total:.4f}; normalising.")
+            for k in list(self.objective_weights):
+                self.objective_weights[k] /= total
+
+
+@dataclass
+class ApprovalConfig:
+    enabled: bool = False
+    timeout_seconds: float = APPROVAL_DEFAULT_TIMEOUT
+    auto_approve_on_timeout: bool = False
+    require_for_sustainability_above_priority: float = 0.8
+    require_for_global_priority_above: float = 0.95
+
+
+@dataclass
+class ChaosConfig:
+    enabled: bool = False
+    interval_seconds: int = 3600
+    probability: float = 0.05
+    auto_restore: bool = True
+
 
 @dataclass
 class CoEvolutionConfig:
     """Centralized configuration for the Co-Evolution Engine."""
-    # Learning parameters
     learning_rate: float = 0.01
     exploration_rate: float = 0.1
     adaptation_threshold: float = 0.7
 
-    # History limits
-    feedback_history_limit: int = 1000
-    performance_history_limit: int = 1000
+    feedback_history_limit: int = MAX_FEEDBACK_HISTORY
+    performance_history_limit: int = MAX_PERFORMANCE_HISTORY
     sustainability_trajectory_limit: int = 1000
-    milestone_limit: int = 100
+    milestone_limit: int = MAX_MILESTONES
 
-    # Retry and circuit breaker
     max_retries: int = 3
     retry_base_delay_ms: float = 100.0
     retry_max_delay_ms: float = 5000.0
     circuit_breaker_failure_threshold: int = 5
     circuit_breaker_recovery_timeout: float = 30.0
 
-    # Persistence
     persistence_path: str = "co_evolution_state.json"
-
-    # Telemetry
     telemetry_export_interval: int = 60
-
-    # Periodic co-evolution interval (seconds)
     co_evolution_interval: int = 300
 
-    # Estimated impact/effort per area
     estimated_impact: Dict[str, float] = field(default_factory=lambda: {
         'quantum': 0.8, 'moe': 0.6, 'sustainability': 0.9,
-        'user_experience': 0.7, 'federated': 0.6, 'system_wide': 0.8
+        'user_experience': 0.7, 'federated': 0.6, 'system_wide': 0.8,
     })
     estimated_effort: Dict[str, float] = field(default_factory=lambda: {
         'quantum': 0.7, 'moe': 0.5, 'sustainability': 0.6,
-        'user_experience': 0.3, 'federated': 0.5, 'system_wide': 0.8
+        'user_experience': 0.3, 'federated': 0.5, 'system_wide': 0.8,
     })
 
-    # Feature flags
     enable_event_driven: bool = True
     enable_self_healing: bool = True
     enable_swarm_coordination: bool = True
@@ -134,38 +427,41 @@ class CoEvolutionConfig:
     enable_cost_benefit: bool = True
     enable_workflow_orchestration: bool = True
     enable_mopd: bool = True
-    enable_human_approval: bool = False    # NEW
-    enable_temporal_safety: bool = True    # NEW
-    enable_chaos_testing: bool = False     # NEW
+    enable_human_approval: bool = False
+    enable_temporal_safety: bool = True
+    enable_chaos_testing: bool = False
+    enable_idempotency: bool = True
 
-    # Workflow triggers
     workflow_on_critical_alert: str = "adjust_co_evolution_strategy"
     workflow_on_slo_breach: str = "rebalance_priorities"
-
-    # Swarm sharing interval
     swarm_share_interval: int = 60
 
-    # MOPD sub‑config
     mopd: MOPDConfig = field(default_factory=MOPDConfig)
+    approval: ApprovalConfig = field(default_factory=ApprovalConfig)
+    chaos: ChaosConfig = field(default_factory=ChaosConfig)
+
 
 # ============================================================================
-# Sentiment Analyzer (unchanged)
+# Sentiment Analyzer
 # ============================================================================
 class SentimentAnalyzer:
-    # ... (same as before) ...
     def __init__(self, config: CoEvolutionConfig):
         self.config = config
-        self.sentiment_keywords = {
-            'positive': {'excellent': 1.0, 'great': 0.8, 'good': 0.6, 'nice': 0.5,
-                         'happy': 0.7, 'satisfied': 0.8, 'impressed': 0.9, 'love': 1.0,
-                         'amazing': 1.0, 'perfect': 1.0, 'awesome': 0.9, 'fantastic': 1.0,
-                         'helpful': 0.6, 'useful': 0.5, 'improved': 0.7, 'better': 0.6},
-            'negative': {'bad': -0.6, 'terrible': -1.0, 'awful': -0.9, 'horrible': -1.0,
-                         'sad': -0.5, 'disappointed': -0.7, 'frustrated': -0.8, 'angry': -0.9,
-                         'useless': -0.7, 'broken': -0.8, 'confusing': -0.5, 'slow': -0.5,
-                         'worse': -0.6, 'issue': -0.4, 'problem': -0.5, 'error': -0.6}
+        self.sentiment_keywords: Dict[str, Dict[str, float]] = {
+            'positive': {
+                'excellent': 1.0, 'great': 0.8, 'good': 0.6, 'nice': 0.5,
+                'happy': 0.7, 'satisfied': 0.8, 'impressed': 0.9, 'love': 1.0,
+                'amazing': 1.0, 'perfect': 1.0, 'awesome': 0.9, 'fantastic': 1.0,
+                'helpful': 0.6, 'useful': 0.5, 'improved': 0.7, 'better': 0.6,
+            },
+            'negative': {
+                'bad': -0.6, 'terrible': -1.0, 'awful': -0.9, 'horrible': -1.0,
+                'sad': -0.5, 'disappointed': -0.7, 'frustrated': -0.8, 'angry': -0.9,
+                'useless': -0.7, 'broken': -0.8, 'confusing': -0.5, 'slow': -0.5,
+                'worse': -0.6, 'issue': -0.4, 'problem': -0.5, 'error': -0.6,
+            },
         }
-        self.emotion_keywords = {
+        self.emotion_keywords: Dict[str, List[str]] = {
             'joy': ['happy', 'glad', 'delighted', 'pleased', 'joy', 'wonderful'],
             'trust': ['trust', 'confident', 'reliable', 'sure', 'dependable'],
             'fear': ['worry', 'afraid', 'scared', 'anxious', 'nervous', 'concern'],
@@ -173,7 +469,7 @@ class SentimentAnalyzer:
             'sadness': ['sad', 'depressed', 'unhappy', 'miserable', 'disappointed'],
             'disgust': ['disgusted', 'appalled', 'horrified', 'revolted'],
             'anger': ['angry', 'furious', 'outraged', 'irritated', 'annoyed'],
-            'anticipation': ['expect', 'anticipate', 'look forward', 'hope', 'eager']
+            'anticipation': ['expect', 'anticipate', 'look forward', 'hope', 'eager'],
         }
         self.intensifiers = ['very', 'really', 'extremely', 'absolutely', 'completely',
                              'totally', 'highly', 'incredibly', 'remarkably', 'exceptionally']
@@ -183,10 +479,11 @@ class SentimentAnalyzer:
                           'hardly', 'scarcely', 'barely', 'no one', 'nothing', 'nowhere']
 
     def analyze_sentiment(self, text: str) -> Dict[str, Any]:
-        # ... same as original ...
         if not text or not text.strip():
-            return {'score': 0.0, 'confidence': 0.0, 'sentiment': 'neutral',
-                    'emotions': {}, 'key_phrases': []}
+            return {
+                'score': 0.0, 'confidence': 0.0, 'sentiment': 'neutral',
+                'emotions': {}, 'key_phrases': [],
+            }
         text_lower = text.lower()
         words = text_lower.split()
         score = 0.0
@@ -197,9 +494,9 @@ class SentimentAnalyzer:
                 negate_next = True
                 continue
             multiplier = 1.0
-            if i > 0 and words[i-1] in self.intensifiers:
+            if i > 0 and words[i - 1] in self.intensifiers:
                 multiplier = 1.5
-            elif i > 0 and words[i-1] in self.downtoners:
+            elif i > 0 and words[i - 1] in self.downtoners:
                 multiplier = 0.6
             for sentiment_type, keywords in self.sentiment_keywords.items():
                 if word in keywords:
@@ -210,21 +507,19 @@ class SentimentAnalyzer:
                     score += sentiment_value
                     total_weight += 1.0
                     break
-        if total_weight > 0:
-            score = score / total_weight
-        else:
-            score = 0.0
+        score = score / total_weight if total_weight > 0 else 0.0
         score = max(-1.0, min(1.0, score))
         sentiment = 'positive' if score > 0.2 else 'negative' if score < -0.2 else 'neutral'
         confidence = min(0.95, total_weight / 10.0)
         emotions = self._detect_emotions(text_lower)
         key_phrases = self._extract_key_phrases(text)
-        return {'score': score, 'confidence': confidence, 'sentiment': sentiment,
-                'emotions': emotions, 'key_phrases': key_phrases}
+        return {
+            'score': score, 'confidence': confidence, 'sentiment': sentiment,
+            'emotions': emotions, 'key_phrases': key_phrases,
+        }
 
     def _detect_emotions(self, text_lower: str) -> Dict[str, float]:
-        # ... same as original ...
-        emotions = {}
+        emotions: Dict[str, float] = {}
         for emotion, keywords in self.emotion_keywords.items():
             count = sum(1 for keyword in keywords if keyword in text_lower)
             if count > 0:
@@ -236,8 +531,7 @@ class SentimentAnalyzer:
         return emotions
 
     def _extract_key_phrases(self, text: str) -> List[str]:
-        # ... same as original ...
-        phrases = []
+        phrases: List[str] = []
         quoted = re.findall(r'"([^"]*)"', text)
         if quoted:
             phrases.extend(quoted)
@@ -252,8 +546,9 @@ class SentimentAnalyzer:
                         phrases.append(phrase[:100])
         return list(set(phrases))[:5]
 
+
 # ============================================================================
-# Recommendation Prioritizer (unchanged)
+# Recommendation Prioritizer
 # ============================================================================
 class RecommendationPrioritizer:
     def __init__(self, config: CoEvolutionConfig):
@@ -263,9 +558,9 @@ class RecommendationPrioritizer:
     def prioritize_recommendations(
         self,
         recommendations: List[Dict[str, Any]],
-        historical_data: Dict[str, float]
+        historical_data: Dict[str, float],
     ) -> List[Dict[str, Any]]:
-        prioritized = []
+        prioritized: List[Dict[str, Any]] = []
         for rec in recommendations:
             area = rec.get('area', 'general')
             impact = self.config.estimated_impact.get(area, 0.5)
@@ -280,7 +575,7 @@ class RecommendationPrioritizer:
                 'roi_score': roi_score,
                 'historical_effectiveness': historical_effectiveness,
                 'estimated_roi': roi,
-                'ranking': 0
+                'ranking': 0,
             })
             prioritized.append(prioritized_rec)
         prioritized.sort(key=lambda x: x['roi_score'], reverse=True)
@@ -288,28 +583,34 @@ class RecommendationPrioritizer:
             rec['ranking'] = i + 1
         return prioritized
 
+
 # ============================================================================
-# Long-Term Impact Tracker (refactored with async)
+# Long-Term Impact Tracker
 # ============================================================================
 class LongTermImpactTracker:
     def __init__(self, config: CoEvolutionConfig):
         self.config = config
-        self.impact_history: Dict[str, Deque[Dict]] = defaultdict(lambda: deque(maxlen=100))
-        self.sustainability_scores: Deque[float] = deque(maxlen=config.sustainability_trajectory_limit)
+        self.impact_history: Dict[str, Deque[Dict[str, Any]]] = defaultdict(
+            lambda: deque(maxlen=100)
+        )
+        self.sustainability_scores: Deque[float] = deque(
+            maxlen=config.sustainability_trajectory_limit
+        )
         self.decay_rates: Dict[str, float] = {}
         self._lock = asyncio.Lock()
 
-    async def record_impact(self, area: str, impact_data: Dict[str, Any], sustainability_score: float):
+    async def record_impact(self, area: str, impact_data: Dict[str, Any],
+                            sustainability_score: float) -> None:
         async with self._lock:
             self.impact_history[area].append({
                 'timestamp': datetime.now(timezone.utc).isoformat(),
                 'impact': impact_data,
-                'sustainability_score': sustainability_score
+                'sustainability_score': float(sustainability_score),
             })
-            self.sustainability_scores.append(sustainability_score)
+            self.sustainability_scores.append(float(sustainability_score))
             await self._update_decay_rate(area)
 
-    async def _update_decay_rate(self, area: str):
+    async def _update_decay_rate(self, area: str) -> None:
         history = list(self.impact_history.get(area, []))
         if len(history) < 5:
             return
@@ -317,7 +618,7 @@ class LongTermImpactTracker:
         if len(scores) > 5:
             x = np.array(range(len(scores)))
             y = np.array(scores)
-            slope = np.polyfit(x, y, 1)[0]
+            slope = float(np.polyfit(x, y, 1)[0])
             self.decay_rates[area] = -slope
 
     def get_area_trend(self, area: str) -> Dict[str, Any]:
@@ -326,9 +627,14 @@ class LongTermImpactTracker:
             return {'status': 'insufficient_data'}
         scores = [entry['sustainability_score'] for entry in history[-10:]]
         recent_scores = scores[-5:] if len(scores) >= 5 else scores
-        avg_score = np.mean(scores) if scores else 0.5
-        avg_recent = np.mean(recent_scores) if recent_scores else 0.5
-        trend = "improving" if avg_recent > avg_score * 1.05 else "stable" if avg_recent > avg_score * 0.95 else "declining"
+        avg_score = float(np.mean(scores)) if scores else 0.5
+        avg_recent = float(np.mean(recent_scores)) if recent_scores else 0.5
+        if avg_recent > avg_score * 1.05:
+            trend = "improving"
+        elif avg_recent > avg_score * 0.95:
+            trend = "stable"
+        else:
+            trend = "declining"
         decay_rate = self.decay_rates.get(area, 0.0)
         return {
             'area': area,
@@ -337,7 +643,7 @@ class LongTermImpactTracker:
             'trend': trend,
             'decay_rate': decay_rate,
             'sample_count': len(scores),
-            'needs_attention': decay_rate > 0.05 or trend == "declining"
+            'needs_attention': decay_rate > 0.05 or trend == "declining",
         }
 
     def get_overall_trend(self) -> Dict[str, Any]:
@@ -345,41 +651,56 @@ class LongTermImpactTracker:
         if not scores:
             return {'status': 'insufficient_data'}
         scores = scores[-20:]
-        avg_score = np.mean(scores)
-        avg_recent = np.mean(scores[-5:]) if len(scores) >= 5 else avg_score
-        trend = "improving" if avg_recent > avg_score * 1.05 else "stable" if avg_recent > avg_score * 0.95 else "declining"
+        avg_score = float(np.mean(scores))
+        avg_recent = float(np.mean(scores[-5:])) if len(scores) >= 5 else avg_score
+        if avg_recent > avg_score * 1.05:
+            trend = "improving"
+        elif avg_recent > avg_score * 0.95:
+            trend = "stable"
+        else:
+            trend = "declining"
         return {
             'average_sustainability_score': avg_score,
             'recent_sustainability_score': avg_recent,
             'trend': trend,
             'sample_count': len(scores),
-            'improvement_rate': (avg_recent - avg_score) / max(avg_score, 0.01) if len(scores) > 5 else 0.0
+            'improvement_rate': (
+                (avg_recent - avg_score) / max(avg_score, 0.01) if len(scores) > 5 else 0.0
+            ),
         }
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> Dict[str, Any]:
         return {
             'impact_history': {k: list(v) for k, v in self.impact_history.items()},
             'sustainability_scores': list(self.sustainability_scores),
-            'decay_rates': self.decay_rates
+            'decay_rates': self.decay_rates,
         }
 
-    def from_dict(self, data: Dict):
+    def from_dict(self, data: Dict[str, Any]) -> None:
         self.impact_history = defaultdict(lambda: deque(maxlen=100))
         for k, v in data.get('impact_history', {}).items():
             self.impact_history[k] = deque(v, maxlen=100)
-        self.sustainability_scores = deque(data.get('sustainability_scores', []), maxlen=self.config.sustainability_trajectory_limit)
+        self.sustainability_scores = deque(
+            data.get('sustainability_scores', []),
+            maxlen=self.config.sustainability_trajectory_limit,
+        )
         self.decay_rates = data.get('decay_rates', {})
 
+
 # ============================================================================
-# Persistence Manager (JSON with versioning)
+# Persistence Manager (typed, threaded)
 # ============================================================================
 class CoEvolutionPersistenceManager:
+    TIMESTAMP_KEYS: FrozenSet[str] = frozenset({
+        'timestamp', 'requested_at', 'decided_at', 'last_assessment',
+    })
+
     def __init__(self, config: CoEvolutionConfig):
         self.config = config
         self.path = config.persistence_path
         self._lock = asyncio.Lock()
-        self._version = 3  # Bumped for enhanced features
-        logger.info(f"CoEvolutionPersistenceManager initialized (path={self.path})")
+        self._version = STATE_SCHEMA_VERSION
+        logger.info(f"CoEvolutionPersistenceManager initialised (path={self.path})")
 
     async def save_state(self, state: Dict[str, Any]) -> bool:
         async with self._lock:
@@ -387,136 +708,88 @@ class CoEvolutionPersistenceManager:
                 payload = {
                     'version': self._version,
                     'timestamp': datetime.now(timezone.utc).isoformat(),
-                    'data': self._make_serializable(state)
+                    'data': _to_serializable(state),
                 }
-                with open(self.path, 'w') as f:
-                    json.dump(payload, f, indent=2)
+                tmp = f"{self.path}.tmp"
+
+                def _write() -> None:
+                    with open(tmp, 'w') as f:
+                        json.dump(payload, f, indent=2)
+                    os.replace(tmp, self.path)
+
+                await asyncio.to_thread(_write)
                 logger.info(f"State saved to {self.path}")
                 return True
             except Exception as e:
                 logger.error(f"Failed to save state: {e}")
                 return False
 
-    async def load_state(self) -> Optional[Dict]:
+    async def load_state(self) -> Optional[Dict[str, Any]]:
         async with self._lock:
             if not os.path.exists(self.path):
                 logger.warning(f"Persistence file {self.path} not found")
                 return None
             try:
-                with open(self.path, 'r') as f:
-                    payload = json.load(f)
-                if payload.get('version') != self._version:
-                    logger.warning(f"State version mismatch; may be incompatible")
+                def _read() -> Dict[str, Any]:
+                    with open(self.path, 'r') as f:
+                        return json.load(f)
+
+                payload = await asyncio.to_thread(_read)
+                version = payload.get('version', 0)
+                if version != self._version:
+                    logger.warning(
+                        f"State version mismatch (file={version}, expected={self._version})"
+                    )
                 return self._deserialize(payload.get('data', {}))
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
                 return None
 
-    def _make_serializable(self, obj: Any) -> Any:
+    def _deserialize(self, obj: Any, key: Optional[str] = None) -> Any:
         if isinstance(obj, dict):
-            return {k: self._make_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [self._make_serializable(v) for v in obj]
-        elif isinstance(obj, datetime):
-            return obj.isoformat()
-        elif isinstance(obj, (deque, set)):
-            return self._make_serializable(list(obj))
-        elif hasattr(obj, '__dict__'):
-            return self._make_serializable(obj.__dict__)
-        else:
-            return obj
-
-    def _deserialize(self, obj: Any) -> Any:
-        if isinstance(obj, dict):
-            return {k: self._deserialize(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [self._deserialize(v) for v in obj]
-        elif isinstance(obj, str):
+            return {k: self._deserialize(v, key=k) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._deserialize(v, key=key) for v in obj]
+        if isinstance(obj, str) and key in self.TIMESTAMP_KEYS:
             try:
                 return datetime.fromisoformat(obj)
             except ValueError:
                 return obj
-        else:
-            return obj
+        return obj
 
-    async def delete_state(self):
+    async def delete_state(self) -> bool:
         async with self._lock:
             if os.path.exists(self.path):
-                os.remove(self.path)
+                await asyncio.to_thread(os.remove, self.path)
                 logger.info(f"Persistence file {self.path} deleted")
                 return True
             return False
 
-# ============================================================================
-# Telemetry Collector
-# ============================================================================
-class CoEvolutionTelemetry:
-    def __init__(self):
-        self.metrics: Dict[str, Any] = defaultdict(lambda: defaultdict(int))
-        self._lock = asyncio.Lock()
-
-    def increment(self, metric_name: str, tags: Optional[Dict[str, str]] = None, value: float = 1.0):
-        key = self._make_key(metric_name, tags)
-        self.metrics['counters'][key] += value
-
-    def gauge(self, metric_name: str, value: float, tags: Optional[Dict[str, str]] = None):
-        key = self._make_key(metric_name, tags)
-        self.metrics['gauges'][key] = value
-
-    def histogram(self, metric_name: str, value: float, tags: Optional[Dict[str, str]] = None):
-        key = self._make_key(metric_name, tags)
-        if key not in self.metrics['histograms']:
-            self.metrics['histograms'][key] = []
-        self.metrics['histograms'][key].append(value)
-        if len(self.metrics['histograms'][key]) > 1000:
-            self.metrics['histograms'][key] = self.metrics['histograms'][key][-1000:]
-
-    def _make_key(self, metric_name: str, tags: Optional[Dict[str, str]]) -> str:
-        if tags:
-            tag_str = ','.join(f"{k}={v}" for k, v in sorted(tags.items()))
-            return f"{metric_name}{{{tag_str}}}"
-        return metric_name
-
-    async def export(self) -> str:
-        async with self._lock:
-            output = []
-            for key, value in self.metrics['counters'].items():
-                output.append(f"# TYPE {key} counter\n{key} {value}")
-            for key, value in self.metrics['gauges'].items():
-                output.append(f"# TYPE {key} gauge\n{key} {value}")
-            for key, values in self.metrics['histograms'].items():
-                output.append(f"# TYPE {key} histogram\n{key}_count {len(values)}\n{key}_sum {sum(values)}")
-            return "\n".join(output)
-
-    def reset(self):
-        self.metrics.clear()
-        self.metrics['counters'] = defaultdict(int)
-        self.metrics['gauges'] = {}
-        self.metrics['histograms'] = defaultdict(list)
 
 # ============================================================================
 # Retry Helper
 # ============================================================================
 async def retry_async(
-    func: Callable,
+    func: Callable[..., Awaitable[Any]],
     max_retries: int,
     base_delay_ms: float,
     max_delay_ms: float,
-    *args,
-    **kwargs
+    *args: Any,
+    **kwargs: Any,
 ) -> Any:
     for attempt in range(max_retries):
         try:
             return await func(*args, **kwargs)
-        except Exception as e:
+        except Exception:
             if attempt == max_retries - 1:
                 raise
             delay = min(base_delay_ms * (2 ** attempt), max_delay_ms) / 1000.0
             await asyncio.sleep(delay)
     raise RuntimeError("Max retries exceeded")
 
+
 # ============================================================================
-# Evolution Milestone Dataclass
+# Evolution Milestone
 # ============================================================================
 @dataclass
 class EvolutionMilestone:
@@ -535,20 +808,35 @@ class EvolutionMilestone:
             'timestamp': self.timestamp.isoformat(),
             'milestone_type': self.milestone_type,
             'description': self.description,
-            'metrics': self.metrics,
+            'metrics': dict(self.metrics),
             'human_feedback_count': self.human_feedback_count,
             'ai_suggestion_impact': self.ai_suggestion_impact,
             'strategy_signature': self.strategy_signature,
             'reuse_count': self.reuse_count,
-            'avg_effectiveness': np.mean(self.effectiveness_history) if self.effectiveness_history else 0.0
+            'avg_effectiveness': (
+                float(np.mean(self.effectiveness_history))
+                if self.effectiveness_history else 0.0
+            ),
+            'effectiveness_history': list(self.effectiveness_history),
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "EvolutionMilestone":
+        d = dict(data)
+        if isinstance(d.get('timestamp'), str):
+            d['timestamp'] = datetime.fromisoformat(d['timestamp'])
+        d.pop('avg_effectiveness', None)
+        d['metrics'] = dict(d.get('metrics', {}))
+        d['effectiveness_history'] = list(d.get('effectiveness_history', []))
+        return cls(**d)
+
 
 # ============================================================================
 # MOPD Data Classes
 # ============================================================================
 @dataclass
 class MOPDPlan:
-    """Represents a co‑evolution strategy with its objective vector."""
+    """Represents a co-evolution strategy with its objective vector and XAI."""
     area: str
     action: str
     strategy_signature: str
@@ -558,14 +846,36 @@ class MOPDPlan:
     risk: float
     historical_effectiveness: float
     scalarised_score: float = 0.0
-    explanation: str = ""    # NEW: XAI field
+    explanation: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return {
+            'area': self.area,
+            'action': self.action,
+            'strategy_signature': self.strategy_signature,
+            'cost': self.cost,
+            'impact': self.impact,
+            'time_days': self.time_days,
+            'risk': self.risk,
+            'historical_effectiveness': self.historical_effectiveness,
+            'scalarised_score': self.scalarised_score,
+            'explanation': self.explanation,
+        }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'MOPDPlan':
+    def from_dict(cls, data: Dict[str, Any]) -> "MOPDPlan":
         return cls(**data)
+
+    def objective_vector(self) -> List[float]:
+        """Canonical lower-is-better objective vector."""
+        vec: List[float] = []
+        for name in MOPD_OBJECTIVE_NAMES:
+            val = float(getattr(self, name, 0.0))
+            if name in MOPD_HIGHER_IS_BETTER:
+                val = -val
+            vec.append(val)
+        return vec
+
 
 # ============================================================================
 # Storage Module
@@ -573,80 +883,87 @@ class MOPDPlan:
 class CoEvolutionStorage:
     def __init__(self, config: CoEvolutionConfig):
         self.config = config
-        self.feedback_history: Deque[Dict] = deque(maxlen=config.feedback_history_limit)
+        self.feedback_history: Deque[Dict[str, Any]] = deque(
+            maxlen=config.feedback_history_limit
+        )
         self.user_models: Dict[str, Dict[str, Any]] = {}
         self.policy_suggestions: List[Dict[str, Any]] = []
         self.collaborative_decisions: List[Dict[str, Any]] = []
-        self.evolution_milestones: Deque[EvolutionMilestone] = deque(maxlen=config.milestone_limit)
-        self.milestone_strategies: Dict[str, List[Dict]] = {}
-        self.performance_history: Deque[Dict] = deque(maxlen=config.performance_history_limit)
+        self.evolution_milestones: Deque[EvolutionMilestone] = deque(
+            maxlen=config.milestone_limit
+        )
+        self.milestone_strategies: Dict[str, List[Dict[str, Any]]] = {}
+        self.performance_history: Deque[Dict[str, Any]] = deque(
+            maxlen=config.performance_history_limit
+        )
         self.trust_history: Deque[float] = deque(maxlen=1000)
-        self.sustainability_trajectory: Deque[float] = deque(maxlen=config.sustainability_trajectory_limit)
+        self.sustainability_trajectory: Deque[float] = deque(
+            maxlen=config.sustainability_trajectory_limit
+        )
         self.historical_effectiveness: Dict[str, float] = {
             'quantum': 0.5, 'moe': 0.5, 'sustainability': 0.5,
-            'user_experience': 0.5, 'federated': 0.5, 'system_wide': 0.5
+            'user_experience': 0.5, 'federated': 0.5, 'system_wide': 0.5,
         }
-        self.mopd_plans: List[MOPDPlan] = []
+        self.mopd_plans: Deque[MOPDPlan] = deque(maxlen=MAX_MOPD_PLANS)
         self._lock = asyncio.Lock()
 
-    # ... (all methods same as before) ...
-    # -------------------- Feedback --------------------
-    async def add_feedback(self, feedback: Dict):
+    # ---------------- Feedback ----------------
+    async def add_feedback(self, feedback: Dict[str, Any]) -> None:
         async with self._lock:
-            self.feedback_history.append(feedback)
+            self.feedback_history.append(_to_serializable(feedback))
 
-    async def get_feedback(self, limit: Optional[int] = None) -> List[Dict]:
+    async def get_feedback(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         async with self._lock:
             if limit is not None:
                 return list(self.feedback_history)[-limit:]
             return list(self.feedback_history)
 
-    async def clear_feedback(self):
+    async def clear_feedback(self) -> None:
         async with self._lock:
             self.feedback_history.clear()
 
-    # -------------------- User Models --------------------
-    async def get_user_model(self, user_id: str) -> Optional[Dict]:
+    # ---------------- User Models ----------------
+    async def get_user_model(self, user_id: str) -> Optional[Dict[str, Any]]:
         async with self._lock:
             return self.user_models.get(user_id)
 
-    async def update_user_model(self, user_id: str, updates: Dict):
+    async def update_user_model(self, user_id: str, updates: Dict[str, Any]) -> None:
         async with self._lock:
             if user_id not in self.user_models:
                 self.user_models[user_id] = {}
             self.user_models[user_id].update(updates)
 
-    async def get_user_models(self) -> Dict[str, Dict]:
+    async def get_user_models(self) -> Dict[str, Dict[str, Any]]:
         async with self._lock:
             return dict(self.user_models)
 
-    async def clear_user_models(self):
+    async def clear_user_models(self) -> None:
         async with self._lock:
             self.user_models.clear()
 
-    # -------------------- Policies & Decisions --------------------
-    async def add_policy_suggestion(self, suggestion: Dict):
+    # ---------------- Policies & Decisions ----------------
+    async def add_policy_suggestion(self, suggestion: Dict[str, Any]) -> None:
         async with self._lock:
-            self.policy_suggestions.append(suggestion)
+            self.policy_suggestions.append(_to_serializable(suggestion))
 
-    async def get_policy_suggestions(self, limit: Optional[int] = None) -> List[Dict]:
-        async with self._lock:
-            if limit:
-                return self.policy_suggestions[-limit:]
-            return self.policy_suggestions.copy()
-
-    async def add_collaborative_decision(self, decision: Dict):
-        async with self._lock:
-            self.collaborative_decisions.append(decision)
-
-    async def get_collaborative_decisions(self, limit: Optional[int] = None) -> List[Dict]:
+    async def get_policy_suggestions(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         async with self._lock:
             if limit:
-                return self.collaborative_decisions[-limit:]
-            return self.collaborative_decisions.copy()
+                return list(self.policy_suggestions[-limit:])
+            return list(self.policy_suggestions)
 
-    # -------------------- Milestones --------------------
-    async def add_milestone(self, milestone: EvolutionMilestone):
+    async def add_collaborative_decision(self, decision: Dict[str, Any]) -> None:
+        async with self._lock:
+            self.collaborative_decisions.append(_to_serializable(decision))
+
+    async def get_collaborative_decisions(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        async with self._lock:
+            if limit:
+                return list(self.collaborative_decisions[-limit:])
+            return list(self.collaborative_decisions)
+
+    # ---------------- Milestones ----------------
+    async def add_milestone(self, milestone: EvolutionMilestone) -> None:
         async with self._lock:
             self.evolution_milestones.append(milestone)
 
@@ -663,31 +980,31 @@ class CoEvolutionStorage:
                     return m
             return None
 
-    # -------------------- Milestone Strategies --------------------
-    async def add_milestone_strategy(self, strategy_signature: str, entry: Dict):
+    # ---------------- Milestone Strategies ----------------
+    async def add_milestone_strategy(self, strategy_signature: str, entry: Dict[str, Any]) -> None:
         async with self._lock:
             if strategy_signature not in self.milestone_strategies:
                 self.milestone_strategies[strategy_signature] = []
-            self.milestone_strategies[strategy_signature].append(entry)
+            self.milestone_strategies[strategy_signature].append(_to_serializable(entry))
 
-    async def get_milestone_strategies(self) -> Dict[str, List[Dict]]:
+    async def get_milestone_strategies(self) -> Dict[str, List[Dict[str, Any]]]:
         async with self._lock:
             return dict(self.milestone_strategies)
 
-    # -------------------- Performance & Trust --------------------
-    async def add_performance_record(self, record: Dict):
+    # ---------------- Performance & Trust ----------------
+    async def add_performance_record(self, record: Dict[str, Any]) -> None:
         async with self._lock:
-            self.performance_history.append(record)
+            self.performance_history.append(_to_serializable(record))
 
-    async def get_performance_history(self, limit: Optional[int] = None) -> List[Dict]:
+    async def get_performance_history(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         async with self._lock:
             if limit:
                 return list(self.performance_history)[-limit:]
             return list(self.performance_history)
 
-    async def add_trust_score(self, score: float):
+    async def add_trust_score(self, score: float) -> None:
         async with self._lock:
-            self.trust_history.append(score)
+            self.trust_history.append(float(score))
 
     async def get_trust_history(self, limit: Optional[int] = None) -> List[float]:
         async with self._lock:
@@ -695,10 +1012,10 @@ class CoEvolutionStorage:
                 return list(self.trust_history)[-limit:]
             return list(self.trust_history)
 
-    # -------------------- Sustainability Trajectory --------------------
-    async def add_sustainability_score(self, score: float):
+    # ---------------- Sustainability Trajectory ----------------
+    async def add_sustainability_score(self, score: float) -> None:
         async with self._lock:
-            self.sustainability_trajectory.append(score)
+            self.sustainability_trajectory.append(float(score))
 
     async def get_sustainability_trajectory(self, limit: Optional[int] = None) -> List[float]:
         async with self._lock:
@@ -706,93 +1023,380 @@ class CoEvolutionStorage:
                 return list(self.sustainability_trajectory)[-limit:]
             return list(self.sustainability_trajectory)
 
-    # -------------------- Historical Effectiveness --------------------
+    # ---------------- Historical Effectiveness ----------------
     async def get_historical_effectiveness(self) -> Dict[str, float]:
         async with self._lock:
             return dict(self.historical_effectiveness)
 
-    async def update_historical_effectiveness(self, area: str, effectiveness: float):
+    async def update_historical_effectiveness(self, area: str, effectiveness: float) -> None:
         async with self._lock:
             old = self.historical_effectiveness.get(area, 0.5)
-            self.historical_effectiveness[area] = old * 0.7 + effectiveness * 0.3
+            self.historical_effectiveness[area] = old * 0.7 + float(effectiveness) * 0.3
 
-    async def reset_historical_effectiveness(self):
+    async def reset_historical_effectiveness(self) -> None:
         async with self._lock:
             self.historical_effectiveness = {
                 'quantum': 0.5, 'moe': 0.5, 'sustainability': 0.5,
-                'user_experience': 0.5, 'federated': 0.5, 'system_wide': 0.5
+                'user_experience': 0.5, 'federated': 0.5, 'system_wide': 0.5,
             }
 
-    # -------------------- MOPD Plans --------------------
-    async def add_mopd_plan(self, plan: MOPDPlan):
+    # ---------------- MOPD Plans ----------------
+    async def add_mopd_plan(self, plan: MOPDPlan) -> None:
         async with self._lock:
             self.mopd_plans.append(plan)
-            if len(self.mopd_plans) > 10000:
-                self.mopd_plans = self.mopd_plans[-10000:]
 
     async def get_mopd_plans(self, limit: Optional[int] = None) -> List[MOPDPlan]:
         async with self._lock:
             if limit is not None:
-                return self.mopd_plans[-limit:]
-            return self.mopd_plans.copy()
+                return list(self.mopd_plans)[-limit:]
+            return list(self.mopd_plans)
 
-    # -------------------- State Snapshot --------------------
-    async def to_dict(self) -> Dict:
+    # ---------------- State Snapshot ----------------
+    async def to_dict(self) -> Dict[str, Any]:
         async with self._lock:
             return {
-                'feedback_history': list(self.feedback_history),
-                'user_models': self.user_models,
-                'policy_suggestions': self.policy_suggestions,
-                'collaborative_decisions': self.collaborative_decisions,
+                'feedback_history': [_to_serializable(f) for f in self.feedback_history],
+                'user_models': _to_serializable(self.user_models),
+                'policy_suggestions': [_to_serializable(s) for s in self.policy_suggestions],
+                'collaborative_decisions': [_to_serializable(d) for d in self.collaborative_decisions],
                 'evolution_milestones': [m.to_dict() for m in self.evolution_milestones],
-                'milestone_strategies': self.milestone_strategies,
-                'performance_history': list(self.performance_history),
+                'milestone_strategies': _to_serializable(self.milestone_strategies),
+                'performance_history': [_to_serializable(p) for p in self.performance_history],
                 'trust_history': list(self.trust_history),
                 'sustainability_trajectory': list(self.sustainability_trajectory),
-                'historical_effectiveness': self.historical_effectiveness,
+                'historical_effectiveness': dict(self.historical_effectiveness),
                 'mopd_plans': [p.to_dict() for p in self.mopd_plans],
             }
 
-    async def from_dict(self, data: Dict):
+    async def from_dict(self, data: Dict[str, Any]) -> None:
         async with self._lock:
-            self.feedback_history = deque(data.get('feedback_history', []), maxlen=self.config.feedback_history_limit)
-            self.user_models = data.get('user_models', {})
-            self.policy_suggestions = data.get('policy_suggestions', [])
-            self.collaborative_decisions = data.get('collaborative_decisions', [])
-            self.evolution_milestones = deque()
-            for m_dict in data.get('evolution_milestones', []):
-                milestone = self._dict_to_milestone(m_dict)
-                if milestone:
-                    self.evolution_milestones.append(milestone)
-            self.milestone_strategies = data.get('milestone_strategies', {})
-            self.performance_history = deque(data.get('performance_history', []), maxlen=self.config.performance_history_limit)
-            self.trust_history = deque(data.get('trust_history', []), maxlen=1000)
-            self.sustainability_trajectory = deque(data.get('sustainability_trajectory', []), maxlen=self.config.sustainability_trajectory_limit)
-            self.historical_effectiveness = data.get('historical_effectiveness', {})
-            # Restore MOPD plans
-            mopd_plans = data.get('mopd_plans', [])
-            for p_dict in mopd_plans:
-                self.mopd_plans.append(MOPDPlan.from_dict(p_dict))
-
-    def _dict_to_milestone(self, d: Dict) -> Optional[EvolutionMilestone]:
-        try:
-            return EvolutionMilestone(
-                timestamp=datetime.fromisoformat(d['timestamp']),
-                milestone_type=d['milestone_type'],
-                description=d['description'],
-                metrics=d['metrics'],
-                human_feedback_count=d['human_feedback_count'],
-                ai_suggestion_impact=d['ai_suggestion_impact'],
-                strategy_signature=d.get('strategy_signature'),
-                reuse_count=d.get('reuse_count', 0),
-                effectiveness_history=d.get('effectiveness_history', [])
+            self.feedback_history = deque(
+                data.get('feedback_history', []),
+                maxlen=self.config.feedback_history_limit,
             )
-        except Exception as e:
-            logger.error(f"Failed to reconstruct milestone: {e}")
-            return None
+            self.user_models = dict(data.get('user_models', {}))
+            self.policy_suggestions = list(data.get('policy_suggestions', []))
+            self.collaborative_decisions = list(data.get('collaborative_decisions', []))
+
+            self.evolution_milestones = deque(maxlen=self.config.milestone_limit)
+            for m_dict in data.get('evolution_milestones', []):
+                try:
+                    self.evolution_milestones.append(EvolutionMilestone.from_dict(m_dict))
+                except Exception as e:
+                    logger.warning(f"Skipping invalid milestone: {e}")
+
+            self.milestone_strategies = dict(data.get('milestone_strategies', {}))
+            self.performance_history = deque(
+                data.get('performance_history', []),
+                maxlen=self.config.performance_history_limit,
+            )
+            self.trust_history = deque(data.get('trust_history', []), maxlen=1000)
+            self.sustainability_trajectory = deque(
+                data.get('sustainability_trajectory', []),
+                maxlen=self.config.sustainability_trajectory_limit,
+            )
+            self.historical_effectiveness = dict(data.get('historical_effectiveness', {}))
+
+            self.mopd_plans = deque(maxlen=MAX_MOPD_PLANS)
+            for p_dict in data.get('mopd_plans', []):
+                try:
+                    self.mopd_plans.append(MOPDPlan.from_dict(p_dict))
+                except Exception as e:
+                    logger.warning(f"Skipping invalid MOPD plan: {e}")
+
 
 # ============================================================================
-# Analyzer Module (Enhanced with MOPD and XAI)
+# Temporal Safety
+# ============================================================================
+class SafetyInvariant:
+    def __init__(self, name: str, predicate: Callable[[Dict[str, Any]], bool],
+                 description: str, kind: str = "always") -> None:
+        if kind not in ("always", "eventually"):
+            raise ValueError(f"Unsupported invariant kind: {kind}")
+        self.name = name
+        self.predicate = predicate
+        self.description = description
+        self.kind = kind
+
+
+class SafetyMonitor:
+    def __init__(self) -> None:
+        self.invariants: List[SafetyInvariant] = []
+        self._eventually_flags: Dict[str, bool] = {}
+
+    def add_invariant(self, name: str, condition_fn: Callable[[Dict[str, Any]], bool],
+                      description: str, kind: str = "always") -> None:
+        self.invariants.append(SafetyInvariant(name, condition_fn, description, kind))
+        if kind == "eventually":
+            self._eventually_flags[name] = False
+
+    def check(self, state: Dict[str, Any]) -> List[str]:
+        violations: List[str] = []
+        for inv in self.invariants:
+            try:
+                ok = bool(inv.predicate(state))
+            except Exception as e:
+                violations.append(f"{inv.name}: predicate error ({e})")
+                continue
+            if inv.kind == "always" and not ok:
+                violations.append(f"{inv.name}: {inv.description}")
+            elif inv.kind == "eventually" and ok:
+                self._eventually_flags[inv.name] = True
+        return violations
+
+    def final_check(self) -> List[str]:
+        return [
+            f"{inv.name}: {inv.description} (never satisfied)"
+            for inv in self.invariants
+            if inv.kind == "eventually" and not self._eventually_flags.get(inv.name, False)
+        ]
+
+
+# ============================================================================
+# Governance (Human Approval)
+# ============================================================================
+@dataclass
+class ApprovalRequest:
+    request_id: str
+    context: Dict[str, Any]
+    requested_at: datetime
+    timeout_seconds: float
+    status: ApprovalStatus = ApprovalStatus.PENDING
+    future: Optional[asyncio.Future] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'request_id': self.request_id,
+            'context': _to_serializable(self.context),
+            'requested_at': self.requested_at.isoformat(),
+            'timeout_seconds': self.timeout_seconds,
+            'status': self.status.value,
+        }
+
+
+@dataclass
+class ApprovalResult:
+    request_id: str
+    status: ApprovalStatus
+    reason: str = ""
+    decided_at: Optional[datetime] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'request_id': self.request_id,
+            'status': self.status.value,
+            'reason': self.reason,
+            'decided_at': self.decided_at.isoformat() if self.decided_at else None,
+        }
+
+
+class GovernanceLayer:
+    def __init__(self, config: ApprovalConfig,
+                 publish_fn: Optional[Callable[[str, Any], Awaitable[None]]] = None) -> None:
+        self.config = config
+        self.publish_fn = publish_fn
+        self.pending: Dict[str, ApprovalRequest] = {}
+        self.audit: Deque[Dict[str, Any]] = deque(maxlen=MAX_APPROVAL_AUDIT)
+        self._lock = asyncio.Lock()
+
+    async def request_approval(self, context: Dict[str, Any],
+                               timeout: Optional[float] = None) -> ApprovalResult:
+        if not self.config.enabled:
+            result = ApprovalResult(
+                request_id='auto',
+                status=ApprovalStatus.AUTO_APPROVED,
+                reason='approval_disabled',
+                decided_at=datetime.now(timezone.utc),
+            )
+            self._audit(context, result)
+            return result
+
+        timeout = timeout if timeout is not None else self.config.timeout_seconds
+        request_id = uuid.uuid4().hex
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        req = ApprovalRequest(
+            request_id=request_id,
+            context=context,
+            requested_at=datetime.now(timezone.utc),
+            timeout_seconds=timeout,
+            future=future,
+        )
+        async with self._lock:
+            self.pending[request_id] = req
+
+        try:
+            if self.publish_fn is not None:
+                await self.publish_fn('approval_requests',
+                                       json.dumps(req.to_dict(), default=str))
+            decision = await asyncio.wait_for(future, timeout=timeout)
+            result = ApprovalResult(
+                request_id=request_id,
+                status=ApprovalStatus.APPROVED if decision else ApprovalStatus.DENIED,
+                reason='human_decision',
+                decided_at=datetime.now(timezone.utc),
+            )
+        except asyncio.TimeoutError:
+            if self.config.auto_approve_on_timeout:
+                result = ApprovalResult(
+                    request_id=request_id,
+                    status=ApprovalStatus.AUTO_APPROVED,
+                    reason='timeout_auto_approved',
+                    decided_at=datetime.now(timezone.utc),
+                )
+            else:
+                result = ApprovalResult(
+                    request_id=request_id,
+                    status=ApprovalStatus.TIMEOUT,
+                    reason='timeout_denied',
+                    decided_at=datetime.now(timezone.utc),
+                )
+        except Exception as e:
+            result = ApprovalResult(
+                request_id=request_id,
+                status=ApprovalStatus.DENIED,
+                reason=f'error:{e}',
+                decided_at=datetime.now(timezone.utc),
+            )
+        finally:
+            async with self._lock:
+                self.pending.pop(request_id, None)
+
+        self._audit(context, result)
+        return result
+
+    async def submit_decision(self, request_id: str, approved: bool) -> bool:
+        async with self._lock:
+            req = self.pending.get(request_id)
+            if req is None or req.future is None or req.future.done():
+                return False
+            req.future.set_result(approved)
+            return True
+
+    def _audit(self, context: Dict[str, Any], result: ApprovalResult) -> None:
+        self.audit.append({
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'context': _to_serializable(context),
+            'result': result.to_dict(),
+        })
+
+    def get_audit_log(self) -> List[Dict[str, Any]]:
+        return list(self.audit)
+
+
+# ============================================================================
+# Chaos Service
+# ============================================================================
+class ChaosService:
+    def __init__(self, orchestrator: "CoEvolutionOrchestrator",
+                 config: ChaosConfig) -> None:
+        self.orchestrator = orchestrator
+        self.config = config
+        self._saved: Dict[str, Any] = {}
+        self._lock = asyncio.Lock()
+
+    async def inject_fault(self, fault_type: Union[str, FaultType],
+                           **params: Any) -> Dict[str, Any]:
+        if isinstance(fault_type, str):
+            try:
+                fault_type = FaultType(fault_type)
+            except ValueError:
+                return {'fault': fault_type, 'error': 'unknown_fault'}
+
+        async with self._lock:
+            try:
+                if fault_type == FaultType.CARBON_SPIKE:
+                    if self.orchestrator.carbon_manager is not None:
+                        self._saved.setdefault(
+                            'carbon_intensity',
+                            self.orchestrator.carbon_manager.carbon_intensity,
+                        )
+                        self.orchestrator.carbon_manager.carbon_intensity = params.get(
+                            'intensity', CARBON_CRITICAL_THRESHOLD + 50,
+                        )
+                    return {'fault': fault_type.value}
+                if fault_type == FaultType.HELIUM_CRITICAL:
+                    # Non-destructive marker — the injected component reports scarcity
+                    return {'fault': fault_type.value, 'noop': True}
+                if fault_type == FaultType.QUANTUM_FAILURE:
+                    self._saved.setdefault(
+                        'quantum_benchmark', self.orchestrator.quantum_benchmark,
+                    )
+                    self.orchestrator.quantum_benchmark = None
+                    return {'fault': fault_type.value}
+                if fault_type == FaultType.MOE_FAILURE:
+                    self._saved.setdefault('fft_moe', self.orchestrator.fft_moe)
+                    self.orchestrator.fft_moe = None
+                    return {'fault': fault_type.value}
+                if fault_type == FaultType.FEDERATED_FAILURE:
+                    self._saved.setdefault(
+                        'federated_orchestrator',
+                        self.orchestrator.federated_orchestrator,
+                    )
+                    self.orchestrator.federated_orchestrator = None
+                    return {'fault': fault_type.value}
+                if fault_type == FaultType.PREDICTIVE_FAILURE:
+                    self._saved.setdefault(
+                        'predictive_analyzer', self.orchestrator.predictive_analyzer,
+                    )
+                    self.orchestrator.predictive_analyzer = None
+                    return {'fault': fault_type.value}
+                if fault_type == FaultType.STORAGE_CORRUPTION:
+                    return {'fault': fault_type.value, 'noop': True}
+                if fault_type == FaultType.EVENT_QUEUE_OVERFLOW:
+                    return {'fault': fault_type.value, 'noop': True}
+            except Exception as e:
+                logger.error(f"Fault injection failed ({fault_type}): {e}")
+                return {'fault': fault_type.value, 'error': str(e)}
+            return {'fault': fault_type.value, 'not_implemented': True}
+
+    def restore(self) -> None:
+        if 'carbon_intensity' in self._saved and self.orchestrator.carbon_manager is not None:
+            self.orchestrator.carbon_manager.carbon_intensity = self._saved.pop('carbon_intensity')
+        if 'quantum_benchmark' in self._saved:
+            self.orchestrator.quantum_benchmark = self._saved.pop('quantum_benchmark')
+        if 'fft_moe' in self._saved:
+            self.orchestrator.fft_moe = self._saved.pop('fft_moe')
+        if 'federated_orchestrator' in self._saved:
+            self.orchestrator.federated_orchestrator = self._saved.pop('federated_orchestrator')
+        if 'predictive_analyzer' in self._saved:
+            self.orchestrator.predictive_analyzer = self._saved.pop('predictive_analyzer')
+
+    async def run_chaos_test(self) -> Dict[str, Any]:
+        report: Dict[str, Any] = {'faults': [], 'results': {}, 'restored': False}
+        faults = [
+            FaultType.QUANTUM_FAILURE,
+            FaultType.MOE_FAILURE,
+            FaultType.FEDERATED_FAILURE,
+            FaultType.PREDICTIVE_FAILURE,
+            FaultType.CARBON_SPIKE,
+        ]
+        try:
+            for ft in faults[:CHAOS_MAX_FAULTS_PER_RUN]:
+                res = await self.inject_fault(ft)
+                report['faults'].append(ft.value)
+                report['results'][ft.value] = res
+
+            # Exercise the system under fault
+            try:
+                cycle = await self.orchestrator.co_evolve()
+                report['results']['post_fault_cycle'] = {
+                    'status': cycle.get('status', 'unknown'),
+                    'applied_count': len(cycle.get('recommendations_applied', [])),
+                }
+            except Exception as e:
+                report['results']['post_fault_cycle'] = {
+                    'status': 'error', 'error': str(e),
+                }
+        finally:
+            if self.config.auto_restore:
+                self.restore()
+                report['restored'] = True
+        return report
+
+
+# ============================================================================
+# Analyzer Module
 # ============================================================================
 class CoEvolutionAnalyzer:
     def __init__(
@@ -801,40 +1405,46 @@ class CoEvolutionAnalyzer:
         storage: CoEvolutionStorage,
         sentiment_analyzer: SentimentAnalyzer,
         recommender: RecommendationPrioritizer,
-        impact_tracker: LongTermImpactTracker
-    ):
+        impact_tracker: LongTermImpactTracker,
+    ) -> None:
         self.config = config
         self.storage = storage
         self.sentiment = sentiment_analyzer
         self.recommender = recommender
         self.impact_tracker = impact_tracker
 
-    # ... (existing methods: aggregate_human_feedback_with_sentiment, extract_feedback_themes_with_sentiment, identify_opportunities) ...
+    # ------------------------------------------------------------------
+    # Feedback aggregation
+    # ------------------------------------------------------------------
     async def aggregate_human_feedback_with_sentiment(self) -> List[Dict[str, Any]]:
         user_models = await self.storage.get_user_models()
         decisions = await self.storage.get_collaborative_decisions()
-        all_feedback = []
-        for user_id, user_model in user_models.items():
-            for fb in user_model.get('feedback', []):
-                if 'comment' in fb:
+        all_feedback: List[Dict[str, Any]] = []
+        for _user_id, user_model in user_models.items():
+            for fb in user_model.get('feedback', []) or []:
+                if isinstance(fb, dict) and 'comment' in fb:
+                    fb = dict(fb)
                     fb['sentiment'] = self.sentiment.analyze_sentiment(fb['comment'])
                     all_feedback.append(fb)
         for decision in decisions:
-            for fb in decision.get('feedback', []):
-                if 'comment' in fb:
+            for fb in decision.get('feedback', []) or []:
+                if isinstance(fb, dict) and 'comment' in fb:
+                    fb = dict(fb)
                     fb['sentiment'] = self.sentiment.analyze_sentiment(fb['comment'])
                     all_feedback.append(fb)
         return all_feedback[-self.config.feedback_history_limit:]
 
-    async def extract_feedback_themes_with_sentiment(self, feedback: List[Dict]) -> Dict[str, Dict]:
+    async def extract_feedback_themes_with_sentiment(
+        self, feedback: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
         keyword_map = {
             'usability': ['confusing', 'complicated', 'hard to use', 'intuitive', 'usability'],
             'performance': ['slow', 'fast', 'lag', 'responsiveness', 'performance'],
             'accuracy': ['wrong', 'incorrect', 'accurate', 'correct', 'precision'],
             'sustainability': ['carbon', 'helium', 'green', 'environmental', 'energy', 'sustainable'],
-            'trust': ['trust', 'confidence', 'reliable', 'unreliable', 'trustworthy']
+            'trust': ['trust', 'confidence', 'reliable', 'unreliable', 'trustworthy'],
         }
-        themes = {}
+        themes: Dict[str, Dict[str, Any]] = {}
         for fb in feedback:
             text = fb.get('comment', '').lower()
             sentiment = fb.get('sentiment', {}).get('score', 0)
@@ -846,28 +1456,30 @@ class CoEvolutionAnalyzer:
                     themes[theme]['sentiment_sum'] += sentiment
         for theme in themes:
             if themes[theme]['count'] > 0:
-                themes[theme]['avg_sentiment'] = themes[theme]['sentiment_sum'] / themes[theme]['count']
+                themes[theme]['avg_sentiment'] = (
+                    themes[theme]['sentiment_sum'] / themes[theme]['count']
+                )
         return themes
 
     async def identify_opportunities(
         self,
         system_state: Dict[str, Any],
-        human_feedback: List[Dict[str, Any]]
+        human_feedback: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        opportunities = []
+        opportunities: List[Dict[str, Any]] = []
         q = system_state.get('components', {}).get('quantum', {})
         if q.get('average_energy_savings_percent', 0) < 10:
             opportunities.append({
                 'area': 'quantum', 'type': 'performance', 'priority': 0.7,
                 'suggestion': 'Optimize quantum circuit depth and qubit usage',
-                'expected_impact': '20-30% energy savings'
+                'expected_impact': '20-30% energy savings',
             })
         m = system_state.get('components', {}).get('moe', {})
         if m.get('total_updates_processed', 0) < 10:
             opportunities.append({
                 'area': 'moe', 'type': 'adoption', 'priority': 0.5,
                 'suggestion': 'Increase client participation in FFT-MoE',
-                'expected_impact': 'Improved personalization and accuracy'
+                'expected_impact': 'Improved personalization and accuracy',
             })
         h = system_state.get('components', {}).get('helium', {})
         scarcity = h.get('current', {}).get('scarcity_index', 0)
@@ -875,18 +1487,24 @@ class CoEvolutionAnalyzer:
             opportunities.append({
                 'area': 'sustainability', 'type': 'constraint', 'priority': 0.9,
                 'suggestion': 'Reduce helium usage through alternative cooling',
-                'expected_impact': '50-80% helium savings'
+                'expected_impact': '50-80% helium savings',
             })
 
         if human_feedback:
-            sentiments = [f.get('sentiment', {}).get('score', 0) for f in human_feedback if 'sentiment' in f]
+            sentiments = [
+                f.get('sentiment', {}).get('score', 0)
+                for f in human_feedback if 'sentiment' in f
+            ]
             if sentiments:
                 negative_ratio = sum(1 for s in sentiments if s < -0.3) / max(len(sentiments), 1)
                 if negative_ratio > 0.2:
                     opportunities.append({
-                        'area': 'user_experience', 'type': 'sentiment_driven', 'priority': 0.75,
-                        'suggestion': f'Address user concerns - {negative_ratio:.0%} negative feedback detected',
-                        'expected_impact': 'Improved user satisfaction and trust'
+                        'area': 'user_experience', 'type': 'sentiment_driven',
+                        'priority': 0.75,
+                        'suggestion': (
+                            f'Address user concerns - {negative_ratio:.0%} negative feedback detected'
+                        ),
+                        'expected_impact': 'Improved user satisfaction and trust',
                     })
             themes = await self.extract_feedback_themes_with_sentiment(human_feedback)
             for theme, data in themes.items():
@@ -895,75 +1513,71 @@ class CoEvolutionAnalyzer:
                     priority = min(0.9, 0.6 + sentiment_weight * 0.3)
                     opportunities.append({
                         'area': 'user_experience', 'type': theme, 'priority': priority,
-                        'suggestion': f'Address user concerns about {theme} (sentiment: {data["avg_sentiment"]:.2f})',
-                        'expected_impact': 'Improved user satisfaction and trust'
+                        'suggestion': (
+                            f'Address user concerns about {theme} '
+                            f'(sentiment: {data["avg_sentiment"]:.2f})'
+                        ),
+                        'expected_impact': 'Improved user satisfaction and trust',
                     })
 
         opportunities.sort(key=lambda x: x['priority'], reverse=True)
         return opportunities[:5]
 
-    # ============================================================================
-    # MOPD Methods (Enhanced with XAI)
-    # ============================================================================
+    # ------------------------------------------------------------------
+    # MOPD computation
+    # ------------------------------------------------------------------
     async def _compute_plan_objectives(self, rec: Dict[str, Any]) -> MOPDPlan:
         area = rec.get('area', 'general')
         action = rec.get('action', '')
-        strategy_signature = rec.get('strategy_signature', hashlib.md5(f"{area}:{action}".encode()).hexdigest()[:12])
+        strategy_signature = rec.get(
+            'strategy_signature',
+            hashlib.md5(f"{area}:{action}".encode()).hexdigest()[:12],
+        )
 
         cost = 1.0 - rec.get('historical_effectiveness', 0.5)
         impact = self.config.estimated_impact.get(area, 0.5) * rec.get('priority', 0.5)
-        time_days = 1.0 / (0.5 + impact)
+        time_days = 1.0 / (0.5 + max(impact, 1e-6))
         risk = 1.0 - rec.get('priority', 0.5)
         historical_effectiveness = rec.get('historical_effectiveness', 0.5)
 
-        # Build explanation
-        explanation = f"Area={area}, action={action}, impact={impact:.2f}, time={time_days:.2f} days, risk={risk:.2f}, historical effectiveness={historical_effectiveness:.2f}"
+        explanation = (
+            f"Area={area}, action={action}, impact={impact:.2f}, "
+            f"time={time_days:.2f} days, risk={risk:.2f}, "
+            f"historical effectiveness={historical_effectiveness:.2f}"
+        )
 
         return MOPDPlan(
             area=area,
             action=action,
             strategy_signature=strategy_signature,
-            cost=cost,
-            impact=impact,
-            time_days=time_days,
-            risk=risk,
-            historical_effectiveness=historical_effectiveness,
-            explanation=explanation
+            cost=float(cost),
+            impact=float(impact),
+            time_days=float(time_days),
+            risk=float(risk),
+            historical_effectiveness=float(historical_effectiveness),
+            explanation=explanation,
         )
 
     async def _generate_pareto_front_for_recommendations(
-        self,
-        recommendations: List[Dict[str, Any]]
+        self, recommendations: List[Dict[str, Any]],
     ) -> List[MOPDPlan]:
         if not recommendations:
             return []
-        plans = []
+        plans: List[MOPDPlan] = []
         for rec in recommendations:
-            plan = await self._compute_plan_objectives(rec)
-            plans.append(plan)
+            plans.append(await self._compute_plan_objectives(rec))
 
-        objective_names = ['cost', 'impact', 'time_days', 'risk', 'historical_effectiveness']
-        pareto = []
+        pareto: List[MOPDPlan] = []
         for i, p_i in enumerate(plans):
+            a_vec = p_i.objective_vector()
             dominated = False
             for j, p_j in enumerate(plans):
                 if i == j:
                     continue
-                a_vec = [
-                    p_i.cost,
-                    -p_i.impact,
-                    p_i.time_days,
-                    p_i.risk,
-                    -p_i.historical_effectiveness
-                ]
-                b_vec = [
-                    p_j.cost,
-                    -p_j.impact,
-                    p_j.time_days,
-                    p_j.risk,
-                    -p_j.historical_effectiveness
-                ]
-                if all(b <= a for a, b in zip(a_vec, b_vec)) and any(b < a for a, b in zip(a_vec, b_vec)):
+                b_vec = p_j.objective_vector()
+                if all(b <= a for a, b in zip(a_vec, b_vec)) and any(
+                    b < a for a, b in zip(a_vec, b_vec)
+                ):
                     dominated = True
                     break
             if not dominated:
@@ -974,60 +1588,49 @@ class CoEvolutionAnalyzer:
         if not pareto_front:
             return None
         weights = self.config.mopd.objective_weights
-        objective_names = ['cost', 'impact', 'time_days', 'risk', 'historical_effectiveness']
-        # Map weight keys: config uses 'time' instead of 'time_days'
-        weight_keys = {
-            'cost': 'cost',
-            'impact': 'impact',
-            'time_days': 'time',
-            'risk': 'risk',
-            'historical_effectiveness': 'historical_effectiveness'
-        }
+        vectors = [p.objective_vector() for p in pareto_front]
+        arr = np.array(vectors)
+        mins = arr.min(axis=0)
+        maxs = arr.max(axis=0)
+        ranges = np.where(maxs - mins > 1e-9, maxs - mins, 1.0)
 
-        max_vals = {}
-        min_vals = {}
-        for key in objective_names:
-            vals = [getattr(p, key) for p in pareto_front]
-            max_vals[key] = max(vals)
-            min_vals[key] = min(vals)
-        ranges = {k: max_vals[k] - min_vals[k] if max_vals[k] != min_vals[k] else 1.0 for k in objective_names}
-
-        best = None
+        best: Optional[MOPDPlan] = None
         best_score = -float('inf')
         for plan in pareto_front:
+            vec = np.array(plan.objective_vector())
+            # 1 = best (smallest canonical), 0 = worst
+            normalised = 1.0 - (vec - mins) / ranges
             score = 0.0
-            for key in objective_names:
-                val = getattr(plan, key)
-                if key in ['cost', 'time_days', 'risk']:  # minimise
-                    norm = 1.0 - (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
-                else:  # maximise
-                    norm = (val - min_vals[key]) / ranges[key] if ranges[key] > 0 else 1.0
-                weight_key = weight_keys[key]
-                weight = weights.get(weight_key, 1.0 / len(objective_names))
-                score += weight * norm
+            for idx, name in enumerate(MOPD_OBJECTIVE_NAMES):
+                w = weights.get(name, 1.0 / len(MOPD_OBJECTIVE_NAMES))
+                score += w * float(normalised[idx])
+            plan.scalarised_score = score
             if score > best_score:
                 best_score = score
                 best = plan
-                best.scalarised_score = score
         return best
 
-    # ============================================================================
-    # Enhanced Recommendation Generation with MOPD (consistent return type)
-    # ============================================================================
+    # ------------------------------------------------------------------
+    # Recommendation generation
+    # ------------------------------------------------------------------
     async def generate_holistic_recommendations(
         self,
         system_state: Dict[str, Any],
         opportunities: List[Dict[str, Any]],
-        return_mopd: bool = False
+        return_mopd: bool = False,
     ) -> Dict[str, Any]:
-        combined = {}
+        combined: Dict[str, Dict[str, Any]] = {}
         for opp in opportunities:
             key = opp['area']
             if key not in combined:
                 combined[key] = {
-                    'area': key, 'types': [], 'priority': opp['priority'],
-                    'suggestions': [opp['suggestion']], 'expected_impact': opp.get('expected_impact', 'Expected improvement'),
-                    'predicted': opp.get('predicted', False), 'timeframe_hours': opp.get('timeframe_hours', None)
+                    'area': key,
+                    'types': [],
+                    'priority': opp['priority'],
+                    'suggestions': [opp['suggestion']],
+                    'expected_impact': opp.get('expected_impact', 'Expected improvement'),
+                    'predicted': opp.get('predicted', False),
+                    'timeframe_hours': opp.get('timeframe_hours', None),
                 }
             else:
                 combined[key]['types'].append(opp.get('type', 'general'))
@@ -1035,24 +1638,31 @@ class CoEvolutionAnalyzer:
                 combined[key]['priority'] = max(combined[key]['priority'], opp['priority'])
 
         historical = await self.storage.get_historical_effectiveness()
-        recommendations = []
+        recommendations: List[Dict[str, Any]] = []
         for area, data in combined.items():
             strategy_sig = self._generate_strategy_signature(area, data['suggestions'])
             existing = await self.storage.find_milestone_by_strategy(strategy_sig)
-            rec = {
+            rec: Dict[str, Any] = {
                 'area': area,
-                'action': data['suggestions'][0] if len(data['suggestions']) == 1 else f"Multiple actions: {', '.join(data['suggestions'][:2])}",
+                'action': (
+                    data['suggestions'][0] if len(data['suggestions']) == 1
+                    else f"Multiple actions: {', '.join(data['suggestions'][:2])}"
+                ),
                 'priority': data['priority'],
                 'rationale': self._generate_rationale(area, system_state),
-                'expected_outcome': self._predict_outcome(area, data['types'], historical),
+                'expected_outcome': self._predict_outcome(
+                    area, data['types'], historical,
+                ),
                 'predicted': data.get('predicted', False),
                 'timeframe_hours': data.get('timeframe_hours', None),
                 'strategy_signature': strategy_sig,
-                'historical_effectiveness': historical.get(area, 0.5)
+                'historical_effectiveness': historical.get(area, 0.5),
             }
             if existing:
                 rec['previous_effectiveness'] = existing.ai_suggestion_impact
-                rec['reuse_benefit'] = f"Strategy previously effective ({existing.ai_suggestion_impact:.2f})"
+                rec['reuse_benefit'] = (
+                    f"Strategy previously effective ({existing.ai_suggestion_impact:.2f})"
+                )
             recommendations.append(rec)
 
         if len(opportunities) >= 3:
@@ -1060,14 +1670,18 @@ class CoEvolutionAnalyzer:
                 'area': 'system_wide',
                 'action': 'Schedule a comprehensive system optimization sprint',
                 'priority': 0.8,
-                'rationale': f'Multiple improvement areas identified ({len(opportunities)} opportunities)',
+                'rationale': (
+                    f'Multiple improvement areas identified ({len(opportunities)} opportunities)'
+                ),
                 'expected_outcome': 'System-wide performance uplift',
-                'strategy_signature': 'system_wide_optimization'
+                'strategy_signature': 'system_wide_optimization',
             })
 
-        result = {'recommendations': recommendations}
+        result: Dict[str, Any] = {'recommendations': recommendations}
         if self.config.enable_mopd and return_mopd:
-            pareto_front = await self._generate_pareto_front_for_recommendations(recommendations)
+            pareto_front = await self._generate_pareto_front_for_recommendations(
+                recommendations,
+            )
             if pareto_front:
                 for plan in pareto_front:
                     await self.storage.add_mopd_plan(plan)
@@ -1087,7 +1701,7 @@ class CoEvolutionAnalyzer:
             'moe': 'MoE adoption is limited, more client participation needed',
             'sustainability': 'High helium scarcity requires immediate action',
             'user_experience': 'User feedback indicates areas for improvement',
-            'federated': 'Federated learning performance can be improved'
+            'federated': 'Federated learning performance can be improved',
         }
         base = rationales.get(area, f'Improvement needed in {area}')
         trend = self.impact_tracker.get_area_trend(area)
@@ -1098,13 +1712,14 @@ class CoEvolutionAnalyzer:
                 base += f" (Long-term trend: {trend['trend']}, continue momentum)"
         return base
 
-    def _predict_outcome(self, area: str, types: List[str], historical: Dict[str, float]) -> str:
+    def _predict_outcome(self, area: str, types: List[str],
+                         historical: Dict[str, float]) -> str:
         outcomes = {
             'quantum': '10-30% reduction in energy consumption',
             'moe': 'Improved personalization and model accuracy',
             'sustainability': 'Significant reduction in resource usage',
             'user_experience': 'Increased user engagement and trust',
-            'federated': 'Better global model performance'
+            'federated': 'Better global model performance',
         }
         base = outcomes.get(area, 'Expected performance improvement')
         eff = historical.get(area, 0.5)
@@ -1119,56 +1734,66 @@ class CoEvolutionAnalyzer:
         if len(traj) < 10:
             return "stable"
         recent = traj[-10:]
-        avg_recent = np.mean(recent)
+        avg_recent = float(np.mean(recent))
         older = traj[-20:-10] if len(traj) >= 20 else recent
-        avg_older = np.mean(older)
+        avg_older = float(np.mean(older))
         if avg_recent > avg_older * 1.05:
             return "improving"
-        elif avg_recent < avg_older * 0.95:
+        if avg_recent < avg_older * 0.95:
             return "declining"
-        else:
-            return "stable"
+        return "stable"
 
     async def detect_milestone(self, impact: Dict[str, Any]) -> Optional[EvolutionMilestone]:
         metrics = impact['metrics']
+        milestone: Optional[EvolutionMilestone] = None
+
         if metrics.get('sustainability', 0) > 0.8:
             best_area = 'sustainability'
             details = impact.get('details', [])
             if details:
-                best_area = max(details, key=lambda x: x.get('effectiveness', 0)).get('area', 'sustainability')
-            strategy_sig = self._generate_strategy_signature(best_area, ["sustainability_breakthrough"])
+                best_area = max(
+                    details, key=lambda x: x.get('effectiveness', 0),
+                ).get('area', 'sustainability')
+            strategy_sig = self._generate_strategy_signature(
+                best_area, ["sustainability_breakthrough"],
+            )
             milestone = EvolutionMilestone(
                 timestamp=datetime.now(timezone.utc),
                 milestone_type='breakthrough',
                 description='Achieved major sustainability improvement',
-                metrics=metrics,
+                metrics=dict(metrics),
                 human_feedback_count=len(await self.storage.get_feedback()),
                 ai_suggestion_impact=0.9,
-                strategy_signature=strategy_sig
+                strategy_signature=strategy_sig,
             )
         elif metrics.get('performance', 0) > 0.7 and metrics.get('user_satisfaction', 0) > 0.6:
             milestone = EvolutionMilestone(
                 timestamp=datetime.now(timezone.utc),
                 milestone_type='breakthrough',
                 description='System performance and user satisfaction at high levels',
-                metrics=metrics,
+                metrics=dict(metrics),
                 human_feedback_count=len(await self.storage.get_feedback()),
-                ai_suggestion_impact=0.8
+                ai_suggestion_impact=0.8,
             )
         elif len(await self.storage.get_performance_history()) > 5:
             perf_hist = await self.storage.get_performance_history(5)
             if len(perf_hist) >= 3:
-                recent_perf = [h['impact']['metrics']['performance'] for h in perf_hist if 'metrics' in h['impact']]
+                recent_perf = [
+                    h['impact']['metrics']['performance']
+                    for h in perf_hist if 'impact' in h and 'metrics' in h.get('impact', {})
+                ]
                 if len(recent_perf) >= 3:
-                    improvement = np.mean(recent_perf[-3:]) - np.mean(recent_perf[:3])
+                    improvement = (
+                        float(np.mean(recent_perf[-3:])) - float(np.mean(recent_perf[:3]))
+                    )
                     if improvement > 0.15:
                         milestone = EvolutionMilestone(
                             timestamp=datetime.now(timezone.utc),
                             milestone_type='learning_spike',
                             description=f'Performance improvement of {improvement:.1%} detected',
-                            metrics=metrics,
+                            metrics=dict(metrics),
                             human_feedback_count=len(await self.storage.get_feedback()),
-                            ai_suggestion_impact=improvement
+                            ai_suggestion_impact=improvement,
                         )
         elif len(await self.storage.get_sustainability_trajectory()) > 10:
             traj = await self.storage.get_sustainability_trajectory(5)
@@ -1177,31 +1802,34 @@ class CoEvolutionAnalyzer:
                     timestamp=datetime.now(timezone.utc),
                     milestone_type='adaptation',
                     description='System showing stable, high sustainability performance',
-                    metrics=metrics,
+                    metrics=dict(metrics),
                     human_feedback_count=len(await self.storage.get_feedback()),
-                    ai_suggestion_impact=0.7
+                    ai_suggestion_impact=0.7,
                 )
-        else:
-            milestone = None
 
         if milestone:
             await self.storage.add_milestone(milestone)
             await self._learn_from_milestone(milestone)
         return milestone
 
-    async def _learn_from_milestone(self, milestone: EvolutionMilestone):
+    async def _learn_from_milestone(self, milestone: EvolutionMilestone) -> None:
         if milestone.strategy_signature:
             await self.storage.add_milestone_strategy(milestone.strategy_signature, {
                 'effectiveness': milestone.ai_suggestion_impact,
                 'timestamp': milestone.timestamp.isoformat(),
-                'context': milestone.description
+                'context': milestone.description,
             })
             area = self._extract_area_from_milestone(milestone)
             if area:
-                await self.storage.update_historical_effectiveness(area, milestone.ai_suggestion_impact)
+                await self.storage.update_historical_effectiveness(
+                    area, milestone.ai_suggestion_impact,
+                )
         if milestone.ai_suggestion_impact > 0.7:
             milestone.reuse_count += 1
-            logger.info(f"Milestone strategy {milestone.strategy_signature} marked for reuse (impact: {milestone.ai_suggestion_impact:.2f})")
+            logger.info(
+                f"Milestone strategy {milestone.strategy_signature} marked for reuse "
+                f"(impact: {milestone.ai_suggestion_impact:.2f})"
+            )
 
     def _extract_area_from_milestone(self, milestone: EvolutionMilestone) -> Optional[str]:
         areas = ['quantum', 'moe', 'sustainability', 'user_experience', 'federated']
@@ -1210,8 +1838,9 @@ class CoEvolutionAnalyzer:
                 return area
         return None
 
+
 # ============================================================================
-# Orchestrator (Main Controller) - Enhanced
+# Orchestrator (Main Controller) - Enhanced with lifecycle
 # ============================================================================
 class CoEvolutionOrchestrator:
     def __init__(
@@ -1221,10 +1850,11 @@ class CoEvolutionOrchestrator:
         analyzer: CoEvolutionAnalyzer,
         prioritizer: RecommendationPrioritizer,
         impact_tracker: LongTermImpactTracker,
-        telemetry: CoEvolutionTelemetry,
+        telemetry: "CoEvolutionTelemetry",
         persistence: Optional[CoEvolutionPersistenceManager],
-        bio_core: Optional[EnhancedBioInspiredCore] = None
-    ):
+        bio_core: Optional[Any] = None,
+        carbon_manager: Optional[CarbonManagerProtocol] = None,
+    ) -> None:
         self.config = config
         self.storage = storage
         self.analyzer = analyzer
@@ -1233,25 +1863,31 @@ class CoEvolutionOrchestrator:
         self.telemetry = telemetry
         self.persistence = persistence
         self.bio_core = bio_core
+        self.carbon_manager = carbon_manager
 
-        # Extract bio-core managers (fix event broker)
-        self.event_broker = getattr(bio_core, 'event_broker', None) if bio_core else None
-        self.alert_system = getattr(bio_core, 'alert_system', None) if bio_core else None
-        self.self_healer = getattr(bio_core, 'self_healer', None) if bio_core else None
-        self.workflow_orchestrator = getattr(bio_core, 'workflow_orchestrator', None) if bio_core else None
-        self.swarm_coordinator = getattr(bio_core, 'swarm_coordinator', None) if bio_core else None
-        self.tick_engine = getattr(bio_core, 'tick_engine', None) if bio_core else None
-        self.quantum_bridge = getattr(bio_core, 'quantum_bridge', None) if bio_core else None
-        self.cost_benefit_engine = getattr(bio_core, 'cost_benefit_engine', None) if bio_core else None
-        self.token_manager = getattr(bio_core, 'token_manager', None) if bio_core else None
-        self.gradient_manager = getattr(bio_core, 'gradient_manager', None) if bio_core else None
+        # Observability
+        self.observability = ObservabilityHub()
+
+        # Bio-core
+        self.event_broker: Optional[EventBrokerProtocol] = None
+        self.alert_system: Optional[Any] = None
+        self.self_healer: Optional[SelfHealerProtocol] = None
+        self.workflow_orchestrator: Optional[WorkflowOrchestratorProtocol] = None
+        self.swarm_coordinator: Optional[SwarmCoordinatorProtocol] = None
+        self.tick_engine: Optional[Any] = None
+        self.quantum_bridge: Optional[Any] = None
+        self.cost_benefit_engine: Optional[Any] = None
+        self.token_manager: Optional[Any] = None
+        self.gradient_manager: Optional[Any] = None
+        if bio_core is not None:
+            self._wire_bio_core(bio_core)
 
         # External components (injected)
-        self.quantum_benchmark = None
-        self.fft_moe = None
-        self.helium_manager = None
-        self.federated_orchestrator = None
-        self.predictive_analyzer = None
+        self.quantum_benchmark: Optional[QuantumBenchmarkProtocol] = None
+        self.fft_moe: Optional[FFTMoEProtocol] = None
+        self.helium_manager: Optional[HeliumManagerProtocol] = None
+        self.federated_orchestrator: Optional[FederatedOrchestratorProtocol] = None
+        self.predictive_analyzer: Optional[PredictiveAnalyzerProtocol] = None
 
         # Circuit breakers
         self._quantum_circuit = CircuitBreaker("quantum_benchmark")
@@ -1260,109 +1896,252 @@ class CoEvolutionOrchestrator:
         self._federated_circuit = CircuitBreaker("federated_orchestrator")
         self._predictive_circuit = CircuitBreaker("predictive_analyzer")
 
+        # Governance
+        self.governance: Optional[GovernanceLayer] = (
+            GovernanceLayer(config.approval, publish_fn=self._publish_message)
+            if config.approval.enabled else None
+        )
+
+        # Safety
+        self.safety_monitor = SafetyMonitor() if config.enable_temporal_safety else None
+        if self.safety_monitor is not None:
+            self._setup_safety_invariants()
+
+        # Chaos
+        self.chaos_service: Optional[ChaosService] = (
+            ChaosService(self, config.chaos) if config.enable_chaos_testing else None
+        )
+
         # Health
         self.health_status = "healthy"
-        self.last_error = None
+        self.last_error: Optional[str] = None
 
-        # Event queue
-        self._event_queue: asyncio.Queue = asyncio.Queue()
+        # Idempotency
+        self._idempotency_seen: Set[str] = set()
+        self._idempotency_order: Deque[str] = deque(maxlen=IDEMPOTENCY_CACHE_SIZE)
+
+        # Dead letters
+        self._dead_letters: Deque[Dict[str, Any]] = deque(maxlen=MAX_DEAD_LETTERS)
+
+        # Async resources (created in start())
+        self._event_queue: Optional[asyncio.Queue] = None
         self._event_consumer_task: Optional[asyncio.Task] = None
-
-        # Background tasks
         self._background_tasks: List[asyncio.Task] = []
-        self._running = True
         self._co_evolution_task: Optional[asyncio.Task] = None
+        self._started = False
+        self._shutting_down = False
 
-        # Subscribe to events if enabled
-        if self.config.enable_event_driven and self.event_broker:
+        # Baseline config snapshot for non-destructive anomaly handling
+        self._baseline_learning_rate = config.learning_rate
+        self._baseline_exploration_rate = config.exploration_rate
+        self._baseline_adaptation_threshold = config.adaptation_threshold
+
+        logger.info("CoEvolutionOrchestrator v6.0.0 initialised (not started)")
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+
+        self._event_queue = asyncio.Queue(maxsize=10_000)
+
+        if self.config.enable_event_driven and self.event_broker is not None:
             self._subscribe_events()
 
-        # Start background tasks
         self._start_background_tasks()
 
-    # ========================================================================
-    # Injection Methods
-    # ========================================================================
+        if self.persistence is not None:
+            await self.load_state()
+
+        logger.info("CoEvolutionOrchestrator started")
+
+    async def wait_ready(self) -> None:
+        if not self._started:
+            await self.start()
+
+    # ------------------------------------------------------------------
+    # Bio-core wiring
+    # ------------------------------------------------------------------
+    def _wire_bio_core(self, bio_core: Any) -> None:
+        self.event_broker = getattr(bio_core, 'event_broker', None)
+        self.alert_system = getattr(bio_core, 'alert_system', None)
+        self.self_healer = getattr(bio_core, 'self_healer', None)
+        self.workflow_orchestrator = getattr(bio_core, 'workflow_orchestrator', None)
+        self.swarm_coordinator = getattr(bio_core, 'swarm_coordinator', None)
+        self.tick_engine = getattr(bio_core, 'tick_engine', None)
+        self.quantum_bridge = getattr(bio_core, 'quantum_bridge', None)
+        self.cost_benefit_engine = getattr(bio_core, 'cost_benefit_engine', None)
+        self.token_manager = getattr(bio_core, 'token_manager', None)
+        self.gradient_manager = getattr(bio_core, 'gradient_manager', None)
+
+    def inject_bio_core(self, bio_core: Any) -> None:
+        self.bio_core = bio_core
+        if bio_core is not None:
+            self._wire_bio_core(bio_core)
+
+    # ------------------------------------------------------------------
+    # External component injection
+    # ------------------------------------------------------------------
     def inject_components(
         self,
-        quantum_benchmark=None,
-        fft_moe=None,
-        helium_manager=None,
-        federated_orchestrator=None,
-        predictive_analyzer=None
-    ):
-        self.quantum_benchmark = quantum_benchmark
-        self.fft_moe = fft_moe
-        self.helium_manager = helium_manager
-        self.federated_orchestrator = federated_orchestrator
-        self.predictive_analyzer = predictive_analyzer
+        quantum_benchmark: Optional[QuantumBenchmarkProtocol] = None,
+        fft_moe: Optional[FFTMoEProtocol] = None,
+        helium_manager: Optional[HeliumManagerProtocol] = None,
+        federated_orchestrator: Optional[FederatedOrchestratorProtocol] = None,
+        predictive_analyzer: Optional[PredictiveAnalyzerProtocol] = None,
+        carbon_manager: Optional[CarbonManagerProtocol] = None,
+    ) -> None:
+        if quantum_benchmark is not None:
+            self.quantum_benchmark = quantum_benchmark
+        if fft_moe is not None:
+            self.fft_moe = fft_moe
+        if helium_manager is not None:
+            self.helium_manager = helium_manager
+        if federated_orchestrator is not None:
+            self.federated_orchestrator = federated_orchestrator
+        if predictive_analyzer is not None:
+            self.predictive_analyzer = predictive_analyzer
+        if carbon_manager is not None:
+            self.carbon_manager = carbon_manager
         logger.info("External components injected into Co-Evolution Orchestrator")
 
-    # ========================================================================
-    # Event Handling
-    # ========================================================================
-    def _subscribe_events(self):
-        if self.event_broker:
-            self.event_broker.subscribe('carbon_update', self._enqueue_event)
-            self.event_broker.subscribe('helium_update', self._enqueue_event)
-            self.event_broker.subscribe('alert_generated', self._enqueue_event)
-            self.event_broker.subscribe('config_updated', self._enqueue_event)
-            self.event_broker.subscribe('token_balance_update', self._enqueue_event)
-            self.event_broker.subscribe('health_update', self._enqueue_event)
-            self.event_broker.subscribe('anomaly_detected', self._enqueue_event)
+    # ------------------------------------------------------------------
+    # Safety invariants
+    # ------------------------------------------------------------------
+    def _setup_safety_invariants(self) -> None:
+        if self.safety_monitor is None:
+            return
+
+        def _learning_rate_bounded(state: Dict[str, Any]) -> bool:
+            v = state.get('learning_rate', 0.01)
+            return 0.0 <= v <= 1.0
+
+        def _exploration_rate_bounded(state: Dict[str, Any]) -> bool:
+            v = state.get('exploration_rate', 0.1)
+            return 0.0 <= v <= 1.0
+
+        def _adaptation_threshold_bounded(state: Dict[str, Any]) -> bool:
+            v = state.get('adaptation_threshold', 0.7)
+            return 0.0 <= v <= 1.0
+
+        def _carbon_intensity_bounded(state: Dict[str, Any]) -> bool:
+            v = state.get('carbon_intensity', DEFAULT_CARBON_INTENSITY)
+            return v <= CARBON_CRITICAL_THRESHOLD
+
+        def _helium_scarcity_bounded(state: Dict[str, Any]) -> bool:
+            v = state.get('helium_scarcity', 0.0)
+            return v <= 1.0
+
+        self.safety_monitor.add_invariant(
+            "learning_rate_bounded", _learning_rate_bounded,
+            "Learning rate must be in [0, 1]",
+        )
+        self.safety_monitor.add_invariant(
+            "exploration_rate_bounded", _exploration_rate_bounded,
+            "Exploration rate must be in [0, 1]",
+        )
+        self.safety_monitor.add_invariant(
+            "adaptation_threshold_bounded", _adaptation_threshold_bounded,
+            "Adaptation threshold must be in [0, 1]",
+        )
+        self.safety_monitor.add_invariant(
+            "carbon_intensity_bounded", _carbon_intensity_bounded,
+            "Carbon intensity must be below critical threshold",
+        )
+        self.safety_monitor.add_invariant(
+            "helium_scarcity_bounded", _helium_scarcity_bounded,
+            "Helium scarcity must be in [0, 1]",
+        )
+
+    # ------------------------------------------------------------------
+    # Event handling
+    # ------------------------------------------------------------------
+    def _subscribe_events(self) -> None:
+        if self.event_broker is None:
+            return
+        try:
+            for ev in (
+                'carbon_update', 'helium_update', 'alert_generated',
+                'config_updated', 'token_balance_update',
+                'health_update', 'anomaly_detected',
+            ):
+                self.event_broker.subscribe(ev, self._enqueue_event)
             logger.info("Co-Evolution Engine subscribed to core events via queue")
+        except Exception as e:
+            logger.warning(f"Event subscription failed: {e}")
 
-    async def _enqueue_event(self, event: BioEvent):
-        await self._event_queue.put(event)
+    async def _enqueue_event(self, event: Any) -> None:
+        if self._event_queue is None:
+            return
+        try:
+            self._event_queue.put_nowait(event)
+        except asyncio.QueueFull:
+            logger.warning("Event queue full; dropping event")
+            self.observability.counter('event_queue_drops')
 
-    async def _event_consumer(self):
-        while True:
+    async def _event_consumer(self) -> None:
+        assert self._event_queue is not None
+        while not self._shutting_down:
             try:
-                event = await self._event_queue.get()
-                await self._handle_event(event)
-                self._event_queue.task_done()
+                event = await asyncio.wait_for(self._event_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.error(f"Event consumer error: {e}")
-
-    async def _handle_event(self, event: BioEvent):
-        handler = getattr(self, f"_on_{event.event_type}", None)
-        if handler:
             try:
-                await handler(event)
+                await self._handle_event(event)
             except Exception as e:
-                logger.error(f"Error handling event {event.event_type}: {e}")
+                logger.error(f"Event handler error: {e}")
+            finally:
+                self._event_queue.task_done()
 
-    async def _on_carbon_update(self, event: BioEvent):
-        intensity = event.data.get('intensity', 400)
-        price = event.data.get('price', 50.0)
+    async def _handle_event(self, event: Any) -> None:
+        event_type = getattr(event, 'event_type', None)
+        if not event_type:
+            return
+        handler = getattr(self, f"_on_{event_type}", None)
+        if handler:
+            await handler(event)
+
+    async def _on_carbon_update(self, event: Any) -> None:
+        intensity = float(event.data.get('intensity', DEFAULT_CARBON_INTENSITY))
+        price = float(event.data.get('price', 50.0))
         await self.impact_tracker.record_impact(
             'sustainability',
             {'carbon_intensity': intensity, 'carbon_price': price},
-            1.0 - (intensity / 800)
+            1.0 - (intensity / CARBON_CRITICAL_THRESHOLD),
         )
 
-    async def _on_helium_update(self, event: BioEvent):
-        scarcity = event.data.get('scarcity', 0.5)
-        if self.helium_manager:
-            pass
+    async def _on_helium_update(self, event: Any) -> None:
+        scarcity = float(event.data.get('scarcity', 0.5))
         await self.impact_tracker.record_impact(
             'sustainability',
             {'helium_scarcity': scarcity, 'helium_price': event.data.get('price', 0.5)},
-            1.0 - scarcity
+            1.0 - scarcity,
         )
 
-    async def _on_alert_generated(self, event: BioEvent):
+    async def _on_alert_generated(self, event: Any) -> None:
         if event.data.get('severity') == 'critical':
-            logger.warning("Critical alert; triggering self‑healing")
-            self.config.exploration_rate = 0.05
-            if self.config.enable_self_healing and self.self_healer:
-                await self.self_healer.apply_healing('damage_accumulation')
-            if self.workflow_orchestrator and self.config.workflow_on_critical_alert:
-                await self.workflow_orchestrator.execute_workflow(self.config.workflow_on_critical_alert)
+            logger.warning("Critical alert; triggering self-healing")
+            self.config.exploration_rate = self._baseline_exploration_rate * 0.5
+            if self.config.enable_self_healing and self.self_healer is not None:
+                try:
+                    await self.self_healer.apply_healing('damage_accumulation')
+                except Exception as e:
+                    logger.error(f"Self-healing failed: {e}")
+            if (self.workflow_orchestrator is not None and
+                    self.config.workflow_on_critical_alert):
+                try:
+                    await self.workflow_orchestrator.execute_workflow(
+                        self.config.workflow_on_critical_alert,
+                    )
+                except Exception as e:
+                    logger.error(f"Workflow failed: {e}")
 
-    async def _on_config_updated(self, event: BioEvent):
+    async def _on_config_updated(self, event: Any) -> None:
         updates = event.data.get('updates', {})
         if 'co_evolution' in updates:
             new = updates['co_evolution']
@@ -1371,71 +2150,127 @@ class CoEvolutionOrchestrator:
                     setattr(self.config, key, value)
             logger.info("Co-Evolution configuration reloaded")
 
-    async def _on_token_update(self, event: BioEvent):
+    async def _on_token_balance_update(self, event: Any) -> None:
         pass
 
-    async def _on_health_update(self, event: BioEvent):
+    async def _on_health_update(self, event: Any) -> None:
         self.health_status = event.data.get('status', 'healthy')
 
-    async def _on_anomaly_detected(self, event: BioEvent):
-        if event.data.get('metric') == 'carbon_intensity':
-            self.config.learning_rate *= 0.9
-        if event.data.get('metric') == 'helium_scarcity':
-            self.config.adaptation_threshold = max(0.5, self.config.adaptation_threshold * 0.9)
+    async def _on_anomaly_detected(self, event: Any) -> None:
+        metric = event.data.get('metric')
+        if metric == 'carbon_intensity':
+            # Derive from baseline — do NOT compound
+            self.config.learning_rate = self._baseline_learning_rate * 0.9
+        elif metric == 'helium_scarcity':
+            self.config.adaptation_threshold = max(
+                0.5, self._baseline_adaptation_threshold * 0.9,
+            )
 
-    # ========================================================================
-    # Background Tasks
-    # ========================================================================
-    def _start_background_tasks(self):
-        if self.config.enable_event_driven:
+    # ------------------------------------------------------------------
+    # Background tasks
+    # ------------------------------------------------------------------
+    def _start_background_tasks(self) -> None:
+        if self.config.enable_event_driven and self._event_queue is not None:
             self._event_consumer_task = asyncio.create_task(self._event_consumer())
             self._background_tasks.append(self._event_consumer_task)
 
-        async def co_evolution_loop():
-            while self._running:
+        async def co_evolution_loop() -> None:
+            while not self._shutting_down:
                 try:
                     await self.co_evolve()
                     await asyncio.sleep(self.config.co_evolution_interval)
+                except asyncio.CancelledError:
+                    break
                 except Exception as e:
                     logger.error(f"Co-evolution loop error: {e}")
                     await asyncio.sleep(60)
+
         self._co_evolution_task = asyncio.create_task(co_evolution_loop())
         self._background_tasks.append(self._co_evolution_task)
 
-        if self.config.enable_swarm_coordination and self.swarm_coordinator:
-            async def swarm_loop():
-                while True:
+        if self.config.enable_swarm_coordination and self.swarm_coordinator is not None:
+            async def swarm_loop() -> None:
+                while not self._shutting_down:
                     try:
                         await self.share_with_swarm()
                         await asyncio.sleep(self.config.swarm_share_interval)
+                    except asyncio.CancelledError:
+                        break
                     except Exception as e:
                         logger.error(f"Swarm update error: {e}")
                         await asyncio.sleep(120)
-            t = asyncio.create_task(swarm_loop())
-            self._background_tasks.append(t)
 
-    # ========================================================================
-    # Swarm Coordination
-    # ========================================================================
-    async def share_with_swarm(self):
-        if not self.swarm_coordinator:
+            self._background_tasks.append(asyncio.create_task(swarm_loop()))
+
+        if self.config.enable_chaos_testing and self.chaos_service is not None:
+            async def chaos_loop() -> None:
+                while not self._shutting_down:
+                    try:
+                        await asyncio.sleep(self.config.chaos.interval_seconds)
+                        await self.chaos_service.run_chaos_test()
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        logger.error(f"Chaos loop error: {e}")
+                        await asyncio.sleep(60)
+
+            self._background_tasks.append(asyncio.create_task(chaos_loop()))
+
+    # ------------------------------------------------------------------
+    # Idempotency
+    # ------------------------------------------------------------------
+    def _is_duplicate(self, key: Optional[str]) -> bool:
+        if not key or not self.config.enable_idempotency:
+            return False
+        if key in self._idempotency_seen:
+            return True
+        self._idempotency_seen.add(key)
+        self._idempotency_order.append(key)
+        if len(self._idempotency_seen) > self._idempotency_order.maxlen:
+            oldest = self._idempotency_order[0]
+            self._idempotency_seen.discard(oldest)
+        return False
+
+    # ------------------------------------------------------------------
+    # Swarm coordination
+    # ------------------------------------------------------------------
+    async def share_with_swarm(self) -> None:
+        if not self.config.enable_swarm_coordination or self.swarm_coordinator is None:
             return
         historical = await self.storage.get_historical_effectiveness()
         payload = {
-            'orchestrator_id': hashlib.md5(str(historical).encode()).hexdigest()[:8],
-            'sustainability_score': self.impact_tracker.get_overall_trend().get('average_sustainability_score', 0.5),
+            'orchestrator_id': uuid.uuid4().hex[:8],
+            'sustainability_score': self.impact_tracker.get_overall_trend().get(
+                'average_sustainability_score', 0.5,
+            ),
             'milestones': len(await self.storage.get_milestones()),
             'feedback_count': len(await self.storage.get_feedback()),
             'historical_effectiveness': historical,
             'mopd_enabled': self.config.enable_mopd,
         }
-        await self.swarm_coordinator.share_predictions(payload)
+        try:
+            await self.swarm_coordinator.share_predictions(payload)
+        except Exception as e:
+            logger.warning(f"Swarm share failed: {e}")
+            self._dead_letters.append({
+                'topic': 'swarm',
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'error': str(e),
+            })
 
-    # ========================================================================
-    # Main Co-Evolution Cycle (Enhanced with safety/approval)
-    # ========================================================================
-    async def co_evolve(self) -> Dict[str, Any]:
-        self.telemetry.increment('co_evolution_cycles')
+    # ------------------------------------------------------------------
+    # Main co-evolution cycle
+    # ------------------------------------------------------------------
+    async def co_evolve(self, idempotency_key: Optional[str] = None) -> Dict[str, Any]:
+        await self.wait_ready()
+        if self._is_duplicate(idempotency_key):
+            return {
+                'status': 'duplicate',
+                'idempotency_key': idempotency_key,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+            }
+
+        self.observability.counter('co_evolution_cycles')
 
         system_state = await self._collect_system_state()
         human_feedback = await self.analyzer.aggregate_human_feedback_with_sentiment()
@@ -1445,9 +2280,8 @@ class CoEvolutionOrchestrator:
         if predicted:
             opportunities.extend(predicted)
 
-        # Generate recommendations (consistent dict return)
         rec_result = await self.analyzer.generate_holistic_recommendations(
-            system_state, opportunities, return_mopd=self.config.enable_mopd
+            system_state, opportunities, return_mopd=self.config.enable_mopd,
         )
         recommendations = rec_result.get('recommendations', [])
         mopd_pareto_front = rec_result.get('mopd_pareto_front', None)
@@ -1456,30 +2290,58 @@ class CoEvolutionOrchestrator:
         historical = await self.storage.get_historical_effectiveness()
         prioritized = self.prioritizer.prioritize_recommendations(recommendations, historical)
 
-        # Filter recommendations requiring human approval
-        approved_recs = prioritized
-        if self.config.enable_human_approval:
-            approved_recs = []
+        # Human approval filtering
+        approved_recs: List[Dict[str, Any]] = []
+        if self.governance is not None:
             for rec in prioritized:
-                # Critical areas or high priority
-                if (rec['area'] == 'sustainability' and rec['priority'] > 0.8) or rec['priority'] > 0.95:
-                    if await self.request_approval(rec):
+                needs_approval = (
+                    (rec['area'] == 'sustainability' and
+                     rec['priority'] > self.config.approval.require_for_sustainability_above_priority)
+                    or rec['priority'] > self.config.approval.require_for_global_priority_above
+                )
+                if needs_approval:
+                    approval = await self.governance.request_approval({
+                        'action': 'approve_recommendation',
+                        'recommendation': rec,
+                    })
+                    if approval.status in (ApprovalStatus.APPROVED, ApprovalStatus.AUTO_APPROVED):
                         approved_recs.append(rec)
                     else:
-                        logger.info(f"Recommendation {rec['action']} skipped: human approval not granted")
+                        logger.info(
+                            f"Recommendation {rec.get('action', 'unknown')} skipped: "
+                            f"approval status={approval.status.value}"
+                        )
                 else:
                     approved_recs.append(rec)
+        else:
+            approved_recs = prioritized
 
         # Temporal safety check
-        if self.config.enable_temporal_safety:
-            violations = await self.check_invariants(system_state)
+        if self.safety_monitor is not None:
+            safety_state = {
+                'learning_rate': self.config.learning_rate,
+                'exploration_rate': self.config.exploration_rate,
+                'adaptation_threshold': self.config.adaptation_threshold,
+                'carbon_intensity': (
+                    self.carbon_manager.carbon_intensity
+                    if self.carbon_manager is not None and hasattr(self.carbon_manager, 'carbon_intensity')
+                    else DEFAULT_CARBON_INTENSITY
+                ),
+                'helium_scarcity': (
+                    system_state.get('components', {}).get('helium', {})
+                    .get('current', {}).get('scarcity_index', 0.0)
+                ),
+            }
+            violations = self.safety_monitor.check(safety_state)
             if violations:
                 logger.warning(f"Temporal safety violations detected: {violations}")
-                # Remove recommendations that would exacerbate violations
-                approved_recs = [r for r in approved_recs if r['area'] not in ['sustainability']]  # simplistic
+                # Derive from baseline non-destructively
+                self.config.learning_rate = self._baseline_learning_rate
+                self.config.exploration_rate = self._baseline_exploration_rate
+                self.config.adaptation_threshold = self._baseline_adaptation_threshold
 
         if not approved_recs:
-            applied = []
+            applied: List[Dict[str, Any]] = []
         else:
             applied = await self._apply_recommendations(approved_recs)
 
@@ -1491,18 +2353,22 @@ class CoEvolutionOrchestrator:
                 await self.impact_tracker.record_impact(
                     area,
                     item['result'],
-                    impact['metrics']['sustainability']
+                    impact['metrics']['sustainability'],
                 )
-                await self.storage.add_sustainability_score(impact['metrics']['sustainability'])
+                await self.storage.add_sustainability_score(
+                    impact['metrics']['sustainability'],
+                )
 
         await self.storage.add_performance_record({
             'timestamp': datetime.now(timezone.utc),
-            'impact': impact
+            'impact': impact,
         })
 
         milestone = await self.analyzer.detect_milestone(impact)
         if milestone:
-            logger.info(f"Milestone detected: {milestone.milestone_type} - {milestone.description}")
+            logger.info(
+                f"Milestone detected: {milestone.milestone_type} - {milestone.description}"
+            )
 
         for item in applied:
             if item.get('result', {}).get('success'):
@@ -1510,12 +2376,14 @@ class CoEvolutionOrchestrator:
                 eff = item.get('result', {}).get('effectiveness', 0.5)
                 await self.storage.update_historical_effectiveness(area, eff)
 
-        self.telemetry.gauge('sustainability_score', impact['metrics']['sustainability'])
-        self.telemetry.gauge('performance_score', impact['metrics']['performance'])
-        self.telemetry.gauge('milestone_count', len(await self.storage.get_milestones()))
+        self.observability.gauge('sustainability_score', impact['metrics']['sustainability'])
+        self.observability.gauge('performance_score', impact['metrics']['performance'])
+        self.observability.gauge(
+            'milestone_count', len(await self.storage.get_milestones()),
+        )
         if self.config.enable_mopd and mopd_pareto_front:
-            self.telemetry.increment('mopd_generations')
-            self.telemetry.histogram('mopd_pareto_front_size', len(mopd_pareto_front))
+            self.observability.counter('mopd_generations')
+            self.observability.histogram('mopd_pareto_front_size', len(mopd_pareto_front))
 
         return {
             'status': 'success' if applied else 'partial',
@@ -1527,138 +2395,83 @@ class CoEvolutionOrchestrator:
             'sustainability_trend': await self.analyzer.calculate_trend(),
             'long_term_trend': self.impact_tracker.get_overall_trend(),
             'mopd_pareto_front': mopd_pareto_front,
-            'mopd_best_plan': mopd_best_plan
+            'mopd_best_plan': mopd_best_plan,
         }
 
-    # ========================================================================
-    # Temporal Safety and Human Approval
-    # ========================================================================
-    async def check_invariants(self, system_state: Dict[str, Any]) -> List[str]:
-        """Check safety invariants. Returns list of violation strings."""
-        violations = []
-        # Check helium scarcity
-        helium = system_state.get('components', {}).get('helium', {})
-        scarcity = helium.get('current', {}).get('scarcity_index', 0)
-        if scarcity > 0.9:
-            violations.append(f"Helium scarcity critical: {scarcity:.2f}")
-        # Check carbon intensity (if available)
-        if self.carbon_manager:
-            intensity = await self.carbon_manager.get_current_intensity()
-            if intensity > 800:
-                violations.append(f"Carbon intensity critical: {intensity}")
-        return violations
+    # ------------------------------------------------------------------
+    # Public: approval decision
+    # ------------------------------------------------------------------
+    async def submit_approval_decision(self, request_id: str, approved: bool) -> bool:
+        if self.governance is None:
+            return False
+        return await self.governance.submit_decision(request_id, approved)
 
-    async def request_approval(self, recommendation: Dict[str, Any]) -> bool:
-        """Request human approval for a critical recommendation. Returns True if approved."""
-        if not self.config.enable_human_approval:
-            return True  # auto-approve if disabled
-        # In a real system, this would send a request and await response.
-        logger.warning(f"Human approval required for recommendation: {recommendation.get('action', 'unknown')}. Auto-denying.")
-        return False
-
-    # ========================================================================
-    # Chaos Testing
-    # ========================================================================
-    async def inject_fault(self, fault_type: str, **params):
-        if not self.config.enable_chaos_testing:
-            logger.info("Chaos testing disabled")
-            return
-        if fault_type == 'helium_critical':
-            if self.helium_manager:
-                # Simulate critical helium scarcity
-                # In a real system, override provider; here we just log
-                logger.warning("Injected helium_critical fault")
-        elif fault_type == 'quantum_failure':
-            self.quantum_benchmark = None
-            logger.warning("Injected quantum_failure")
-        elif fault_type == 'carbon_spike':
-            if hasattr(self, 'carbon_manager') and self.carbon_manager:
-                self.carbon_manager.carbon_intensity = 900.0
-                logger.warning("Injected carbon_spike")
-        else:
-            logger.warning(f"Unknown fault type: {fault_type}")
+    # ------------------------------------------------------------------
+    # Public: chaos
+    # ------------------------------------------------------------------
+    async def inject_fault(self, fault_type: Union[str, FaultType],
+                           **params: Any) -> Dict[str, Any]:
+        if self.chaos_service is None:
+            return {'status': 'disabled'}
+        return await self.chaos_service.inject_fault(fault_type, **params)
 
     async def run_chaos_test(self) -> Dict[str, Any]:
-        if not self.config.enable_chaos_testing:
+        if self.chaos_service is None:
             return {'status': 'disabled'}
-        report = {'faults': [], 'results': {}}
+        return await self.chaos_service.run_chaos_test()
 
-        # Fault 1: quantum failure
-        await self.inject_fault('quantum_failure')
-        report['faults'].append('quantum_failure')
-        system_state = await self._collect_system_state()
-        if 'error' in system_state.get('components', {}).get('quantum', {}):
-            report['results']['quantum_failure'] = 'component_missing'
-        else:
-            report['results']['quantum_failure'] = 'component_still_present'
-
-        # Reset quantum
-        if self.quantum_benchmark is None:
-            # Assume injection removed it; we can't restore without re-injection
-            pass
-
-        # Fault 2: carbon spike
-        await self.inject_fault('carbon_spike')
-        report['faults'].append('carbon_spike')
-        violations = await self.check_invariants(system_state)
-        report['results']['carbon_spike'] = {'violations': violations}
-
-        return report
-
-    # ========================================================================
-    # Other methods (collect state, predict, apply, measure, queries, etc.)
-    # (unchanged from previous version, but with MOPD and explanation enhancements)
-    # ... [we include all the existing methods from the original file, but with modifications where necessary]
-    # For brevity, we refer to the original file's methods; they remain the same.
-    # However, we need to ensure they are present. We'll include the remaining methods as in the file.
-
+    # ------------------------------------------------------------------
+    # System state collection
+    # ------------------------------------------------------------------
     async def _collect_system_state(self) -> Dict[str, Any]:
-        # ... (same as before)
-        state = {'timestamp': datetime.now(timezone.utc).isoformat(), 'components': {}}
-        if self.quantum_benchmark:
+        state: Dict[str, Any] = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'components': {},
+        }
+        if self.quantum_benchmark is not None:
             try:
                 state['components']['quantum'] = await self._quantum_circuit.call(
                     retry_async,
                     self.quantum_benchmark.get_benchmark_summary,
                     self.config.max_retries,
                     self.config.retry_base_delay_ms,
-                    self.config.retry_max_delay_ms
+                    self.config.retry_max_delay_ms,
                 )
             except Exception as e:
                 logger.error(f"Quantum benchmark failed: {e}")
                 state['components']['quantum'] = {'error': str(e)}
-        if self.fft_moe:
+        if self.fft_moe is not None:
             try:
                 state['components']['moe'] = await self._moe_circuit.call(
                     retry_async,
                     self.fft_moe.get_fft_moe_status,
                     self.config.max_retries,
                     self.config.retry_base_delay_ms,
-                    self.config.retry_max_delay_ms
+                    self.config.retry_max_delay_ms,
                 )
             except Exception as e:
                 logger.error(f"FFT-MoE failed: {e}")
                 state['components']['moe'] = {'error': str(e)}
-        if self.helium_manager:
+        if self.helium_manager is not None:
             try:
                 state['components']['helium'] = await self._helium_circuit.call(
                     retry_async,
                     self.helium_manager.get_stats,
                     self.config.max_retries,
                     self.config.retry_base_delay_ms,
-                    self.config.retry_max_delay_ms
+                    self.config.retry_max_delay_ms,
                 )
             except Exception as e:
                 logger.error(f"Helium manager failed: {e}")
                 state['components']['helium'] = {'error': str(e)}
-        if self.federated_orchestrator:
+        if self.federated_orchestrator is not None:
             try:
                 state['components']['federated'] = await self._federated_circuit.call(
                     retry_async,
                     self.federated_orchestrator.get_status,
                     self.config.max_retries,
                     self.config.retry_base_delay_ms,
-                    self.config.retry_max_delay_ms
+                    self.config.retry_max_delay_ms,
                 )
             except Exception as e:
                 logger.error(f"Federated orchestrator failed: {e}")
@@ -1672,22 +2485,33 @@ class CoEvolutionOrchestrator:
         return state
 
     def _calculate_system_metrics(self, components: Dict[str, Any]) -> Dict[str, float]:
-        metrics = {'overall_health': 0.0, 'sustainability_score': 0.0, 'performance_score': 0.0, 'user_engagement': 0.0}
+        metrics = {
+            'overall_health': 0.0, 'sustainability_score': 0.0,
+            'performance_score': 0.0, 'user_engagement': 0.0,
+        }
         if components.get('helium'):
             scarcity = components['helium'].get('current', {}).get('scarcity_index', 0)
-            metrics['sustainability_score'] = 1.0 - scarcity
+            metrics['sustainability_score'] = max(0.0, 1.0 - scarcity)
         if components.get('quantum'):
-            metrics['performance_score'] = min(1.0, components['quantum'].get('average_speedup', 0) / 5)
+            metrics['performance_score'] = min(
+                1.0, components['quantum'].get('average_speedup', 0) / 5,
+            )
         if components.get('moe'):
-            metrics['user_engagement'] = min(1.0, components['moe'].get('num_clients', 0) / 100)
-        metrics['overall_health'] = (metrics['sustainability_score'] * 0.4 +
-                                     metrics['performance_score'] * 0.3 +
-                                     metrics['user_engagement'] * 0.3)
+            metrics['user_engagement'] = min(
+                1.0, components['moe'].get('num_clients', 0) / 100,
+            )
+        metrics['overall_health'] = (
+            metrics['sustainability_score'] * 0.4 +
+            metrics['performance_score'] * 0.3 +
+            metrics['user_engagement'] * 0.3
+        )
         return metrics
 
+    # ------------------------------------------------------------------
+    # Predictive opportunities
+    # ------------------------------------------------------------------
     async def _predict_opportunities(self, system_state: Dict[str, Any]) -> List[Dict[str, Any]]:
-        # ... (same as before)
-        opportunities = []
+        opportunities: List[Dict[str, Any]] = []
         if not self.predictive_analyzer:
             return opportunities
 
@@ -1695,16 +2519,16 @@ class CoEvolutionOrchestrator:
             try:
                 forecast = self.tick_engine.get_helium_forecast(4)
                 if forecast and len(forecast) > 3:
-                    avg_future = np.mean(forecast)
+                    avg_future = float(np.mean(forecast))
                     if avg_future < 0.3:
                         opportunities.append({
                             'area': 'sustainability',
                             'type': 'predicted_constraint',
                             'priority': 0.85,
-                            'suggestion': f'Helium scarcity predicted in 4 hours - proactive reduction needed',
+                            'suggestion': 'Helium scarcity predicted in 4 hours - proactive reduction needed',
                             'expected_impact': 'Prevent critical helium shortage',
                             'predicted': True,
-                            'timeframe_hours': 4
+                            'timeframe_hours': 4,
                         })
             except Exception as e:
                 logger.warning(f"TimeTickEngine forecast error: {e}")
@@ -1720,7 +2544,7 @@ class CoEvolutionOrchestrator:
                         'priority': 0.8,
                         'suggestion': 'QuantumBridge indicates high helium penalty - implement recovery',
                         'expected_impact': '50% reduction in helium usage',
-                        'predicted': True
+                        'predicted': True,
                     })
             except Exception as e:
                 logger.warning(f"QuantumBridge error: {e}")
@@ -1735,7 +2559,7 @@ class CoEvolutionOrchestrator:
                         'priority': 0.7,
                         'suggestion': f'System-wide optimization recommended (ROI: {analysis.roi:.2f})',
                         'expected_impact': 'Overall performance uplift',
-                        'predicted': True
+                        'predicted': True,
                     })
             except Exception as e:
                 logger.warning(f"CostBenefitEngine error: {e}")
@@ -1747,24 +2571,32 @@ class CoEvolutionOrchestrator:
                     self.predictive_analyzer.predict_federation_trend,
                     self.config.max_retries,
                     self.config.retry_base_delay_ms,
-                    self.config.retry_max_delay_ms
+                    self.config.retry_max_delay_ms,
                 )
                 if forecast and forecast.get('predicted_sustainability_score', 0.5) < 0.4:
                     opportunities.append({
                         'area': 'federated',
                         'type': 'predicted_performance_decline',
                         'priority': 0.7,
-                        'suggestion': 'Federated learning sustainability predicted to decline - proactive optimization needed',
+                        'suggestion': (
+                            'Federated learning sustainability predicted to decline - '
+                            'proactive optimization needed'
+                        ),
                         'expected_impact': 'Prevent performance degradation',
-                        'predicted': True
+                        'predicted': True,
                     })
             except Exception as e:
                 logger.warning(f"Predictive opportunity identification error: {e}")
 
         return opportunities
 
-    async def _apply_recommendations(self, recommendations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        applied = []
+    # ------------------------------------------------------------------
+    # Apply recommendations
+    # ------------------------------------------------------------------
+    async def _apply_recommendations(
+        self, recommendations: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        applied: List[Dict[str, Any]] = []
         for rec in recommendations[:3]:
             try:
                 if rec['area'] == 'quantum':
@@ -1777,47 +2609,59 @@ class CoEvolutionOrchestrator:
                     result = await self._apply_ux_improvement()
                 else:
                     result = await self._apply_system_wide_optimization()
+
+                # Do not fabricate random effectiveness — use provided or measured
                 if result.get('success', False):
-                    result['effectiveness'] = 0.7 + np.random.random() * 0.2
-                applied.append({'recommendation': rec, 'result': result, 'timestamp': datetime.now(timezone.utc).isoformat()})
+                    result.setdefault('effectiveness', 0.6)
+                applied.append({
+                    'recommendation': rec,
+                    'result': result,
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                })
             except Exception as e:
                 logger.error(f"Failed to apply recommendation: {e}")
-                applied.append({'recommendation': rec, 'result': {'success': False, 'error': str(e)}})
+                applied.append({
+                    'recommendation': rec,
+                    'result': {'success': False, 'error': str(e)},
+                })
         return applied
 
     async def _apply_quantum_optimization(self) -> Dict[str, Any]:
-        if self.quantum_benchmark:
+        if self.quantum_benchmark is not None:
             result = await self.quantum_benchmark.run_benchmark(
                 task_name="circuit_optimization_test",
-                task_input={'type': 'optimization', 'size': 50}
+                task_input={'type': 'optimization', 'size': 50},
             )
+            savings = getattr(result, 'energy_savings_percent', 0.0)
             return {
                 'success': True,
-                'energy_savings': result.energy_savings_percent,
-                'recommendation': result.recommended_approach,
-                'effectiveness': min(1.0, result.energy_savings_percent / 50)
+                'energy_savings': savings,
+                'recommendation': getattr(result, 'recommended_approach', ''),
+                'effectiveness': min(1.0, savings / 50.0),
             }
         return {'success': False, 'error': 'Quantum benchmark not available'}
 
     async def _apply_moe_improvement(self) -> Dict[str, Any]:
-        if self.fft_moe:
+        if self.fft_moe is not None:
             specialization = await self.fft_moe.analyze_expert_specialization()
+            specialized = specialization.get('total_specialized_experts', 0)
             return {
                 'success': True,
-                'specialization_score': specialization['total_specialized_experts'],
-                'top_domain': specialization['top_performing_domain'],
-                'effectiveness': min(1.0, specialization['total_specialized_experts'] / 8)
+                'specialization_score': specialized,
+                'top_domain': specialization.get('top_performing_domain'),
+                'effectiveness': min(1.0, specialized / 8.0),
             }
         return {'success': False, 'error': 'FFT-MoE not available'}
 
     async def _apply_sustainability_measure(self) -> Dict[str, Any]:
-        if self.helium_manager:
+        if self.helium_manager is not None:
             forecast = await self.helium_manager.get_sustainability_forecast()
+            days = forecast.get('days_to_critical', 0)
             return {
                 'success': True,
                 'forecast': forecast,
                 'actions_taken': self._generate_recommendations(forecast),
-                'effectiveness': 0.8 if forecast.get('days_to_critical', 0) > 7 else 0.5
+                'effectiveness': 0.8 if days > 7 else 0.5,
             }
         return {'success': False, 'error': 'Helium manager not available'}
 
@@ -1825,26 +2669,42 @@ class CoEvolutionOrchestrator:
         return {'success': True, 'feedback_loop_improved': True, 'user_engagement_boost': 1.2, 'effectiveness': 0.7}
 
     async def _apply_system_wide_optimization(self) -> Dict[str, Any]:
-        return {'success': True, 'optimizations_applied': ['cache_clearing', 'model_pruning', 'data_compression'], 'effectiveness': 0.6}
+        return {
+            'success': True,
+            'optimizations_applied': ['cache_clearing', 'model_pruning', 'data_compression'],
+            'effectiveness': 0.6,
+        }
 
     def _generate_recommendations(self, forecast: Dict[str, Any]) -> List[str]:
         days = forecast.get('days_to_critical')
         if days is not None:
             if days <= 3:
-                return ["URGENT: Implement immediate helium reduction measures", "Prioritize critical jobs only"]
-            elif days <= 7:
-                return ["Accelerate helium efficiency improvements", "Begin transitioning to helium-efficient operations"]
+                return [
+                    "URGENT: Implement immediate helium reduction measures",
+                    "Prioritize critical jobs only",
+                ]
+            if days <= 7:
+                return [
+                    "Accelerate helium efficiency improvements",
+                    "Begin transitioning to helium-efficient operations",
+                ]
         return []
 
+    # ------------------------------------------------------------------
+    # Impact measurement
+    # ------------------------------------------------------------------
     async def _measure_impact(self, applied: List[Dict[str, Any]]) -> Dict[str, Any]:
-        impact = {
+        impact: Dict[str, Any] = {
             'timestamp': datetime.now(timezone.utc).isoformat(),
-            'metrics': {'performance': 0.0, 'sustainability': 0.0, 'user_satisfaction': 0.0, 'overall_effectiveness': 0.0},
-            'details': []
+            'metrics': {
+                'performance': 0.0, 'sustainability': 0.0,
+                'user_satisfaction': 0.0, 'overall_effectiveness': 0.0,
+            },
+            'details': [],
         }
         for item in applied:
             if item.get('result', {}).get('success'):
-                effectiveness = item['result'].get('effectiveness', 0.7)
+                effectiveness = float(item['result'].get('effectiveness', 0.6))
                 area = item['recommendation'].get('area', 'general')
                 if area == 'quantum':
                     impact['metrics']['performance'] += 0.15 * effectiveness
@@ -1856,14 +2716,15 @@ class CoEvolutionOrchestrator:
                 else:
                     impact['metrics']['performance'] += 0.1 * effectiveness
                 impact['details'].append({
-                    'area': area, 'impact': 'positive', 'effectiveness': effectiveness,
-                    'details': item['result'], 'recommendation': item['recommendation'].get('action', 'Unknown action')
+                    'area': area,
+                    'impact': 'positive',
+                    'effectiveness': effectiveness,
+                    'details': item['result'],
+                    'recommendation': item['recommendation'].get('action', 'Unknown action'),
                 })
-        total = sum(impact['metrics'].values())
-        if total > 0:
-            impact['metrics']['performance'] = min(1.0, impact['metrics']['performance'] / 0.8)
-            impact['metrics']['sustainability'] = min(1.0, impact['metrics']['sustainability'] / 0.8)
-            impact['metrics']['user_satisfaction'] = min(1.0, impact['metrics']['user_satisfaction'] / 0.8)
+        impact['metrics']['performance'] = min(1.0, impact['metrics']['performance'] / 0.8)
+        impact['metrics']['sustainability'] = min(1.0, impact['metrics']['sustainability'] / 0.8)
+        impact['metrics']['user_satisfaction'] = min(1.0, impact['metrics']['user_satisfaction'] / 0.8)
         impact['metrics']['overall_effectiveness'] = (
             impact['metrics']['performance'] * 0.3 +
             impact['metrics']['sustainability'] * 0.4 +
@@ -1872,10 +2733,11 @@ class CoEvolutionOrchestrator:
         impact['long_term_trend'] = self.impact_tracker.get_overall_trend()
         return impact
 
-    # ========================================================================
-    # Public Query Methods (with MOPD)
-    # ========================================================================
+    # ------------------------------------------------------------------
+    # Public query methods
+    # ------------------------------------------------------------------
     async def get_evolution_status(self) -> Dict[str, Any]:
+        await self.wait_ready()
         return {
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'performance_history': len(await self.storage.get_performance_history()),
@@ -1891,84 +2753,121 @@ class CoEvolutionOrchestrator:
             'long_term_trend': self.impact_tracker.get_overall_trend(),
             'mopd_enabled': self.config.enable_mopd,
             'mopd_plans': len(await self.storage.get_mopd_plans()),
-            'human_approval_enabled': self.config.enable_human_approval,
+            'human_approval_enabled': self.config.approval.enabled,
             'temporal_safety_enabled': self.config.enable_temporal_safety,
             'chaos_testing_enabled': self.config.enable_chaos_testing,
+            'dead_letters': len(self._dead_letters),
         }
 
     async def get_feedback_sentiment_summary(self) -> Dict[str, Any]:
         feedback = await self.storage.get_feedback()
         if not feedback:
             return {'status': 'no_feedback'}
-        sentiments = [fb.get('sentiment', {}).get('score', 0) for fb in feedback if 'sentiment' in fb]
+        sentiments = [
+            fb.get('sentiment', {}).get('score', 0)
+            for fb in feedback if 'sentiment' in fb
+        ]
         if not sentiments:
             return {'status': 'no_sentiment_data'}
         return {
-            'average_sentiment': np.mean(sentiments),
+            'average_sentiment': float(np.mean(sentiments)),
             'positive_ratio': sum(1 for s in sentiments if s > 0.2) / len(sentiments),
             'negative_ratio': sum(1 for s in sentiments if s < -0.2) / len(sentiments),
             'neutral_ratio': sum(1 for s in sentiments if -0.2 <= s <= 0.2) / len(sentiments),
             'samples': len(sentiments),
-            'trend': 'improving' if len(sentiments) > 10 and np.mean(sentiments[-5:]) > np.mean(sentiments[:5]) else 'stable'
+            'trend': (
+                'improving'
+                if len(sentiments) > 10 and
+                float(np.mean(sentiments[-5:])) > float(np.mean(sentiments[:5]))
+                else 'stable'
+            ),
         }
 
     async def get_milestone_summary(self) -> Dict[str, Any]:
         milestones = await self.storage.get_milestones()
         if not milestones:
             return {'status': 'no_milestones'}
-        types = defaultdict(int)
-        impacts = []
+        types: Dict[str, int] = defaultdict(int)
+        impacts: List[float] = []
         for m in milestones:
             types[m.milestone_type] += 1
             impacts.append(m.ai_suggestion_impact)
         return {
             'total_milestones': len(milestones),
             'types': dict(types),
-            'average_impact': np.mean(impacts) if impacts else 0,
-            'max_impact': max(impacts) if impacts else 0,
+            'average_impact': float(np.mean(impacts)) if impacts else 0.0,
+            'max_impact': max(impacts) if impacts else 0.0,
             'reused_strategies': sum(1 for m in milestones if m.reuse_count > 0),
-            'most_recent': milestones[-1].to_dict() if milestones else None
+            'most_recent': milestones[-1].to_dict() if milestones else None,
         }
 
     async def get_recommendation_pareto_front(
-        self,
-        system_state: Dict[str, Any],
-        opportunities: List[Dict[str, Any]]
+        self, system_state: Dict[str, Any], opportunities: List[Dict[str, Any]],
     ) -> List[MOPDPlan]:
+        await self.wait_ready()
         if not self.config.enable_mopd:
             return []
-        rec_result = await self.analyzer.generate_holistic_recommendations(system_state, opportunities, return_mopd=True)
+        rec_result = await self.analyzer.generate_holistic_recommendations(
+            system_state, opportunities, return_mopd=True,
+        )
         if 'mopd_pareto_front' in rec_result:
             return [MOPDPlan.from_dict(p) for p in rec_result['mopd_pareto_front']]
         return []
 
     async def get_mopd_summary(self) -> Dict[str, Any]:
+        await self.wait_ready()
         if not self.config.enable_mopd:
             return {'enabled': False}
         plans = await self.storage.get_mopd_plans(20)
         return {
             'enabled': True,
-            'objective_weights': self.config.mopd.objective_weights,
+            'objective_weights': dict(self.config.mopd.objective_weights),
             'grid_resolution': self.config.mopd.grid_resolution,
             'total_mopd_plans': len(await self.storage.get_mopd_plans()),
-            'sample_plans': [p.to_dict() for p in plans]
+            'sample_plans': [p.to_dict() for p in plans],
         }
 
-    # ========================================================================
-    # Health Status
-    # ========================================================================
+    async def get_prometheus_metrics(self) -> str:
+        return await self.observability.export_prometheus()
+
+    def get_dead_letters(self) -> List[Dict[str, Any]]:
+        return list(self._dead_letters)
+
+    async def _publish_message(self, topic: str, payload: Any) -> None:
+        if self.event_broker is not None and hasattr(self.event_broker, 'publish'):
+            try:
+                res = self.event_broker.publish(topic, payload)
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as e:
+                logger.warning(f"Event publish failed: {e}")
+                self._dead_letters.append({
+                    'topic': topic,
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'error': str(e),
+                })
+
+    # ------------------------------------------------------------------
+    # Health status
+    # ------------------------------------------------------------------
     async def get_health_status(self) -> Dict[str, Any]:
         return {
             'status': self.health_status,
             'last_error': self.last_error,
-            'score': min(1.0, self.impact_tracker.get_overall_trend().get('average_sustainability_score', 0.5)),
+            'score': min(
+                1.0,
+                self.impact_tracker.get_overall_trend().get(
+                    'average_sustainability_score', 0.5,
+                ),
+            ),
             'details': {
                 'injected_components': {
                     'quantum_benchmark': self.quantum_benchmark is not None,
                     'fft_moe': self.fft_moe is not None,
                     'helium_manager': self.helium_manager is not None,
                     'federated_orchestrator': self.federated_orchestrator is not None,
-                    'predictive_analyzer': self.predictive_analyzer is not None
+                    'predictive_analyzer': self.predictive_analyzer is not None,
+                    'carbon_manager': self.carbon_manager is not None,
                 },
                 'milestones': len(await self.storage.get_milestones()),
                 'feedback_count': len(await self.storage.get_feedback()),
@@ -1979,53 +2878,68 @@ class CoEvolutionOrchestrator:
                 'self_healing_enabled': self.config.enable_self_healing,
                 'swarm_coordination_active': self.config.enable_swarm_coordination,
                 'mopd_enabled': self.config.enable_mopd,
-                'human_approval_enabled': self.config.enable_human_approval,
+                'human_approval_enabled': self.config.approval.enabled,
                 'temporal_safety_enabled': self.config.enable_temporal_safety,
                 'chaos_testing_enabled': self.config.enable_chaos_testing,
-            }
+                'dead_letters': len(self._dead_letters),
+            },
         }
 
     async def get_telemetry_export(self) -> str:
         return await self.telemetry.export()
 
-    # ========================================================================
+    # ------------------------------------------------------------------
     # Persistence
-    # ========================================================================
-    async def save_state(self):
-        if self.persistence:
-            storage_dict = await self.storage.to_dict()
-            impact_dict = self.impact_tracker.to_dict()
-            state = {
-                'storage': storage_dict,
-                'impact_tracker': impact_dict,
-                'config': asdict(self.config)
-            }
-            await self.persistence.save_state(state)
+    # ------------------------------------------------------------------
+    async def save_state(self) -> None:
+        if self.persistence is None:
+            return
+        storage_dict = await self.storage.to_dict()
+        impact_dict = self.impact_tracker.to_dict()
+        state = {
+            'storage': storage_dict,
+            'impact_tracker': impact_dict,
+            'learning_rate': self.config.learning_rate,
+            'exploration_rate': self.config.exploration_rate,
+            'adaptation_threshold': self.config.adaptation_threshold,
+        }
+        await self.persistence.save_state(state)
 
-    async def load_state(self):
-        if self.persistence:
-            state = await self.persistence.load_state()
-            if state:
-                await self.storage.from_dict(state.get('storage', {}))
-                self.impact_tracker.from_dict(state.get('impact_tracker', {}))
-                logger.info("State loaded successfully")
+    async def load_state(self) -> None:
+        if self.persistence is None:
+            return
+        state = await self.persistence.load_state()
+        if not state:
+            return
+        await self.storage.from_dict(state.get('storage', {}))
+        self.impact_tracker.from_dict(state.get('impact_tracker', {}))
+        self.config.learning_rate = float(
+            state.get('learning_rate', self.config.learning_rate)
+        )
+        self.config.exploration_rate = float(
+            state.get('exploration_rate', self.config.exploration_rate)
+        )
+        self.config.adaptation_threshold = float(
+            state.get('adaptation_threshold', self.config.adaptation_threshold)
+        )
+        logger.info("State loaded successfully")
 
-    async def delete_state(self):
-        if self.persistence:
+    async def delete_state(self) -> None:
+        if self.persistence is not None:
             await self.persistence.delete_state()
 
-    # ========================================================================
-    # Self‑Healing
-    # ========================================================================
-    async def self_heal(self):
-        logger.info("CoEvolutionEngine self‑healing")
+    # ------------------------------------------------------------------
+    # Self-healing
+    # ------------------------------------------------------------------
+    async def self_heal(self) -> None:
+        logger.info("CoEvolutionEngine self-healing")
         if not self.config.enable_self_healing:
-            logger.warning("Self‑healing disabled")
+            logger.warning("Self-healing disabled")
             return
 
-        self.config.learning_rate = 0.01
-        self.config.exploration_rate = 0.1
-        self.config.adaptation_threshold = 0.7
+        self.config.learning_rate = self._baseline_learning_rate
+        self.config.exploration_rate = self._baseline_exploration_rate
+        self.config.adaptation_threshold = self._baseline_adaptation_threshold
 
         feedback = await self.storage.get_feedback()
         if len(feedback) > 10:
@@ -2036,7 +2950,9 @@ class CoEvolutionOrchestrator:
         perf = await self.storage.get_performance_history()
         if len(perf) > 10:
             async with self.storage._lock:
-                self.storage.performance_history = deque(perf[-10:], maxlen=self.config.performance_history_limit)
+                self.storage.performance_history = deque(
+                    perf[-10:], maxlen=self.config.performance_history_limit,
+                )
 
         await self.storage.reset_historical_effectiveness()
 
@@ -2044,104 +2960,234 @@ class CoEvolutionOrchestrator:
         self.last_error = None
 
         await self.save_state()
-        logger.info("Self‑healing completed")
+        logger.info("Self-healing completed")
 
-    # ========================================================================
+    # ------------------------------------------------------------------
     # Shutdown
-    # ========================================================================
-    async def shutdown(self):
+    # ------------------------------------------------------------------
+    async def shutdown(self) -> None:
         logger.info("Shutting down Co-Evolution Engine")
-        self._running = False
+        self._shutting_down = True
+
+        if self._event_consumer_task is not None:
+            self._event_consumer_task.cancel()
+
         for task in self._background_tasks:
             task.cancel()
-        await asyncio.gather(*self._background_tasks, return_exceptions=True)
-        if self.persistence:
-            await self.save_state()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
+
+        if self.persistence is not None:
+            try:
+                await self.save_state()
+            except Exception as e:
+                logger.error(f"Final save failed: {e}")
+
+        if self.carbon_manager is not None and hasattr(self.carbon_manager, 'close'):
+            try:
+                res = self.carbon_manager.close()
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as e:
+                logger.warning(f"Carbon manager close failed: {e}")
+
+        if self.safety_monitor is not None:
+            unmet = self.safety_monitor.final_check()
+            if unmet:
+                logger.warning(f"Unmet eventual invariants at shutdown: {unmet}")
+
         logger.info("Co-Evolution Engine shutdown complete")
 
+
 # ============================================================================
-# Main Entrypoint (legacy wrapper, now async-safe)
+# Telemetry Collector (kept for backwards compatibility)
+# ============================================================================
+class CoEvolutionTelemetry:
+    def __init__(self) -> None:
+        self.metrics: Dict[str, Any] = defaultdict(lambda: defaultdict(int))
+        self._lock = asyncio.Lock()
+
+    def increment(self, metric_name: str, tags: Optional[Dict[str, str]] = None,
+                  value: float = 1.0) -> None:
+        key = self._make_key(metric_name, tags)
+        self.metrics['counters'][key] += value
+
+    def gauge(self, metric_name: str, value: float,
+              tags: Optional[Dict[str, str]] = None) -> None:
+        key = self._make_key(metric_name, tags)
+        self.metrics['gauges'][key] = value
+
+    def histogram(self, metric_name: str, value: float,
+                  tags: Optional[Dict[str, str]] = None) -> None:
+        key = self._make_key(metric_name, tags)
+        if key not in self.metrics['histograms']:
+            self.metrics['histograms'][key] = []
+        self.metrics['histograms'][key].append(value)
+        if len(self.metrics['histograms'][key]) > 1000:
+            self.metrics['histograms'][key] = self.metrics['histograms'][key][-1000:]
+
+    def _make_key(self, metric_name: str,
+                  tags: Optional[Dict[str, str]]) -> str:
+        if tags:
+            tag_str = ','.join(f"{k}={v}" for k, v in sorted(tags.items()))
+            return f"{metric_name}{{{tag_str}}}"
+        return metric_name
+
+    async def export(self) -> str:
+        async with self._lock:
+            output: List[str] = []
+            for key, value in self.metrics['counters'].items():
+                output.append(f"# TYPE {key} counter\n{key} {value}")
+            for key, value in self.metrics['gauges'].items():
+                output.append(f"# TYPE {key} gauge\n{key} {value}")
+            for key, values in self.metrics['histograms'].items():
+                output.append(
+                    f"# TYPE {key} histogram\n{key}_count {len(values)}\n{key}_sum {sum(values)}"
+                )
+            return "\n".join(output)
+
+    def reset(self) -> None:
+        self.metrics.clear()
+        self.metrics['counters'] = defaultdict(int)
+        self.metrics['gauges'] = {}
+        self.metrics['histograms'] = defaultdict(list)
+
+
+# ============================================================================
+# Main Entrypoint (Legacy wrapper, now fully async with lifecycle)
 # ============================================================================
 class EnhancedCoEvolutionEngine(CoEvolutionOrchestrator):
     """
-    Legacy wrapper for backward compatibility, now fully async.
+    Legacy wrapper for backward compatibility, now with full lifecycle.
     """
+
     def __init__(
         self,
-        bio_core: Optional[EnhancedBioInspiredCore] = None,
+        bio_core: Optional[Any] = None,
         config: Optional[CoEvolutionConfig] = None,
-        **kwargs
-    ):
+        **kwargs: Any,
+    ) -> None:
         if config is None:
-            config = CoEvolutionConfig(**{k: v for k, v in kwargs.items() if k in CoEvolutionConfig.__annotations__})
+            valid = {f.name for f in dataclass_fields(CoEvolutionConfig)}
+            filtered = {k: v for k, v in kwargs.items() if k in valid}
+            config = CoEvolutionConfig(**filtered)
         self.config = config
 
         self.storage = CoEvolutionStorage(config)
         self.sentiment = SentimentAnalyzer(config)
         self.prioritizer = RecommendationPrioritizer(config)
         self.impact_tracker = LongTermImpactTracker(config)
-        self.analyzer = CoEvolutionAnalyzer(config, self.storage, self.sentiment, self.prioritizer, self.impact_tracker)
+        self.analyzer = CoEvolutionAnalyzer(
+            config, self.storage, self.sentiment, self.prioritizer, self.impact_tracker,
+        )
         self.telemetry = CoEvolutionTelemetry()
-        self.persistence = CoEvolutionPersistenceManager(config) if config.persistence_path else None
-
-        super().__init__(
-            config,
-            self.storage,
-            self.analyzer,
-            self.prioritizer,
-            self.impact_tracker,
-            self.telemetry,
-            self.persistence,
-            bio_core
+        self.persistence = (
+            CoEvolutionPersistenceManager(config) if config.persistence_path else None
         )
 
-        # We already have bio_core set in super; but we need to explicitly extract event broker
-        self.bio_core = bio_core
-        if bio_core:
-            self.event_broker = getattr(bio_core, 'event_broker', None)
-            self.self_healer = getattr(bio_core, 'self_healer', None)
-            self.workflow_orchestrator = getattr(bio_core, 'workflow_orchestrator', None)
-            self.swarm_coordinator = getattr(bio_core, 'swarm_coordinator', None)
-            self.tick_engine = getattr(bio_core, 'tick_engine', None)
-            self.quantum_bridge = getattr(bio_core, 'quantum_bridge', None)
-            self.cost_benefit_engine = getattr(bio_core, 'cost_benefit_engine', None)
+        super().__init__(
+            config=config,
+            storage=self.storage,
+            analyzer=self.analyzer,
+            prioritizer=self.prioritizer,
+            impact_tracker=self.impact_tracker,
+            telemetry=self.telemetry,
+            persistence=self.persistence,
+            bio_core=bio_core,
+            carbon_manager=None,
+        )
 
-        # Subscribe to events (if not already done)
-        if self.config.enable_event_driven and self.event_broker:
-            self._subscribe_events()
+        logger.info(
+            "Enhanced Co-Evolution Engine v6.0.0 initialised "
+            "(not started) with MOPD, XAI, temporal safety, human approval, "
+            "chaos testing, and ObservabilityHub"
+        )
 
-        if self.persistence:
-            asyncio.create_task(self.load_state())
 
-        logger.info("Enhanced Co-Evolution Engine v5.2.0 initialized with MOPD, XAI, temporal safety, human approval, and chaos testing")
+# ============================================================================
+# Example usage
+# ============================================================================
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
 
-    # Override methods to be async (no asyncio.run)
-    async def get_evolution_status(self) -> Dict[str, Any]:
-        return await super().get_evolution_status()
+    async def main() -> None:
+        config = CoEvolutionConfig()
+        config.enable_chaos_testing = True
+        config.chaos.enabled = True
+        config.chaos.interval_seconds = 9999
 
-    async def get_feedback_sentiment_summary(self) -> Dict[str, Any]:
-        return await super().get_feedback_sentiment_summary()
+        engine = EnhancedCoEvolutionEngine(config=config)
+        await engine.start()
 
-    async def get_milestone_summary(self) -> Dict[str, Any]:
-        return await super().get_milestone_summary()
+        cycle = await engine.co_evolve(idempotency_key=uuid.uuid4().hex)
+        print(json.dumps(cycle, indent=2, default=str))
 
-    async def get_health_status(self) -> Dict[str, Any]:
-        return await super().get_health_status()
+        status = await engine.get_evolution_status()
+        print(json.dumps(status, indent=2, default=str))
 
-    async def get_telemetry_export(self) -> str:
-        return await super().get_telemetry_export()
+        health = await engine.get_health_status()
+        print(json.dumps(health, indent=2, default=str))
 
-    async def save_state(self):
-        await super().save_state()
+        chaos_report = await engine.run_chaos_test()
+        print(json.dumps(chaos_report, indent=2, default=str))
 
-    async def load_state(self):
-        await super().load_state()
+        metrics = await engine.get_prometheus_metrics()
+        print(metrics[:500])
 
-    async def delete_state(self):
-        await super().delete_state()
+        await engine.shutdown()
 
-    async def self_heal(self):
-        await super().self_heal()
+    asyncio.run(main())
 
-    async def shutdown(self):
-        await super().shutdown()
+
+# ============================================================================
+# Exports
+# ============================================================================
+__all__ = [
+    # Main
+    "EnhancedCoEvolutionEngine",
+    "CoEvolutionOrchestrator",
+    "CoEvolutionConfig",
+    # Sub-modules
+    "SentimentAnalyzer",
+    "RecommendationPrioritizer",
+    "LongTermImpactTracker",
+    "CoEvolutionPersistenceManager",
+    "CoEvolutionTelemetry",
+    "CoEvolutionStorage",
+    "CoEvolutionAnalyzer",
+    # Infra
+    "ObservabilityHub",
+    "SafetyMonitor",
+    "SafetyInvariant",
+    "GovernanceLayer",
+    "ApprovalConfig",
+    "ApprovalRequest",
+    "ApprovalResult",
+    "ApprovalStatus",
+    "ChaosService",
+    "ChaosConfig",
+    "FaultType",
+    "MOPDConfig",
+    # Data
+    "EvolutionMilestone",
+    "MOPDPlan",
+    # Protocols
+    "BioCoreProtocol",
+    "EventBrokerProtocol",
+    "SwarmCoordinatorProtocol",
+    "SelfHealerProtocol",
+    "WorkflowOrchestratorProtocol",
+    "HeliumProviderProtocol",
+    "CarbonManagerProtocol",
+    "QuantumBenchmarkProtocol",
+    "FFTMoEProtocol",
+    "HeliumManagerProtocol",
+    "FederatedOrchestratorProtocol",
+    "PredictiveAnalyzerProtocol",
+    # Constants
+    "MOPD_OBJECTIVE_NAMES",
+    "MOPD_HIGHER_IS_BETTER",
+    "STATE_SCHEMA_VERSION",
+    "retry_async",
+]
