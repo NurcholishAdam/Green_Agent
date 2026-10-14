@@ -1,217 +1,951 @@
 #!/usr/bin/env python3
+# predictive_maintenance.py
 """
-Enhanced Predictive Maintenance for Hardware Based on Sustainability Metrics v3.3.1
-============================================================================
+Integrated Predictive Maintenance Engine v5.0.0
+================================================
 
-Tracks energy efficiency (FLOPs/Joule) per node over time, forecasts when
-efficiency will drop below a threshold, simulates replacement impact via
-DigitalTwin, and generates maintenance recommendations during low‑carbon periods.
+Full-stack integration of the Predictive Maintenance Engine with the
+Green Agent ecosystem:
 
-ENHANCEMENTS OVER v3.3.0:
-- Fixed all missing class definitions.
-- Corrected feature dimension (11).
-- Added async start for background tasks.
-- Safe persistence and integration.
+1. **Config composition** — reuses `sustainability.config` (v7.1.0) for
+   `MOPDConfig`, `ApprovalConfig`, `ChaosConfig`, `FederatedConfig`, and the
+   Pydantic v1/v2 detection layer, with local dataclass fallbacks.
+
+2. **ExpertMetricsCollector bridge (v9.0.0)** — pushes recommendations and
+   outcomes into the collector's feedback and dead-letter flow.
+
+3. **UnifiedSustainabilityEngine bridge (v6.0.0)** — pulls live carbon,
+   helium, energy, circularity, and biodiversity dimension scores into
+   `MaintenanceState` so recommendations account for real sustainability
+   signals.
+
+4. **ColdStartOptimizer bridge (v4.0.0)** — shares the distillation teacher
+   registry, the NSGA-II engine, and the MoE gating service across domains.
+
+5. **Federated learning** — syncs aggregated recommendation statistics across
+   deployments with Gaussian DP noise + L2 clipping.
+
+6. **FastAPI surface** — `/metrics`, `/recommendations`, `/analyze/{node_id}`,
+   `/approvals`, `/approvals/{id}`, `/chaos/run`, `/federated/sync`, `/health`.
+
+7. **Schema migration** — automatic v3.3.1 → v4.0.0 SQLite migration that adds
+   indices, re-serialises recommendation JSON with type-safe encoding, and
+   records a schema version.
+
+The v4.0.0 core (sub-services, Protocols, ObservabilityHub, GovernanceLayer,
+non-destructive ChaosService, unified MOPD scalarisation, full lifecycle,
+idempotency, dead-letter queue, bounded caches) is preserved.
 """
+
+from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import logging
+import math
 import os
-import sqlite3
 import pickle
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional, Tuple, Callable, Union
-import numpy as np
-from collections import deque
 import random
-from abc import ABC, abstractmethod
-import pandas as pd
-from pathlib import Path
-import uuid
-import copy
+import sqlite3
 import time
-import hashlib
+import uuid
+import zlib
+from abc import ABC, abstractmethod
+from collections import OrderedDict, defaultdict, deque
+from dataclasses import dataclass, field, fields as dataclass_fields, asdict
+from datetime import datetime, timezone, timedelta
+from enum import Enum
+from pathlib import Path
+from typing import (
+    Any, Awaitable, Callable, Deque, Dict, FrozenSet, List, Optional,
+    Protocol, Sequence, Set, Tuple, Union, runtime_checkable,
+)
 
-# ---------- Pydantic ----------
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+import numpy as np
 
-# ---------- aiosqlite ----------
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Sibling integration — graceful imports with fallback
+# ============================================================================
+SIBLING_CONFIG_AVAILABLE = False
+SIBLING_METRICS_AVAILABLE = False
+SIBLING_ENGINE_AVAILABLE = False
+SIBLING_COLD_START_AVAILABLE = False
+
+# ---- sustainability.config (v7.1.0) ----
 try:
-    import aiosqlite
-    AIOSQLITE_AVAILABLE = True
+    from ..sustainability.config import (  # type: ignore
+        MOPDConfig as _SiblingMOPDConfig,
+        ApprovalConfig as _SiblingApprovalConfig,
+        ChaosConfig as _SiblingChaosConfig,
+        FederatedConfig as _SiblingFederatedConfig,
+        PYDANTIC_AVAILABLE as _SIB_PYDANTIC_AVAILABLE,
+        PYDANTIC_V1 as _SIB_PYDANTIC_V1,
+        PYDANTIC_V2 as _SIB_PYDANTIC_V2,
+    )
+    SIBLING_CONFIG_AVAILABLE = True
+    PYDANTIC_AVAILABLE = _SIB_PYDANTIC_AVAILABLE
+    PYDANTIC_V1 = _SIB_PYDANTIC_V1
+    PYDANTIC_V2 = _SIB_PYDANTIC_V2
+    logger.info("predictive_maintenance: using sustainability.config v7.1.0")
 except ImportError:
-    AIOSQLITE_AVAILABLE = False
+    PYDANTIC_AVAILABLE = False
+    PYDANTIC_V1 = False
+    PYDANTIC_V2 = False
 
-# ---------- Prometheus ----------
+# ---- ExpertMetricsCollector (v9.0.0) ----
 try:
-    from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry
+    from ..monitoring.expert_metrics import (  # type: ignore
+        ExpertMetricsCollector as _SiblingMetricsCollector,
+    )
+    SIBLING_METRICS_AVAILABLE = True
+except ImportError:
+    _SiblingMetricsCollector = None
+
+# ---- UnifiedSustainabilityEngine (v6.0.0) ----
+try:
+    from ..sustainability.unified_engine import (  # type: ignore
+        UnifiedSustainabilityEngine as _SiblingSustainabilityEngine,
+        MaintenanceState as _SiblingMaintenanceState,
+    )
+    SIBLING_ENGINE_AVAILABLE = True
+except ImportError:
+    _SiblingSustainabilityEngine = None
+    _SiblingMaintenanceState = None
+
+# ---- ColdStartOptimizer (v4.0.0) ----
+try:
+    from ..cold_start.cold_start_optimizer import (  # type: ignore
+        ColdStartOptimizer as _SiblingColdStartOptimizer,
+        DistillationService as _SiblingDistillationService,
+        EvolutionService as _SiblingEvolutionService,
+        GatingService as _SiblingGatingService,
+    )
+    SIBLING_COLD_START_AVAILABLE = True
+except ImportError:
+    _SiblingColdStartOptimizer = None
+    _SiblingDistillationService = None
+    _SiblingEvolutionService = None
+    _SiblingGatingService = None
+
+# ---- Optional third-party ----
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    aiohttp = None  # type: ignore
+    AIOHTTP_AVAILABLE = False
+
+try:
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing  # type: ignore
+    STATSMODELS_AVAILABLE = True
+except ImportError:
+    ExponentialSmoothing = None  # type: ignore
+    STATSMODELS_AVAILABLE = False
+
+try:
+    from sklearn.ensemble import RandomForestClassifier  # type: ignore
+    from sklearn.preprocessing import LabelEncoder  # type: ignore
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    RandomForestClassifier = None  # type: ignore
+    LabelEncoder = None  # type: ignore
+    SKLEARN_AVAILABLE = False
+
+try:
+    from prometheus_client import (  # type: ignore
+        Counter, Gauge, Histogram, CollectorRegistry, generate_latest,
+        CONTENT_TYPE_LATEST, start_http_server,
+    )
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
 
-# ---------- Structlog ----------
 try:
-    import structlog
-    logger = structlog.get_logger(__name__)
-except ImportError:
-    logger = logging.getLogger(__name__)
-    logging.basicConfig(level=logging.INFO)
-
-# ---------- FastAPI ----------
-try:
-    from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
-    from fastapi.responses import JSONResponse
+    from fastapi import (  # type: ignore
+        FastAPI, HTTPException, Request, Response, status,
+    )
+    from fastapi.responses import JSONResponse  # type: ignore
+    from contextlib import asynccontextmanager  # type: ignore
     FASTAPI_AVAILABLE = True
 except ImportError:
     FASTAPI_AVAILABLE = False
 
-# ---------- Optional forecasting libraries ----------
-try:
-    from statsmodels.tsa.holtwinters import ExponentialSmoothing
-    STATSMODELS_AVAILABLE = True
-except ImportError:
-    STATSMODELS_AVAILABLE = False
 
-try:
-    from statsmodels.tsa.arima.model import ARIMA
-    ARIMA_AVAILABLE = True
-except ImportError:
-    ARIMA_AVAILABLE = False
+# ============================================================================
+# Named constants
+# ============================================================================
+MODULE_VERSION = "5.0.0"
+STATE_SCHEMA_VERSION = 4           # SQLite schema version
+FEATURE_DIM = 16                    # 11 base + 5 sustainability dimensions
+MAINTENANCE_ACTIONS: Tuple[str, ...] = ('replace', 'refurbish', 'monitor')
+SUSTAINABILITY_DIMENSIONS: Tuple[str, ...] = (
+    'carbon', 'helium', 'energy', 'circularity', 'biodiversity',
+)
+MOPD_OBJECTIVE_NAMES: Tuple[str, ...] = (
+    'net_savings', 'carbon_savings', 'risk_reduction', 'longterm_efficiency',
+)
+MOPD_HIGHER_IS_BETTER: FrozenSet[str] = frozenset(MOPD_OBJECTIVE_NAMES)
 
-# ---------- Tenacity for retries ----------
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+DEFAULT_EFFICIENCY_THRESHOLD = 1.0e9
+DEFAULT_MIN_POINTS = 10
+DEFAULT_FORECAST_HORIZON_DAYS = 30
+DEFAULT_REFRESH_INTERVAL = 3600
 
-# ---------- scikit-learn for ML teacher ----------
-try:
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.preprocessing import LabelEncoder
-    SKLEARN_ML = True
-except ImportError:
-    SKLEARN_ML = False
+MAX_IDEMPOTENCY_CACHE = 4_096
+MAX_DEAD_LETTERS = 1_000
+MAX_APPROVAL_AUDIT = 1_000
+MAX_APPROVAL_PENDING = 512
+MAX_INTERACTION_LOG = 10_000
+APPROVAL_DEFAULT_TIMEOUT = 60.0
+CHAOS_MAX_FAULTS_PER_RUN = 6
+DEFAULT_Z_SCORE_95 = 1.959964
 
-# ---------- Circuit Breaker ----------
-class CircuitBreaker:
-    """Async circuit breaker with half‑open state."""
-    def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 30.0):
-        self.name = name
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self._state = "closed"
-        self._failure_count = 0
-        self._last_failure_time: Optional[float] = None
-        self._lock = asyncio.Lock()
 
-    async def call(self, func, *args, **kwargs):
-        async with self._lock:
-            if self._state == "open":
-                if time.time() - self._last_failure_time > self.recovery_timeout:
-                    self._state = "half-open"
-                    self._failure_count = 0
-                else:
-                    raise RuntimeError(f"Circuit breaker {self.name} is open")
+# ============================================================================
+# Serialization helpers
+# ============================================================================
+def _to_serializable(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, Enum):
+        return obj.value
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {str(k): _to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [_to_serializable(v) for v in obj]
+    if isinstance(obj, deque):
+        return [_to_serializable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if hasattr(obj, 'to_dict') and callable(obj.to_dict):
+        return _to_serializable(obj.to_dict())
+    if hasattr(obj, 'model_dump') and callable(obj.model_dump):
         try:
-            result = await func(*args, **kwargs)
-            async with self._lock:
-                if self._state == "half-open":
-                    self._state = "closed"
-                    self._failure_count = 0
-            return result
-        except Exception as e:
-            async with self._lock:
-                self._failure_count += 1
-                self._last_failure_time = time.time()
-                if self._failure_count >= self.failure_threshold:
-                    self._state = "open"
-            raise e
+            return _to_serializable(obj.model_dump(mode='json'))
+        except Exception:
+            pass
+    if hasattr(obj, 'dict') and callable(obj.dict):
+        try:
+            return _to_serializable(obj.dict())
+        except Exception:
+            pass
+    if hasattr(obj, '__dict__'):
+        return _to_serializable(obj.__dict__)
+    return str(obj)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _z_score(confidence: float) -> float:
+    confidence = max(0.5, min(0.999, float(confidence)))
+    try:
+        from statistics import NormalDist
+        return NormalDist().inv_cdf(1.0 - (1.0 - confidence) / 2.0)
+    except Exception:
+        table = {0.80: 1.2816, 0.90: 1.6449, 0.95: 1.9600, 0.99: 2.5758}
+        closest = min(table.keys(), key=lambda k: abs(k - confidence))
+        return table[closest]
+
 
 # ============================================================================
-# 1. CONFIGURATION
+# Config composition — reuse siblings when available
 # ============================================================================
-class PredictiveMaintenanceConfig(BaseModel):
-    efficiency_threshold: float = Field(1.0e9, gt=0)
-    min_data_points: int = Field(10, ge=5)
-    forecast_horizon_days: int = Field(30, ge=1)
-    forecast_confidence: float = Field(0.95, gt=0, lt=1)
-    low_carbon_windows: List[Dict[str, str]] = Field(
+if SIBLING_CONFIG_AVAILABLE:
+    MOPDConfig = _SiblingMOPDConfig                     # type: ignore
+    ApprovalConfig = _SiblingApprovalConfig             # type: ignore
+    ChaosConfig = _SiblingChaosConfig                   # type: ignore
+    FederatedConfig = _SiblingFederatedConfig           # type: ignore
+else:
+    @dataclass
+    class MOPDConfig:
+        enabled: bool = True
+        objective_weights: Dict[str, float] = field(default_factory=lambda: {
+            'net_savings': 0.35, 'carbon_savings': 0.25,
+            'risk_reduction': 0.25, 'longterm_efficiency': 0.15,
+        })
+        grid_resolution: int = 5
+        enable_cost_benefit: bool = True
+        enable_predictive: bool = True
+        explain_decisions: bool = True
+        require_human_approval: bool = False
+        aggressive_threshold: float = 0.3
+
+        def __post_init__(self) -> None:
+            total = sum(self.objective_weights.values())
+            if total <= 0:
+                raise ValueError("objective_weights must sum to > 0")
+            if abs(total - 1.0) > 1e-6:
+                logger.warning("MOPD weights sum to %.4f; normalising.", total)
+                for k in list(self.objective_weights):
+                    self.objective_weights[k] /= total
+
+    @dataclass
+    class ApprovalConfig:
+        enabled: bool = False
+        timeout_seconds: float = APPROVAL_DEFAULT_TIMEOUT
+        auto_approve_on_timeout: bool = False
+        require_for_accuracy_drop_above: float = 0.3
+
+    @dataclass
+    class ChaosConfig:
+        enabled: bool = False
+        interval_seconds: int = 3600
+        auto_restore: bool = True
+
+    @dataclass
+    class FederatedConfig:
+        enabled: bool = False
+        server_url: Optional[str] = None
+        sparsity_ratio: float = 0.1
+        privacy_epsilon: float = 1.0
+        privacy_delta: float = 1e-5
+        privacy_clip_norm: float = 1.0
+        sync_interval_seconds: int = 3600
+        request_timeout_seconds: float = 30.0
+
+
+def _make_maintenance_mopd_config() -> "MOPDConfig":
+    """Return an MOPDConfig pre-loaded with maintenance objective weights."""
+    try:
+        cfg = MOPDConfig()
+    except Exception:
+        return MOPDConfig()
+    # Override with our maintenance-specific objectives
+    try:
+        cfg.objective_weights = {
+            'net_savings': 0.35, 'carbon_savings': 0.25,
+            'risk_reduction': 0.25, 'longterm_efficiency': 0.15,
+        }
+    except Exception:
+        pass
+    return cfg
+
+
+def _make_federated_config() -> "FederatedConfig":
+    try:
+        return FederatedConfig()
+    except Exception:
+        return FederatedConfig()  # type: ignore
+
+
+def _make_approval_config() -> "ApprovalConfig":
+    try:
+        return ApprovalConfig()
+    except Exception:
+        return ApprovalConfig()  # type: ignore
+
+
+def _make_chaos_config() -> "ChaosConfig":
+    try:
+        return ChaosConfig()
+    except Exception:
+        return ChaosConfig()  # type: ignore
+
+
+@dataclass
+class PredictiveMaintenanceConfig:
+    """
+    Top-level predictive maintenance config.
+
+    Sub-configs (mopd, approval, chaos, federated) are reused from
+    `sustainability.config` when available, falling back to local
+    dataclasses with identical shapes.
+    """
+    # Core triggers
+    efficiency_threshold: float = DEFAULT_EFFICIENCY_THRESHOLD
+    min_data_points: int = DEFAULT_MIN_POINTS
+    forecast_horizon_days: int = DEFAULT_FORECAST_HORIZON_DAYS
+    forecast_confidence: float = 0.95
+    low_carbon_windows: List[Dict[str, str]] = field(
         default_factory=lambda: [
             {"start": "02:00", "end": "06:00"},
             {"start": "12:00", "end": "14:00"},
         ]
     )
-    replacement_efficiency_gain: float = Field(1.2, gt=1.0)
-    refurbishment_efficiency_gain: float = Field(1.05, ge=1.0)
-    maintenance_lead_time: int = Field(7, ge=0)
-    refresh_interval: int = Field(3600, ge=60)
+    replacement_efficiency_gain: float = 1.2
+    refurbishment_efficiency_gain: float = 1.05
+    maintenance_lead_time: int = 7
+    refresh_interval: int = DEFAULT_REFRESH_INTERVAL
+
+    # Persistence
     persistence_enabled: bool = True
-    persistence_path: str = Field("./predictive_maintenance.db")
-    data_retention_days: int = Field(365, ge=1)
+    persistence_path: str = "./predictive_maintenance.db"
+    data_retention_days: int = 365
+    prune_interval_inserts: int = 1_000
+    auto_migrate_schema: bool = True
+
+    # Carbon / LCA
     carbon_intensity_enabled: bool = True
-    carbon_intensity_api_key: Optional[str] = None
-    carbon_region: str = "global"
+    carbon_region: str = "US-CAL-CISO"
+    carbon_api_timeout_seconds: float = 10.0
+    default_carbon_intensity: float = 400.0
     lca_enabled: bool = True
+    default_co2_per_kwh: float = 0.2
+
+    # Anomaly + costs
     anomaly_trigger_enabled: bool = True
-    hardware_cost_usd: float = Field(5000.0, gt=0)
-    maintenance_cost_usd: float = Field(500.0, ge=0)
-    carbon_offset_price_per_kg_usd: float = Field(0.10, gt=0)
-    electricity_price_per_kwh_usd: float = Field(0.12, gt=0)
+    hardware_cost_usd: float = 5000.0
+    maintenance_cost_usd: float = 500.0
+    carbon_offset_price_per_kg_usd: float = 0.10
+    electricity_price_per_kwh_usd: float = 0.12
 
-    distillation_epsilon: float = Field(0.1, ge=0, le=1)
-    distillation_train_every: int = Field(10, ge=1)
-    distillation_replay_size: int = Field(2000, ge=10)
-    distillation_learning_rate: float = Field(0.01, ge=0.0001, le=1)
-    distill_weight: float = Field(0.7, ge=0, le=1)
-    rl_weight: float = Field(0.3, ge=0, le=1)
+    # Distillation
+    distillation_epsilon: float = 0.1
+    distillation_train_every: int = 10
+    distillation_replay_size: int = 2000
+    distillation_learning_rate: float = 0.01
+    distill_weight: float = 0.7
+    rl_weight: float = 0.3
 
-    moea_enabled: bool = Field(True)
-    moea_interval_seconds: int = Field(300, ge=60)
-    moea_population_size: int = Field(20, ge=5)
-    moea_generations: int = Field(10, ge=1)
-    moea_mutation_rate: float = Field(0.2, ge=0.0, le=1.0)
-    moea_crossover_rate: float = Field(0.8, ge=0.0, le=1.0)
-    moea_tournament_size: int = Field(3, ge=2)
-    moea_objective_weights: Optional[Dict[str, float]] = Field(
-        default_factory=lambda: {
-            'net_savings': 0.35,
-            'carbon_savings': 0.25,
-            'risk_reduction': 0.25,
-            'longterm_efficiency': 0.15,
-        }
-    )
-    moea_dynamic_weights: bool = Field(True)
-    moea_pareto_path: str = Field("./pm_moea_pareto.json")
+    # MOEA
+    moea_enabled: bool = True
+    moea_interval_seconds: int = 300
+    moea_population_size: int = 20
+    moea_generations: int = 10
+    moea_mutation_rate: float = 0.2
+    moea_crossover_rate: float = 0.8
+    moea_tournament_size: int = 3
+    moea_dynamic_weights: bool = True
+    moea_pareto_path: str = "./pm_moea_pareto.json"
+    moea_max_concurrent_evals: int = 8
 
-    enable_limit_graph: bool = Field(True)
-    enable_modp: bool = Field(True)
-    enable_rlhf: bool = Field(True)
-    enable_moe: bool = Field(True)
-    moe_expert_count: int = Field(3, ge=2)
+    # Feature flags
+    enable_limit_graph: bool = True
+    enable_modp: bool = True
+    enable_rlhf: bool = True
+    enable_moe: bool = True
+    enable_human_approval: bool = False
+    enable_temporal_safety: bool = True
+    enable_chaos_testing: bool = False
+    enable_idempotency: bool = True
+    enable_federated: bool = False
+    enable_metrics_bridge: bool = True
+    enable_sustainability_bridge: bool = True
+    enable_cold_start_bridge: bool = False
+    enable_sustainability_dimensions: bool = True
 
-    q_weights_path: str = Field("./pm_q_weights.json")
-    interaction_logs_path: str = Field("./pm_interactions.csv")
-    historical_model_path: str = Field("./pm_historical_model.pkl")
+    # Paths
+    q_weights_path: str = "./pm_q_weights.json"
+    interaction_logs_path: str = "./pm_interactions.csv"
+    historical_model_path: str = "./pm_historical_model.pkl"
 
-    @field_validator('low_carbon_windows')
-    @classmethod
-    def validate_windows(cls, v):
-        for w in v:
+    # Sub-configs (reused from siblings when available)
+    mopd: "MOPDConfig" = field(default_factory=_make_maintenance_mopd_config)
+    approval: "ApprovalConfig" = field(default_factory=_make_approval_config)
+    chaos: "ChaosConfig" = field(default_factory=_make_chaos_config)
+    federated: "FederatedConfig" = field(default_factory=_make_federated_config)
+
+    def __post_init__(self) -> None:
+        if self.efficiency_threshold <= 0:
+            raise ValueError("efficiency_threshold must be > 0")
+        if self.min_data_points < 3:
+            raise ValueError("min_data_points must be >= 3")
+        if not (0.5 <= self.forecast_confidence < 1.0):
+            raise ValueError("forecast_confidence must be in [0.5, 1.0)")
+        if self.replacement_efficiency_gain <= 1.0:
+            raise ValueError("replacement_efficiency_gain must be > 1.0")
+        if self.refurbishment_efficiency_gain < 1.0:
+            raise ValueError("refurbishment_efficiency_gain must be >= 1.0")
+        # Validate windows
+        for w in self.low_carbon_windows:
             if 'start' not in w or 'end' not in w:
-                raise ValueError("Each window must have 'start' and 'end'")
-            start = datetime.strptime(w['start'], "%H:%M").time()
-            end = datetime.strptime(w['end'], "%H:%M").time()
-            if start >= end:
-                raise ValueError("Window start must be before end")
-        return v
+                raise ValueError("Each low_carbon_window must have 'start' and 'end'")
+            try:
+                s = datetime.strptime(w['start'], "%H:%M").time()
+                e = datetime.strptime(w['end'], "%H:%M").time()
+            except ValueError as ex:
+                raise ValueError(f"Invalid time format in window {w}: {ex}")
+            if s >= e:
+                raise ValueError(f"Window start must be before end: {w}")
 
-    model_config = ConfigDict(env_prefix="PRED_MAINT_")
+    def to_dict(self) -> Dict[str, Any]:
+        return _to_serializable(self)
 
     @classmethod
-    def from_dict(cls, data: Dict) -> "PredictiveMaintenanceConfig":
-        return cls(**data)
+    def from_dict(cls, data: Dict[str, Any]) -> "PredictiveMaintenanceConfig":
+        valid = {f.name for f in dataclass_fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in valid})
+
 
 # ============================================================================
-# 2. DATA STRUCTURES
+# Protocols
+# ============================================================================
+@runtime_checkable
+class CarbonProviderProtocol(Protocol):
+    async def get_current_intensity(self, region: str) -> float: ...
+    async def close(self) -> None: ...
+
+
+@runtime_checkable
+class LCAProviderProtocol(Protocol):
+    async def get_material_index(self, hardware_model: str) -> float: ...
+    async def close(self) -> None: ...
+
+
+@runtime_checkable
+class AnomalyDetectorProtocol(Protocol):
+    async def ingest(self, node_id: str, metrics: Dict[str, Any]) -> Optional[Any]: ...
+
+
+@runtime_checkable
+class MessageQueueProtocol(Protocol):
+    async def publish(self, topic: str, payload: Any) -> None: ...
+
+
+@runtime_checkable
+class SustainabilityEngineProtocol(Protocol):
+    """Interface expected of the UnifiedSustainabilityEngine sibling."""
+    async def get_current_score(self) -> float: ...
+    async def get_dimension_status(self) -> Dict[str, str]: ...
+
+
+@runtime_checkable
+class MetricsCollectorProtocol(Protocol):
+    """Interface expected of the ExpertMetricsCollector sibling."""
+    async def record_expert_execution(
+        self,
+        expert_id: str,
+        execution_time: float,
+        energy_kwh: float,
+        carbon_kg: float,
+        helium_units: float,
+        success: bool,
+        correlation_id: Optional[str] = ...,
+        metadata: Optional[Dict[str, Any]] = ...,
+    ) -> None: ...
+
+
+# ============================================================================
+# Enums
+# ============================================================================
+class ApprovalStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+    TIMEOUT = "timeout"
+    AUTO_APPROVED = "auto_approved"
+
+
+class CircuitBreakerState(str, Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+class FaultType(str, Enum):
+    PERSISTENCE_FAILURE = "persistence_failure"
+    CARBON_API_FAILURE = "carbon_api_failure"
+    LCA_API_FAILURE = "lca_api_failure"
+    FORECAST_FAILURE = "forecast_failure"
+    DISTILLATION_FAILURE = "distillation_failure"
+    MOEA_EVALUATION_FAILURE = "moea_evaluation_failure"
+    TRACKER_FAILURE = "tracker_failure"
+    METRICS_BRIDGE_FAILURE = "metrics_bridge_failure"
+    SUSTAINABILITY_BRIDGE_FAILURE = "sustainability_bridge_failure"
+    FEDERATED_FAILURE = "federated_failure"
+
+
+# ============================================================================
+# ObservabilityHub
+# ============================================================================
+class ObservabilityHub:
+    def __init__(self) -> None:
+        self._counters: Dict[str, float] = {}
+        self._gauges: Dict[str, float] = {}
+        self._histograms: Dict[str, Deque[float]] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _key(name: str, labels: Optional[Dict[str, str]]) -> str:
+        if not labels:
+            return name
+        tag = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+        return f"{name}{{{tag}}}"
+
+    def counter(self, name: str, value: float = 1.0, **labels: str) -> None:
+        k = self._key(name, labels or None)
+        self._counters[k] = self._counters.get(k, 0.0) + float(value)
+
+    def gauge(self, name: str, value: float, **labels: str) -> None:
+        k = self._key(name, labels or None)
+        self._gauges[k] = float(value)
+
+    def histogram(self, name: str, value: float, **labels: str) -> None:
+        k = self._key(name, labels or None)
+        if k not in self._histograms:
+            self._histograms[k] = deque(maxlen=1024)
+        self._histograms[k].append(float(value))
+
+    async def export_prometheus(self) -> str:
+        async with self._lock:
+            lines: List[str] = []
+            for k, v in self._counters.items():
+                base = k.split('{')[0]
+                lines.append(f"# TYPE {base} counter")
+                lines.append(f"{k} {v}")
+            for k, v in self._gauges.items():
+                base = k.split('{')[0]
+                lines.append(f"# TYPE {base} gauge")
+                lines.append(f"{k} {v}")
+            for k, vals in self._histograms.items():
+                if not vals:
+                    continue
+                base = k.split('{')[0]
+                lines.append(f"# TYPE {base} histogram")
+                lines.append(f"{base}_count {len(vals)}")
+                lines.append(f"{base}_sum {sum(vals)}")
+            return "\n".join(lines)
+
+
+# ============================================================================
+# Dead-letter queue, idempotency, circuit breaker
+# ============================================================================
+class DeadLetterQueue:
+    def __init__(self, max_size: int = MAX_DEAD_LETTERS) -> None:
+        self._items: Deque[Dict[str, Any]] = deque(maxlen=max_size)
+        self._lock = asyncio.Lock()
+
+    async def record(self, topic: str, error: str,
+                     payload: Any = None) -> None:
+        async with self._lock:
+            self._items.append({
+                'topic': topic,
+                'error': str(error),
+                'timestamp': _utcnow().isoformat(),
+                'payload': _to_serializable(payload) if payload is not None else None,
+            })
+
+    def snapshot(self) -> List[Dict[str, Any]]:
+        return list(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+class IdempotencyCache:
+    def __init__(self, max_size: int = MAX_IDEMPOTENCY_CACHE) -> None:
+        self.max_size = max_size
+        self._cache: "OrderedDict[str, float]" = OrderedDict()
+
+    def seen(self, key: Optional[str]) -> bool:
+        if not key:
+            return False
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return True
+        self._cache[key] = time.monotonic()
+        if len(self._cache) > self.max_size:
+            self._cache.popitem(last=False)
+        return False
+
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int, recovery_timeout: float,
+                 name: str = "default") -> None:
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.name = name
+        self.state = CircuitBreakerState.CLOSED
+        self.failure_count = 0
+        self.last_failure_time: Optional[float] = None
+        self._lock = asyncio.Lock()
+
+    async def call(self, func: Callable[..., Awaitable[Any]],
+                   *args: Any, **kwargs: Any) -> Any:
+        async with self._lock:
+            if self.state == CircuitBreakerState.OPEN:
+                if (self.last_failure_time is not None and
+                        (time.monotonic() - self.last_failure_time) >= self.recovery_timeout):
+                    self.state = CircuitBreakerState.HALF_OPEN
+                    self.failure_count = 0
+                else:
+                    raise RuntimeError(f"Circuit breaker {self.name} is OPEN")
+        try:
+            result = await func(*args, **kwargs)
+            async with self._lock:
+                if self.state == CircuitBreakerState.HALF_OPEN:
+                    self.state = CircuitBreakerState.CLOSED
+                self.failure_count = 0
+            return result
+        except Exception:
+            async with self._lock:
+                self.failure_count += 1
+                self.last_failure_time = time.monotonic()
+                if self.failure_count >= self.failure_threshold:
+                    self.state = CircuitBreakerState.OPEN
+            raise
+
+
+# ============================================================================
+# Governance layer
+# ============================================================================
+@dataclass
+class ApprovalRequest:
+    request_id: str
+    context: Dict[str, Any]
+    requested_at: datetime
+    timeout_seconds: float
+    status: ApprovalStatus = ApprovalStatus.PENDING
+    future: Optional[asyncio.Future] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'request_id': self.request_id,
+            'context': _to_serializable(self.context),
+            'requested_at': self.requested_at.isoformat(),
+            'timeout_seconds': self.timeout_seconds,
+            'status': self.status.value,
+        }
+
+
+@dataclass
+class ApprovalResult:
+    request_id: str
+    status: ApprovalStatus
+    reason: str = ""
+    decided_at: Optional[datetime] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'request_id': self.request_id,
+            'status': self.status.value,
+            'reason': self.reason,
+            'decided_at': self.decided_at.isoformat() if self.decided_at else None,
+        }
+
+
+class GovernanceLayer:
+    def __init__(
+        self,
+        enabled: bool = False,
+        timeout_seconds: float = APPROVAL_DEFAULT_TIMEOUT,
+        auto_approve_on_timeout: bool = False,
+        publish_fn: Optional[Callable[[str, Any], Awaitable[None]]] = None,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.timeout_seconds = float(timeout_seconds)
+        self.auto_approve_on_timeout = bool(auto_approve_on_timeout)
+        self.publish_fn = publish_fn
+        self.pending: "OrderedDict[str, ApprovalRequest]" = OrderedDict()
+        self.audit: Deque[Dict[str, Any]] = deque(maxlen=MAX_APPROVAL_AUDIT)
+        self._lock = asyncio.Lock()
+
+    async def request_approval(
+        self, context: Dict[str, Any], timeout: Optional[float] = None,
+    ) -> ApprovalResult:
+        if not self.enabled:
+            r = ApprovalResult(
+                request_id='auto', status=ApprovalStatus.AUTO_APPROVED,
+                reason='approval_disabled', decided_at=_utcnow(),
+            )
+            self._audit(context, r)
+            return r
+        timeout = float(timeout if timeout is not None else self.timeout_seconds)
+        request_id = uuid.uuid4().hex
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        req = ApprovalRequest(
+            request_id=request_id, context=context,
+            requested_at=_utcnow(), timeout_seconds=timeout, future=future,
+        )
+        async with self._lock:
+            self.pending[request_id] = req
+            while len(self.pending) > MAX_APPROVAL_PENDING:
+                self.pending.popitem(last=False)
+        try:
+            if self.publish_fn is not None:
+                try:
+                    await self.publish_fn(
+                        'approval_requests', json.dumps(req.to_dict(), default=str),
+                    )
+                except Exception as e:
+                    logger.warning("Approval publish failed: %s", e)
+            decision = await asyncio.wait_for(future, timeout=timeout)
+            result = ApprovalResult(
+                request_id=request_id,
+                status=ApprovalStatus.APPROVED if decision else ApprovalStatus.DENIED,
+                reason='human_decision', decided_at=_utcnow(),
+            )
+        except asyncio.TimeoutError:
+            status = (ApprovalStatus.AUTO_APPROVED if self.auto_approve_on_timeout
+                      else ApprovalStatus.TIMEOUT)
+            result = ApprovalResult(
+                request_id=request_id, status=status, reason='timeout',
+                decided_at=_utcnow(),
+            )
+        except Exception as e:
+            result = ApprovalResult(
+                request_id=request_id, status=ApprovalStatus.DENIED,
+                reason=f'error:{e}', decided_at=_utcnow(),
+            )
+        finally:
+            async with self._lock:
+                self.pending.pop(request_id, None)
+        self._audit(context, result)
+        return result
+
+    async def submit_decision(self, request_id: str, approved: bool) -> bool:
+        async with self._lock:
+            req = self.pending.get(request_id)
+            if req is None or req.future is None or req.future.done():
+                return False
+            req.future.set_result(approved)
+            return True
+
+    def list_pending(self) -> List[Dict[str, Any]]:
+        return [r.to_dict() for r in self.pending.values()]
+
+    def _audit(self, context: Dict[str, Any], result: ApprovalResult) -> None:
+        self.audit.append({
+            'timestamp': _utcnow().isoformat(),
+            'context': _to_serializable(context),
+            'result': result.to_dict(),
+        })
+
+    def get_audit_log(self) -> List[Dict[str, Any]]:
+        return list(self.audit)
+
+
+# ============================================================================
+# Safety
+# ============================================================================
+class SafetyInvariant:
+    def __init__(self, name: str, predicate: Callable[[Dict[str, Any]], bool],
+                 description: str, kind: str = "always") -> None:
+        if kind not in ("always", "eventually"):
+            raise ValueError(f"Unsupported invariant kind: {kind}")
+        self.name = name
+        self.predicate = predicate
+        self.description = description
+        self.kind = kind
+
+
+class SafetyMonitor:
+    def __init__(self) -> None:
+        self.invariants: List[SafetyInvariant] = []
+        self._eventually_flags: Dict[str, bool] = {}
+
+    def add(self, name: str, predicate: Callable[[Dict[str, Any]], bool],
+            description: str, kind: str = "always") -> None:
+        self.invariants.append(SafetyInvariant(name, predicate, description, kind))
+        if kind == "eventually":
+            self._eventually_flags[name] = False
+
+    def check(self, state: Dict[str, Any]) -> List[str]:
+        violations: List[str] = []
+        for inv in self.invariants:
+            try:
+                ok = bool(inv.predicate(state))
+            except Exception as e:
+                violations.append(f"{inv.name}: error ({e})")
+                continue
+            if inv.kind == "always" and not ok:
+                violations.append(f"{inv.name}: {inv.description}")
+            elif inv.kind == "eventually" and ok:
+                self._eventually_flags[inv.name] = True
+        return violations
+
+    def final_check(self) -> List[str]:
+        return [
+            f"{inv.name}: {inv.description} (never satisfied)"
+            for inv in self.invariants
+            if inv.kind == "eventually" and not self._eventually_flags.get(inv.name, False)
+        ]
+
+
+# ============================================================================
+# Unified MOPD helpers
+# ============================================================================
+def _objective_vector(point: Any, names: Sequence[str],
+                      higher_is_better: FrozenSet[str]) -> List[float]:
+    method = getattr(point, 'objective_vector', None)
+    if callable(method):
+        try:
+            vec = method()
+            if vec is not None and len(vec) == len(names):
+                return [float(v) for v in vec]
+        except Exception:
+            pass
+    out: List[float] = []
+    for name in names:
+        val = float(getattr(point, name, 0.0))
+        if name in higher_is_better:
+            val = -val
+        out.append(val)
+    return out
+
+
+def scalarise_pareto(
+    points: Sequence[Any],
+    weights: Optional[Dict[str, float]] = None,
+    objective_names: Optional[Sequence[str]] = None,
+    higher_is_better: Optional[FrozenSet[str]] = None,
+    score_attr: str = 'scalarised_score',
+) -> Optional[Any]:
+    if not points:
+        return None
+    names = list(objective_names or MOPD_OBJECTIVE_NAMES)
+    hib = set(higher_is_better or MOPD_HIGHER_IS_BETTER)
+    w = dict(weights or {name: 1.0 / len(names) for name in names})
+    vectors = [_objective_vector(p, names, hib) for p in points]
+    arr = np.array(vectors, dtype=float)
+    mins = arr.min(axis=0)
+    maxs = arr.max(axis=0)
+    ranges = np.where(maxs - mins > 1e-9, maxs - mins, 1.0)
+    best: Optional[Any] = None
+    best_score = -float('inf')
+    for idx, p in enumerate(points):
+        normalised = 1.0 - (arr[idx] - mins) / ranges
+        score = 0.0
+        for i, name in enumerate(names):
+            score += float(w.get(name, 1.0 / len(names))) * float(normalised[i])
+        try:
+            setattr(p, score_attr, score)
+        except Exception:
+            pass
+        if score > best_score:
+            best_score = score
+            best = p
+    return best
+
+
+def filter_pareto(
+    points: Sequence[Any],
+    objective_names: Optional[Sequence[str]] = None,
+    higher_is_better: Optional[FrozenSet[str]] = None,
+) -> List[Any]:
+    if not points:
+        return []
+    names = list(objective_names or MOPD_OBJECTIVE_NAMES)
+    hib = set(higher_is_better or MOPD_HIGHER_IS_BETTER)
+    vecs = [_objective_vector(p, names, hib) for p in points]
+    arr = np.array(vecs, dtype=float)
+    n = len(points)
+    dominated = np.zeros(n, dtype=bool)
+    for i in range(n):
+        if dominated[i]:
+            continue
+        for j in range(n):
+            if i == j or dominated[i]:
+                continue
+            if np.all(arr[j] <= arr[i]) and np.any(arr[j] < arr[i]):
+                dominated[i] = True
+    return [points[i] for i in range(n) if not dominated[i]]
+
+
+# ============================================================================
+# Data classes
 # ============================================================================
 @dataclass
 class EfficiencyRecord:
@@ -219,6 +953,32 @@ class EfficiencyRecord:
     flops_per_joule: float
     energy_joules: float
     flops: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'timestamp': self.timestamp.isoformat(),
+            'flops_per_joule': float(self.flops_per_joule),
+            'energy_joules': float(self.energy_joules),
+            'flops': float(self.flops),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "EfficiencyRecord":
+        ts = data.get('timestamp')
+        if isinstance(ts, str):
+            try:
+                ts = datetime.fromisoformat(ts)
+            except ValueError:
+                ts = _utcnow()
+        elif not isinstance(ts, datetime):
+            ts = _utcnow()
+        return cls(
+            timestamp=ts,
+            flops_per_joule=float(data.get('flops_per_joule', 0.0)),
+            energy_joules=float(data.get('energy_joules', 0.0)),
+            flops=float(data.get('flops', 0.0)),
+        )
+
 
 @dataclass
 class MaintenanceRecommendation:
@@ -233,338 +993,45 @@ class MaintenanceRecommendation:
     cost_savings_usd: float
     payback_days: Optional[float]
     simulation_result: Dict[str, Any] = field(default_factory=dict)
+    # Sustainability context (bridged from UnifiedSustainabilityEngine)
+    sustainability_context: Dict[str, float] = field(default_factory=dict)
 
-# ============================================================================
-# 3. PERSISTENCE MANAGER
-# ============================================================================
-class PersistenceManager:
-    def __init__(self, config: PredictiveMaintenanceConfig):
-        self.config = config
-        self.db_path = config.persistence_path
-        self._lock = asyncio.Lock()
-        self._init_db_sync()
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'node_id': self.node_id,
+            'current_efficiency': float(self.current_efficiency),
+            'predicted_efficiency_in_30_days': float(self.predicted_efficiency_in_30_days),
+            'threshold': float(self.threshold),
+            'days_to_threshold': float(self.days_to_threshold),
+            'recommended_action': self.recommended_action,
+            'suggested_date': self.suggested_date.isoformat(),
+            'carbon_savings_kg': float(self.carbon_savings_kg),
+            'cost_savings_usd': float(self.cost_savings_usd),
+            'payback_days': (
+                float(self.payback_days) if self.payback_days is not None else None
+            ),
+            'simulation_result': _to_serializable(self.simulation_result),
+            'sustainability_context': dict(self.sustainability_context),
+        }
 
-    def _init_db_sync(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS efficiency_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                node_id TEXT,
-                timestamp REAL,
-                flops_per_joule REAL,
-                energy_joules REAL,
-                flops REAL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS recommendations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                node_id TEXT,
-                recommendation TEXT,
-                created_at REAL
-            )
-        """)
-        conn.commit()
-        conn.close()
-
-    async def _execute_async(self, query: str, params: tuple = ()) -> Any:
-        def _sync():
-            conn = sqlite3.connect(self.db_path)
-            cur = conn.execute(query, params)
-            conn.commit()
-            return cur
-        return await asyncio.to_thread(_sync)
-
-    async def _prune_old_data(self):
-        cutoff = datetime.now() - timedelta(days=self.config.data_retention_days)
-        await self._execute_async("DELETE FROM efficiency_history WHERE timestamp < ?", (cutoff.timestamp(),))
-
-    async def save_efficiency(self, node_id: str, record: EfficiencyRecord):
-        await self._prune_old_data()
-        await self._execute_async(
-            "INSERT INTO efficiency_history (node_id, timestamp, flops_per_joule, energy_joules, flops) VALUES (?, ?, ?, ?, ?)",
-            (node_id, record.timestamp.timestamp(), record.flops_per_joule, record.energy_joules, record.flops)
-        )
-
-    async def load_efficiency(self, node_id: str, limit: int = 1000) -> List[EfficiencyRecord]:
-        def _sync():
-            conn = sqlite3.connect(self.db_path)
-            rows = conn.execute("SELECT timestamp, flops_per_joule, energy_joules, flops FROM efficiency_history WHERE node_id = ? ORDER BY timestamp DESC LIMIT ?", (node_id, limit)).fetchall()
-            conn.close()
-            return rows
-        rows = await asyncio.to_thread(_sync)
-        records = []
-        for r in reversed(rows):
-            records.append(EfficiencyRecord(
-                timestamp=datetime.fromtimestamp(r[0]),
-                flops_per_joule=r[1],
-                energy_joules=r[2],
-                flops=r[3]
-            ))
-        return records
-
-    async def save_recommendation(self, rec: MaintenanceRecommendation):
-        await self._execute_async(
-            "INSERT INTO recommendations (node_id, recommendation, created_at) VALUES (?, ?, ?)",
-            (rec.node_id, json.dumps(rec.__dict__, default=str), datetime.now().timestamp())
-        )
-
-    async def load_recommendations(self, node_id: Optional[str] = None, limit: int = 10) -> List[MaintenanceRecommendation]:
-        def _sync():
-            conn = sqlite3.connect(self.db_path)
-            if node_id:
-                rows = conn.execute("SELECT recommendation FROM recommendations WHERE node_id = ? ORDER BY created_at DESC LIMIT ?", (node_id, limit)).fetchall()
-            else:
-                rows = conn.execute("SELECT recommendation FROM recommendations ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-            conn.close()
-            return rows
-        rows = await asyncio.to_thread(_sync)
-        recs = []
-        for r in rows:
-            data = json.loads(r[0])
-            rec = MaintenanceRecommendation(**data)
-            rec.suggested_date = datetime.fromisoformat(data['suggested_date'])
-            recs.append(rec)
-        return recs
-
-# ============================================================================
-# 4. NODE EFFICIENCY TRACKER
-# ============================================================================
-class NodeEfficiencyTracker:
-    def __init__(self, config: PredictiveMaintenanceConfig, persistence: Optional[PersistenceManager] = None):
-        self.config = config
-        self.history: Dict[str, List[EfficiencyRecord]] = {}
-        self.max_history = 1000
-        self.persistence = persistence
-        self._lock = asyncio.Lock()
-
-    async def _load_node_history(self, node_id: str):
-        if self.persistence:
-            records = await self.persistence.load_efficiency(node_id, limit=self.max_history)
-            if records:
-                async with self._lock:
-                    self.history[node_id] = records
-
-    async def add_measurement(self, node_id: str, flops: float, energy_joules: float) -> None:
-        if node_id not in self.history:
-            await self._load_node_history(node_id)
-        if node_id not in self.history:
-            self.history[node_id] = []
-
-        efficiency = flops / energy_joules if energy_joules > 0 else 0.0
-        record = EfficiencyRecord(
-            timestamp=datetime.now(),
-            flops_per_joule=efficiency,
-            energy_joules=energy_joules,
-            flops=flops,
-        )
-        async with self._lock:
-            self.history[node_id].append(record)
-            if len(self.history[node_id]) > self.max_history:
-                self.history[node_id] = self.history[node_id][-self.max_history:]
-
-        if self.persistence:
-            await self.persistence.save_efficiency(node_id, record)
-
-    async def get_efficiency_series(self, node_id: str) -> Tuple[np.ndarray, np.ndarray]:
-        if node_id not in self.history:
-            await self._load_node_history(node_id)
-        if node_id not in self.history or len(self.history[node_id]) == 0:
-            return np.array([]), np.array([])
-        async with self._lock:
-            records = self.history[node_id]
-        times = np.array([r.timestamp.timestamp() for r in records])
-        effs = np.array([r.flops_per_joule for r in records])
-        return times, effs
-
-    async def get_latest_efficiency(self, node_id: str) -> Optional[float]:
-        if node_id not in self.history:
-            await self._load_node_history(node_id)
-        if node_id not in self.history or not self.history[node_id]:
-            return None
-        async with self._lock:
-            return self.history[node_id][-1].flops_per_joule
-
-    async def get_node_health(self, node_id: str, threshold: float) -> Dict[str, Any]:
-        eff = await self.get_latest_efficiency(node_id)
-        if eff is None:
-            return {"status": "unknown", "efficiency": None}
-        if eff < threshold:
-            return {"status": "critical", "efficiency": eff}
-        times, effs = await self.get_efficiency_series(node_id)
-        if len(effs) > 5:
-            slope = np.polyfit(range(len(effs)), effs, 1)[0]
-            if slope < 0:
-                return {"status": "degrading", "efficiency": eff}
-        return {"status": "healthy", "efficiency": eff}
-
-# ============================================================================
-# 5. PREDICTIVE REFLEXIVITY
-# ============================================================================
-class PredictiveReflexivity:
-    def __init__(self, config: PredictiveMaintenanceConfig):
-        self.config = config
-        self.horizon_days = config.forecast_horizon_days
-        self.min_points = config.min_data_points
-
-    def forecast(self, times: np.ndarray, values: np.ndarray) -> Dict[str, Any]:
-        if len(values) < self.min_points:
-            return {"error": "Insufficient data"}
-
-        if STATSMODELS_AVAILABLE:
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MaintenanceRecommendation":
+        d = dict(data)
+        ts = d.get('suggested_date')
+        if isinstance(ts, str):
             try:
-                model = ExponentialSmoothing(values, trend='add', seasonal=None, damped_trend=True)
-                fit = model.fit()
-                forecast = fit.forecast(self.horizon_days)
-                slope = fit.params.get('trend', 0.0)
-                residuals = values - fit.fittedvalues
-                std_res = np.std(residuals)
-                lower = forecast - 1.96 * std_res
-                upper = forecast + 1.96 * std_res
-                return self._postprocess_forecast(times, values, forecast, lower, upper, slope=slope)
-            except Exception as e:
-                logger.warning(f"Exponential smoothing failed: {e}, falling back to linear regression")
+                d['suggested_date'] = datetime.fromisoformat(ts)
+            except ValueError:
+                d['suggested_date'] = _utcnow()
+        elif not isinstance(ts, datetime):
+            d['suggested_date'] = _utcnow()
+        return cls(**{k: v for k, v in d.items()
+                      if k in {f.name for f in dataclass_fields(cls)}})
 
-        return self._linear_forecast(times, values)
 
-    def _linear_forecast(self, times: np.ndarray, values: np.ndarray) -> Dict[str, Any]:
-        t0 = times[0]
-        x = (times - t0) / (24 * 3600)
-        y = values
-        coeffs = np.polyfit(x, y, 1)
-        slope = coeffs[0]
-        intercept = coeffs[1]
-
-        last_day = x[-1]
-        future_days = np.linspace(last_day, last_day + self.horizon_days, 100)
-        predictions = slope * future_days + intercept
-
-        residuals = y - (slope * x + intercept)
-        std_res = np.std(residuals)
-        lower = predictions - 1.96 * std_res
-        upper = predictions + 1.96 * std_res
-        return self._postprocess_forecast(times, values, predictions, lower, upper, slope=slope)
-
-    def _postprocess_forecast(self, times, values, predictions, lower, upper, slope):
-        threshold = self.config.efficiency_threshold
-        days_to_threshold = None
-        crossing_day = None
-        future_days = np.linspace(0, self.horizon_days, len(predictions))
-        for i, pred in enumerate(predictions):
-            if pred < threshold:
-                crossing_day = future_days[i]
-                days_to_threshold = crossing_day
-                break
-        if predictions[0] < threshold:
-            days_to_threshold = 0.0
-        return {
-            "slope": slope,
-            "predictions": predictions.tolist(),
-            "future_days": future_days.tolist(),
-            "lower_bound": lower.tolist(),
-            "upper_bound": upper.tolist(),
-            "days_to_threshold": days_to_threshold,
-            "crossing_day": crossing_day,
-        }
-
-# ============================================================================
-# 6. DIGITALTWIN SIMULATOR
-# ============================================================================
-class DigitalTwinSimulator:
-    def __init__(self, config: PredictiveMaintenanceConfig,
-                 carbon_manager: Optional[Any] = None,
-                 lca_client: Optional[Any] = None):
-        self.config = config
-        self.carbon_manager = carbon_manager
-        self.lca_client = lca_client
-        self.co2_per_kwh = 0.2
-        self._carbon_circuit = CircuitBreaker("carbon_api")
-        self._lca_circuit = CircuitBreaker("lca_api")
-
-    async def _get_carbon_intensity(self) -> float:
-        if not self.config.carbon_intensity_enabled or self.carbon_manager is None:
-            return self.co2_per_kwh
-        try:
-            intensity_data = await self._carbon_circuit.call(self.carbon_manager.get_current_intensity)
-            return intensity_data.get('intensity', 400) / 1000
-        except Exception as e:
-            logger.warning(f"Carbon intensity retrieval failed: {e}")
-            return self.co2_per_kwh
-
-    async def _get_material_index(self, hardware_model: str) -> float:
-        if not self.config.lca_enabled or self.lca_client is None:
-            return 0.0
-        try:
-            result = await self._lca_circuit.call(self.lca_client.get_material_index, hardware_model)
-            return result.get('material_index', 0.0)
-        except Exception as e:
-            logger.warning(f"LCA material index retrieval failed: {e}")
-            return 0.0
-
-    async def simulate_replacement(
-        self,
-        node_id: str,
-        current_efficiency: float,
-        action: str = "replace",
-        expected_new_efficiency: float = None,
-        workload_flops_per_day: float = 1e12,
-        simulation_days: int = 365,
-        hardware_model: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        if action == "replace":
-            gain = self.config.replacement_efficiency_gain
-        else:
-            gain = self.config.refurbishment_efficiency_gain
-
-        if expected_new_efficiency is None:
-            expected_new_efficiency = current_efficiency * gain
-
-        energy_current = workload_flops_per_day / current_efficiency
-        energy_new = workload_flops_per_day / expected_new_efficiency
-        energy_saved_per_day = energy_current - energy_new
-        energy_saved_total = energy_saved_per_day * simulation_days
-
-        carbon_intensity = await self._get_carbon_intensity()
-        co2_saved_total = energy_saved_total / 3.6e6 * carbon_intensity
-        cost_saved_total = energy_saved_total / 3.6e6 * self.config.electricity_price_per_kwh_usd
-
-        hardware_cost = self.config.hardware_cost_usd if action == "replace" else 0.0
-        maintenance_cost = self.config.maintenance_cost_usd if action == "refurbish" else 0.0
-        total_initial_cost = hardware_cost + maintenance_cost
-
-        carbon_offset_value = co2_saved_total * self.config.carbon_offset_price_per_kg_usd
-        net_savings = cost_saved_total + carbon_offset_value - total_initial_cost
-
-        daily_savings = (cost_saved_total + carbon_offset_value) / simulation_days
-        payback_days = total_initial_cost / daily_savings if daily_savings > 0 else None
-
-        material_index = await self._get_material_index(hardware_model or f"node_{node_id}_model")
-
-        return {
-            "node_id": node_id,
-            "action": action,
-            "current_efficiency": current_efficiency,
-            "new_efficiency": expected_new_efficiency,
-            "workload_flops_per_day": workload_flops_per_day,
-            "simulation_days": simulation_days,
-            "energy_saved_per_day_joules": energy_saved_per_day,
-            "energy_saved_total_joules": energy_saved_total,
-            "co2_saved_total_kg": co2_saved_total,
-            "cost_saved_total_usd": cost_saved_total,
-            "carbon_offset_value_usd": carbon_offset_value,
-            "hardware_cost_usd": hardware_cost,
-            "maintenance_cost_usd": maintenance_cost,
-            "total_initial_cost_usd": total_initial_cost,
-            "net_savings_usd": net_savings,
-            "payback_days": payback_days,
-            "material_index": material_index,
-        }
-
-# ============================================================================
-# 7. DISTILLATION COMPONENTS
-# ============================================================================
 @dataclass
 class MaintenanceState:
+    # Base features (11)
     current_efficiency: float
     slope: float
     days_to_threshold: float
@@ -574,35 +1041,780 @@ class MaintenanceState:
     payback_refurbish: Optional[float]
     carbon_intensity: float
     material_index: float
-    action_success_rates: Dict[str, float]
-    avg_reward: float
+    action_success_rates: Dict[str, float] = field(default_factory=dict)
+    avg_reward: float = 0.5
+    # Sustainability dimensions (5) — bridged from UnifiedSustainabilityEngine
+    sustainability_dimensions: Dict[str, float] = field(default_factory=lambda: {
+        d: 0.5 for d in SUSTAINABILITY_DIMENSIONS
+    })
 
     def to_feature_vector(self) -> np.ndarray:
-        features = [
-            min(self.current_efficiency / 5e9, 1.0),
-            min(abs(self.slope) / 1e7, 1.0),
-            min(self.days_to_threshold / 90.0, 1.0),
-            min(self.net_savings_replace / 10000.0, 1.0),
-            min(self.net_savings_refurbish / 10000.0, 1.0),
-            min(self.carbon_intensity / 1.0, 1.0),
-            min(self.material_index / 2.0, 1.0),
-            self.action_success_rates.get('replace', 0.5),
-            self.action_success_rates.get('refurbish', 0.5),
-            self.action_success_rates.get('monitor', 0.5),
-            self.avg_reward,
+        """16-dim canonical feature vector (11 base + 5 sustainability)."""
+        base = [
+            float(np.clip(self.current_efficiency / 5e9, 0.0, 1.0)),
+            float(np.clip(abs(self.slope) / 1e7, 0.0, 1.0)),
+            float(np.clip(self.days_to_threshold / 90.0, 0.0, 1.0)),
+            float(np.clip(self.net_savings_replace / 10000.0, -1.0, 1.0)),
+            float(np.clip(self.net_savings_refurbish / 10000.0, -1.0, 1.0)),
+            float(np.clip(self.carbon_intensity, 0.0, 1.0)),
+            float(np.clip(self.material_index / 2.0, 0.0, 1.0)),
+            float(np.clip(self.action_success_rates.get('replace', 0.5), 0.0, 1.0)),
+            float(np.clip(self.action_success_rates.get('refurbish', 0.5), 0.0, 1.0)),
+            float(np.clip(self.action_success_rates.get('monitor', 0.5), 0.0, 1.0)),
+            float(np.clip(self.avg_reward, 0.0, 1.0)),
         ]
-        return np.array(features, dtype=np.float32)
+        sustainability = [
+            float(np.clip(self.sustainability_dimensions.get(d, 0.5), 0.0, 1.0))
+            for d in SUSTAINABILITY_DIMENSIONS
+        ]
+        return np.array(base + sustainability, dtype=np.float32)
 
-class Teacher(ABC):
+
+@dataclass
+class MOPDActionWeights:
+    vector_id: str
+    weights: Dict[str, float]
+    objectives: Dict[str, float]
+    scalarised_score: float = 0.0
+    stable_id: int = 0
+
+    def objective_vector(self) -> List[float]:
+        vec: List[float] = []
+        for name in MOPD_OBJECTIVE_NAMES:
+            val = float(self.objectives.get(name, 0.0))
+            if name in MOPD_HIGHER_IS_BETTER:
+                val = -val
+            vec.append(val)
+        return vec
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'vector_id': self.vector_id,
+            'weights': dict(self.weights),
+            'objectives': dict(self.objectives),
+            'scalarised_score': float(self.scalarised_score),
+            'stable_id': int(self.stable_id),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MOPDActionWeights":
+        return cls(
+            vector_id=data.get('vector_id', uuid.uuid4().hex),
+            weights=dict(data.get('weights', {})),
+            objectives=dict(data.get('objectives', {})),
+            scalarised_score=float(data.get('scalarised_score', 0.0)),
+            stable_id=int(data.get('stable_id', 0)),
+        )
+
+
+# ============================================================================
+# Schema migration (v3.3.1 → v4.0.0)
+# ============================================================================
+class SchemaMigrator:
+    """
+    Handles SQLite migration from PredictiveMaintenanceEngine v3.3.1
+    to v4.0.0 (schema version 4).
+
+    Changes:
+    - Add `schema_version` table.
+    - Add indices `idx_efficiency_node_ts` and `idx_rec_node_created`.
+    - Re-serialise the `recommendations.recommendation` JSON column using
+      typed `to_dict`/`from_dict` encoding (v3.3.1 used `__dict__` which
+      stringified numpy floats).
+    """
+
+    TARGET_VERSION = STATE_SCHEMA_VERSION
+
+    def __init__(self, db_path: str, dlq: Optional[DeadLetterQueue] = None,
+                 observability: Optional[ObservabilityHub] = None) -> None:
+        self.db_path = db_path
+        self.dlq = dlq
+        self.obs = observability or ObservabilityHub()
+
+    def _detect_version(self, conn: sqlite3.Connection) -> int:
+        try:
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='schema_version'"
+            )
+            if cur.fetchone() is None:
+                return 0
+            cur = conn.execute(
+                "SELECT MAX(version) FROM schema_version"
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        except sqlite3.Error:
+            return 0
+
+    def _ensure_schema_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL,
+                note TEXT
+            )
+        """)
+        conn.commit()
+
+    def _record_version(self, conn: sqlite3.Connection, version: int,
+                        note: str) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_version (version, applied_at, note) "
+            "VALUES (?, ?, ?)",
+            (version, _utcnow().isoformat(), note),
+        )
+        conn.commit()
+
+    def _add_indices(self, conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_efficiency_node_ts
+            ON efficiency_history(node_id, timestamp DESC)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_rec_node_created
+            ON recommendations(node_id, created_at DESC)
+        """)
+        conn.commit()
+
+    def _reserialize_recommendations(self, conn: sqlite3.Connection) -> int:
+        """Re-encode recommendation JSON with typed to_dict format."""
+        cur = conn.execute("SELECT id, recommendation FROM recommendations")
+        rows = cur.fetchall()
+        fixed = 0
+        for row_id, raw in rows:
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else {}
+            except json.JSONDecodeError:
+                continue
+            # Detect old format: `suggested_date` should be present
+            if 'node_id' not in data or 'suggested_date' not in data:
+                continue
+            # Ensure numeric types are real floats
+            for key in ('current_efficiency', 'predicted_efficiency_in_30_days',
+                        'threshold', 'days_to_threshold', 'carbon_savings_kg',
+                        'cost_savings_usd'):
+                if key in data and data[key] is not None:
+                    try:
+                        data[key] = float(data[key])
+                    except (TypeError, ValueError):
+                        pass
+            if data.get('payback_days') is not None:
+                try:
+                    data['payback_days'] = float(data['payback_days'])
+                except (TypeError, ValueError):
+                    data['payback_days'] = None
+            # Normalize empty/missing simulation_result
+            data.setdefault('simulation_result', {})
+            data.setdefault('sustainability_context', {})
+            new_raw = json.dumps(_to_serializable(data), default=str)
+            conn.execute(
+                "UPDATE recommendations SET recommendation = ? WHERE id = ?",
+                (new_raw, row_id),
+            )
+            fixed += 1
+        conn.commit()
+        return fixed
+
+    async def migrate_if_needed(self) -> Dict[str, Any]:
+        def _sync() -> Dict[str, Any]:
+            os.makedirs(os.path.dirname(os.path.abspath(self.db_path)) or '.',
+                        exist_ok=True)
+            conn = sqlite3.connect(self.db_path)
+            result: Dict[str, Any] = {
+                'db_path': self.db_path,
+                'from_version': 0,
+                'to_version': self.TARGET_VERSION,
+                'migrated': False,
+                'fixes': {},
+            }
+            try:
+                self._ensure_schema_table(conn)
+                current = self._detect_version(conn)
+                result['from_version'] = current
+                if current >= self.TARGET_VERSION:
+                    return result
+                # v3.3.1 (version 0) → v4.0.0 (version 4)
+                if current < 1:
+                    self._add_indices(conn)
+                    self._record_version(conn, 1, "indices_added")
+                    result['fixes']['indices_added'] = True
+                if current < 2:
+                    fixed = self._reserialize_recommendations(conn)
+                    self._record_version(
+                        conn, 2, f"recommendations_reserialized:{fixed}",
+                    )
+                    result['fixes']['recommendations_reserialized'] = fixed
+                if current < 3:
+                    # Reserved for future migrations
+                    self._record_version(conn, 3, "noop")
+                    result['fixes']['v3_noop'] = True
+                if current < 4:
+                    self._record_version(conn, 4, "target_reached")
+                    result['fixes']['target_reached'] = True
+                result['migrated'] = True
+            finally:
+                conn.close()
+            return result
+
+        try:
+            result = await asyncio.to_thread(_sync)
+            if result.get('migrated'):
+                logger.info("SQLite migrated %s → v%d (fixes=%s)",
+                            result['from_version'], result['to_version'],
+                            result['fixes'])
+                self.obs.counter('schema_migrations_total')
+            return result
+        except Exception as e:
+            logger.error("Schema migration failed: %s", e)
+            if self.dlq:
+                await self.dlq.record('schema_migration', str(e))
+            return {'migrated': False, 'error': str(e)}
+
+
+# ============================================================================
+# PersistenceService
+# ============================================================================
+class PersistenceService:
+    def __init__(self, config: PredictiveMaintenanceConfig,
+                 observability: Optional[ObservabilityHub] = None,
+                 dlq: Optional[DeadLetterQueue] = None) -> None:
+        self.config = config
+        self.obs = observability or ObservabilityHub()
+        self.dlq = dlq
+        self.db_path = config.persistence_path
+        os.makedirs(os.path.dirname(os.path.abspath(self.db_path)) or '.',
+                    exist_ok=True)
+        self._lock = asyncio.Lock()
+        self._write_count = 0
+        self._disabled = False
+        self._init_db_sync()
+
+    def _init_db_sync(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS efficiency_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id TEXT,
+                    timestamp REAL,
+                    flops_per_joule REAL,
+                    energy_joules REAL,
+                    flops REAL
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_efficiency_node_ts
+                ON efficiency_history(node_id, timestamp DESC)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS recommendations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id TEXT,
+                    recommendation TEXT,
+                    created_at REAL
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_rec_node_created
+                ON recommendations(node_id, created_at DESC)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    note TEXT
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def disable(self) -> None:
+        self._disabled = True
+
+    def enable(self) -> None:
+        self._disabled = False
+
+    async def migrate(self) -> Dict[str, Any]:
+        migrator = SchemaMigrator(self.db_path, self.dlq, self.obs)
+        return await migrator.migrate_if_needed()
+
+    async def _execute_write(self, query: str,
+                             params: Tuple[Any, ...] = ()) -> None:
+        if self._disabled:
+            raise RuntimeError("PersistenceService disabled (chaos)")
+
+        def _sync() -> None:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                conn.execute(query, params)
+                conn.commit()
+            finally:
+                conn.close()
+
+        await asyncio.to_thread(_sync)
+
+    async def _execute_read(self, query: str,
+                            params: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:
+        def _sync() -> List[Tuple[Any, ...]]:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cur = conn.execute(query, params)
+                return cur.fetchall()
+            finally:
+                conn.close()
+
+        return await asyncio.to_thread(_sync)
+
+    async def _prune_old_data(self) -> None:
+        cutoff = (_utcnow() - timedelta(days=self.config.data_retention_days)).timestamp()
+
+        def _sync() -> None:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                conn.execute("DELETE FROM efficiency_history WHERE timestamp < ?",
+                             (cutoff,))
+                conn.execute("DELETE FROM recommendations WHERE created_at < ?",
+                             (cutoff,))
+                conn.commit()
+            finally:
+                conn.close()
+
+        try:
+            await asyncio.to_thread(_sync)
+            self.obs.counter('persistence_prunes_total')
+        except Exception as e:
+            logger.warning("Pruning failed: %s", e)
+            if self.dlq:
+                await self.dlq.record('persistence_prune', str(e))
+
+    async def save_efficiency(self, node_id: str,
+                              record: EfficiencyRecord) -> None:
+        async with self._lock:
+            try:
+                await self._execute_write(
+                    "INSERT INTO efficiency_history "
+                    "(node_id, timestamp, flops_per_joule, energy_joules, flops) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (node_id, record.timestamp.timestamp(),
+                     record.flops_per_joule, record.energy_joules, record.flops),
+                )
+                self._write_count += 1
+                if self._write_count % self.config.prune_interval_inserts == 0:
+                    await self._prune_old_data()
+            except Exception as e:
+                logger.error("save_efficiency failed: %s", e)
+                if self.dlq:
+                    await self.dlq.record('save_efficiency', str(e),
+                                          {'node_id': node_id})
+
+    async def load_efficiency(self, node_id: str,
+                              limit: int = 1000) -> List[EfficiencyRecord]:
+        rows = await self._execute_read(
+            "SELECT timestamp, flops_per_joule, energy_joules, flops "
+            "FROM efficiency_history WHERE node_id = ? "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (node_id, limit),
+        )
+        records: List[EfficiencyRecord] = []
+        for r in reversed(rows):
+            try:
+                records.append(EfficiencyRecord(
+                    timestamp=datetime.fromtimestamp(r[0], tz=timezone.utc),
+                    flops_per_joule=float(r[1]),
+                    energy_joules=float(r[2]),
+                    flops=float(r[3]),
+                ))
+            except Exception as e:
+                logger.warning("Skipping invalid efficiency row: %s", e)
+        return records
+
+    async def save_recommendation(self, rec: MaintenanceRecommendation) -> None:
+        async with self._lock:
+            try:
+                await self._execute_write(
+                    "INSERT INTO recommendations (node_id, recommendation, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (rec.node_id, json.dumps(rec.to_dict(), default=str),
+                     _utcnow().timestamp()),
+                )
+            except Exception as e:
+                logger.error("save_recommendation failed: %s", e)
+                if self.dlq:
+                    await self.dlq.record('save_recommendation', str(e),
+                                          {'node_id': rec.node_id})
+
+    async def load_recommendations(
+        self, node_id: Optional[str] = None, limit: int = 10,
+    ) -> List[MaintenanceRecommendation]:
+        if node_id:
+            rows = await self._execute_read(
+                "SELECT recommendation FROM recommendations WHERE node_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (node_id, limit),
+            )
+        else:
+            rows = await self._execute_read(
+                "SELECT recommendation FROM recommendations "
+                "ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            )
+        recs: List[MaintenanceRecommendation] = []
+        for r in rows:
+            try:
+                data = json.loads(r[0])
+                recs.append(MaintenanceRecommendation.from_dict(data))
+            except Exception as e:
+                logger.warning("Skipping invalid recommendation row: %s", e)
+        return recs
+
+    async def close(self) -> None:
+        logger.debug("PersistenceService closed")
+
+
+# ============================================================================
+# TrackingService
+# ============================================================================
+class TrackingService:
+    def __init__(self, config: PredictiveMaintenanceConfig,
+                 persistence: Optional[PersistenceService] = None,
+                 observability: Optional[ObservabilityHub] = None) -> None:
+        self.config = config
+        self.persistence = persistence
+        self.obs = observability or ObservabilityHub()
+        self.max_history = 1000
+        self.history: Dict[str, Deque[EfficiencyRecord]] = defaultdict(
+            lambda: deque(maxlen=self.max_history),
+        )
+        self._loaded: Set[str] = set()
+        self._lock = asyncio.Lock()
+        self._disabled = False
+
+    def disable(self) -> None:
+        self._disabled = True
+
+    def enable(self) -> None:
+        self._disabled = False
+
+    async def _ensure_loaded(self, node_id: str) -> None:
+        if node_id in self._loaded:
+            return
+        async with self._lock:
+            if node_id in self._loaded:
+                return
+            if self.persistence is not None:
+                try:
+                    records = await self.persistence.load_efficiency(
+                        node_id, limit=self.max_history,
+                    )
+                    for rec in records:
+                        self.history[node_id].append(rec)
+                except Exception as e:
+                    logger.warning("Failed to load history for %s: %s", node_id, e)
+            self._loaded.add(node_id)
+
+    async def add_measurement(self, node_id: str, flops: float,
+                              energy_joules: float) -> None:
+        if self._disabled:
+            raise RuntimeError("TrackingService disabled (chaos)")
+        if energy_joules <= 0:
+            logger.warning("Non-positive energy for %s; skipping", node_id)
+            return
+        await self._ensure_loaded(node_id)
+        efficiency = float(flops) / float(energy_joules)
+        rec = EfficiencyRecord(
+            timestamp=_utcnow(),
+            flops_per_joule=efficiency,
+            energy_joules=float(energy_joules),
+            flops=float(flops),
+        )
+        async with self._lock:
+            self.history[node_id].append(rec)
+        if self.persistence is not None:
+            await self.persistence.save_efficiency(node_id, rec)
+        self.obs.histogram('efficiency_flops_per_joule', efficiency, node=node_id)
+        self.obs.gauge('nodes_tracked', len(self.history))
+
+    async def get_series(self, node_id: str) -> Tuple[np.ndarray, np.ndarray]:
+        await self._ensure_loaded(node_id)
+        async with self._lock:
+            records = list(self.history.get(node_id, []))
+        if not records:
+            return np.array([]), np.array([])
+        times = np.array([r.timestamp.timestamp() for r in records], dtype=float)
+        effs = np.array([r.flops_per_joule for r in records], dtype=float)
+        return times, effs
+
+    async def get_latest(self, node_id: str) -> Optional[float]:
+        await self._ensure_loaded(node_id)
+        async with self._lock:
+            dq = self.history.get(node_id)
+            if not dq:
+                return None
+            return float(dq[-1].flops_per_joule)
+
+    async def get_node_health(self, node_id: str,
+                              threshold: float) -> Dict[str, Any]:
+        eff = await self.get_latest(node_id)
+        if eff is None:
+            return {"status": "unknown", "efficiency": None}
+        _, effs = await self.get_series(node_id)
+        if eff < threshold:
+            return {"status": "critical", "efficiency": eff}
+        if len(effs) > 5:
+            slope = float(np.polyfit(np.arange(len(effs)), effs, 1)[0])
+            if slope < 0:
+                return {"status": "degrading", "efficiency": eff}
+        return {"status": "healthy", "efficiency": eff}
+
+    def list_nodes(self) -> List[str]:
+        return list(self.history.keys())
+
+
+# ============================================================================
+# ForecastService
+# ============================================================================
+class ForecastService:
+    def __init__(self, config: PredictiveMaintenanceConfig,
+                 observability: Optional[ObservabilityHub] = None) -> None:
+        self.config = config
+        self.obs = observability or ObservabilityHub()
+        self._disabled = False
+
+    def disable(self) -> None:
+        self._disabled = True
+
+    def enable(self) -> None:
+        self._disabled = False
+
+    def forecast(self, times: np.ndarray, values: np.ndarray) -> Dict[str, Any]:
+        if self._disabled:
+            raise RuntimeError("ForecastService disabled (chaos)")
+        if len(values) < self.config.min_data_points:
+            return {"error": "Insufficient data",
+                    "min_points": self.config.min_data_points,
+                    "samples": len(values)}
+        if STATSMODELS_AVAILABLE:
+            try:
+                return self._statsmodels_forecast(times, values)
+            except Exception as e:
+                logger.warning("ExponentialSmoothing failed: %s; using linear", e)
+        return self._linear_forecast(times, values)
+
+    def _statsmodels_forecast(self, times: np.ndarray,
+                              values: np.ndarray) -> Dict[str, Any]:
+        model = ExponentialSmoothing(
+            values, trend='add', seasonal=None, damped_trend=True,
+        )
+        fit = model.fit()
+        forecast = np.array(fit.forecast(self.config.forecast_horizon_days))
+        slope = float(fit.params.get('trend', 0.0))
+        residuals = values - np.asarray(fit.fittedvalues)
+        std_res = float(np.std(residuals)) if residuals.size else 0.0
+        z = _z_score(self.config.forecast_confidence)
+        lower = forecast - z * std_res
+        upper = forecast + z * std_res
+        return self._postprocess(times, values, forecast, lower, upper, slope)
+
+    def _linear_forecast(self, times: np.ndarray,
+                         values: np.ndarray) -> Dict[str, Any]:
+        t0 = float(times[0])
+        x = (times - t0) / (24 * 3600)
+        y = values.astype(float)
+        try:
+            coeffs = np.polyfit(x, y, 1)
+        except Exception:
+            coeffs = np.array([0.0, float(np.mean(y))])
+        slope, intercept = float(coeffs[0]), float(coeffs[1])
+        last_day = float(x[-1])
+        future_days = np.linspace(
+            last_day, last_day + self.config.forecast_horizon_days,
+            max(50, self.config.forecast_horizon_days),
+        )
+        predictions = slope * future_days + intercept
+        residuals = y - (slope * x + intercept)
+        std_res = float(np.std(residuals)) if residuals.size else 0.0
+        z = _z_score(self.config.forecast_confidence)
+        lower = predictions - z * std_res
+        upper = predictions + z * std_res
+        return self._postprocess(times, values, predictions, lower, upper, slope)
+
+    def _postprocess(self, times: np.ndarray, values: np.ndarray,
+                     predictions: np.ndarray, lower: np.ndarray,
+                     upper: np.ndarray, slope: float) -> Dict[str, Any]:
+        threshold = self.config.efficiency_threshold
+        predictions = np.maximum.accumulate(predictions) if slope < 0 else predictions
+        predictions = np.minimum.accumulate(predictions) if slope > 0 else predictions
+
+        days_to_threshold: Optional[float] = None
+        crossing_day: Optional[float] = None
+        n = max(1, len(predictions) - 1)
+        for i, pred in enumerate(predictions):
+            if pred < threshold:
+                crossing_day = (i / n) * self.config.forecast_horizon_days
+                days_to_threshold = crossing_day
+                break
+        if predictions[0] < threshold:
+            days_to_threshold = 0.0
+            crossing_day = 0.0
+
+        self.obs.histogram('forecast_slope', float(slope))
+        return {
+            "slope": float(slope),
+            "predictions": predictions.tolist(),
+            "future_days": np.linspace(
+                0.0, self.config.forecast_horizon_days, len(predictions),
+            ).tolist(),
+            "lower_bound": lower.tolist(),
+            "upper_bound": upper.tolist(),
+            "days_to_threshold": days_to_threshold,
+            "crossing_day": crossing_day,
+            "confidence": self.config.forecast_confidence,
+        }
+
+
+# ============================================================================
+# DigitalTwinService
+# ============================================================================
+class DigitalTwinService:
+    def __init__(self, config: PredictiveMaintenanceConfig,
+                 carbon_manager: Optional[CarbonProviderProtocol] = None,
+                 lca_client: Optional[LCAProviderProtocol] = None,
+                 observability: Optional[ObservabilityHub] = None) -> None:
+        self.config = config
+        self.carbon_manager = carbon_manager
+        self.lca_client = lca_client
+        self.obs = observability or ObservabilityHub()
+        self._carbon_circuit = CircuitBreaker(
+            "carbon_api",
+            failure_threshold=config.moea_max_concurrent_evals,
+            recovery_timeout=30.0,
+        )
+        self._lca_circuit = CircuitBreaker("lca_api", failure_threshold=3,
+                                            recovery_timeout=30.0)
+        self._disabled = False
+
+    def disable(self) -> None:
+        self._disabled = True
+
+    def enable(self) -> None:
+        self._disabled = False
+
+    async def _get_carbon_intensity(self) -> float:
+        if not self.config.carbon_intensity_enabled or self.carbon_manager is None:
+            return self.config.default_co2_per_kwh
+        try:
+            intensity = await self._carbon_circuit.call(
+                self.carbon_manager.get_current_intensity,
+                self.config.carbon_region,
+            )
+            self.obs.counter('carbon_fetches_total', status='ok')
+            return float(intensity)
+        except Exception as e:
+            logger.warning("Carbon intensity failed: %s", e)
+            self.obs.counter('carbon_fetches_total', status='error')
+            return self.config.default_co2_per_kwh
+
+    async def _get_material_index(self, hardware_model: str) -> float:
+        if not self.config.lca_enabled or self.lca_client is None:
+            return 0.0
+        try:
+            idx = await self._lca_circuit.call(
+                self.lca_client.get_material_index, hardware_model,
+            )
+            return float(idx)
+        except Exception as e:
+            logger.warning("LCA failed: %s", e)
+            return 0.0
+
+    async def simulate_replacement(
+        self,
+        node_id: str,
+        current_efficiency: float,
+        action: str = "replace",
+        expected_new_efficiency: Optional[float] = None,
+        workload_flops_per_day: float = 1e12,
+        simulation_days: int = 365,
+        hardware_model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if self._disabled:
+            raise RuntimeError("DigitalTwinService disabled (chaos)")
+        if action == "replace":
+            gain = self.config.replacement_efficiency_gain
+        else:
+            gain = self.config.refurbishment_efficiency_gain
+        if expected_new_efficiency is None:
+            expected_new_efficiency = current_efficiency * gain
+        if current_efficiency <= 0 or expected_new_efficiency <= 0:
+            return {"error": "Non-positive efficiency"}
+
+        energy_current = workload_flops_per_day / current_efficiency
+        energy_new = workload_flops_per_day / expected_new_efficiency
+        energy_saved_per_day = energy_current - energy_new
+        energy_saved_total = energy_saved_per_day * simulation_days
+
+        carbon_intensity = await self._get_carbon_intensity()
+        co2_saved_total = (energy_saved_total / 3.6e6) * (carbon_intensity / 1000.0)
+        cost_saved_total = (energy_saved_total / 3.6e6) * self.config.electricity_price_per_kwh_usd
+
+        hardware_cost = self.config.hardware_cost_usd if action == "replace" else 0.0
+        maintenance_cost = self.config.maintenance_cost_usd if action == "refurbish" else 0.0
+        total_initial_cost = hardware_cost + maintenance_cost
+
+        carbon_offset_value = co2_saved_total * self.config.carbon_offset_price_per_kg_usd
+        net_savings = cost_saved_total + carbon_offset_value - total_initial_cost
+
+        daily_savings = ((cost_saved_total + carbon_offset_value) / simulation_days
+                         if simulation_days > 0 else 0.0)
+        payback_days = (total_initial_cost / daily_savings) if daily_savings > 0 else None
+
+        material_index = await self._get_material_index(
+            hardware_model or f"node_{node_id}_model",
+        )
+
+        self.obs.counter('digital_twin_simulations_total', action=action)
+        return {
+            "node_id": node_id,
+            "action": action,
+            "current_efficiency": float(current_efficiency),
+            "new_efficiency": float(expected_new_efficiency),
+            "workload_flops_per_day": float(workload_flops_per_day),
+            "simulation_days": int(simulation_days),
+            "energy_saved_per_day_joules": float(energy_saved_per_day),
+            "energy_saved_total_joules": float(energy_saved_total),
+            "co2_saved_total_kg": float(co2_saved_total),
+            "cost_saved_total_usd": float(cost_saved_total),
+            "carbon_offset_value_usd": float(carbon_offset_value),
+            "hardware_cost_usd": float(hardware_cost),
+            "maintenance_cost_usd": float(maintenance_cost),
+            "total_initial_cost_usd": float(total_initial_cost),
+            "net_savings_usd": float(net_savings),
+            "payback_days": float(payback_days) if payback_days is not None else None,
+            "material_index": float(material_index),
+        }
+
+
+# ============================================================================
+# DistillationService
+# ============================================================================
+class _Teacher(ABC):
     @abstractmethod
     def predict(self, state: MaintenanceState) -> np.ndarray: ...
+
     @abstractmethod
     def confidence(self, state: MaintenanceState) -> float: ...
 
-class ActionRuleBasedTeacher(Teacher):
-    ACTIONS = ['replace', 'refurbish', 'monitor']
-    def predict(self, state):
-        probs = np.ones(3) * 0.1
+    @abstractmethod
+    def name(self) -> str: ...
+
+
+class RuleBasedTeacher(_Teacher):
+    def name(self) -> str:
+        return "rule_based"
+
+    def predict(self, state: MaintenanceState) -> np.ndarray:
+        probs = np.ones(len(MAINTENANCE_ACTIONS)) * 0.1
         if state.days_to_threshold <= 0:
             if state.net_savings_replace > state.net_savings_refurbish:
                 probs[0] = 0.8
@@ -616,802 +1828,2308 @@ class ActionRuleBasedTeacher(Teacher):
         else:
             probs[2] = 0.7
         return probs / probs.sum()
-    def confidence(self, state):
+
+    def confidence(self, state: MaintenanceState) -> float:
         return 0.6 if state.days_to_threshold <= 0 else 0.4
 
-class ActionHistoricalMLTeacher(Teacher):
-    def __init__(self, model_path=None):
-        self.model = None
-        self.label_encoder = None
-        self.model_path = model_path or Path(PredictiveMaintenanceConfig().historical_model_path)
-        if self.model_path.exists() and SKLEARN_ML:
-            with open(self.model_path, 'rb') as f:
-                self.model, self.label_encoder = pickle.load(f)
-    def predict(self, state):
+
+class HistoricalMLTeacher(_Teacher):
+    def __init__(self, config: PredictiveMaintenanceConfig) -> None:
+        self.config = config
+        self.model: Optional[Any] = None
+        self.label_encoder: Optional[Any] = None
+        self.model_path = Path(config.historical_model_path)
+        if self.model_path.exists() and SKLEARN_AVAILABLE:
+            try:
+                with open(self.model_path, 'rb') as f:
+                    self.model, self.label_encoder = pickle.load(f)
+            except Exception as e:
+                logger.warning("Failed to load historical model: %s", e)
+
+    def name(self) -> str:
+        return "historical_ml"
+
+    def predict(self, state: MaintenanceState) -> np.ndarray:
         if self.model is None:
-            return np.ones(3)/3
+            return np.ones(len(MAINTENANCE_ACTIONS)) / len(MAINTENANCE_ACTIONS)
         x = state.to_feature_vector().reshape(1, -1)
-        return self.model.predict_proba(x)[0]
-    def confidence(self, state):
+        try:
+            probs = np.asarray(self.model.predict_proba(x)[0])
+            if probs.size < len(MAINTENANCE_ACTIONS):
+                padded = np.zeros(len(MAINTENANCE_ACTIONS))
+                padded[:probs.size] = probs
+                probs = padded
+            total = probs.sum()
+            return probs / total if total > 0 else np.ones_like(probs) / probs.size
+        except Exception:
+            return np.ones(len(MAINTENANCE_ACTIONS)) / len(MAINTENANCE_ACTIONS)
+
+    def confidence(self, state: MaintenanceState) -> float:
         return 0.7 if self.model is not None else 0.0
 
-class ActionStatefulQTeacher(Teacher):
-    def __init__(self, lr=0.1):
+
+class StatefulQTeacher(_Teacher):
+    def __init__(self, config: PredictiveMaintenanceConfig,
+                 lr: float = 0.1) -> None:
+        self.config = config
         self.lr = lr
-        self.weights = np.zeros((11, 3))
+        self.n_actions = len(MAINTENANCE_ACTIONS)
+        self.weights = np.zeros((FEATURE_DIM, self.n_actions))
+        self._save_lock = asyncio.Lock()
         self._load_state()
-    def _load_state(self):
-        path = Path(PredictiveMaintenanceConfig().q_weights_path)
-        if path.exists():
+
+    def name(self) -> str:
+        return "stateful_q"
+
+    def _load_state(self) -> None:
+        path = Path(self.config.q_weights_path)
+        if not path.exists():
+            return
+        try:
             with open(path, 'r') as f:
-                self.weights = np.array(json.load(f))
-    def _save_state(self):
-        path = Path(PredictiveMaintenanceConfig().q_weights_path)
-        with open(path, 'w') as f:
-            json.dump(self.weights.tolist(), f, indent=2)
-    def predict(self, state):
+                data = json.load(f)
+            arr = np.asarray(data, dtype=float)
+            if arr.shape == self.weights.shape:
+                self.weights = arr
+            elif arr.shape[0] < FEATURE_DIM:
+                # Zero-pad older smaller feature vectors
+                padded = np.zeros((FEATURE_DIM, arr.shape[1]))
+                padded[:arr.shape[0], :arr.shape[1]] = arr
+                self.weights = padded
+                logger.info("Migrated Q-teacher weights from %s to %s",
+                            arr.shape, self.weights.shape)
+            else:
+                logger.warning("Q-teacher shape mismatch: %s vs %s",
+                               arr.shape, self.weights.shape)
+        except Exception as e:
+            logger.debug("Failed to load Q weights: %s", e)
+
+    async def _save_state_async(self) -> None:
+        async with self._save_lock:
+            def _write() -> None:
+                path = Path(self.config.q_weights_path)
+                tmp = f"{path}.tmp"
+                with open(tmp, 'w') as f:
+                    json.dump(self.weights.tolist(), f, indent=2)
+                os.replace(tmp, path)
+            try:
+                await asyncio.to_thread(_write)
+            except Exception as e:
+                logger.debug("Failed to save Q weights: %s", e)
+
+    def predict(self, state: MaintenanceState) -> np.ndarray:
         x = state.to_feature_vector()
         q = x @ self.weights
         exp_q = np.exp(q - np.max(q))
         return exp_q / exp_q.sum()
-    def confidence(self, state):
+
+    def confidence(self, state: MaintenanceState) -> float:
         return 0.5
-    def update(self, state, action, reward):
+
+    async def update(self, state: MaintenanceState, action_idx: int,
+                     reward: float) -> None:
         x = state.to_feature_vector()
-        q_current = np.dot(x, self.weights[:, action])
-        self.weights[:, action] += self.lr * (reward - q_current) * x
-        self._save_state()
+        q_current = float(np.dot(x, self.weights[:, action_idx]))
+        self.weights[:, action_idx] += self.lr * (reward - q_current) * x
+        await self._save_state_async()
+
 
 class DistillationStudent:
-    def __init__(self, feature_dim=11, n_classes=3, lr=0.01):
+    def __init__(self, feature_dim: int = FEATURE_DIM,
+                 n_classes: int = len(MAINTENANCE_ACTIONS),
+                 lr: float = 0.01) -> None:
         self.weights = np.zeros((feature_dim, n_classes))
         self.biases = np.zeros(n_classes)
         self.lr = lr
         self.n_classes = n_classes
         self.counter = 0
-    def predict_proba(self, state_vector, num_classes=None):
-        if num_classes is None:
-            num_classes = self.n_classes
+
+    def predict_proba(self, state_vector: np.ndarray) -> np.ndarray:
         logits = state_vector @ self.weights + self.biases
-        max_logit = np.max(logits)
-        exp_logits = np.exp(logits - max_logit)
+        exp_logits = np.exp(logits - np.max(logits))
         return exp_logits / exp_logits.sum()
-    def update(self, state_vector, teacher_probs, reward, action, distill_weight=0.7, rl_weight=0.3):
+
+    def update(self, state_vector: np.ndarray, teacher_probs: np.ndarray,
+               reward: float, action_idx: int,
+               distill_weight: float = 0.7, rl_weight: float = 0.3) -> None:
         current = self.predict_proba(state_vector)
         grad_distill = -(teacher_probs - current)
-        one_hot = np.zeros(self.n_classes); one_hot[action] = 1.0
+        one_hot = np.zeros(self.n_classes)
+        one_hot[action_idx] = 1.0
         grad_rl = -reward * (one_hot - current)
         grad = distill_weight * grad_distill + rl_weight * grad_rl
         self.weights -= self.lr * np.outer(state_vector, grad)
         self.biases -= self.lr * grad
         self.counter += 1
 
+
 class ReplayBuffer:
-    def __init__(self, max_size=2000):
-        self.buffer = deque(maxlen=max_size)
-    def push(self, s, a, r, ns, tp):
+    def __init__(self, max_size: int = 2000) -> None:
+        self.buffer: Deque[Tuple[np.ndarray, int, float, np.ndarray, np.ndarray]] = deque(
+            maxlen=max_size,
+        )
+
+    def push(self, s: np.ndarray, a: int, r: float, ns: np.ndarray,
+             tp: np.ndarray) -> None:
         self.buffer.append((s, a, r, ns, tp))
-    def sample(self, batch_size=32):
+
+    def sample(self, batch_size: int = 32) -> Tuple[np.ndarray, List[int],
+                                                     np.ndarray, np.ndarray, np.ndarray]:
+        if not self.buffer:
+            empty = np.zeros((0, FEATURE_DIM), dtype=np.float32)
+            return (empty, [], np.zeros(0), empty,
+                    np.zeros((0, len(MAINTENANCE_ACTIONS))))
         if len(self.buffer) < batch_size:
             batch = list(self.buffer)
         else:
             batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, teacher_probs = zip(*batch)
-        return np.array(states), actions, np.array(rewards), np.array(next_states), np.array(teacher_probs)
-    def __len__(self):
+        return (np.array(states), list(actions), np.array(rewards),
+                np.array(next_states), np.array(teacher_probs))
+
+    def __len__(self) -> int:
         return len(self.buffer)
 
-class DistillationActionOptimizer:
-    ACTIONS = ['replace', 'refurbish', 'monitor']
-    def __init__(self, config):
+
+class DistillationService:
+    def __init__(self, config: PredictiveMaintenanceConfig,
+                 observability: Optional[ObservabilityHub] = None,
+                 shared_teachers: Optional[List[_Teacher]] = None) -> None:
         self.config = config
-        self.student = DistillationStudent(lr=config.get('distillation_learning_rate', 0.01))
-        self.teachers = [ActionRuleBasedTeacher(), ActionHistoricalMLTeacher(), ActionStatefulQTeacher()]
-        self.replay_buffer = ReplayBuffer(max_size=config.get('distillation_replay_size', 2000))
-        self.epsilon = config.get('distillation_epsilon', 0.1)
-        self.train_every = config.get('distillation_train_every', 10)
+        self.obs = observability or ObservabilityHub()
+        self.teachers: List[_Teacher] = list(shared_teachers or [])
+        self.teachers.extend([
+            RuleBasedTeacher(),
+            HistoricalMLTeacher(config),
+            StatefulQTeacher(config),
+        ])
+        self.student = DistillationStudent(lr=config.distillation_learning_rate)
+        self.replay = ReplayBuffer(max_size=config.distillation_replay_size)
+        self.epsilon = config.distillation_epsilon
+        self.train_every = config.distillation_train_every
+        self.distill_weight = config.distill_weight
+        self.rl_weight = config.rl_weight
         self.counter = 0
-    async def select_action(self, state, exploration=True):
+        self._lock = asyncio.Lock()
+        self._disabled = False
+
+    def disable(self) -> None:
+        self._disabled = True
+
+    def enable(self) -> None:
+        self._disabled = False
+
+    def add_teacher(self, teacher: _Teacher) -> None:
+        self.teachers.append(teacher)
+
+    async def select_action(
+        self, state: MaintenanceState, exploration: bool = True,
+    ) -> Tuple[str, int, np.ndarray, np.ndarray]:
+        if self._disabled:
+            raise RuntimeError("DistillationService disabled (chaos)")
         state_vec = state.to_feature_vector()
-        teacher_probs = np.zeros(3); total_conf = 0.0
+        teacher_probs = np.zeros(len(MAINTENANCE_ACTIONS))
+        total_conf = 0.0
         for teacher in self.teachers:
-            prob = teacher.predict(state); conf = teacher.confidence(state)
-            teacher_probs += prob * conf; total_conf += conf
-        if total_conf > 0: teacher_probs /= total_conf
-        else: teacher_probs = np.ones(3)/3
+            try:
+                prob = teacher.predict(state)
+                conf = teacher.confidence(state)
+                teacher_probs += prob * conf
+                total_conf += conf
+            except Exception as e:
+                logger.warning("Teacher %s failed: %s", teacher.name(), e)
+        if total_conf > 0:
+            teacher_probs /= total_conf
+        else:
+            teacher_probs = np.ones(len(MAINTENANCE_ACTIONS)) / len(MAINTENANCE_ACTIONS)
+
         student_probs = self.student.predict_proba(state_vec)
         if exploration and random.random() < self.epsilon:
-            action_idx = random.randint(0, 2)
+            action_idx = random.randint(0, len(MAINTENANCE_ACTIONS) - 1)
         else:
-            combined = 0.8*student_probs + 0.2*teacher_probs
-            action_idx = np.argmax(combined)
-        return self.ACTIONS[action_idx], action_idx, state_vec, teacher_probs
-    async def update(self, state_vec, action_idx, reward, next_state_vec, teacher_probs):
-        self.replay_buffer.push(state_vec, action_idx, reward, next_state_vec, teacher_probs)
-        self.counter += 1
-        if self.counter % self.train_every == 0 and len(self.replay_buffer) >= 8:
-            batch = self.replay_buffer.sample(8)
-            states, actions, rewards, _, teacher_probs_batch = batch
-            for i in range(len(states)):
-                self.student.update(states[i], teacher_probs_batch[i], rewards[i], actions[i])
-    def get_stats(self):
-        return {'student_counter': self.student.counter, 'buffer_size': len(self.replay_buffer)}
+            combined = 0.8 * student_probs + 0.2 * teacher_probs
+            action_idx = int(np.argmax(combined))
+        return MAINTENANCE_ACTIONS[action_idx], action_idx, state_vec, teacher_probs
+
+    async def update(self, state_vec: np.ndarray, action_idx: int, reward: float,
+                     next_state_vec: np.ndarray,
+                     teacher_probs: np.ndarray) -> None:
+        async with self._lock:
+            self.replay.push(state_vec, action_idx, reward,
+                             next_state_vec, teacher_probs)
+            self.counter += 1
+            if self.counter % self.train_every == 0 and len(self.replay) >= 8:
+                states, actions, rewards, _, teacher_probs_batch = self.replay.sample(8)
+                for i in range(len(states)):
+                    self.student.update(
+                        states[i], teacher_probs_batch[i], float(rewards[i]),
+                        int(actions[i]),
+                        distill_weight=self.distill_weight,
+                        rl_weight=self.rl_weight,
+                    )
+                self.obs.counter('distill_updates_total')
+
+    async def update_teacher(self, state: MaintenanceState, action_idx: int,
+                             reward: float) -> None:
+        for teacher in self.teachers:
+            if isinstance(teacher, StatefulQTeacher):
+                try:
+                    await teacher.update(state, action_idx, reward)
+                except Exception as e:
+                    logger.warning("Q-teacher update failed: %s", e)
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            'student_counter': self.student.counter,
+            'buffer_size': len(self.replay),
+            'teacher_count': len(self.teachers),
+            'disabled': self._disabled,
+        }
+
 
 # ============================================================================
-# MOEA
+# EvolutionService (NSGA-II)
 # ============================================================================
-@dataclass
-class MOPDActionWeights:
-    vector_id: str
-    weights: Dict[str, float]
-    objectives: Dict[str, float]
-    scalarised_score: float = 0.0
-    def to_dict(self):
-        return {'vector_id': self.vector_id, 'weights': self.weights, 'objectives': self.objectives, 'scalarised_score': self.scalarised_score}
-    @classmethod
-    def from_dict(cls, data):
-        return cls(**data)
+class EvolutionService:
+    def __init__(
+        self,
+        config: PredictiveMaintenanceConfig,
+        evaluate: Callable[[Dict[str, float]], Awaitable[Dict[str, float]]],
+        observability: Optional[ObservabilityHub] = None,
+    ) -> None:
+        self.config = config
+        self.evaluate = evaluate
+        self.obs = observability or ObservabilityHub()
+        self.population_size = config.moea_population_size
+        self.generations = config.moea_generations
+        self.mutation_rate = config.moea_mutation_rate
+        self.crossover_rate = config.moea_crossover_rate
+        self.tournament_size = config.moea_tournament_size
+        self.objective_weights = dict(
+            getattr(config.mopd, 'objective_weights', {})
+            or {'net_savings': 0.35, 'carbon_savings': 0.25,
+                'risk_reduction': 0.25, 'longterm_efficiency': 0.15}
+        )
+        self.dynamic_weights = config.moea_dynamic_weights
+        self._semaphore = asyncio.Semaphore(config.moea_max_concurrent_evals)
+        self._rng = random.Random(42)
+        self._next_id = 1
+        self.pareto_front: List[MOPDActionWeights] = []
+        self.best: Optional[MOPDActionWeights] = None
+        self._disabled = False
 
-class NSGAIAActionOptimizer:
-    def __init__(self, evaluate_func, population_size=20, generations=10, mutation_rate=0.2, crossover_rate=0.8, tournament_size=3, objective_weights=None, dynamic_weights=True):
-        self.evaluate_func = evaluate_func
-        self.population_size = population_size
-        self.generations = generations
-        self.mutation_rate = mutation_rate
-        self.crossover_rate = crossover_rate
-        self.tournament_size = tournament_size
-        self.objective_weights = objective_weights or {'net_savings':0.35,'carbon_savings':0.25,'risk_reduction':0.25,'longterm_efficiency':0.15}
-        self.dynamic_weights = dynamic_weights
-        self.best_individual = None
-        self.best_fitness = -float('inf')
-        self.pareto_front = []
-        self._eval_cache = {}
-        self._all_points = []
-    def _random_individual(self):
-        keys = ['replace','refurbish','monitor']
-        w = {k: random.random() for k in keys}
+    def disable(self) -> None:
+        self._disabled = True
+
+    def enable(self) -> None:
+        self._disabled = False
+
+    def _random_individual(self) -> Dict[str, float]:
+        w = {k: self._rng.random() for k in MAINTENANCE_ACTIONS}
         total = sum(w.values())
-        if total > 0: w = {k: v/total for k,v in w.items()}
-        return w
-    def _crossover(self, p1, p2):
-        child = {}
+        return {k: v / total for k, v in w.items()} if total > 0 else w
+
+    def _crossover(self, p1: Dict[str, float], p2: Dict[str, float]) -> Dict[str, float]:
+        child: Dict[str, float] = {}
         for key in p1:
-            if random.random() < 0.5:
-                u = random.random()
-                if u <= 0.5: beta = (2*u)**(1/(20+1))
-                else: beta = (1/(2*(1-u)))**(1/(20+1))
-                child[key] = max(0.0, min(1.0, 0.5*((1+beta)*p1[key] + (1-beta)*p2[key])))
-            else: child[key] = p1[key] if random.random() < 0.5 else p2[key]
+            if self._rng.random() < 0.5:
+                u = self._rng.random()
+                beta = ((2 * u) ** (1 / 21)) if u <= 0.5 else ((1 / (2 * (1 - u))) ** (1 / 21))
+                child[key] = max(0.0, min(1.0, 0.5 * ((1 + beta) * p1[key] + (1 - beta) * p2[key])))
+            else:
+                child[key] = p1[key] if self._rng.random() < 0.5 else p2[key]
         total = sum(child.values())
-        if total > 0: child = {k: v/total for k,v in child.items()}
-        return child
-    def _mutate(self, ind):
-        mutant = ind.copy()
+        return {k: v / total for k, v in child.items()} if total > 0 else child
+
+    def _mutate(self, ind: Dict[str, float]) -> Dict[str, float]:
+        mutant = dict(ind)
         for key in mutant:
-            if random.random() < self.mutation_rate:
-                u = random.random()
-                if u < 0.5: delta = (2*u)**(1/(20+1)) - 1
-                else: delta = 1 - (2*(1-u))**(1/(20+1))
+            if self._rng.random() < self.mutation_rate:
+                u = self._rng.random()
+                delta = ((2 * u) ** (1 / 21) - 1) if u < 0.5 else (1 - (2 * (1 - u)) ** (1 / 21))
                 mutant[key] = max(0.0, min(1.0, mutant[key] + delta))
         total = sum(mutant.values())
-        if total > 0: mutant = {k: v/total for k,v in mutant.items()}
-        return mutant
-    def _fast_non_dominated_sort(self, points):
-        fronts = []
-        domination_count = {id(p):0 for p in points}
-        dominated_solutions = {id(p):[] for p in points}
-        for i,p in enumerate(points):
-            p_obj = p.objectives
-            for j,q in enumerate(points):
-                if i==j: continue
-                q_obj = q.objectives
-                if all(p_obj[k]>=q_obj[k] for k in p_obj) and any(p_obj[k]>q_obj[k] for k in p_obj):
-                    dominated_solutions[id(p)].append(q)
-                elif all(q_obj[k]>=p_obj[k] for k in q_obj) and any(q_obj[k]>p_obj[k] for k in q_obj):
-                    domination_count[id(p)] += 1
-            if domination_count[id(p)]==0:
-                if not fronts: fronts.append([])
-                fronts[0].append(p)
-        i=0
-        while i<len(fronts):
-            next_front=[]
-            for p in fronts[i]:
-                for q in dominated_solutions[id(p)]:
-                    domination_count[id(q)]-=1
-                    if domination_count[id(q)]==0: next_front.append(q)
-            if next_front: fronts.append(next_front)
-            i+=1
-        return fronts
-    def _crowding_distance(self, front):
-        if not front: return {}
-        distances={id(p):0.0 for p in front}
-        obj_keys=list(front[0].objectives.keys())
-        for obj in obj_keys:
-            sorted_front=sorted(front, key=lambda x: x.objectives[obj])
-            distances[id(sorted_front[0])]=float('inf')
-            distances[id(sorted_front[-1])]=float('inf')
-            obj_min=sorted_front[0].objectives[obj]; obj_max=sorted_front[-1].objectives[obj]
-            if obj_max==obj_min: continue
-            for i in range(1,len(sorted_front)-1):
-                distances[id(sorted_front[i])]+=(sorted_front[i+1].objectives[obj]-sorted_front[i-1].objectives[obj])/(obj_max-obj_min)
+        return {k: v / total for k, v in mutant.items()} if total > 0 else mutant
+
+    def _fast_non_dominated_sort(
+        self, points: Sequence[MOPDActionWeights],
+    ) -> List[List[MOPDActionWeights]]:
+        if not points:
+            return []
+        n = len(points)
+        domination_count = [0] * n
+        dominated: List[List[int]] = [[] for _ in range(n)]
+        fronts: List[List[int]] = [[]]
+        for i in range(n):
+            pi = points[i].objective_vector()
+            for j in range(n):
+                if i == j:
+                    continue
+                pj = points[j].objective_vector()
+                if all(a <= b for a, b in zip(pj, pi)) and any(a < b for a, b in zip(pj, pi)):
+                    dominated[i].append(j)
+                elif all(a <= b for a, b in zip(pi, pj)) and any(a < b for a, b in zip(pi, pj)):
+                    domination_count[i] += 1
+            if domination_count[i] == 0:
+                fronts[0].append(i)
+        i = 0
+        while i < len(fronts) and fronts[i]:
+            nxt: List[int] = []
+            for idx in fronts[i]:
+                for other in dominated[idx]:
+                    domination_count[other] -= 1
+                    if domination_count[other] == 0:
+                        nxt.append(other)
+            if nxt:
+                fronts.append(nxt)
+            i += 1
+        return [[points[idx] for idx in front] for front in fronts if front]
+
+    def _crowding_distance(
+        self, front: Sequence[MOPDActionWeights],
+    ) -> Dict[int, float]:
+        if not front:
+            return {}
+        distances = {p.stable_id: 0.0 for p in front}
+        for obj in MOPD_OBJECTIVE_NAMES:
+            sf = sorted(front, key=lambda x: x.objectives.get(obj, 0.0))
+            distances[sf[0].stable_id] = float('inf')
+            distances[sf[-1].stable_id] = float('inf')
+            lo = sf[0].objectives.get(obj, 0.0)
+            hi = sf[-1].objectives.get(obj, 0.0)
+            if hi == lo:
+                continue
+            for i in range(1, len(sf) - 1):
+                distances[sf[i].stable_id] += (
+                    (sf[i + 1].objectives.get(obj, 0.0) - sf[i - 1].objectives.get(obj, 0.0))
+                    / (hi - lo)
+                )
         return distances
-    def _tournament_selection(self, population, fronts, crowding):
-        candidates=random.sample(population, self.tournament_size)
-        ind_to_point={id(ind):point for ind,point in zip(population, self._all_points)}
-        best=candidates[0]; best_rank=float('inf'); best_crowding=-float('inf')
-        for cand in candidates:
-            point=ind_to_point.get(id(cand))
-            if not point: continue
-            rank=len(fronts)
-            for fi,front in enumerate(fronts):
-                if point in front: rank=fi; break
-            cd=crowding.get(id(point),0)
-            if rank<best_rank or (rank==best_rank and cd>best_crowding):
-                best=cand; best_rank=rank; best_crowding=cd
-        return best
-    def _compute_dynamic_weights(self):
-        weights=self.objective_weights.copy()
-        if not self.dynamic_weights or not self.pareto_front: return weights
-        obj_keys=list(weights.keys())
-        avg={k: np.mean([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
-        max_val={k: np.max([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
-        for k in obj_keys:
-            if max_val[k]>0 and avg[k]<0.5*max_val[k]: weights[k]=min(0.6, weights[k]*1.5)
-        total=sum(weights.values())
-        if total>0: weights={k:v/total for k,v in weights.items()}
+
+    def _tournament_selection(
+        self,
+        population: Sequence[Dict[str, float]],
+        points: Sequence[MOPDActionWeights],
+        fronts: Sequence[Sequence[MOPDActionWeights]],
+        crowding: Dict[int, float],
+    ) -> Dict[str, float]:
+        k = min(self.tournament_size, len(population))
+        if k <= 0:
+            return self._random_individual()
+        candidates = self._rng.sample(list(range(len(population))), k)
+        rank_of = {}
+        for rank, front in enumerate(fronts):
+            for p in front:
+                rank_of[p.stable_id] = rank
+        best_idx = candidates[0]
+        best_rank = float('inf')
+        best_cd = -float('inf')
+        for idx in candidates:
+            p = points[idx]
+            r = rank_of.get(p.stable_id, len(fronts))
+            cd = crowding.get(p.stable_id, 0.0)
+            if r < best_rank or (r == best_rank and cd > best_cd):
+                best_idx = idx
+                best_rank = r
+                best_cd = cd
+        return dict(population[best_idx])
+
+    def _compute_dynamic_weights(self) -> Dict[str, float]:
+        weights = dict(self.objective_weights)
+        if not self.dynamic_weights or not self.pareto_front:
+            return weights
+        keys = list(weights.keys())
+        avg = {k: float(np.mean([p.objectives.get(k, 0.0) for p in self.pareto_front]))
+               for k in keys}
+        maxv = {k: float(np.max([p.objectives.get(k, 0.0) for p in self.pareto_front]))
+                for k in keys}
+        for k in keys:
+            if maxv[k] > 0 and avg[k] < 0.5 * maxv[k]:
+                weights[k] = min(0.6, weights.get(k, 0.0) * 1.5)
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in weights.items()}
         return weights
-    def _select_best_from_pareto(self, pareto, weights):
-        if not pareto: return None
-        obj_keys=list(weights.keys())
-        max_vals={k:max(p.objectives[k] for p in pareto) for k in obj_keys}
-        min_vals={k:min(p.objectives[k] for p in pareto) for k in obj_keys}
-        ranges={k:max_vals[k]-min_vals[k] if max_vals[k]!=min_vals[k] else 1.0 for k in obj_keys}
-        best=None; best_score=-float('inf')
-        for p in pareto:
-            score=sum(weights[k]*(p.objectives[k]-min_vals[k])/ranges[k] for k in obj_keys)
-            p.scalarised_score=score
-            if score>best_score: best_score=score; best=p
-        return best
-    async def evolve(self):
-        population=[self._random_individual() for _ in range(self.population_size)]
-        eval_tasks=[self.evaluate_func(ind) for ind in population]
-        eval_results=await asyncio.gather(*eval_tasks)
-        points=[]
-        for ind,obj in zip(population,eval_results):
-            point=MOPDActionWeights(vector_id=str(uuid.uuid4()), weights=ind, objectives=obj)
-            points.append(point)
-            self._eval_cache[tuple(sorted(ind.items()))]=obj
-        self._all_points=points
+
+    async def evolve(self) -> List[MOPDActionWeights]:
+        if self._disabled:
+            raise RuntimeError("EvolutionService disabled (chaos)")
+
+        async def _eval(ind: Dict[str, float]) -> Dict[str, float]:
+            async with self._semaphore:
+                return await self.evaluate(ind)
+
+        population = [self._random_individual() for _ in range(self.population_size)]
+        results = await asyncio.gather(*[_eval(ind) for ind in population])
+        points: List[MOPDActionWeights] = []
+        for ind, obj in zip(population, results):
+            points.append(MOPDActionWeights(
+                vector_id=uuid.uuid4().hex,
+                weights=dict(ind), objectives=dict(obj),
+                stable_id=self._next_id,
+            ))
+            self._next_id += 1
+
         for gen in range(self.generations):
-            fronts=self._fast_non_dominated_sort(points)
-            crowding={}
+            fronts = self._fast_non_dominated_sort(points)
+            crowding: Dict[int, float] = {}
             for front in fronts:
-                front_crowding=self._crowding_distance(front); crowding.update(front_crowding)
-            offspring=[]
-            while len(offspring)<self.population_size:
-                p1=self._tournament_selection(population, fronts, crowding)
-                p2=self._tournament_selection(population, fronts, crowding)
-                child=self._crossover(p1,p2) if random.random()<self.crossover_rate else copy.deepcopy(p1)
-                child=self._mutate(child)
+                crowding.update(self._crowding_distance(front))
+            offspring: List[Dict[str, float]] = []
+            while len(offspring) < self.population_size:
+                p1 = self._tournament_selection(population, points, fronts, crowding)
+                p2 = self._tournament_selection(population, points, fronts, crowding)
+                child = (self._crossover(p1, p2) if self._rng.random() < self.crossover_rate
+                         else dict(p1))
+                child = self._mutate(child)
                 offspring.append(child)
-            child_tasks=[self.evaluate_func(ind) for ind in offspring]
-            child_results=await asyncio.gather(*child_tasks)
-            child_points=[]
-            for ind,obj in zip(offspring,child_results):
-                point=MOPDActionWeights(vector_id=str(uuid.uuid4()), weights=ind, objectives=obj)
-                child_points.append(point)
-                self._eval_cache[tuple(sorted(ind.items()))]=obj
-            combined_inds=population+offspring
-            combined_points=points+child_points
-            unique_pairs={}
-            for ind,p in zip(combined_inds,combined_points):
-                key=tuple(sorted(ind.items())); unique_pairs[key]=(ind,p)
-            population=[v[0] for v in unique_pairs.values()]
-            points=[v[1] for v in unique_pairs.values()]
-            self._all_points=points
-            fronts=self._fast_non_dominated_sort(points)
-            new_pop=[]; new_points=[]
+
+            child_results = await asyncio.gather(*[_eval(ind) for ind in offspring])
+            child_points: List[MOPDActionWeights] = []
+            for ind, obj in zip(offspring, child_results):
+                child_points.append(MOPDActionWeights(
+                    vector_id=uuid.uuid4().hex,
+                    weights=dict(ind), objectives=dict(obj),
+                    stable_id=self._next_id,
+                ))
+                self._next_id += 1
+
+            combined_inds = list(population) + offspring
+            combined_points = points + child_points
+            fronts = self._fast_non_dominated_sort(combined_points)
+
+            new_pop: List[Dict[str, float]] = []
+            new_points: List[MOPDActionWeights] = []
             for front in fronts:
-                if len(new_pop)+len(front)<=self.population_size:
-                    for p in front:
-                        for ind,p2 in zip(population,points):
-                            if p2 is p: new_pop.append(ind); new_points.append(p); break
+                front_ids = {p.stable_id for p in front}
+                indices = [i for i, p in enumerate(combined_points)
+                           if p.stable_id in front_ids]
+                if len(new_pop) + len(indices) <= self.population_size:
+                    for i in indices:
+                        new_pop.append(dict(combined_inds[i]))
+                        new_points.append(combined_points[i])
                 else:
-                    crowding=self._crowding_distance(front)
-                    sorted_front=sorted(front,key=lambda x: crowding.get(id(x),0), reverse=True)
-                    for p in sorted_front:
-                        if len(new_pop)>=self.population_size: break
-                        for ind,p2 in zip(population,points):
-                            if p2 is p: new_pop.append(ind); new_points.append(p); break
-            population=new_pop[:self.population_size]
-            points=new_points[:self.population_size]
-            self._all_points=points
-            fronts=self._fast_non_dominated_sort(points)
-            if fronts: self.pareto_front=fronts[0]
-            logger.info(f"Generation {gen+1}/{self.generations}: Pareto front size={len(self.pareto_front)}")
-        weights=self._compute_dynamic_weights()
-        best=self._select_best_from_pareto(self.pareto_front, weights)
-        if best:
-            self.best_individual=best.weights; self.best_fitness=best.scalarised_score
+                    cd = self._crowding_distance(front)
+                    sorted_idx = sorted(
+                        indices,
+                        key=lambda i: cd.get(combined_points[i].stable_id, 0.0),
+                        reverse=True,
+                    )
+                    for i in sorted_idx:
+                        if len(new_pop) >= self.population_size:
+                            break
+                        new_pop.append(dict(combined_inds[i]))
+                        new_points.append(combined_points[i])
+                if len(new_pop) >= self.population_size:
+                    break
+
+            # Refill if dedup shrank us below capacity
+            if len(new_pop) < self.population_size:
+                for front in fronts:
+                    for p in front:
+                        if len(new_pop) >= self.population_size:
+                            break
+                        if p.stable_id in {np_.stable_id for np_ in new_points}:
+                            continue
+                        idx = next((i for i, cp in enumerate(combined_points)
+                                    if cp.stable_id == p.stable_id), None)
+                        if idx is not None:
+                            new_pop.append(dict(combined_inds[idx]))
+                            new_points.append(combined_points[idx])
+
+            population = new_pop[:self.population_size]
+            points = new_points[:self.population_size]
+            fronts = self._fast_non_dominated_sort(points)
+            self.pareto_front = fronts[0] if fronts else []
+            self.obs.histogram('moea_pareto_size', len(self.pareto_front))
+            self.obs.counter('moea_generations_total')
+
+        weights = self._compute_dynamic_weights()
+        self.best = scalarise_pareto(
+            self.pareto_front, weights=weights,
+            objective_names=MOPD_OBJECTIVE_NAMES,
+            higher_is_better=MOPD_HIGHER_IS_BETTER,
+        )
         return self.pareto_front
 
-# ============================================================================
-# NEW COMPONENTS: LIMIT Graph, MODP, RLHF, MoE
-# ============================================================================
-class LimitGraphManager:
-    def __init__(self, storage=None):
-        self.storage=storage; self.graphs={}
-    def create_graph(self, graph_id, description, configuration):
-        if self.storage and hasattr(self.storage,'save_limit_graph_metadata'):
-            self.storage.save_limit_graph_metadata(graph_id, description, configuration)
-        else:
-            self.graphs[graph_id]={'description':description,'configuration':configuration,'nodes':{},'edges':{}}
-    def add_node(self, graph_id, node_id, node_type, attributes):
-        if self.storage and hasattr(self.storage,'save_limit_graph_node'):
-            self.storage.save_limit_graph_node(node_id, graph_id, node_type, attributes)
-        else:
-            self.graphs.setdefault(graph_id, {'nodes':{},'edges':{}})
-            self.graphs[graph_id]['nodes'][node_id]={'node_type':node_type,'attributes':attributes}
-    def add_edge(self, graph_id, edge_id, source, target, weight, attributes):
-        if self.storage and hasattr(self.storage,'save_limit_graph_edge'):
-            self.storage.save_limit_graph_edge(edge_id, graph_id, source, target, weight, attributes)
-        else:
-            self.graphs.setdefault(graph_id, {'nodes':{},'edges':{}})
-            self.graphs[graph_id]['edges'][edge_id]={'source':source,'target':target,'weight':weight,'attributes':attributes}
-    def get_nodes(self, graph_id):
-        if self.storage and hasattr(self.storage,'get_limit_graph_nodes'): return self.storage.get_limit_graph_nodes(graph_id)
-        return list(self.graphs.get(graph_id,{}).get('nodes',{}).values())
-    def get_edges(self, graph_id):
-        if self.storage and hasattr(self.storage,'get_limit_graph_edges'): return self.storage.get_limit_graph_edges(graph_id)
-        return list(self.graphs.get(graph_id,{}).get('edges',{}).values())
-    def get_metadata(self, graph_id):
-        if self.storage and hasattr(self.storage,'get_limit_graph_metadata'): return self.storage.get_limit_graph_metadata(graph_id)
-        return self.graphs.get(graph_id,{})
+    async def save_pareto(self) -> bool:
+        if not self.pareto_front:
+            return False
 
-class MODPOptimizer:
-    def __init__(self, storage=None):
-        self.storage=storage; self.states={}
-    def add_state(self, state_id, problem_id, state_attributes, objective_values, stage):
-        if self.storage and hasattr(self.storage,'save_modp_state'):
-            self.storage.save_modp_state(state_id, problem_id, state_attributes, objective_values, stage)
-        else:
-            self.states.setdefault(problem_id, []).append({
-                'state_id': state_id, 'state_attributes': state_attributes,
-                'objective_values': objective_values, 'stage': stage
-            })
-    def add_policy(self, policy_id, problem_id, state_id, action, expected_objectives):
-        if self.storage and hasattr(self.storage,'save_modp_policy'):
-            self.storage.save_modp_policy(policy_id, problem_id, state_id, action, expected_objectives)
-    def get_states(self, problem_id):
-        if self.storage and hasattr(self.storage,'get_modp_states'): return self.storage.get_modp_states(problem_id)
-        return self.states.get(problem_id,[])
-    def get_policies(self, problem_id):
-        if self.storage and hasattr(self.storage,'get_modp_policies'): return self.storage.get_modp_policies(problem_id)
-        return []
+        def _write() -> None:
+            payload = {
+                'version': MODULE_VERSION,
+                'timestamp': _utcnow().isoformat(),
+                'pareto': [p.to_dict() for p in self.pareto_front],
+            }
+            tmp = f"{self.config.moea_pareto_path}.tmp"
+            with open(tmp, 'w') as f:
+                json.dump(payload, f, indent=2, default=str)
+            os.replace(tmp, self.config.moea_pareto_path)
 
-class RLHFTrainer:
-    def __init__(self, storage=None):
-        self.storage=storage; self.pairs=[]
-    def record_pair(self, pair_id, prompt, chosen, rejected, reward_diff, metadata=None):
-        if self.storage and hasattr(self.storage,'save_preference_pair'):
-            self.storage.save_preference_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
-        else:
-            self.pairs.append({'pair_id':pair_id,'prompt':prompt,'chosen':chosen,'rejected':rejected,'reward_diff':reward_diff,'metadata':metadata})
-    def get_pairs(self, limit=100):
-        if self.storage and hasattr(self.storage,'get_preference_pairs'): return self.storage.get_preference_pairs(limit)
-        return self.pairs[-limit:]
-    def train_reward_model(self):
-        pairs=self.get_pairs()
-        if len(pairs)<5: logger.info("Not enough preference pairs for RLHF training."); return
-        logger.info(f"Training reward model on {len(pairs)} preference pairs...")
+        try:
+            await asyncio.to_thread(_write)
+            return True
+        except Exception as e:
+            logger.warning("Failed to save pareto: %s", e)
+            return False
 
-class MoEGatingNetwork:
-    def __init__(self, storage=None, config=None):
-        self.storage=storage; self.config=config or {}
-        self.expert_names=self.config.get('expert_names', ['replace','refurbish','monitor'])
-        self.num_experts=len(self.expert_names)
-        self.gating_weights=np.random.randn(self.num_experts, 11)
-    def _encode_state(self, state):
-        if isinstance(state, dict):
-            features=[state.get(k,0) for k in ['current_efficiency','slope','days_to_threshold',
-                                               'net_savings_replace','net_savings_refurbish',
-                                               'carbon_intensity','material_index',
-                                               'success_replace','success_refurbish','success_monitor','avg_reward']]
-            return np.array(features, dtype=np.float32)
-        else:
-            return state.to_feature_vector()
-    async def select_expert(self, state):
-        x=self._encode_state(state)
-        logits=self.gating_weights @ x
-        probs=np.exp(logits-np.max(logits)); probs/=probs.sum()
-        expert_idx=np.argmax(probs)
-        selected=self.expert_names[expert_idx]
-        return selected, probs
-    async def add_training_sample(self, state, selected_expert, reward):
-        x=self._encode_state(state)
-        expert_idx=self.expert_names.index(selected_expert)
-        target=np.zeros(self.num_experts); target[expert_idx]=1.0
-        logits=self.gating_weights @ x
-        probs=np.exp(logits-np.max(logits)); probs/=probs.sum()
-        grad=(probs-target)[:,None]*x[None,:]
-        self.gating_weights-=0.1*grad
 
 # ============================================================================
-# MAINTENANCE SCHEDULER
+# GatingService (MoE)
 # ============================================================================
-class MaintenanceScheduler:
-    def __init__(self, config, carbon_manager=None, storage=None,
-                 enable_limit_graph=True, enable_modp=True, enable_rlhf=True, enable_moe=True):
-        self.config=config
-        self.carbon_manager=carbon_manager
-        self.storage=storage
-        self.low_carbon_windows=config.low_carbon_windows
-        self.lead_time=config.maintenance_lead_time
-        self.recommendations={}
-        self._lock=asyncio.Lock()
+class GatingService:
+    def __init__(self, config: PredictiveMaintenanceConfig,
+                 observability: Optional[ObservabilityHub] = None,
+                 seed: int = 42) -> None:
+        self.config = config
+        self.obs = observability or ObservabilityHub()
+        self.expert_names: Tuple[str, ...] = MAINTENANCE_ACTIONS
+        self.num_experts = len(self.expert_names)
+        rng = np.random.default_rng(seed)
+        self.gating_weights = rng.standard_normal((self.num_experts, FEATURE_DIM)) * 0.01
+        self.learning_rate = 0.1
+        self._lock = asyncio.Lock()
 
-        self.action_optimizer=DistillationActionOptimizer({
-            'distillation_epsilon': config.distillation_epsilon,
-            'distillation_train_every': config.distillation_train_every,
-            'distillation_replay_size': config.distillation_replay_size,
-            'distillation_learning_rate': config.distillation_learning_rate,
-        })
+    async def select_expert(self, state: MaintenanceState
+                            ) -> Tuple[str, np.ndarray]:
+        x = state.to_feature_vector()
+        logits = self.gating_weights @ x
+        probs = np.exp(logits - np.max(logits))
+        probs /= probs.sum()
+        idx = int(np.argmax(probs))
+        self.obs.counter('gating_selections_total', expert=self.expert_names[idx])
+        return self.expert_names[idx], probs
 
-        self.moea_enabled=config.moea_enabled
-        self.moea_optimizer=None
-        self.global_best_weights=None
-        self.pareto_front=[]
-        self._moea_task=None
+    async def add_training_sample(self, state: MaintenanceState,
+                                   selected_expert: str,
+                                   reward: float) -> None:
+        if selected_expert not in self.expert_names:
+            return
+        idx = self.expert_names.index(selected_expert)
+        x = state.to_feature_vector()
+        async with self._lock:
+            logits = self.gating_weights @ x
+            probs = np.exp(logits - np.max(logits))
+            probs /= probs.sum()
+            target = np.zeros(self.num_experts)
+            target[idx] = 1.0
+            grad = (probs - target)[:, None] * x[None, :]
+            self.gating_weights -= self.learning_rate * reward * grad
+        self.obs.counter('gating_updates_total')
 
-        self.limit_graph_manager=LimitGraphManager(storage) if enable_limit_graph else None
-        self.modp_solver=MODPOptimizer(storage) if enable_modp else None
-        self.rlhf_trainer=RLHFTrainer(storage) if enable_rlhf else None
-        self.moe_gating=MoEGatingNetwork(storage, {'expert_names': self.action_optimizer.ACTIONS}) if enable_moe else None
 
-        self.interaction_log=[]
-        self.last_state_vec=None
-        self.last_action_idx=None
-        self.last_teacher_probs=None
+# ============================================================================
+# FederatedService — DP-noised recommendation sync
+# ============================================================================
+class FederatedService:
+    """
+    Syncs aggregated recommendation statistics across deployments with
+    Gaussian DP noise + L2 clipping.
 
-        if self.limit_graph_manager:
-            self._init_limit_graph()
-        if self.moea_enabled:
-            self._moea_task=asyncio.create_task(self._moea_loop())
+    Each sync sends a compact payload:
+        {
+            "deployment_id": str,
+            "count": int,
+            "mean_efficiency": float,
+            "mean_carbon_savings": float,
+            "mean_net_savings": float,
+            "action_distribution": {action: fraction},
+        }
+    """
+    def __init__(self, config: PredictiveMaintenanceConfig,
+                 observability: Optional[ObservabilityHub] = None,
+                 dlq: Optional[DeadLetterQueue] = None) -> None:
+        self.config = config
+        self.fed_cfg = config.federated
+        self.obs = observability or ObservabilityHub()
+        self.dlq = dlq
+        self.deployment_id = uuid.uuid4().hex[:8]
+        self._session: Optional[Any] = None
+        self._lock = asyncio.Lock()
+        self._disabled = False
+        self._last_global: Dict[str, Any] = {}
 
-    def _init_limit_graph(self):
-        graph_id="maintenance_actions"
-        if not self.limit_graph_manager.get_metadata(graph_id):
-            self.limit_graph_manager.create_graph(graph_id, "Maintenance Action Relationships", {})
-            for action in self.action_optimizer.ACTIONS:
-                self.limit_graph_manager.add_node(graph_id, f"action_{action}", action, {})
-            for i in range(len(self.action_optimizer.ACTIONS)-1):
-                src=self.action_optimizer.ACTIONS[i]; dst=self.action_optimizer.ACTIONS[i+1]
-                self.limit_graph_manager.add_edge(graph_id, f"edge_{src}_{dst}", f"action_{src}", f"action_{dst}", 1.0, {})
+    def disable(self) -> None:
+        self._disabled = True
 
-    async def _moea_loop(self):
-        while True:
+    def enable(self) -> None:
+        self._disabled = False
+
+    async def _get_session(self) -> Optional[Any]:
+        if (not AIOHTTP_AVAILABLE or
+                not getattr(self.fed_cfg, 'server_url', None)):
+            return None
+        if self._session is None or getattr(self._session, 'closed', False):
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    def _clip(self, value: float) -> float:
+        clip = float(getattr(self.fed_cfg, 'privacy_clip_norm', 1.0))
+        return max(-clip, min(clip, value))
+
+    def _noise(self) -> float:
+        eps = max(1e-6, float(getattr(self.fed_cfg, 'privacy_epsilon', 1.0)))
+        delta = max(1e-12, float(getattr(self.fed_cfg, 'privacy_delta', 1e-5)))
+        clip = float(getattr(self.fed_cfg, 'privacy_clip_norm', 1.0))
+        sigma = math.sqrt(2.0 * math.log(1.25 / delta)) / eps
+        return float(np.random.normal(0.0, sigma * clip))
+
+    def _dp_noise(self, value: float) -> float:
+        return self._clip(value) + self._noise()
+
+    async def build_payload(
+        self, recommendations: Sequence[MaintenanceRecommendation],
+    ) -> Dict[str, Any]:
+        n = len(recommendations)
+        if n == 0:
+            return {
+                'deployment_id': self.deployment_id,
+                'count': 0,
+                'mean_efficiency': 0.0,
+                'mean_carbon_savings': 0.0,
+                'mean_net_savings': 0.0,
+                'action_distribution': {a: 0.0 for a in MAINTENANCE_ACTIONS},
+            }
+        mean_eff = float(np.mean([r.current_efficiency for r in recommendations]))
+        mean_carbon = float(np.mean([r.carbon_savings_kg for r in recommendations]))
+        mean_savings = float(np.mean([r.cost_savings_usd for r in recommendations]))
+        action_counts = {a: 0 for a in MAINTENANCE_ACTIONS}
+        for r in recommendations:
+            if r.recommended_action in action_counts:
+                action_counts[r.recommended_action] += 1
+        distribution = {a: action_counts[a] / n for a in MAINTENANCE_ACTIONS}
+        # Normalise means and apply DP noise to each
+        return {
+            'deployment_id': self.deployment_id,
+            'count': int(n),
+            'mean_efficiency': self._dp_noise(mean_eff / 5e9),
+            'mean_carbon_savings': self._dp_noise(mean_carbon / 100.0),
+            'mean_net_savings': self._dp_noise(mean_savings / 5000.0),
+            'action_distribution': {
+                a: float(np.clip(v + self._noise() * 0.01, 0.0, 1.0))
+                for a, v in distribution.items()
+            },
+        }
+
+    async def sync(
+        self, recommendations: Sequence[MaintenanceRecommendation],
+    ) -> Dict[str, Any]:
+        if self._disabled:
+            raise RuntimeError("FederatedService disabled (chaos)")
+        if not getattr(self.fed_cfg, 'enabled', False):
+            return {'status': 'disabled'}
+        session = await self._get_session()
+        if session is None:
+            return {'status': 'no_server_url'}
+
+        payload = await self.build_payload(recommendations)
+        server_url = getattr(self.fed_cfg, 'server_url', None)
+        timeout = float(getattr(self.fed_cfg, 'request_timeout_seconds', 30.0))
+        max_retries = 3
+        for attempt in range(max_retries):
             try:
-                await asyncio.sleep(self.config.moea_interval_seconds)
-                await self.run_moea_update()
-            except asyncio.CancelledError: break
+                async with self._lock:
+                    async with session.post(
+                        f"{server_url}/federated/maintenance/sync",
+                        json=payload, timeout=timeout,
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            self.obs.counter('federated_syncs_total', status='ok')
+                            return data
+                        logger.warning("Federated sync HTTP %s (attempt %d)",
+                                       resp.status, attempt + 1)
             except Exception as e:
-                logger.error(f"MOEA loop error: {e}"); await asyncio.sleep(60)
+                logger.warning("Federated sync error (attempt %d): %s",
+                               attempt + 1, e)
+                if self.dlq:
+                    await self.dlq.record('federated_sync', str(e), payload)
+            await asyncio.sleep(min(2 ** attempt, 10))
+        self.obs.counter('federated_syncs_total', status='error')
+        return {'status': 'failed'}
 
-    async def run_moea_update(self):
-        if len(self.interaction_log) < 20: return []
-        async def evaluate(weights):
-            action_metrics={a:[] for a in self.action_optimizer.ACTIONS}
-            for entry in self.interaction_log[-200:]:
-                a=entry.get('action')
-                if a in action_metrics:
-                    action_metrics[a].append({
-                        'net_savings': entry.get('net_savings',0),
-                        'carbon_savings': entry.get('carbon_savings',0),
-                        'risk_reduction': entry.get('risk_reduction',0),
-                        'longterm_efficiency': entry.get('longterm_efficiency',0),
-                    })
-            objectives={}
-            for metric in ['net_savings','carbon_savings','risk_reduction','longterm_efficiency']:
-                weighted=[]
-                for a,w in weights.items():
-                    if action_metrics.get(a):
-                        avg=np.mean([m[metric] for m in action_metrics[a]]); weighted.append(w*avg)
-                    else: weighted.append(w*0.5)
-                objectives[metric]=sum(weighted)
-            return objectives
-        self.moea_optimizer=NSGAIAActionOptimizer(evaluate_func=evaluate,
-                                                   population_size=self.config.moea_population_size,
-                                                   generations=self.config.moea_generations)
-        pareto=await self.moea_optimizer.evolve()
-        self.pareto_front=pareto
-        if pareto:
-            best=self.moea_optimizer._select_best_from_pareto(pareto, self.moea_optimizer._compute_dynamic_weights())
-            if best:
-                self.global_best_weights=best.weights
-                logger.info(f"MOEA best weights: {best.weights}")
-        return pareto
+    async def fetch_global(self) -> Dict[str, Any]:
+        session = await self._get_session()
+        if session is None:
+            return self._last_global
+        server_url = getattr(self.fed_cfg, 'server_url', None)
+        timeout = float(getattr(self.fed_cfg, 'request_timeout_seconds', 30.0))
+        try:
+            async with self._lock:
+                async with session.get(
+                    f"{server_url}/federated/maintenance/global",
+                    timeout=timeout,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        self._last_global = data
+                        return data
+        except Exception as e:
+            logger.warning("Federated fetch error: %s", e)
+        return self._last_global
 
-    def parse_time(self, time_str):
+    async def close(self) -> None:
+        if self._session and not getattr(self._session, 'closed', False):
+            await self._session.close()
+
+
+# ============================================================================
+# ExpertMetricsCollector bridge (v9.0.0)
+# ============================================================================
+class MetricsCollectorBridge:
+    """
+    Forwards maintenance recommendations and outcomes into the
+    ExpertMetricsCollector's execution + feedback flow.
+    """
+
+    def __init__(self, collector: Any,
+                 observability: Optional[ObservabilityHub] = None,
+                 dlq: Optional[DeadLetterQueue] = None) -> None:
+        self.collector = collector
+        self.obs = observability or ObservabilityHub()
+        self.dlq = dlq
+        self._disabled = False
+
+    def disable(self) -> None:
+        self._disabled = True
+
+    def enable(self) -> None:
+        self._disabled = False
+
+    async def publish_recommendation(
+        self, rec: MaintenanceRecommendation,
+    ) -> None:
+        if self._disabled or self.collector is None:
+            return
+        try:
+            # Attribute:
+            #   expert_id  := node_id
+            #   execution_time := estimated maintenance latency (heuristic)
+            #   energy_kwh := modelled savings / (3600 * 1000) as a proxy
+            #   carbon_kg := modelled savings
+            #   helium_units := 0 (maintenance doesn't use helium)
+            #   success := True (recommendation was generated)
+            latency_ms = float(max(0.0, rec.days_to_threshold * 24 * 3600 * 1000))
+            energy_kwh = float(max(0.0, rec.simulation_result.get(
+                'energy_saved_total_joules', 0.0,
+            )) / 3.6e6)
+            carbon_kg = float(max(0.0, rec.carbon_savings_kg))
+            await self.collector.record_expert_execution(
+                expert_id=f"maintenance:{rec.node_id}",
+                execution_time=min(latency_ms, 5_000.0),
+                energy_kwh=energy_kwh,
+                carbon_kg=carbon_kg,
+                helium_units=0.0,
+                success=True,
+                correlation_id=rec.node_id,
+                metadata={
+                    'source': 'predictive_maintenance',
+                    'recommended_action': rec.recommended_action,
+                    'payback_days': rec.payback_days,
+                    'cost_savings_usd': rec.cost_savings_usd,
+                    'sustainability_context': rec.sustainability_context,
+                },
+            )
+            self.obs.counter('metrics_bridge_published_total', status='ok')
+        except Exception as e:
+            logger.warning("Metrics bridge publish failed: %s", e)
+            self.obs.counter('metrics_bridge_published_total', status='error')
+            if self.dlq:
+                await self.dlq.record('metrics_bridge_publish', str(e),
+                                      {'node_id': rec.node_id})
+
+    async def publish_outcome(
+        self,
+        node_id: str,
+        action: str,
+        reward: float,
+        actual_energy_saved: float,
+        actual_cost_saved: float,
+        actual_carbon_saved: float,
+    ) -> None:
+        if self._disabled or self.collector is None:
+            return
+        try:
+            await self.collector.record_expert_execution(
+                expert_id=f"maintenance_outcome:{node_id}",
+                execution_time=100.0,           # outcome logging is cheap
+                energy_kwh=float(max(0.0, actual_energy_saved)) / 3.6e6,
+                carbon_kg=float(max(0.0, actual_carbon_saved)),
+                helium_units=0.0,
+                success=reward >= 0.5,
+                correlation_id=node_id,
+                metadata={
+                    'source': 'predictive_maintenance_outcome',
+                    'action': action,
+                    'reward': float(reward),
+                    'cost_saved_usd': float(actual_cost_saved),
+                },
+            )
+            self.obs.counter('metrics_bridge_outcomes_total', status='ok')
+        except Exception as e:
+            logger.warning("Metrics bridge outcome failed: %s", e)
+            self.obs.counter('metrics_bridge_outcomes_total', status='error')
+            if self.dlq:
+                await self.dlq.record('metrics_bridge_outcome', str(e),
+                                      {'node_id': node_id})
+
+
+# ============================================================================
+# UnifiedSustainabilityEngine bridge (v6.0.0)
+# ============================================================================
+class SustainabilityEngineBridge:
+    """
+    Pulls live dimension scores (carbon/helium/energy/circularity/biodiversity)
+    from the UnifiedSustainabilityEngine and enriches MaintenanceState.
+    """
+
+    def __init__(self, engine: Any,
+                 observability: Optional[ObservabilityHub] = None,
+                 dlq: Optional[DeadLetterQueue] = None) -> None:
+        self.engine = engine
+        self.obs = observability or ObservabilityHub()
+        self.dlq = dlq
+        self._disabled = False
+        self._cache: Dict[str, float] = {d: 0.5 for d in SUSTAINABILITY_DIMENSIONS}
+        self._cache_time: Optional[float] = None
+        self._cache_ttl = 30.0
+        self._lock = asyncio.Lock()
+
+    def disable(self) -> None:
+        self._disabled = True
+
+    def enable(self) -> None:
+        self._disabled = False
+
+    async def get_dimension_scores(self) -> Dict[str, float]:
+        if self._disabled or self.engine is None:
+            return dict(self._cache)
+        async with self._lock:
+            now = time.monotonic()
+            if (self._cache_time is not None and
+                    (now - self._cache_time) < self._cache_ttl):
+                return dict(self._cache)
+            try:
+                dims = getattr(self.engine, 'dimensions', None) or {}
+                for name in SUSTAINABILITY_DIMENSIONS:
+                    dim = dims.get(name)
+                    if dim is None:
+                        continue
+                    value = getattr(dim, 'current_value', None)
+                    if value is None and isinstance(dim, dict):
+                        value = dim.get('current_value')
+                    if value is not None:
+                        self._cache[name] = float(np.clip(value, 0.0, 1.0))
+                self._cache_time = now
+                self.obs.counter('sustainability_bridge_fetches_total', status='ok')
+            except Exception as e:
+                logger.warning("Sustainability bridge fetch failed: %s", e)
+                self.obs.counter('sustainability_bridge_fetches_total', status='error')
+                if self.dlq:
+                    await self.dlq.record('sustainability_bridge_fetch', str(e))
+            return dict(self._cache)
+
+
+# ============================================================================
+# ColdStartOptimizer bridge (v4.0.0)
+# ============================================================================
+class ColdStartBridge:
+    """
+    Shares the distillation teacher registry, the NSGA-II machinery, and the
+    MoE gating service with the ColdStartOptimizer.
+
+    Sharing is intentionally at the *class* level (not trained model level)
+    because the two modules operate on different action spaces. If a user
+    wants to import a trained distillation teacher, they can do so via
+    `import_teacher()`.
+    """
+
+    def __init__(self, optimizer: Any,
+                 observability: Optional[ObservabilityHub] = None) -> None:
+        self.optimizer = optimizer
+        self.obs = observability or ObservabilityHub()
+
+    @property
+    def available(self) -> bool:
+        return self.optimizer is not None
+
+    def import_teachers(self) -> List[Any]:
+        """Return teachers from the cold-start distillation service, if any."""
+        if not self.available:
+            return []
+        svc = getattr(self.optimizer, 'distillation_service', None)
+        if svc is None:
+            return []
+        return list(getattr(svc, 'teachers', []))
+
+    def shared_evolution_class(self) -> Optional[type]:
+        """Return the EvolutionService class for reuse."""
+        if not self.available:
+            return None
+        return type(getattr(self.optimizer, 'evolution_service', None)) \
+            if getattr(self.optimizer, 'evolution_service', None) is not None \
+            else _SiblingEvolutionService
+
+    def shared_gating_class(self) -> Optional[type]:
+        if not self.available:
+            return None
+        return type(getattr(self.optimizer, 'gating_service', None)) \
+            if getattr(self.optimizer, 'gating_service', None) is not None \
+            else _SiblingGatingService
+
+
+# ============================================================================
+# SchedulingService
+# ============================================================================
+class SchedulingService:
+    def __init__(
+        self,
+        config: PredictiveMaintenanceConfig,
+        tracker: TrackingService,
+        forecaster: ForecastService,
+        simulator: DigitalTwinService,
+        distillation: DistillationService,
+        carbon_manager: Optional[CarbonProviderProtocol] = None,
+        evolution: Optional[EvolutionService] = None,
+        gating: Optional[GatingService] = None,
+        governance: Optional[GovernanceLayer] = None,
+        observability: Optional[ObservabilityHub] = None,
+        sustainability_bridge: Optional[SustainabilityEngineBridge] = None,
+        metrics_bridge: Optional[MetricsCollectorBridge] = None,
+        federated: Optional[FederatedService] = None,
+    ) -> None:
+        self.config = config
+        self.tracker = tracker
+        self.forecaster = forecaster
+        self.simulator = simulator
+        self.distillation = distillation
+        self.carbon_manager = carbon_manager
+        self.evolution = evolution
+        self.gating = gating
+        self.governance = governance or GovernanceLayer(enabled=False)
+        self.obs = observability or ObservabilityHub()
+        self.sustainability_bridge = sustainability_bridge
+        self.metrics_bridge = metrics_bridge
+        self.federated = federated
+
+        self.recommendations: Dict[str, MaintenanceRecommendation] = {}
+        self.interaction_log: Deque[Dict[str, Any]] = deque(maxlen=MAX_INTERACTION_LOG)
+        self._pending_states: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._lock = asyncio.Lock()
+        self.global_best_weights: Optional[Dict[str, float]] = None
+        self.pareto_front: List[MOPDActionWeights] = []
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _parse_time(self, time_str: str) -> Any:
         return datetime.strptime(time_str, "%H:%M").time()
 
-    async def get_next_low_carbon_window(self, from_date):
-        for window in self.low_carbon_windows:
-            start_time=self.parse_time(window["start"]); end_time=self.parse_time(window["end"])
-            candidate=datetime.combine(from_date.date(), start_time)
-            if candidate>from_date: return candidate
-        tomorrow=from_date.date()+timedelta(days=1)
-        first_window=self.low_carbon_windows[0]
-        return datetime.combine(tomorrow, self.parse_time(first_window["start"]))
+    async def get_next_low_carbon_window(self, from_date: datetime) -> datetime:
+        if from_date.tzinfo is None:
+            from_date = from_date.replace(tzinfo=timezone.utc)
+        for window in self.config.low_carbon_windows:
+            try:
+                st = self._parse_time(window["start"])
+            except Exception:
+                continue
+            candidate = datetime.combine(from_date.date(), st, tzinfo=timezone.utc)
+            if candidate > from_date:
+                return candidate
+        tomorrow = (from_date + timedelta(days=1)).date()
+        first = self.config.low_carbon_windows[0]
+        st = self._parse_time(first["start"])
+        return datetime.combine(tomorrow, st, tzinfo=timezone.utc)
 
-    async def generate_recommendation(self, node_id, current_efficiency, forecast_result, sim_replace, sim_refurb):
-        state=MaintenanceState(
-            current_efficiency=current_efficiency,
-            slope=forecast_result.get("slope",0),
-            days_to_threshold=forecast_result.get("days_to_threshold", float('inf')),
-            net_savings_replace=sim_replace.get("net_savings_usd",0),
-            net_savings_refurbish=sim_refurb.get("net_savings_usd",0),
+    async def _get_carbon_intensity(self) -> float:
+        if self.carbon_manager is None or not self.config.carbon_intensity_enabled:
+            return self.config.default_co2_per_kwh
+        try:
+            val = await self.carbon_manager.get_current_intensity(
+                self.config.carbon_region,
+            )
+            return float(val)
+        except Exception as e:
+            logger.debug("Carbon fetch failed: %s", e)
+            return self.config.default_co2_per_kwh
+
+    def _get_action_success_rates(self, node_id: Optional[str] = None) -> Dict[str, float]:
+        rates = {a: 0.5 for a in MAINTENANCE_ACTIONS}
+        entries = list(self.interaction_log)
+        if node_id:
+            entries = [e for e in entries if e.get('node_id') == node_id]
+        if not entries:
+            return rates
+        recent = entries[-100:]
+        for a in rates:
+            subset = [e for e in recent if e.get('action') == a]
+            if subset:
+                rates[a] = sum(1 for e in subset if e.get('reward', 0.0) > 0.5) / len(subset)
+        return rates
+
+    def _get_avg_reward(self, node_id: Optional[str] = None) -> float:
+        entries = list(self.interaction_log)
+        if node_id:
+            entries = [e for e in entries if e.get('node_id') == node_id]
+        if not entries:
+            return 0.5
+        return float(np.mean([e.get('reward', 0.5) for e in entries[-50:]]))
+
+    async def _evaluate_individual(self, weights: Dict[str, float]) -> Dict[str, float]:
+        entries = list(self.interaction_log)[-500:]
+        if not entries:
+            return {n: 0.5 for n in MOPD_OBJECTIVE_NAMES}
+        action_metrics: Dict[str, Dict[str, List[float]]] = {
+            a: {m: [] for m in MOPD_OBJECTIVE_NAMES} for a in MAINTENANCE_ACTIONS
+        }
+        for e in entries:
+            a = e.get('action')
+            if a not in action_metrics:
+                continue
+            action_metrics[a]['net_savings'].append(float(e.get('net_savings', 0.0)))
+            action_metrics[a]['carbon_savings'].append(float(e.get('carbon_savings', 0.0)))
+            action_metrics[a]['risk_reduction'].append(float(e.get('risk_reduction', 0.0)))
+            action_metrics[a]['longterm_efficiency'].append(float(e.get('longterm_efficiency', 0.0)))
+
+        objectives: Dict[str, float] = {}
+        for m in MOPD_OBJECTIVE_NAMES:
+            weighted_avg = 0.0
+            total_w = 0.0
+            for a, w in weights.items():
+                series = action_metrics.get(a, {}).get(m, [])
+                avg = float(np.mean(series)) if series else 0.5
+                if m == 'net_savings':
+                    avg = float(np.clip(avg / 5000.0, 0.0, 1.0))
+                elif m == 'carbon_savings':
+                    avg = float(np.clip(avg / 100.0, 0.0, 1.0))
+                weighted_avg += w * avg
+                total_w += w
+            objectives[m] = weighted_avg / total_w if total_w > 0 else 0.5
+        return objectives
+
+    # ------------------------------------------------------------------
+    # Recommendation generation
+    # ------------------------------------------------------------------
+    async def generate_recommendation(
+        self,
+        node_id: str,
+        current_efficiency: float,
+        forecast_result: Dict[str, Any],
+        sim_replace: Dict[str, Any],
+        sim_refurb: Dict[str, Any],
+        idempotency_key: Optional[str] = None,
+    ) -> MaintenanceRecommendation:
+        # Pull sustainability dimension scores
+        sustainability_dims = {d: 0.5 for d in SUSTAINABILITY_DIMENSIONS}
+        if self.sustainability_bridge is not None:
+            try:
+                sustainability_dims = await self.sustainability_bridge.get_dimension_scores()
+            except Exception as e:
+                logger.debug("Sustainability bridge failed: %s", e)
+
+        state = MaintenanceState(
+            current_efficiency=float(current_efficiency),
+            slope=float(forecast_result.get("slope", 0.0)),
+            days_to_threshold=float(forecast_result.get("days_to_threshold") or 1e9),
+            net_savings_replace=float(sim_replace.get("net_savings_usd", 0.0)),
+            net_savings_refurbish=float(sim_refurb.get("net_savings_usd", 0.0)),
             payback_replace=sim_replace.get("payback_days"),
             payback_refurbish=sim_refurb.get("payback_days"),
             carbon_intensity=await self._get_carbon_intensity(),
-            material_index=sim_replace.get("material_index",0),
-            action_success_rates=self._get_action_success_rates(),
-            avg_reward=self._get_avg_reward(),
+            material_index=float(sim_replace.get("material_index", 0.0)),
+            action_success_rates=self._get_action_success_rates(node_id),
+            avg_reward=self._get_avg_reward(node_id),
+            sustainability_dimensions=sustainability_dims,
         )
-        if self.moe_gating:
-            expert_name,_=await self.moe_gating.select_expert(state)
-            action=expert_name if expert_name in self.action_optimizer.ACTIONS else 'monitor'
-            action_idx=self.action_optimizer.ACTIONS.index(action)
-            state_vec=state.to_feature_vector(); teacher_probs=np.ones(3)/3
-            self._last_selected_expert=expert_name
-        else:
-            action, action_idx, state_vec, teacher_probs=await self.action_optimizer.select_action(state, exploration=True)
-        self.last_state_vec=state_vec; self.last_action_idx=action_idx; self.last_teacher_probs=teacher_probs
 
+        # Action selection
+        if self.gating is not None:
+            try:
+                expert_name, _ = await self.gating.select_expert(state)
+                action = expert_name if expert_name in MAINTENANCE_ACTIONS else 'monitor'
+                action_idx = MAINTENANCE_ACTIONS.index(action)
+                state_vec = state.to_feature_vector()
+                teacher_probs = np.ones(len(MAINTENANCE_ACTIONS)) / len(MAINTENANCE_ACTIONS)
+            except Exception as e:
+                logger.warning("Gating failed: %s", e)
+                action, action_idx, state_vec, teacher_probs = \
+                    await self.distillation.select_action(state)
+        else:
+            action, action_idx, state_vec, teacher_probs = \
+                await self.distillation.select_action(state)
+
+        # Blend with MOEA best weights
         if self.global_best_weights is not None:
-            one_hot=np.zeros(3); one_hot[action_idx]=1.0
-            moea_probs=np.array([self.global_best_weights[a] for a in self.action_optimizer.ACTIONS])
-            moea_probs=moea_probs/moea_probs.sum()
-            blended=0.7*moea_probs+0.3*one_hot; blended=blended/blended.sum()
-            action_idx=np.argmax(blended); action=self.action_optimizer.ACTIONS[action_idx]
+            one_hot = np.zeros(len(MAINTENANCE_ACTIONS))
+            one_hot[action_idx] = 1.0
+            moea_probs = np.array([
+                float(self.global_best_weights.get(a, 0.0)) for a in MAINTENANCE_ACTIONS
+            ])
+            if moea_probs.sum() > 0:
+                moea_probs = moea_probs / moea_probs.sum()
+                blended = 0.7 * moea_probs + 0.3 * one_hot
+                blended = blended / blended.sum()
+                action_idx = int(np.argmax(blended))
+                action = MAINTENANCE_ACTIONS[action_idx]
 
-        days_to=forecast_result.get("days_to_threshold")
-        if action=="monitor" or days_to is None or days_to>30:
-            suggested_date=datetime.now()+timedelta(days=30)
+        # Governance
+        if self.governance.enabled and action == 'replace' and \
+                sim_replace.get("net_savings_usd", 0.0) > 0:
+            approval = await self.governance.request_approval({
+                'action': 'approve_maintenance',
+                'node_id': node_id,
+                'maintenance_action': action,
+                'net_savings_usd': sim_replace.get("net_savings_usd", 0.0),
+                'carbon_savings_kg': sim_replace.get("co2_saved_total_kg", 0.0),
+            })
+            if approval.status not in (ApprovalStatus.APPROVED,
+                                        ApprovalStatus.AUTO_APPROVED):
+                logger.info("Replace denied for %s: %s",
+                            node_id, approval.status.value)
+                action = 'monitor'
+                action_idx = MAINTENANCE_ACTIONS.index('monitor')
+
+        # Suggested date
+        days_to = forecast_result.get("days_to_threshold")
+        if action == 'monitor' or days_to is None or days_to > 30:
+            suggested_date = _utcnow() + timedelta(days=30)
         else:
-            crossing=datetime.now()+timedelta(days=days_to)
-            maintenance_date=crossing-timedelta(days=self.lead_time)
-            suggested_date=await self.get_next_low_carbon_window(maintenance_date)
+            crossing = _utcnow() + timedelta(days=float(days_to))
+            maintenance_date = crossing - timedelta(days=self.config.maintenance_lead_time)
+            suggested_date = await self.get_next_low_carbon_window(maintenance_date)
 
-        if action=="replace": simulation_result=sim_replace
-        elif action=="refurbish": simulation_result=sim_refurb
-        else: simulation_result={}
+        if action == 'replace':
+            simulation_result = sim_replace
+        elif action == 'refurbish':
+            simulation_result = sim_refurb
+        else:
+            simulation_result = {}
 
-        co2=simulation_result.get("co2_saved_total_kg",0) if action in ["replace","refurbish"] else 0
-        cost=simulation_result.get("net_savings_usd",0) if action in ["replace","refurbish"] else 0
-        payback=simulation_result.get("payback_days")
+        co2 = float(simulation_result.get("co2_saved_total_kg", 0.0)) \
+            if action in ("replace", "refurbish") else 0.0
+        cost = float(simulation_result.get("net_savings_usd", 0.0)) \
+            if action in ("replace", "refurbish") else 0.0
+        payback = simulation_result.get("payback_days")
 
-        slope=forecast_result.get("slope",0)
-        pred_eff_30=current_efficiency+slope*30
+        slope = float(forecast_result.get("slope", 0.0))
+        pred_eff_30 = current_efficiency + slope * 30
 
-        rec=MaintenanceRecommendation(
-            node_id=node_id, current_efficiency=current_efficiency,
-            predicted_efficiency_in_30_days=pred_eff_30, threshold=self.config.efficiency_threshold,
-            days_to_threshold=days_to if days_to is not None else float('inf'),
-            recommended_action=action, suggested_date=suggested_date,
-            carbon_savings_kg=co2, cost_savings_usd=cost, payback_days=payback,
-            simulation_result=simulation_result
+        rec = MaintenanceRecommendation(
+            node_id=node_id,
+            current_efficiency=float(current_efficiency),
+            predicted_efficiency_in_30_days=float(pred_eff_30),
+            threshold=float(self.config.efficiency_threshold),
+            days_to_threshold=float(days_to) if days_to is not None else float('inf'),
+            recommended_action=action,
+            suggested_date=suggested_date,
+            carbon_savings_kg=co2,
+            cost_savings_usd=cost,
+            payback_days=float(payback) if payback is not None else None,
+            simulation_result=simulation_result,
+            sustainability_context=dict(sustainability_dims),
         )
-        async with self._lock: self.recommendations[node_id]=rec
-        logger.info(f"Maintenance scheduled for {node_id}: {action} on {suggested_date}")
+
+        async with self._lock:
+            self.recommendations[node_id] = rec
+            self._pending_states[node_id] = {
+                'state': state,
+                'action_idx': action_idx,
+                'teacher_probs': teacher_probs,
+                'state_vec': state_vec,
+            }
+            while len(self._pending_states) > 500:
+                self._pending_states.popitem(last=False)
+
+        self.obs.counter('recommendations_total', action=action)
+
+        # Metrics bridge forwarding
+        if self.metrics_bridge is not None:
+            try:
+                await self.metrics_bridge.publish_recommendation(rec)
+            except Exception as e:
+                logger.debug("Metrics bridge publish failed: %s", e)
+
+        logger.info("Recommendation for %s: %s on %s",
+                    node_id, action, suggested_date.date())
         return rec
 
-    async def record_outcome(self, node_id, action, actual_energy_saved, actual_cost_saved, actual_carbon_saved):
-        reward=max(0.0, min(1.0, 0.4*min(1,actual_energy_saved/1e6)+0.3*min(1,actual_cost_saved/1000)+0.3*min(1,actual_carbon_saved/100)))
-        self.interaction_log.append({
-            'timestamp': datetime.now().isoformat(), 'node_id': node_id, 'action': action,
-            'reward': reward, 'net_savings': actual_cost_saved, 'carbon_savings': actual_carbon_saved,
-            'risk_reduction': 0.5, 'longterm_efficiency': 0.5,
-        })
-        if self.last_state_vec is not None and self.last_action_idx is not None:
-            await self.action_optimizer.update(self.last_state_vec, self.last_action_idx, reward, self.last_state_vec, self.last_teacher_probs)
-        if self.rlhf_trainer and random.random()<0.05:
-            chosen=action; rejected=random.choice([a for a in self.action_optimizer.ACTIONS if a!=chosen])
-            self.rlhf_trainer.record_pair(str(uuid.uuid4()), "Which maintenance action?", chosen, rejected, reward, {'node_id':node_id})
-        if self.modp_solver:
-            self.modp_solver.add_state(str(uuid.uuid4()), "maintenance", {'node_id':node_id}, {'reward':reward}, 0)
+    async def record_outcome(
+        self,
+        node_id: str,
+        action: str,
+        actual_energy_saved: float,
+        actual_cost_saved: float,
+        actual_carbon_saved: float,
+        risk_reduction: float = 0.5,
+        longterm_efficiency: float = 0.5,
+    ) -> None:
+        reward = float(np.clip(
+            0.4 * min(1.0, actual_energy_saved / 1e6) +
+            0.3 * min(1.0, actual_cost_saved / 1000.0) +
+            0.3 * min(1.0, actual_carbon_saved / 100.0),
+            0.0, 1.0,
+        ))
+        entry = {
+            'timestamp': _utcnow().isoformat(),
+            'node_id': node_id,
+            'action': action,
+            'reward': reward,
+            'net_savings': float(actual_cost_saved),
+            'carbon_savings': float(actual_carbon_saved),
+            'risk_reduction': float(risk_reduction),
+            'longterm_efficiency': float(longterm_efficiency),
+        }
+        async with self._lock:
+            self.interaction_log.append(entry)
 
-    def _get_action_success_rates(self):
-        rates={'replace':0.5,'refurbish':0.5,'monitor':0.5}
-        if not self.interaction_log: return rates
-        for a in rates:
-            entries=[e for e in self.interaction_log[-100:] if e['action']==a]
-            if entries: rates[a]=sum(1 for e in entries if e['reward']>0.5)/len(entries)
-        return rates
-
-    def _get_avg_reward(self):
-        if not self.interaction_log: return 0.5
-        return np.mean([e['reward'] for e in self.interaction_log[-50:]])
-
-    async def _get_carbon_intensity(self):
-        if self.carbon_manager and self.config.carbon_intensity_enabled:
+        snapshot = self._pending_states.get(node_id)
+        if snapshot is not None:
             try:
-                data=await self.carbon_manager.get_current_intensity()
-                return data.get('intensity',400)/1000
-            except: pass
-        return 0.4
+                await self.distillation.update(
+                    snapshot['state_vec'],
+                    snapshot['action_idx'],
+                    reward,
+                    snapshot['state_vec'],
+                    snapshot['teacher_probs'],
+                )
+                await self.distillation.update_teacher(
+                    snapshot['state'], snapshot['action_idx'], reward,
+                )
+                if self.gating is not None:
+                    await self.gating.add_training_sample(
+                        snapshot['state'], action, reward,
+                    )
+            except Exception as e:
+                logger.warning("Distillation update failed: %s", e)
 
-    async def get_recommendations(self):
-        async with self._lock: return list(self.recommendations.values())
+        self.obs.counter('outcomes_total', action=action)
 
-    async def get_limit_graph(self, graph_id="maintenance_actions"):
-        if self.limit_graph_manager:
-            return {'metadata':self.limit_graph_manager.get_metadata(graph_id),
-                    'nodes':self.limit_graph_manager.get_nodes(graph_id),
-                    'edges':self.limit_graph_manager.get_edges(graph_id)}
-        return {}
+        # Metrics bridge forwarding
+        if self.metrics_bridge is not None:
+            try:
+                await self.metrics_bridge.publish_outcome(
+                    node_id, action, reward,
+                    actual_energy_saved, actual_cost_saved, actual_carbon_saved,
+                )
+            except Exception as e:
+                logger.debug("Metrics bridge outcome publish failed: %s", e)
 
-    async def get_moe_experts(self):
-        return self.moe_gating.expert_names if self.moe_gating else []
+    async def run_moea_update(self) -> List[MOPDActionWeights]:
+        if self.evolution is None:
+            return []
+        if len(self.interaction_log) < 5:
+            return []
+        try:
+            pareto = await self.evolution.evolve()
+            self.pareto_front = pareto
+            if self.evolution.best is not None:
+                self.global_best_weights = dict(self.evolution.best.weights)
+                await self.evolution.save_pareto()
+                logger.info("MOEA best weights: %s", self.global_best_weights)
+            return pareto
+        except Exception as e:
+            logger.error("MOEA update failed: %s", e)
+            return []
 
-    async def get_rlhf_pairs(self, limit=100):
-        return self.rlhf_trainer.get_pairs(limit) if self.rlhf_trainer else []
+    async def get_recommendations(self) -> List[MaintenanceRecommendation]:
+        async with self._lock:
+            return list(self.recommendations.values())
 
-    async def record_rlhf_pair(self, pair_id, prompt, chosen, rejected, reward_diff, metadata=None):
-        if self.rlhf_trainer:
-            self.rlhf_trainer.record_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
+    async def sync_federated(self) -> Dict[str, Any]:
+        if self.federated is None:
+            return {'status': 'disabled'}
+        recs = await self.get_recommendations()
+        return await self.federated.sync(recs)
+
 
 # ============================================================================
-# PREDICTIVE MAINTENANCE ENGINE
+# ChaosService
+# ============================================================================
+class ChaosService:
+    def __init__(self, engine: "PredictiveMaintenanceEngine",
+                 config: PredictiveMaintenanceConfig) -> None:
+        self.engine = engine
+        self.config = config
+        self._saved: Dict[str, Any] = {}
+        self._injected: List[str] = []
+        self._lock = asyncio.Lock()
+
+    async def inject(self, fault_type: FaultType, **params: Any) -> Dict[str, Any]:
+        async with self._lock:
+            try:
+                if fault_type == FaultType.PERSISTENCE_FAILURE:
+                    if self.engine.persistence is not None:
+                        self._saved.setdefault(
+                            'persistence_disabled', self.engine.persistence._disabled,
+                        )
+                        self.engine.persistence.disable()
+                    return {'status': 'injected'}
+                if fault_type == FaultType.CARBON_API_FAILURE:
+                    if self.engine.digital_twin is not None and \
+                            self.engine.digital_twin.carbon_manager is not None:
+                        self._saved.setdefault(
+                            'carbon_manager',
+                            self.engine.digital_twin.carbon_manager,
+                        )
+                        self.engine.digital_twin.carbon_manager = None
+                    return {'status': 'injected'}
+                if fault_type == FaultType.LCA_API_FAILURE:
+                    if self.engine.digital_twin is not None:
+                        self._saved.setdefault('lca_client',
+                                                self.engine.digital_twin.lca_client)
+                        self.engine.digital_twin.lca_client = None
+                    return {'status': 'injected'}
+                if fault_type == FaultType.FORECAST_FAILURE:
+                    if self.engine.forecaster is not None:
+                        self._saved.setdefault(
+                            'forecast_disabled', self.engine.forecaster._disabled,
+                        )
+                        self.engine.forecaster.disable()
+                    return {'status': 'injected'}
+                if fault_type == FaultType.DISTILLATION_FAILURE:
+                    if self.engine.distillation is not None:
+                        self._saved.setdefault(
+                            'distill_disabled', self.engine.distillation._disabled,
+                        )
+                        self.engine.distillation.disable()
+                    return {'status': 'injected'}
+                if fault_type == FaultType.MOEA_EVALUATION_FAILURE:
+                    if self.engine.evolution is not None:
+                        self._saved.setdefault(
+                            'evolution_disabled', self.engine.evolution._disabled,
+                        )
+                        self.engine.evolution.disable()
+                    return {'status': 'injected'}
+                if fault_type == FaultType.TRACKER_FAILURE:
+                    if self.engine.tracker is not None:
+                        self._saved.setdefault(
+                            'tracker_disabled', self.engine.tracker._disabled,
+                        )
+                        self.engine.tracker.disable()
+                    return {'status': 'injected'}
+                if fault_type == FaultType.METRICS_BRIDGE_FAILURE:
+                    if self.engine.metrics_bridge is not None:
+                        self._saved.setdefault(
+                            'metrics_bridge_disabled',
+                            self.engine.metrics_bridge._disabled,
+                        )
+                        self.engine.metrics_bridge.disable()
+                    return {'status': 'injected'}
+                if fault_type == FaultType.SUSTAINABILITY_BRIDGE_FAILURE:
+                    if self.engine.sustainability_bridge is not None:
+                        self._saved.setdefault(
+                            'sustainability_bridge_disabled',
+                            self.engine.sustainability_bridge._disabled,
+                        )
+                        self.engine.sustainability_bridge.disable()
+                    return {'status': 'injected'}
+                if fault_type == FaultType.FEDERATED_FAILURE:
+                    if self.engine.federated is not None:
+                        self._saved.setdefault(
+                            'federated_disabled', self.engine.federated._disabled,
+                        )
+                        self.engine.federated.disable()
+                    return {'status': 'injected'}
+            except Exception as e:
+                logger.exception("Chaos injection failed: %s", e)
+                return {'status': 'error', 'error': str(e)}
+            return {'status': 'unknown_fault'}
+
+    def restore(self) -> None:
+        eng = self.engine
+        for key, value in list(self._saved.items()):
+            if key == 'persistence_disabled' and eng.persistence is not None:
+                eng.persistence._disabled = bool(value)
+            elif key == 'carbon_manager' and eng.digital_twin is not None:
+                eng.digital_twin.carbon_manager = value
+            elif key == 'lca_client' and eng.digital_twin is not None:
+                eng.digital_twin.lca_client = value
+            elif key == 'forecast_disabled' and eng.forecaster is not None:
+                eng.forecaster._disabled = bool(value)
+            elif key == 'distill_disabled' and eng.distillation is not None:
+                eng.distillation._disabled = bool(value)
+            elif key == 'evolution_disabled' and eng.evolution is not None:
+                eng.evolution._disabled = bool(value)
+            elif key == 'tracker_disabled' and eng.tracker is not None:
+                eng.tracker._disabled = bool(value)
+            elif key == 'metrics_bridge_disabled' and eng.metrics_bridge is not None:
+                eng.metrics_bridge._disabled = bool(value)
+            elif key == 'sustainability_bridge_disabled' and eng.sustainability_bridge is not None:
+                eng.sustainability_bridge._disabled = bool(value)
+            elif key == 'federated_disabled' and eng.federated is not None:
+                eng.federated._disabled = bool(value)
+            self._saved.pop(key, None)
+        self._injected.clear()
+
+    async def run_test(self) -> Dict[str, Any]:
+        report: Dict[str, Any] = {'faults': [], 'results': {}, 'restored': False}
+        faults = [
+            FaultType.PERSISTENCE_FAILURE,
+            FaultType.CARBON_API_FAILURE,
+            FaultType.LCA_API_FAILURE,
+            FaultType.FORECAST_FAILURE,
+            FaultType.DISTILLATION_FAILURE,
+            FaultType.MOEA_EVALUATION_FAILURE,
+        ]
+        try:
+            for ft in faults[:CHAOS_MAX_FAULTS_PER_RUN]:
+                res = await self.inject(ft)
+                report['faults'].append(ft.value)
+                report['results'][ft.value] = res
+            try:
+                health = await self.engine.get_health()
+                report['results']['health_check'] = {
+                    'status': health.get('status', 'unknown'),
+                }
+            except Exception as e:
+                report['results']['health_check'] = {'error': str(e)}
+        finally:
+            if self.config.enable_chaos_testing:
+                self.restore()
+                report['restored'] = True
+        return report
+
+
+# ============================================================================
+# PredictiveMaintenanceEngine (orchestrator)
 # ============================================================================
 class PredictiveMaintenanceEngine:
-    def __init__(self, config: Optional[Union[Dict, PredictiveMaintenanceConfig]] = None,
-                 carbon_manager=None, lca_client=None, anomaly_detector=None,
-                 storage=None, enable_limit_graph=True, enable_modp=True,
-                 enable_rlhf=True, enable_moe=True):
-        if config is None: self.config=PredictiveMaintenanceConfig()
-        elif isinstance(config, dict): self.config=PredictiveMaintenanceConfig.from_dict(config)
-        else: self.config=config
+    """Integrated Predictive Maintenance Engine v5.0.0."""
 
-        self.carbon_manager=carbon_manager; self.lca_client=lca_client; self.anomaly_detector=anomaly_detector; self.storage=storage
+    def __init__(
+        self,
+        config: Optional[Union[Dict[str, Any], PredictiveMaintenanceConfig]] = None,
+        carbon_manager: Optional[CarbonProviderProtocol] = None,
+        lca_client: Optional[LCAProviderProtocol] = None,
+        anomaly_detector: Optional[AnomalyDetectorProtocol] = None,
+        storage: Optional[Any] = None,
+        publish_fn: Optional[Callable[[str, Any], Awaitable[None]]] = None,
+        metrics_collector: Optional[Any] = None,
+        sustainability_engine: Optional[Any] = None,
+        cold_start_optimizer: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> None:
+        if config is None:
+            valid = {f.name for f in dataclass_fields(PredictiveMaintenanceConfig)}
+            filtered = {k: v for k, v in kwargs.items() if k in valid}
+            config = PredictiveMaintenanceConfig(**filtered)
+        elif isinstance(config, dict):
+            config = PredictiveMaintenanceConfig.from_dict(config)
+        self.config = config
+        self.carbon_manager = carbon_manager
+        self.lca_client = lca_client
+        self.anomaly_detector = anomaly_detector
+        self.storage = storage
+        self.publish_fn = publish_fn
 
-        self.persistence=PersistenceManager(self.config) if self.config.persistence_enabled else None
-        self.tracker=NodeEfficiencyTracker(self.config, self.persistence)
-        self.forecaster=PredictiveReflexivity(self.config)
-        self.simulator=DigitalTwinSimulator(self.config, carbon_manager, lca_client)
-        self.scheduler=MaintenanceScheduler(self.config, carbon_manager, storage,
-                                            enable_limit_graph=enable_limit_graph,
-                                            enable_modp=enable_modp,
-                                            enable_rlhf=enable_rlhf,
-                                            enable_moe=enable_moe)
+        # Observability
+        self.observability = ObservabilityHub()
+        self.dlq = DeadLetterQueue()
+        self.governance = GovernanceLayer(
+            enabled=getattr(config.approval, 'enabled', config.enable_human_approval),
+            timeout_seconds=float(getattr(config.approval, 'timeout_seconds',
+                                          APPROVAL_DEFAULT_TIMEOUT)),
+            auto_approve_on_timeout=bool(getattr(
+                config.approval, 'auto_approve_on_timeout', False,
+            )),
+            publish_fn=publish_fn,
+        )
+        self.safety = SafetyMonitor()
+        self._setup_invariants()
 
-        self.telemetry_callback=None; self.dashboard_callback=None
+        self._idempotency = IdempotencyCache()
 
-        if PROMETHEUS_AVAILABLE:
-            self.metrics={
-                'recommendations': Counter('pm_recommendations_total', ['node','action']),
-                'analysis_latency': Histogram('pm_analysis_latency_seconds'),
-                'nodes_tracked': Gauge('pm_nodes_tracked'),
-            }
-        else: self.metrics={}
+        # Persistence with auto-migration
+        self.persistence: Optional[PersistenceService] = (
+            PersistenceService(config, self.observability, self.dlq)
+            if config.persistence_enabled else None
+        )
 
-        self._background_task=None
-        if self.config.refresh_interval>0:
-            self._background_task=asyncio.create_task(self._periodic_analysis())
-        logger.info("PredictiveMaintenanceEngine initialized")
+        # Core sub-services
+        self.tracker = TrackingService(config, self.persistence, self.observability)
+        self.forecaster = ForecastService(config, self.observability)
+        self.digital_twin = DigitalTwinService(
+            config, carbon_manager, lca_client, self.observability,
+        )
+        self.federated = (
+            FederatedService(config, self.observability, self.dlq)
+            if getattr(config.federated, 'enabled', False) else None
+        )
 
-    def register_telemetry_source(self, callback): self.telemetry_callback=callback
-    def register_dashboard_callback(self, callback): self.dashboard_callback=callback
+        # Bridges
+        self.metrics_bridge: Optional[MetricsCollectorBridge] = (
+            MetricsCollectorBridge(metrics_collector, self.observability, self.dlq)
+            if (metrics_collector is not None and config.enable_metrics_bridge)
+            else None
+        )
+        self.sustainability_bridge: Optional[SustainabilityEngineBridge] = (
+            SustainabilityEngineBridge(
+                sustainability_engine, self.observability, self.dlq,
+            )
+            if (sustainability_engine is not None and config.enable_sustainability_bridge)
+            else None
+        )
+        self.cold_start_bridge: Optional[ColdStartBridge] = (
+            ColdStartBridge(cold_start_optimizer, self.observability)
+            if (cold_start_optimizer is not None and config.enable_cold_start_bridge)
+            else None
+        )
 
-    async def update_node(self, node_id, flops, energy_joules):
-        await self.tracker.add_measurement(node_id, flops, energy_joules)
+        # Distillation: optionally seed teachers from ColdStart
+        shared_teachers: List[Any] = []
+        if self.cold_start_bridge is not None and self.cold_start_bridge.available:
+            try:
+                shared_teachers = self.cold_start_bridge.import_teachers()
+                logger.info("Imported %d teachers from ColdStart", len(shared_teachers))
+            except Exception as e:
+                logger.warning("Cold-start teacher import failed: %s", e)
 
-    async def analyze_node(self, node_id):
-        start=time.time()
-        times, effs=await self.tracker.get_efficiency_series(node_id)
-        if len(effs)<self.config.min_data_points:
-            logger.debug(f"Insufficient data for {node_id}"); return None
-        forecast=self.forecaster.forecast(times, effs)
-        if "error" in forecast: return None
-        current_eff=await self.tracker.get_latest_efficiency(node_id)
-        if current_eff is None: return None
+        self.distillation = DistillationService(
+            config, self.observability, shared_teachers=shared_teachers,
+        )
+        self.evolution = (
+            EvolutionService(
+                config,
+                evaluate=self._evaluate_individual_via_scheduler,
+                observability=self.observability,
+            )
+            if config.moea_enabled else None
+        )
+        self.gating = (
+            GatingService(config, self.observability)
+            if config.enable_moe else None
+        )
 
-        total_flops=sum(r.flops for r in self.tracker.history.get(node_id, []))
-        days=max(len(self.tracker.history.get(node_id, [])),1)
-        avg_flops_per_day=total_flops/days if days>0 else 1e12
+        self.scheduler = SchedulingService(
+            config=config,
+            tracker=self.tracker,
+            forecaster=self.forecaster,
+            simulator=self.digital_twin,
+            distillation=self.distillation,
+            carbon_manager=carbon_manager,
+            evolution=self.evolution,
+            gating=self.gating,
+            governance=self.governance,
+            observability=self.observability,
+            sustainability_bridge=self.sustainability_bridge,
+            metrics_bridge=self.metrics_bridge,
+            federated=self.federated,
+        )
 
-        sim_replace=await self.simulator.simulate_replacement(node_id, current_eff, "replace",
-                                                               workload_flops_per_day=avg_flops_per_day)
-        sim_refurb=await self.simulator.simulate_replacement(node_id, current_eff, "refurbish",
-                                                              workload_flops_per_day=avg_flops_per_day)
-        rec=await self.scheduler.generate_recommendation(node_id, current_eff, forecast, sim_replace, sim_refurb)
+        # Chaos
+        self.chaos_service = (
+            ChaosService(self, config) if config.enable_chaos_testing else None
+        )
 
-        if self.persistence: await self.persistence.save_recommendation(rec)
-        if self.dashboard_callback: self.dashboard_callback(rec)
-        if PROMETHEUS_AVAILABLE:
-            self.metrics['recommendations'].labels(node=node_id, action=rec.recommended_action).inc()
-            self.metrics['analysis_latency'].observe(time.time()-start)
-            self.metrics['nodes_tracked'].set(len(self.tracker.history))
-        return rec
+        # Lifecycle
+        self._started = False
+        self._shutting_down = False
+        self._background_tasks: List[asyncio.Task] = []
+        self._analysis_task: Optional[asyncio.Task] = None
+        self._moea_task: Optional[asyncio.Task] = None
+        self._chaos_task: Optional[asyncio.Task] = None
+        self._federated_task: Optional[asyncio.Task] = None
+        self._ready_event = asyncio.Event()
 
-    async def run_analysis(self, node_ids=None):
-        if node_ids is None: node_ids=list(self.tracker.history.keys())
-        recs=[]
-        for nid in node_ids:
-            rec=await self.analyze_node(nid)
-            if rec: recs.append(rec)
-        return recs
+        # Callbacks
+        self.telemetry_callback: Optional[Callable[[str], None]] = None
+        self.dashboard_callback: Optional[Callable[[MaintenanceRecommendation], None]] = None
 
-    async def _periodic_analysis(self):
-        while True:
+        logger.info(
+            "PredictiveMaintenanceEngine v%s initialised "
+            "(siblings: config=%s metrics=%s engine=%s cold_start=%s)",
+            MODULE_VERSION, SIBLING_CONFIG_AVAILABLE, SIBLING_METRICS_AVAILABLE,
+            SIBLING_ENGINE_AVAILABLE, SIBLING_COLD_START_AVAILABLE,
+        )
+
+    def _setup_invariants(self) -> None:
+        def _eff_nonneg(state: Dict[str, Any]) -> bool:
+            return float(state.get('efficiency', 0.0)) >= 0.0
+
+        def _days_nonneg(state: Dict[str, Any]) -> bool:
+            d = state.get('days_to_threshold')
+            if d is None:
+                return True
+            return float(d) >= 0.0
+
+        def _future_date(state: Dict[str, Any]) -> bool:
+            d = state.get('suggested_date')
+            if d is None:
+                return True
+            if isinstance(d, str):
+                try:
+                    d = datetime.fromisoformat(d)
+                except ValueError:
+                    return True
+            return d >= _utcnow() - timedelta(minutes=1)
+
+        self.safety.add('efficiency_nonneg', _eff_nonneg,
+                        'Efficiency must be non-negative')
+        self.safety.add('days_nonneg', _days_nonneg,
+                        'days_to_threshold must be non-negative')
+        self.safety.add('future_date', _future_date,
+                        'suggested_date must not be in the past')
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+
+        # Auto-migrate before any writes
+        if self.persistence is not None and self.config.auto_migrate_schema:
+            try:
+                await self.persistence.migrate()
+            except Exception as e:
+                logger.warning("Migration on startup failed: %s", e)
+
+        if self.config.refresh_interval > 0:
+            self._analysis_task = asyncio.create_task(self._periodic_analysis())
+            self._background_tasks.append(self._analysis_task)
+
+        if self.evolution is not None:
+            self._moea_task = asyncio.create_task(self._moea_loop())
+            self._background_tasks.append(self._moea_task)
+
+        if self.chaos_service is not None:
+            self._chaos_task = asyncio.create_task(self._chaos_loop())
+            self._background_tasks.append(self._chaos_task)
+
+        if self.federated is not None:
+            self._federated_task = asyncio.create_task(self._federated_loop())
+            self._background_tasks.append(self._federated_task)
+
+        self._ready_event.set()
+        logger.info("PredictiveMaintenanceEngine started")
+
+    async def wait_ready(self) -> None:
+        if not self._started:
+            await self.start()
+        await self._ready_event.wait()
+
+    async def shutdown(self) -> None:
+        logger.info("Shutting down PredictiveMaintenanceEngine")
+        self._shutting_down = True
+        for t in self._background_tasks:
+            t.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
+
+        if self.persistence is not None:
+            try:
+                await self.persistence.close()
+            except Exception as e:
+                logger.warning("Persistence close failed: %s", e)
+
+        if self.carbon_manager is not None and hasattr(self.carbon_manager, 'close'):
+            try:
+                res = self.carbon_manager.close()
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as e:
+                logger.warning("Carbon close failed: %s", e)
+
+        if self.lca_client is not None and hasattr(self.lca_client, 'close'):
+            try:
+                res = self.lca_client.close()
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as e:
+                logger.warning("LCA close failed: %s", e)
+
+        if self.federated is not None:
+            try:
+                await self.federated.close()
+            except Exception as e:
+                logger.warning("Federated close failed: %s", e)
+
+        unmet = self.safety.final_check()
+        if unmet:
+            logger.warning("Unmet eventual invariants at shutdown: %s", unmet)
+
+        logger.info("Shutdown complete")
+
+    async def _periodic_analysis(self) -> None:
+        while not self._shutting_down:
             try:
                 await asyncio.sleep(self.config.refresh_interval)
                 await self.run_analysis()
-            except asyncio.CancelledError: break
-            except Exception as e: logger.error(f"Periodic analysis error: {e}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Periodic analysis error: %s", e)
 
-    async def get_dashboard_data(self):
-        recs=await self.scheduler.get_recommendations()
+    async def _moea_loop(self) -> None:
+        while not self._shutting_down:
+            try:
+                await asyncio.sleep(self.config.moea_interval_seconds)
+                pareto = await self.scheduler.run_moea_update()
+                if pareto:
+                    self.scheduler.pareto_front = pareto
+                    if self.evolution is not None and self.evolution.best is not None:
+                        self.scheduler.global_best_weights = dict(
+                            self.evolution.best.weights,
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("MOEA loop error: %s", e)
+                await asyncio.sleep(60)
+
+    async def _chaos_loop(self) -> None:
+        interval = max(60, int(getattr(self.config.chaos, 'interval_seconds', 3600)))
+        while not self._shutting_down:
+            try:
+                await asyncio.sleep(interval)
+                if self.chaos_service is not None:
+                    await self.chaos_service.run_test()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Chaos loop error: %s", e)
+
+    async def _federated_loop(self) -> None:
+        if self.federated is None:
+            return
+        interval = max(60, int(getattr(self.config.federated,
+                                        'sync_interval_seconds', 3600)))
+        while not self._shutting_down:
+            try:
+                await asyncio.sleep(interval)
+                await self.scheduler.sync_federated()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Federated loop error: %s", e)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    async def update_node(self, node_id: str, flops: float,
+                          energy_joules: float) -> None:
+        await self.wait_ready()
+        await self.tracker.add_measurement(node_id, flops, energy_joules)
+        if self.telemetry_callback is not None:
+            try:
+                self.telemetry_callback(node_id)
+            except Exception:
+                pass
+
+    async def _evaluate_individual_via_scheduler(
+        self, weights: Dict[str, float],
+    ) -> Dict[str, float]:
+        return await self.scheduler._evaluate_individual(weights)
+
+    async def analyze_node(
+        self,
+        node_id: str,
+        idempotency_key: Optional[str] = None,
+    ) -> Optional[MaintenanceRecommendation]:
+        await self.wait_ready()
+        if idempotency_key and self._idempotency.seen(idempotency_key):
+            return self.scheduler.recommendations.get(node_id)
+
+        times, effs = await self.tracker.get_series(node_id)
+        if len(effs) < self.config.min_data_points:
+            return None
+
+        try:
+            forecast = self.forecaster.forecast(times, effs)
+        except Exception as e:
+            logger.warning("Forecast failed for %s: %s", node_id, e)
+            await self.dlq.record('forecast', str(e), {'node_id': node_id})
+            return None
+        if "error" in forecast:
+            return None
+
+        current_eff = await self.tracker.get_latest(node_id)
+        if current_eff is None:
+            return None
+
+        recent = list(self.tracker.history.get(node_id, []))
+        if not recent:
+            return None
+        total_flops = sum(r.flops for r in recent)
+        days = max(len(recent), 1)
+        avg_flops_per_day = total_flops / days
+
+        try:
+            sim_replace = await self.digital_twin.simulate_replacement(
+                node_id, current_eff, "replace",
+                workload_flops_per_day=avg_flops_per_day,
+            )
+            sim_refurb = await self.digital_twin.simulate_replacement(
+                node_id, current_eff, "refurbish",
+                workload_flops_per_day=avg_flops_per_day,
+            )
+        except Exception as e:
+            logger.warning("Digital twin failed for %s: %s", node_id, e)
+            await self.dlq.record('digital_twin', str(e), {'node_id': node_id})
+            return None
+
+        rec = await self.scheduler.generate_recommendation(
+            node_id, current_eff, forecast, sim_replace, sim_refurb,
+            idempotency_key=idempotency_key,
+        )
+
+        if self.config.enable_temporal_safety:
+            violations = self.safety.check({
+                'efficiency': rec.current_efficiency,
+                'days_to_threshold': rec.days_to_threshold
+                if math.isfinite(rec.days_to_threshold) else None,
+                'suggested_date': rec.suggested_date,
+            })
+            if violations:
+                logger.warning("Safety violations for %s: %s", node_id, violations)
+                self.observability.counter('safety_violations_total')
+
+        if self.persistence is not None:
+            try:
+                await self.persistence.save_recommendation(rec)
+            except Exception as e:
+                logger.warning("Recommendation save failed: %s", e)
+        if self.dashboard_callback is not None:
+            try:
+                self.dashboard_callback(rec)
+            except Exception:
+                pass
+
+        self.observability.gauge('last_efficiency', rec.current_efficiency,
+                                 node=node_id)
+        self.observability.histogram('analysis_completed',
+                                     rec.current_efficiency)
+        return rec
+
+    async def run_analysis(
+        self, node_ids: Optional[Sequence[str]] = None,
+    ) -> List[MaintenanceRecommendation]:
+        await self.wait_ready()
+        if node_ids is None:
+            node_ids = self.tracker.list_nodes()
+        recs: List[MaintenanceRecommendation] = []
+        for nid in node_ids:
+            try:
+                rec = await self.analyze_node(nid)
+                if rec is not None:
+                    recs.append(rec)
+            except Exception as e:
+                logger.warning("Analysis failed for %s: %s", nid, e)
+        return recs
+
+    async def record_outcome(
+        self,
+        node_id: str,
+        action: str,
+        actual_energy_saved: float,
+        actual_cost_saved: float,
+        actual_carbon_saved: float,
+        risk_reduction: float = 0.5,
+        longterm_efficiency: float = 0.5,
+    ) -> None:
+        await self.wait_ready()
+        await self.scheduler.record_outcome(
+            node_id, action, actual_energy_saved, actual_cost_saved,
+            actual_carbon_saved, risk_reduction, longterm_efficiency,
+        )
+
+    async def run_moea_update(self) -> List[MOPDActionWeights]:
+        await self.wait_ready()
+        pareto = await self.scheduler.run_moea_update()
+        if pareto and self.evolution is not None and self.evolution.best is not None:
+            self.scheduler.global_best_weights = dict(self.evolution.best.weights)
+        return pareto
+
+    async def run_federated_sync(self) -> Dict[str, Any]:
+        await self.wait_ready()
+        return await self.scheduler.sync_federated()
+
+    # ------------------------------------------------------------------
+    # Query / dashboard
+    # ------------------------------------------------------------------
+    async def get_recommendations(self) -> List[MaintenanceRecommendation]:
+        return await self.scheduler.get_recommendations()
+
+    async def get_dashboard_data(self) -> Dict[str, Any]:
+        await self.wait_ready()
+        recs = await self.get_recommendations()
         return {
-            "total_nodes": len(self.tracker.history),
+            "total_nodes": len(self.tracker.list_nodes()),
             "recommendations": [
-                {"node_id": r.node_id, "action": r.recommended_action,
-                 "suggested_date": r.suggested_date.isoformat(),
-                 "carbon_savings_kg": r.carbon_savings_kg, "cost_savings_usd": r.cost_savings_usd,
-                 "payback_days": r.payback_days, "current_efficiency": r.current_efficiency,
-                 "days_to_threshold": r.days_to_threshold}
+                {
+                    "node_id": r.node_id,
+                    "action": r.recommended_action,
+                    "suggested_date": r.suggested_date.isoformat(),
+                    "carbon_savings_kg": r.carbon_savings_kg,
+                    "cost_savings_usd": r.cost_savings_usd,
+                    "payback_days": r.payback_days,
+                    "current_efficiency": r.current_efficiency,
+                    "days_to_threshold": r.days_to_threshold,
+                    "sustainability_context": r.sustainability_context,
+                }
                 for r in recs
             ],
             "efficiency_threshold": self.config.efficiency_threshold,
         }
 
-    async def get_health(self):
+    async def get_health(self) -> Dict[str, Any]:
         return {
-            "status": "healthy",
-            "nodes_tracked": len(self.tracker.history),
+            "status": "healthy" if not self._shutting_down else "stopping",
+            "version": MODULE_VERSION,
+            "schema": STATE_SCHEMA_VERSION,
+            "started": self._started,
+            "nodes_tracked": len(self.tracker.list_nodes()),
             "recommendations_pending": len(self.scheduler.recommendations),
-            "distillation_stats": self.scheduler.action_optimizer.get_stats(),
+            "distillation_stats": self.distillation.get_stats(),
             "moea_pareto_front_size": len(self.scheduler.pareto_front),
             "moea_best_weights": self.scheduler.global_best_weights,
-            "limit_graph": bool(self.scheduler.limit_graph_manager),
-            "modp": bool(self.scheduler.modp_solver),
-            "rlhf": bool(self.scheduler.rlhf_trainer),
-            "moe": bool(self.scheduler.moe_gating),
+            "moe": self.gating is not None,
+            "governance_pending": len(self.governance.pending),
+            "dead_letters": len(self.dlq),
+            "bridges": {
+                "metrics": self.metrics_bridge is not None,
+                "sustainability": self.sustainability_bridge is not None,
+                "cold_start": self.cold_start_bridge is not None,
+                "federated": self.federated is not None,
+            },
+            "siblings": {
+                "config": SIBLING_CONFIG_AVAILABLE,
+                "metrics": SIBLING_METRICS_AVAILABLE,
+                "engine": SIBLING_ENGINE_AVAILABLE,
+                "cold_start": SIBLING_COLD_START_AVAILABLE,
+            },
         }
 
-    async def shutdown(self):
-        if self._background_task:
-            self._background_task.cancel()
-        if self.scheduler._moea_task:
-            self.scheduler._moea_task.cancel()
-        if self.persistence: await self.persistence.close()
+    async def get_prometheus_metrics(self) -> str:
+        return await self.observability.export_prometheus()
+
+    def get_dead_letters(self) -> List[Dict[str, Any]]:
+        return self.dlq.snapshot()
+
+    # ------------------------------------------------------------------
+    # Governance / chaos API
+    # ------------------------------------------------------------------
+    async def submit_approval_decision(self, request_id: str,
+                                        approved: bool) -> bool:
+        return await self.governance.submit_decision(request_id, approved)
+
+    def get_approval_audit(self) -> List[Dict[str, Any]]:
+        return self.governance.get_audit_log()
+
+    def list_pending_approvals(self) -> List[Dict[str, Any]]:
+        return self.governance.list_pending()
+
+    async def inject_fault(self, fault_type: str, **params: Any) -> Dict[str, Any]:
+        if self.chaos_service is None:
+            return {'status': 'disabled'}
+        try:
+            ft = FaultType(fault_type)
+        except ValueError:
+            logger.warning("Unknown fault: %s", fault_type)
+            return {'status': 'unknown_fault'}
+        return await self.chaos_service.inject(ft, **params)
+
+    async def run_chaos_test(self) -> Dict[str, Any]:
+        if self.chaos_service is None:
+            return {'status': 'disabled'}
+        return await self.chaos_service.run_test()
+
+    # ------------------------------------------------------------------
+    # Migration API
+    # ------------------------------------------------------------------
+    async def migrate_schema(self) -> Dict[str, Any]:
+        if self.persistence is None:
+            return {'status': 'no_persistence'}
+        return await self.persistence.migrate()
+
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
+    def register_telemetry_source(self, callback: Callable[[str], None]) -> None:
+        self.telemetry_callback = callback
+
+    def register_dashboard_callback(
+        self, callback: Callable[[MaintenanceRecommendation], None],
+    ) -> None:
+        self.dashboard_callback = callback
+
 
 # ============================================================================
-# FACTORY AND DASHBOARD
+# FastAPI surface
+# ============================================================================
+def create_fastapi_app(engine: PredictiveMaintenanceEngine,
+                       title: str = "Predictive Maintenance API",
+                       version: str = MODULE_VERSION) -> Any:
+    """Build a FastAPI app wired to the given engine."""
+    if not FASTAPI_AVAILABLE:
+        raise RuntimeError("FastAPI not available")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):  # type: ignore
+        await engine.start()
+        logger.info("Predictive Maintenance FastAPI started")
+        try:
+            yield
+        finally:
+            await engine.shutdown()
+            logger.info("Predictive Maintenance FastAPI stopped")
+
+    app = FastAPI(title=title, version=version, lifespan=lifespan)
+
+    @app.get("/health")
+    async def health() -> Dict[str, Any]:
+        return await engine.get_health()
+
+    @app.get("/metrics")
+    async def metrics() -> Response:
+        body = await engine.get_prometheus_metrics()
+        return Response(content=body, media_type="text/plain; version=0.0.4")
+
+    @app.get("/recommendations")
+    async def recommendations() -> Dict[str, Any]:
+        recs = await engine.get_recommendations()
+        return {"count": len(recs), "items": [r.to_dict() for r in recs]}
+
+    @app.post("/analyze/{node_id}")
+    async def analyze(node_id: str) -> Dict[str, Any]:
+        rec = await engine.analyze_node(node_id)
+        if rec is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Insufficient data or analysis failed for {node_id}",
+            )
+        return rec.to_dict()
+
+    @app.post("/nodes/{node_id}/measure")
+    async def measure(node_id: str, payload: Dict[str, float]) -> Dict[str, Any]:
+        flops = float(payload.get("flops", 0.0))
+        energy = float(payload.get("energy_joules", 0.0))
+        if energy <= 0:
+            raise HTTPException(status_code=400, detail="energy_joules must be > 0")
+        await engine.update_node(node_id, flops, energy)
+        return {"status": "ok", "node_id": node_id}
+
+    @app.post("/outcomes")
+    async def outcomes(payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            await engine.record_outcome(
+                node_id=str(payload["node_id"]),
+                action=str(payload["action"]),
+                actual_energy_saved=float(payload.get("energy_saved", 0.0)),
+                actual_cost_saved=float(payload.get("cost_saved", 0.0)),
+                actual_carbon_saved=float(payload.get("carbon_saved", 0.0)),
+                risk_reduction=float(payload.get("risk_reduction", 0.5)),
+                longterm_efficiency=float(payload.get("longterm_efficiency", 0.5)),
+            )
+            return {"status": "ok"}
+        except KeyError as e:
+            raise HTTPException(status_code=400, detail=f"Missing field {e}")
+
+    @app.get("/approvals")
+    async def list_approvals() -> Dict[str, Any]:
+        return {"pending": engine.list_pending_approvals()}
+
+    @app.post("/approvals/{request_id}")
+    async def decide_approval(request_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        approved = bool(payload.get("approved", False))
+        ok = await engine.submit_approval_decision(request_id, approved)
+        if not ok:
+            raise HTTPException(status_code=404,
+                                detail=f"Approval {request_id} not found or already decided")
+        return {"status": "ok", "request_id": request_id, "approved": approved}
+
+    @app.get("/approvals/audit")
+    async def approvals_audit() -> Dict[str, Any]:
+        return {"audit": engine.get_approval_audit()}
+
+    @app.post("/chaos/run")
+    async def chaos_run() -> Dict[str, Any]:
+        return await engine.run_chaos_test()
+
+    @app.post("/federated/sync")
+    async def federated_sync() -> Dict[str, Any]:
+        return await engine.run_federated_sync()
+
+    @app.get("/dead-letters")
+    async def dead_letters() -> Dict[str, Any]:
+        items = engine.get_dead_letters()
+        return {"count": len(items), "items": items}
+
+    @app.post("/migrate")
+    async def migrate() -> Dict[str, Any]:
+        return await engine.migrate_schema()
+
+    return app
+
+
+# ============================================================================
+# Convenience factory
 # ============================================================================
 class SustainabilityDashboard:
-    def __init__(self): self.recommendations=[]
-    def update(self, rec): self.recommendations.append(rec)
+    def __init__(self) -> None:
+        self.recommendations: List[MaintenanceRecommendation] = []
 
-def create_predictive_maintenance_system(config=None, carbon_manager=None, lca_client=None,
-                                        anomaly_detector=None, storage=None):
-    engine=PredictiveMaintenanceEngine(config, carbon_manager, lca_client, anomaly_detector, storage)
-    dashboard=SustainabilityDashboard()
+    def update(self, rec: MaintenanceRecommendation) -> None:
+        self.recommendations.append(rec)
+
+
+def create_predictive_maintenance_system(
+    config: Optional[Union[Dict[str, Any], PredictiveMaintenanceConfig]] = None,
+    carbon_manager: Optional[CarbonProviderProtocol] = None,
+    lca_client: Optional[LCAProviderProtocol] = None,
+    anomaly_detector: Optional[AnomalyDetectorProtocol] = None,
+    storage: Optional[Any] = None,
+    metrics_collector: Optional[Any] = None,
+    sustainability_engine: Optional[Any] = None,
+    cold_start_optimizer: Optional[Any] = None,
+    publish_fn: Optional[Callable[[str, Any], Awaitable[None]]] = None,
+) -> Dict[str, Any]:
+    engine = PredictiveMaintenanceEngine(
+        config=config,
+        carbon_manager=carbon_manager,
+        lca_client=lca_client,
+        anomaly_detector=anomaly_detector,
+        storage=storage,
+        publish_fn=publish_fn,
+        metrics_collector=metrics_collector,
+        sustainability_engine=sustainability_engine,
+        cold_start_optimizer=cold_start_optimizer,
+    )
+    dashboard = SustainabilityDashboard()
     engine.register_dashboard_callback(dashboard.update)
-    return {"engine": engine, "dashboard": dashboard, "tracker": engine.tracker,
-            "scheduler": engine.scheduler, "simulator": engine.simulator}
+    return {
+        "engine": engine,
+        "dashboard": dashboard,
+        "tracker": engine.tracker,
+        "scheduler": engine.scheduler,
+        "simulator": engine.digital_twin,
+        "metrics_bridge": engine.metrics_bridge,
+        "sustainability_bridge": engine.sustainability_bridge,
+        "cold_start_bridge": engine.cold_start_bridge,
+        "federated": engine.federated,
+    }
+
 
 # ============================================================================
-# EXAMPLE USAGE
+# Exports
+# ============================================================================
+__all__ = [
+    # Main
+    "PredictiveMaintenanceEngine",
+    "PredictiveMaintenanceConfig",
+    "create_predictive_maintenance_system",
+    "create_fastapi_app",
+    "SustainabilityDashboard",
+    # Sub-services
+    "TrackingService",
+    "ForecastService",
+    "DigitalTwinService",
+    "DistillationService",
+    "EvolutionService",
+    "GatingService",
+    "PersistenceService",
+    "SchedulingService",
+    "ChaosService",
+    "FederatedService",
+    # Bridges
+    "MetricsCollectorBridge",
+    "SustainabilityEngineBridge",
+    "ColdStartBridge",
+    # Migration
+    "SchemaMigrator",
+    # Infra
+    "ObservabilityHub",
+    "GovernanceLayer",
+    "ApprovalRequest",
+    "ApprovalResult",
+    "ApprovalStatus",
+    "SafetyMonitor",
+    "SafetyInvariant",
+    "CircuitBreaker",
+    "CircuitBreakerState",
+    "DeadLetterQueue",
+    "IdempotencyCache",
+    # Data
+    "EfficiencyRecord",
+    "MaintenanceRecommendation",
+    "MaintenanceState",
+    "MOPDActionWeights",
+    # Teachers
+    "RuleBasedTeacher",
+    "HistoricalMLTeacher",
+    "StatefulQTeacher",
+    "DistillationStudent",
+    "ReplayBuffer",
+    # Utilities
+    "scalarise_pareto",
+    "filter_pareto",
+    # Constants
+    "MODULE_VERSION",
+    "STATE_SCHEMA_VERSION",
+    "FEATURE_DIM",
+    "MAINTENANCE_ACTIONS",
+    "SUSTAINABILITY_DIMENSIONS",
+    "MOPD_OBJECTIVE_NAMES",
+    "MOPD_HIGHER_IS_BETTER",
+    # Sibling availability flags
+    "SIBLING_CONFIG_AVAILABLE",
+    "SIBLING_METRICS_AVAILABLE",
+    "SIBLING_ENGINE_AVAILABLE",
+    "SIBLING_COLD_START_AVAILABLE",
+    "PYDANTIC_AVAILABLE",
+    "PYDANTIC_V1",
+    "PYDANTIC_V2",
+]
+
+
+# ============================================================================
+# Example usage
 # ============================================================================
 if __name__ == "__main__":
-    import asyncio
     logging.basicConfig(level=logging.INFO)
-    async def main():
-        system=create_predictive_maintenance_system()
-        engine=system["engine"]
-        await engine.update_node("node-001", 1e12, 500.0)  # efficiency = 2e9
-        recs=await engine.run_analysis(["node-001"])
+
+    async def _demo() -> None:
+        config = PredictiveMaintenanceConfig()
+        config.enable_chaos_testing = True
+        engine = PredictiveMaintenanceEngine(config=config)
+        await engine.start()
+
+        # Feed synthetic measurements
+        for i in range(20):
+            await engine.update_node(
+                "node-001", flops=1e12, energy_joules=500.0 + 5.0 * i,
+            )
+
+        recs = await engine.run_analysis(["node-001"])
         for rec in recs:
-            print(f"Node {rec.node_id}: action={rec.recommended_action}, suggested={rec.suggested_date}")
+            print(f"Node {rec.node_id}: action={rec.recommended_action}, "
+                  f"suggested={rec.suggested_date.date()}, "
+                  f"sustainability={rec.sustainability_context}")
+
+        await engine.record_outcome(
+            "node-001", action="refurbish",
+            actual_energy_saved=1e6, actual_cost_saved=250.0,
+            actual_carbon_saved=20.0,
+        )
+
+        pareto = await engine.run_moea_update()
+        print(f"MOEA pareto size: {len(pareto)}")
+
+        health = await engine.get_health()
+        print(f"Health: {health['status']}, bridges={health['bridges']}")
+
+        chaos = await engine.run_chaos_test()
+        print(f"Chaos restored: {chaos.get('restored')}")
+
+        fed = await engine.run_federated_sync()
+        print(f"Federated sync: {fed.get('status')}")
+
+        metrics = await engine.get_prometheus_metrics()
+        print(metrics[:400])
+
         await engine.shutdown()
-    asyncio.run(main())
+
+    asyncio.run(_demo())
