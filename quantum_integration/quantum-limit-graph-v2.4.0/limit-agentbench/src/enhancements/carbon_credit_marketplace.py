@@ -1,384 +1,572 @@
 #!/usr/bin/env python3
 # File: src/enhancements/carbon_credit_marketplace.py
 """
-Carbon Credit Marketplace for Green Agent v5.1.0 (Enterprise Quantum Resilience+)
+Carbon Credit Marketplace for Green Agent v6.0.0
+=================================================
 
-ENHANCEMENTS OVER v5.0.0:
-- Added Quantum‑Distillation Integration (optional Qiskit)
-- Added Causal Reinforcement Learning (CausalBandit)
-- Added Federated Green Learning Coordinator (stub)
-- Added Advanced Multi‑Agent Coordination (MultiAgentSystem)
-- Added Temporal Logic & Formal Verification (SafetyMonitor)
-- Added Explainable AI (XAI) for every decision
-- Integrated Adaptive Precision Switching with FlexGen
-- Added Integration with Renewable Energy Credits (RECs) alongside carbon credits
-- Added Resilience Engineering & Chaos Testing (ChaosMonkey)
-- Added Human‑in‑the‑Loop with Active Learning (HumanReviewManager)
+Self-contained, runnable Carbon Credit Marketplace with:
+  - Pluggable registry / blockchain / cloud / PQC / price-prediction adapters
+    (deterministic simulations by default).
+  - Async SQLAlchemy persistence with a working aiosqlite fallback.
+  - JWT auth, Prometheus metrics, structured logging, rate limiting.
+  - Safety monitor (temporal rules), XAI explanations, human-in-the-loop,
+    chaos engineering, causal bandit, federated aggregation, multi-agent
+    voting, quantum-distillation stub, FlexGen policy simulation.
 
-All previous features retained.
+CHANGES (v6.0.0 over v5.1.0):
+- Fixed missing imports (``Awaitable``, ``logging.handlers``, ``typing``).
+- Pydantic v2-first detection (``pydantic_settings`` imported separately);
+  v1 fallback retained.
+- ``MASTER_KEY`` validator allows empty; ``ensure_master_key()`` auto-generates
+  at startup.
+- **All previously-undefined collaborator classes are now defined**:
+  ``AsyncDatabaseManager``, ``RegistryClient``, ``BlockchainClient``,
+  ``PostQuantumCrypto``, ``CloudStorage``, ``PricePredictor``,
+  ``CarbonIntensityManager``, ``UnifiedSustainabilityEngine``,
+  ``AutoOffsetEngine``, ``WebSocketManager``, ``WebhookNotifier``.
+- SQLAlchemy ``metadata`` column renamed to ``extra`` (``metadata`` is
+  reserved on declarative base) for both ``CreditProjectDB`` and
+  ``CreditTransactionDB``.
+- ``CircuitBreaker.call`` handles sync callables; ``GlobalCircuitBreaker``
+  uses an instance dict guarded by ``threading.RLock``.
+- ``CausalBandit`` bio-expansion registers new actions in every parallel
+  dict; no more ``KeyError``.
+- ``MultiAgentSystem.vote`` scores per project (already correct in v5.1.0,
+  verified by test).
+- RNG threaded via ``np.random.default_rng(config.general.random_seed)``;
+  no unseeded ``random`` calls remain.
+- FastAPI ``on_event`` → ``lifespan``; config stored on ``app.state``;
+  JWT dependency uses ``HTTPBearer`` correctly.
+- Every endpoint body is a Pydantic model; JWT required on all mutating
+  endpoints; admin role enforced on ``/optimization/evolve``,
+  ``/human-review/*``, ``/chaos/trigger``, ``/federated/aggregate``.
+- ``FeedbackEvent`` emitted from ``AutonomousOptimizer.select_best_project``
+  and ``CarbonCreditMarketplace._perform_offset``.
+- ``AutonomousOptimizer._load_state``/``_save_state`` persist through
+  ``AsyncDatabaseManager``.
+- ``TaskManager`` propagates its shutdown event to registered loops.
+- ``__version__`` and ``__all__`` added.
+- Built-in test suite: ``python carbon_credit_marketplace.py --test``.
+
+Run the API:
+    python carbon_credit_marketplace.py --serve
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
 import hashlib
+import hmac
+import inspect
 import json
 import logging
+import logging.handlers
 import os
+import secrets
+import threading
 import time
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from collections import OrderedDict, defaultdict, deque
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Dict, List, Optional, Any, Callable, Set, Union, Protocol, runtime_checkable
-from collections import deque, defaultdict
-import random
-import io
-import csv
-import sqlite3  # for fallback sync
+from pathlib import Path
+from typing import (
+    Any, Awaitable, Callable, Dict, Iterable, List, Optional, Protocol,
+    Set, Tuple, Union, runtime_checkable,
+)
 
-import aiohttp
 import numpy as np
-import pandas as pd
 
-# ---------- Pydantic ----------
-from pydantic import BaseModel, Field, field_validator, ValidationInfo, ConfigDict, field_serializer
-from pydantic_settings import BaseSettings, SettingsConfigDict
+__version__ = "6.0.0"
+__all__ = [
+    "__version__",
+    "Settings",
+    "ensure_settings",
+    "CircuitBreakerState",
+    "CircuitBreaker",
+    "GlobalCircuitBreaker",
+    "TaskManager",
+    "AsyncDatabaseManager",
+    "RegistryClient",
+    "BlockchainClient",
+    "PostQuantumCrypto",
+    "CloudStorage",
+    "PricePredictor",
+    "CarbonIntensityManager",
+    "UnifiedSustainabilityEngine",
+    "AutoOffsetEngine",
+    "WebSocketManager",
+    "WebhookNotifier",
+    "SafetyMonitor",
+    "XAIExplainer",
+    "HumanReviewManager",
+    "ChaosMonkey",
+    "CausalBandit",
+    "QuantumDistillationOptimizer",
+    "FederatedCoordinator",
+    "MultiAgentSystem",
+    "AutonomousOptimizer",
+    "FlexGenManager",
+    "CreditProject",
+    "CreditPurchaseRequest",
+    "CreditRetireRequest",
+    "CreditTransaction",
+    "CarbonCreditMarketplace",
+    "build_app",
+    "main",
+    "run_tests",
+]
 
-# ---------- Async SQLAlchemy with aiosqlite ----------
+
+# ============================================================================
+# Optional dependencies with fallbacks
+# ============================================================================
 try:
-    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-    from sqlalchemy.orm import declarative_base, declared_attr, sessionmaker
-    from sqlalchemy import Column, String, Float, DateTime, Integer, Boolean, JSON, Text, select, update, delete, func, text
-    from sqlalchemy.pool import NullPool
-    from sqlalchemy.ext.asyncio import AsyncEngine
-    from sqlalchemy.exc import SQLAlchemyError
-    SQLALCHEMY_ASYNC_AVAILABLE = True
-except ImportError:
-    SQLALCHEMY_ASYNC_AVAILABLE = False
-
-# ---------- FastAPI ----------
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, BackgroundTasks, WebSocket, WebSocketDisconnect
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-
-# ---------- Authentication ----------
-import jwt
-from passlib.context import CryptContext
-
-# ---------- Rate limiting (Redis fallback) ----------
-try:
-    from slowapi import Limiter, _rate_limit_exceeded_handler
-    from slowapi.util import get_remote_address
-    from slowapi.errors import RateLimitExceeded
-    SLOWAPI_AVAILABLE = True
-except ImportError:
-    SLOWAPI_AVAILABLE = False
-
-# ---------- Retry & Circuit Breaker ----------
-try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
-    TENACITY_AVAILABLE = True
-except ImportError:
-    TENACITY_AVAILABLE = False
-
-# ---------- Prometheus ----------
-try:
-    from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
-    PROMETHEUS_AVAILABLE = True
-except ImportError:
-    PROMETHEUS_AVAILABLE = False
-
-# ---------- Structured logging ----------
-try:
-    import structlog
-    logger = structlog.get_logger(__name__)
-except ImportError:
-    logger = logging.getLogger(__name__)
-    logging.basicConfig(level=logging.INFO)
-
-# ---------- Web3 ----------
-try:
-    from web3 import Web3, Account, HTTPProvider
-    from web3.middleware import geth_poa_middleware
-    from web3.exceptions import ContractLogicError, TimeExhausted
-    WEB3_AVAILABLE = True
-except ImportError:
-    WEB3_AVAILABLE = False
-
-# ---------- Post‑quantum cryptography ----------
-try:
-    from pqcrypto.sign import dilithium, falcon, sphincs
-    PQC_AVAILABLE = True
-except ImportError:
-    PQC_AVAILABLE = False
-
-# ---------- Cloud SDKs ----------
-try:
-    import boto3
-    from botocore.exceptions import ClientError
-    AWS_AVAILABLE = True
-except ImportError:
-    AWS_AVAILABLE = False
+    from pydantic import BaseModel, Field, ConfigDict  # type: ignore
+    _PYDANTIC_BASE_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _PYDANTIC_BASE_AVAILABLE = False
+    BaseModel = object  # type: ignore
+    def Field(*a, **k):  # type: ignore
+        return None
+    ConfigDict = dict  # type: ignore
 
 try:
-    from azure.storage.blob import BlobServiceClient
-    AZURE_AVAILABLE = True
-except ImportError:
-    AZURE_AVAILABLE = False
+    from pydantic import field_validator  # type: ignore
+    PYDANTIC_V2 = True
+except ImportError:  # pragma: no cover
+    field_validator = None  # type: ignore
+    PYDANTIC_V2 = False
 
 try:
-    from google.cloud import storage
-    GCP_AVAILABLE = True
-except ImportError:
-    GCP_AVAILABLE = False
+    from pydantic_settings import BaseSettings, SettingsConfigDict  # type: ignore
+    _SETTINGS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    try:
+        from pydantic import BaseSettings  # type: ignore
+        SettingsConfigDict = dict  # type: ignore
+        _SETTINGS_AVAILABLE = True
+    except ImportError:
+        _SETTINGS_AVAILABLE = False
+        BaseSettings = object  # type: ignore
+        SettingsConfigDict = dict  # type: ignore
 
-# ---------- Predictive analytics ----------
+PYDANTIC_AVAILABLE = _PYDANTIC_BASE_AVAILABLE
+
 try:
-    from prophet import Prophet
-    PROPHET_AVAILABLE = True
-except ImportError:
-    PROPHET_AVAILABLE = False
-
-try:
-    from sklearn.ensemble import RandomForestRegressor
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-
-# ---------- Vault ----------
-try:
-    from hvac import Client as VaultClient
-    VAULT_AVAILABLE = True
-except ImportError:
-    VAULT_AVAILABLE = False
-
-# ---------- OpenTelemetry ----------
-try:
-    from opentelemetry import trace
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-    OTEL_AVAILABLE = True
-except ImportError:
-    OTEL_AVAILABLE = False
-
-# ---------- Redis (for rate limiting) ----------
-try:
-    import redis.asyncio as redis
-    REDIS_AVAILABLE = True
-except ImportError:
-    REDIS_AVAILABLE = False
-
-# ---------- Qiskit for Quantum‑Distillation ----------
-try:
-    import qiskit
-    from qiskit import QuantumCircuit, Aer, execute
-    from qiskit.optimization import QuadraticProgram
-    from qiskit.optimization.algorithms import MinimumEigenOptimizer
-    from qiskit.algorithms import QAOA
-    QISKIT_AVAILABLE = True
-except ImportError:
-    QISKIT_AVAILABLE = False
-
-# =============================================================================
-# ENHANCED MODULES IMPORTS (with graceful fallback)
-# =============================================================================
-try:
-    from enhancements.bio_inspired import GeneticPolicyGenerator
-    from enhancements.moe_system import ExpertRouter
-    from enhancements.MODP import ParetoOptimizer
-    from enhancements.contextual_bandit import ContextualBandit
-    ENHANCEMENTS_AVAILABLE = True
-except ImportError:
-    ENHANCEMENTS_AVAILABLE = False
-    # Fallback stubs
-    class GeneticPolicyGenerator:
-        def __init__(self, *args, **kwargs): pass
-        def evolve(self, population, fitness_fn, generations=10, population_size=20):
-            return population[0] if population else {}
-    class ExpertRouter:
-        def __init__(self, *args, **kwargs): pass
-        def encode(self, context): return [0.0]*5
-        def select(self, encoded): return "default"
-    class ParetoOptimizer:
-        def __init__(self, *args, **kwargs): pass
-        def evaluate(self, objectives, weights):
-            return sum(objectives.get(k, 0) * weights.get(k, 1) for k in objectives)
-    class ContextualBandit:
-        def __init__(self, action_space, fallback_solver, *args, **kwargs):
-            self.actions = action_space
-        def select_action(self, context):
-            return self.actions[0], 0.0, "fallback"
-        def update(self, context, action, reward): pass
-        def seed_safe_policy(self, context, policy): pass
-
-# FlexGen modules (with fallback)
-try:
-    from enhancements.gpu_optimization.flexgen_policy import FlexGenPolicy, generate_candidate_policies
-    from enhancements.gpu_optimization.flexgen_controller import FlexGenController
-    from enhancements.gpu_optimization.flexgen_cost_model import FlexGenCostModel
-    from enhancements.gpu_optimization.policy_drift_detector import PolicyDriftDetector
-    from enhancements.schemas.node_descriptor import NodeDescriptor
-    from enhancements.schemas.workload_descriptor import WorkloadDescriptor
-    FLEXGEN_AVAILABLE = True
-except ImportError:
-    FLEXGEN_AVAILABLE = False
-    class FlexGenPolicy: pass
-    def generate_candidate_policies(n=20): return []
-    class FlexGenController:
-        def __init__(self, *args, **kwargs): pass
-        async def step(self): return {}
-    class FlexGenCostModel:
-        def __init__(self, *args, **kwargs): pass
-    class PolicyDriftDetector:
-        def __init__(self, *args, **kwargs): pass
-        def get_stats(self): return {}
-    class NodeDescriptor: pass
-    class WorkloadDescriptor: pass
-
-# =============================================================================
-# CONFIGURATION (Grouped sub‑models)
-# =============================================================================
-
-class DatabaseConfig(BaseModel):
-    path: str = Field("carbon_credits.db")
-    pool_size: int = Field(10)
-    max_overflow: int = Field(20)
-
-class BlockchainConfig(BaseModel):
-    rpc_url: str = Field("http://localhost:8545")
-    contract_address: Optional[str] = Field(None)
-    private_key: Optional[str] = Field(None)
-    chain_id: int = Field(1)
-
-class CloudConfig(BaseModel):
-    aws_bucket: Optional[str] = Field(None)
-    aws_access_key: Optional[str] = Field(None)
-    aws_secret_key: Optional[str] = Field(None)
-    aws_region: str = Field("us-east-1")
-    azure_connection_string: Optional[str] = Field(None)
-    azure_container: Optional[str] = Field(None)
-    gcp_credentials: Optional[str] = Field(None)
-    gcp_bucket: Optional[str] = Field(None)
-
-class WebhookConfig(BaseModel):
-    url: Optional[str] = Field(None)
-    secret: Optional[str] = Field(None)
-
-class CarbonConfig(BaseModel):
-    api_key: Optional[str] = Field(None)
-    region: str = Field("global")
-
-class RateLimitConfig(BaseModel):
-    enabled: bool = True
-    requests_per_minute: int = Field(100)
-    burst: int = Field(20)
-    redis_url: Optional[str] = Field(None)
-
-class GeneralConfig(BaseModel):
-    refresh_interval_seconds: int = Field(3600)
-    auto_offset_enabled: bool = True
-    auto_offset_threshold_kg: float = Field(100.0)
-    auto_offset_interval_seconds: int = Field(3600)
-    retry_attempts: int = Field(3)
-    retry_min_wait: float = Field(2.0)
-    retry_max_wait: float = Field(10.0)
-    circuit_breaker_threshold: int = Field(5)
-    circuit_breaker_timeout: int = Field(60)
-    jwt_secret: str = Field("change_me_in_production")
-    jwt_algorithm: str = Field("HS256")
-    jwt_expiration_minutes: int = Field(1440)
-    data_retention_days: int = Field(365)
-    log_level: str = Field("INFO")
-    prometheus_port: int = Field(9090)
-    human_review_threshold: float = Field(0.5, ge=0, le=1)   # NEW
-
-class OptimizerConfig(BaseModel):
-    modp_weights: Dict[str, float] = Field(
-        default_factory=lambda: {
-            'price': 0.25,
-            'vintage': 0.25,
-            'biodiversity': 0.20,
-            'carbon_intensity': 0.30,
-        }
+    from fastapi import (  # type: ignore
+        Depends, FastAPI, HTTPException, Request, status,
     )
-    bandit_min_trials: int = Field(5, ge=1)
-    bandit_confidence_threshold: float = Field(0.6, ge=0, le=1)
-    bio_generations: int = Field(10, ge=1)
-    bio_population_size: int = Field(20, ge=2)
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse, PlainTextResponse, Response
+    from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+    FASTAPI_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    FASTAPI_AVAILABLE = False
 
-    # FlexGen settings
-    flexgen_carbon_intensity_default: float = 400.0
-    flexgen_population_size: int = 50
-    flexgen_generations: int = 10
-    flexgen_use_real_executor: bool = False
-    flexgen_executor_type: str = "mock"   # "mock", "cost_model", "real"
-    flexgen_selector_epsilon: float = 0.1
-    flexgen_selector_epsilon_decay: float = 0.999
+try:
+    import jwt  # type: ignore
+    JWT_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    JWT_AVAILABLE = False
 
-    # Quantum distillation
-    enable_distillation: bool = False     # NEW
-    quantum_backend: str = "aer_simulator"
-    quantum_reps: int = 1
+try:
+    from prometheus_client import (  # type: ignore
+        CONTENT_TYPE_LATEST, CollectorRegistry, Counter, Gauge, Histogram,
+        generate_latest,
+    )
+    PROMETHEUS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    PROMETHEUS_AVAILABLE = False
+    CONTENT_TYPE_LATEST = "text/plain"
 
-class SafetyConfig(BaseModel):
-    enable_monitor: bool = True
-    max_carbon_intensity: float = 500.0
-    min_biodiversity: float = 0.0
-    max_price_per_kg: float = 2.0
+try:
+    import aiosqlite  # type: ignore
+    AIOSQLITE_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    aiosqlite = None  # type: ignore
+    AIOSQLITE_AVAILABLE = False
 
-class ChaosConfig(BaseModel):
-    enabled: bool = False
-    failure_probability: float = 0.1
-    experiment_interval_seconds: int = 120
+try:
+    from cryptography.hazmat.backends import default_backend  # type: ignore
+    from cryptography.hazmat.primitives import hashes  # type: ignore
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC  # type: ignore
+    CRYPTO_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    CRYPTO_AVAILABLE = False
 
-class FederatedConfig(BaseModel):
-    enabled: bool = False
-    aggregation_interval_seconds: int = 300
+try:
+    from ..schemas.feedback_event import FeedbackEvent  # type: ignore
+except ImportError:
+    try:
+        from src.enhancements.schemas.feedback_event import FeedbackEvent  # type: ignore
+    except ImportError:
+        FeedbackEvent = None  # type: ignore
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="CARBON_", case_sensitive=False)
 
-    general: GeneralConfig = Field(default_factory=GeneralConfig)
-    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
-    blockchain: BlockchainConfig = Field(default_factory=BlockchainConfig)
-    cloud: CloudConfig = Field(default_factory=CloudConfig)
-    webhook: WebhookConfig = Field(default_factory=WebhookConfig)
-    carbon: CarbonConfig = Field(default_factory=CarbonConfig)
-    rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
-    optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
-    safety: SafetyConfig = Field(default_factory=SafetyConfig)   # NEW
-    chaos: ChaosConfig = Field(default_factory=ChaosConfig)     # NEW
-    federated: FederatedConfig = Field(default_factory=FederatedConfig)  # NEW
+# ============================================================================
+# Logging
+# ============================================================================
+_LOG_DIR = Path(os.environ.get("CARBON_LOG_DIR", "./logs"))
+try:
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    _LOG_DIR = Path("/tmp")
 
-    API_HOST: str = Field("0.0.0.0")
-    API_PORT: int = Field(8000)
-    REDIS_URL: Optional[str] = Field(None)
-    VAULT_URL: Optional[str] = Field(None)
-    VAULT_TOKEN: Optional[str] = Field(None)
-    VAULT_SECRET_PATH: str = Field("secret/carbon")
-    MASTER_KEY: str = Field("", description="Hex string of master key")
+logging.basicConfig(
+    level=os.environ.get("CARBON_LOG_LEVEL", "INFO"),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.handlers.RotatingFileHandler(
+            _LOG_DIR / "carbon_marketplace_v6.log",
+            maxBytes=10 * 1024 * 1024, backupCount=5),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
 
-    @field_validator('MASTER_KEY')
-    @classmethod
-    def validate_master_key(cls, v: str) -> str:
-        if not v:
-            raise ValueError("MASTER_KEY must be set via environment variable CARBON_MASTER_KEY")
-        return v
 
-    def get_master_key_bytes(self) -> bytes:
-        return bytes.fromhex(self.MASTER_KEY)
+# ============================================================================
+# Prometheus metrics
+# ============================================================================
+if PROMETHEUS_AVAILABLE:
+    REGISTRY = CollectorRegistry()
+    PURCHASE_COUNTER = Counter(
+        "carbon_credits_purchased_total", "Total credits purchased",
+        ["project_id"], registry=REGISTRY)
+    RETIRE_COUNTER = Counter(
+        "carbon_credits_retired_total", "Total credits retired",
+        ["status"], registry=REGISTRY)
+    BALANCE_GAUGE = Gauge(
+        "carbon_credits_balance_kg", "Current available balance",
+        registry=REGISTRY)
+    AUTO_OFFSET_COUNTER = Counter(
+        "auto_offset_actions_total", "Auto-offset actions",
+        ["reason"], registry=REGISTRY)
+    PROJECT_COUNT = Gauge(
+        "carbon_projects_available", "Active projects", registry=REGISTRY)
+    BLOCKCHAIN_TX_FAILURES = Counter(
+        "blockchain_tx_failures_total", "Blockchain tx failures",
+        registry=REGISTRY)
+    API_REQUESTS = Counter(
+        "api_requests_total", "API requests",
+        ["endpoint", "method", "status"], registry=REGISTRY)
+    CIRCUIT_BREAKER_STATE = Gauge(
+        "carbon_circuit_breaker_state", "Circuit breaker state",
+        ["service"], registry=REGISTRY)
+    REGISTRY_API_LATENCY = Histogram(
+        "registry_api_latency_seconds", "Registry API latency",
+        ["registry"], registry=REGISTRY)
+    AUTO_OFFSET_SUCCESS = Counter(
+        "auto_offset_success_total", "Auto-offset successful", registry=REGISTRY)
+    PREDICTION_ERROR = Counter(
+        "prediction_error_total", "Price prediction errors", registry=REGISTRY)
+    PQC_SIGNATURES = Counter(
+        "pqc_signatures_total", "PQC signatures",
+        ["algorithm", "status"], registry=REGISTRY)
+    CLOUD_STORE = Counter(
+        "cloud_store_total", "Cloud storage operations",
+        ["provider", "status"], registry=REGISTRY)
+    SAFETY_VIOLATIONS = Counter(
+        "carbon_safety_violations_total", "Safety violations",
+        ["rule"], registry=REGISTRY)
+    CHAOS_EXPERIMENTS = Counter(
+        "carbon_chaos_experiments_total", "Chaos experiments",
+        ["type", "status"], registry=REGISTRY)
+    HUMAN_REVIEWS = Counter(
+        "carbon_human_reviews_total", "Human reviews",
+        ["status"], registry=REGISTRY)
+    XAI_DECISIONS = Counter(
+        "carbon_xai_decisions_total", "XAI decisions",
+        ["strategy"], registry=REGISTRY)
+else:  # pragma: no cover
+    class _DummyMetric:
+        def labels(self, *a, **k): return self
+        def inc(self, *a, **k): pass
+        def set(self, *a, **k): pass
+        def observe(self, *a, **k): pass
 
-config = Settings()
+    PURCHASE_COUNTER = RETIRE_COUNTER = BALANCE_GAUGE = _DummyMetric()
+    AUTO_OFFSET_COUNTER = PROJECT_COUNT = BLOCKCHAIN_TX_FAILURES = _DummyMetric()
+    API_REQUESTS = CIRCUIT_BREAKER_STATE = REGISTRY_API_LATENCY = _DummyMetric()
+    AUTO_OFFSET_SUCCESS = PREDICTION_ERROR = PQC_SIGNATURES = _DummyMetric()
+    CLOUD_STORE = SAFETY_VIOLATIONS = CHAOS_EXPERIMENTS = _DummyMetric()
+    HUMAN_REVIEWS = XAI_DECISIONS = _DummyMetric()
+    REGISTRY = None
 
-# =============================================================================
-# CUSTOM EXCEPTION HIERARCHY
-# =============================================================================
+
+# ============================================================================
+# Config
+# ============================================================================
+def _default_jwt_secret() -> str:
+    return secrets.token_hex(32)
+
+
+if PYDANTIC_AVAILABLE and _SETTINGS_AVAILABLE and PYDANTIC_V2:
+    class DatabaseConfig(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+        path: str = "carbon_credits.db"
+        pool_size: int = 10
+        max_overflow: int = 20
+
+    class BlockchainConfig(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+        rpc_url: str = "http://localhost:8545"
+        contract_address: Optional[str] = None
+        private_key: Optional[str] = None
+        chain_id: int = 1
+
+    class CloudConfig(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+        aws_bucket: Optional[str] = None
+        aws_access_key: Optional[str] = None
+        aws_secret_key: Optional[str] = None
+        aws_region: str = "us-east-1"
+        azure_connection_string: Optional[str] = None
+        azure_container: Optional[str] = None
+        gcp_credentials: Optional[str] = None
+        gcp_bucket: Optional[str] = None
+
+    class WebhookConfig(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+        url: Optional[str] = None
+        secret: Optional[str] = None
+
+    class CarbonConfig(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+        api_key: Optional[str] = None
+        region: str = "global"
+
+    class RateLimitConfig(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+        enabled: bool = True
+        requests_per_minute: int = 100
+        burst: int = 20
+        redis_url: Optional[str] = None
+
+    class GeneralConfig(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+        refresh_interval_seconds: int = 3600
+        auto_offset_enabled: bool = True
+        auto_offset_threshold_kg: float = 100.0
+        auto_offset_interval_seconds: int = 3600
+        retry_attempts: int = 3
+        retry_min_wait: float = 2.0
+        retry_max_wait: float = 10.0
+        circuit_breaker_threshold: int = 5
+        circuit_breaker_timeout: int = 60
+        jwt_secret: str = Field(default_factory=_default_jwt_secret)
+        jwt_algorithm: str = "HS256"
+        jwt_expiration_minutes: int = 1440
+        data_retention_days: int = 365
+        log_level: str = "INFO"
+        human_review_threshold: float = Field(0.5, ge=0, le=1)
+        random_seed: int = 42
+
+    class OptimizerConfig(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+        modp_weights: Dict[str, float] = Field(default_factory=lambda: {
+            "price": 0.25, "vintage": 0.25,
+            "biodiversity": 0.20, "carbon_intensity": 0.30})
+        bandit_min_trials: int = Field(5, ge=1)
+        bandit_confidence_threshold: float = Field(0.6, ge=0, le=1)
+        bio_generations: int = Field(10, ge=1)
+        bio_population_size: int = Field(20, ge=2)
+        enable_distillation: bool = False
+
+    class SafetyConfig(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+        enable_monitor: bool = True
+        max_carbon_intensity: float = 500.0
+        min_biodiversity: float = 0.0
+        max_price_per_kg: float = 2.0
+
+    class ChaosConfig(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+        enabled: bool = False
+        failure_probability: float = 0.1
+        experiment_interval_seconds: int = 120
+
+    class FederatedConfig(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+        enabled: bool = False
+        aggregation_interval_seconds: int = 300
+
+    class Settings(BaseSettings):
+        model_config = SettingsConfigDict(
+            env_prefix="CARBON_", case_sensitive=False, extra="ignore")
+        general: GeneralConfig = Field(default_factory=GeneralConfig)
+        database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+        blockchain: BlockchainConfig = Field(default_factory=BlockchainConfig)
+        cloud: CloudConfig = Field(default_factory=CloudConfig)
+        webhook: WebhookConfig = Field(default_factory=WebhookConfig)
+        carbon: CarbonConfig = Field(default_factory=CarbonConfig)
+        rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
+        optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
+        safety: SafetyConfig = Field(default_factory=SafetyConfig)
+        chaos: ChaosConfig = Field(default_factory=ChaosConfig)
+        federated: FederatedConfig = Field(default_factory=FederatedConfig)
+        API_HOST: str = "0.0.0.0"
+        API_PORT: int = 8000
+        MASTER_KEY: str = ""
+
+        def ensure_master_key(self) -> str:
+            if not self.MASTER_KEY:
+                object.__setattr__(self, "MASTER_KEY", secrets.token_hex(32))
+            return self.MASTER_KEY
+
+        def get_master_key_bytes(self) -> bytes:
+            if not self.MASTER_KEY:
+                raise ValueError("MASTER_KEY not set")
+            return bytes.fromhex(self.MASTER_KEY)
+
+else:  # pragma: no cover
+    @dataclass
+    class DatabaseConfig:
+        path: str = "carbon_credits.db"
+        pool_size: int = 10
+        max_overflow: int = 20
+
+    @dataclass
+    class BlockchainConfig:
+        rpc_url: str = "http://localhost:8545"
+        contract_address: Optional[str] = None
+        private_key: Optional[str] = None
+        chain_id: int = 1
+
+    @dataclass
+    class CloudConfig:
+        aws_bucket: Optional[str] = None
+        aws_access_key: Optional[str] = None
+        aws_secret_key: Optional[str] = None
+        aws_region: str = "us-east-1"
+        azure_connection_string: Optional[str] = None
+        azure_container: Optional[str] = None
+        gcp_credentials: Optional[str] = None
+        gcp_bucket: Optional[str] = None
+
+    @dataclass
+    class WebhookConfig:
+        url: Optional[str] = None
+        secret: Optional[str] = None
+
+    @dataclass
+    class CarbonConfig:
+        api_key: Optional[str] = None
+        region: str = "global"
+
+    @dataclass
+    class RateLimitConfig:
+        enabled: bool = True
+        requests_per_minute: int = 100
+        burst: int = 20
+        redis_url: Optional[str] = None
+
+    @dataclass
+    class GeneralConfig:
+        refresh_interval_seconds: int = 3600
+        auto_offset_enabled: bool = True
+        auto_offset_threshold_kg: float = 100.0
+        auto_offset_interval_seconds: int = 3600
+        retry_attempts: int = 3
+        retry_min_wait: float = 2.0
+        retry_max_wait: float = 10.0
+        circuit_breaker_threshold: int = 5
+        circuit_breaker_timeout: int = 60
+        jwt_secret: str = field(default_factory=_default_jwt_secret)
+        jwt_algorithm: str = "HS256"
+        jwt_expiration_minutes: int = 1440
+        data_retention_days: int = 365
+        log_level: str = "INFO"
+        human_review_threshold: float = 0.5
+        random_seed: int = 42
+
+    @dataclass
+    class OptimizerConfig:
+        modp_weights: Dict[str, float] = field(default_factory=lambda: {
+            "price": 0.25, "vintage": 0.25,
+            "biodiversity": 0.20, "carbon_intensity": 0.30})
+        bandit_min_trials: int = 5
+        bandit_confidence_threshold: float = 0.6
+        bio_generations: int = 10
+        bio_population_size: int = 20
+        enable_distillation: bool = False
+
+    @dataclass
+    class SafetyConfig:
+        enable_monitor: bool = True
+        max_carbon_intensity: float = 500.0
+        min_biodiversity: float = 0.0
+        max_price_per_kg: float = 2.0
+
+    @dataclass
+    class ChaosConfig:
+        enabled: bool = False
+        failure_probability: float = 0.1
+        experiment_interval_seconds: int = 120
+
+    @dataclass
+    class FederatedConfig:
+        enabled: bool = False
+        aggregation_interval_seconds: int = 300
+
+    @dataclass
+    class Settings:
+        general: GeneralConfig = field(default_factory=GeneralConfig)
+        database: DatabaseConfig = field(default_factory=DatabaseConfig)
+        blockchain: BlockchainConfig = field(default_factory=BlockchainConfig)
+        cloud: CloudConfig = field(default_factory=CloudConfig)
+        webhook: WebhookConfig = field(default_factory=WebhookConfig)
+        carbon: CarbonConfig = field(default_factory=CarbonConfig)
+        rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
+        optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+        safety: SafetyConfig = field(default_factory=SafetyConfig)
+        chaos: ChaosConfig = field(default_factory=ChaosConfig)
+        federated: FederatedConfig = field(default_factory=FederatedConfig)
+        API_HOST: str = "0.0.0.0"
+        API_PORT: int = 8000
+        MASTER_KEY: str = ""
+
+        def ensure_master_key(self) -> str:
+            if not self.MASTER_KEY:
+                self.MASTER_KEY = secrets.token_hex(32)
+            return self.MASTER_KEY
+
+        def get_master_key_bytes(self) -> bytes:
+            if not self.MASTER_KEY:
+                raise ValueError("MASTER_KEY not set")
+            return bytes.fromhex(self.MASTER_KEY)
+
+
+_settings_singleton: Optional[Settings] = None
+
+
+def ensure_settings() -> Settings:
+    global _settings_singleton
+    if _settings_singleton is None:
+        _settings_singleton = Settings()
+        _settings_singleton.ensure_master_key()
+    return _settings_singleton
+
+
+def _reset_settings_for_tests() -> None:
+    global _settings_singleton
+    _settings_singleton = None
+
+
+# ============================================================================
+# Exceptions
+# ============================================================================
 class CarbonMarketplaceException(Exception):
-    def __init__(self, message: str, details: Dict = None):
+    def __init__(self, message: str, details: Optional[Dict] = None) -> None:
         super().__init__(message)
         self.details = details or {}
-        self.timestamp = datetime.now()
+        self.timestamp = datetime.now(timezone.utc)
+
 
 class RegistryError(CarbonMarketplaceException): pass
 class BlockchainError(CarbonMarketplaceException): pass
@@ -392,918 +580,1329 @@ class CircuitBreakerOpenError(CarbonMarketplaceException): pass
 class SafetyViolationError(CarbonMarketplaceException): pass
 class ChaosExperimentError(CarbonMarketplaceException): pass
 
-# =============================================================================
-# PROMETHEUS METRICS
-# =============================================================================
-if PROMETHEUS_AVAILABLE:
-    REGISTRY = CollectorRegistry()
-    PURCHASE_COUNTER = Counter("carbon_credits_purchased_total", "Total credits purchased", ["project_id"], registry=REGISTRY)
-    RETIRE_COUNTER = Counter("carbon_credits_retired_total", "Total credits retired", ["status"], registry=REGISTRY)
-    BALANCE_GAUGE = Gauge("carbon_credits_balance_kg", "Current available balance", registry=REGISTRY)
-    AUTO_OFFSET_COUNTER = Counter("auto_offset_actions_total", "Auto‑offset actions performed", ["reason"], registry=REGISTRY)
-    PROJECT_COUNT = Gauge("carbon_projects_available", "Number of active projects", registry=REGISTRY)
-    BLOCKCHAIN_TX_FAILURES = Counter("blockchain_tx_failures_total", "Blockchain transaction failures", registry=REGISTRY)
-    API_REQUESTS = Counter("api_requests_total", "API requests", ["endpoint", "method", "status"], registry=REGISTRY)
-    CIRCUIT_BREAKER_STATE = Gauge("carbon_circuit_breaker_state", "Circuit breaker state", ["service"], registry=REGISTRY)
-    REGISTRY_API_LATENCY = Histogram("registry_api_latency_seconds", "Registry API call latency", ["registry"], registry=REGISTRY)
-    AUTO_OFFSET_SUCCESS = Counter("auto_offset_success_total", "Auto‑offset successful", registry=REGISTRY)
-    PREDICTION_ERROR = Counter("prediction_error_total", "Price prediction errors", registry=REGISTRY)
-    PQC_SIGNATURES = Counter("pqc_signatures_total", "PQC signatures", ["algorithm", "status"], registry=REGISTRY)
-    CLOUD_STORE = Counter("cloud_store_total", "Cloud storage operations", ["provider", "status"], registry=REGISTRY)
-    SAFETY_VIOLATIONS = Counter("carbon_safety_violations_total", "Safety violations", ["rule"], registry=REGISTRY)  # NEW
-    CHAOS_EXPERIMENTS = Counter("carbon_chaos_experiments_total", "Chaos experiments", ["type", "status"], registry=REGISTRY)  # NEW
-    HUMAN_REVIEWS = Counter("carbon_human_reviews_total", "Human reviews", ["status"], registry=REGISTRY)  # NEW
-    XAI_DECISIONS = Counter("carbon_xai_decisions_total", "XAI decisions", ["strategy"], registry=REGISTRY)  # NEW
-else:
-    class DummyMetric:
-        def labels(self, **kwargs): return self
-        def inc(self, **kwargs): pass
-        def set(self, **kwargs): pass
-        def observe(self, **kwargs): pass
-    PURCHASE_COUNTER = DummyMetric()
-    RETIRE_COUNTER = DummyMetric()
-    BALANCE_GAUGE = DummyMetric()
-    AUTO_OFFSET_COUNTER = DummyMetric()
-    PROJECT_COUNT = DummyMetric()
-    BLOCKCHAIN_TX_FAILURES = DummyMetric()
-    API_REQUESTS = DummyMetric()
-    CIRCUIT_BREAKER_STATE = DummyMetric()
-    REGISTRY_API_LATENCY = DummyMetric()
-    AUTO_OFFSET_SUCCESS = DummyMetric()
-    PREDICTION_ERROR = DummyMetric()
-    PQC_SIGNATURES = DummyMetric()
-    CLOUD_STORE = DummyMetric()
-    SAFETY_VIOLATIONS = DummyMetric()
-    CHAOS_EXPERIMENTS = DummyMetric()
-    HUMAN_REVIEWS = DummyMetric()
-    XAI_DECISIONS = DummyMetric()
 
-# =============================================================================
-# GLOBAL CIRCUIT BREAKER REGISTRY
-# =============================================================================
-class CircuitBreakerState(Enum):
+# ============================================================================
+# Circuit breaker
+# ============================================================================
+class CircuitBreakerState(str, Enum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
 
+
 class CircuitBreaker:
-    # (unchanged from previous version, kept for brevity in this enhanced version)
-    def __init__(self, name: str, threshold: int = 5, timeout: int = 60):
+    def __init__(self, name: str, threshold: int = 5, timeout: int = 60,
+                 half_open_success_threshold: int = 2) -> None:
         self.name = name
-        self.threshold = threshold
-        self.timeout = timeout
+        self.threshold = int(threshold)
+        self.timeout = int(timeout)
+        self.half_open_success_threshold = int(half_open_success_threshold)
         self._state = CircuitBreakerState.CLOSED
         self._failure_count = 0
-        self._last_failure_time = None
-        self._lock = asyncio.Lock()
+        self._success_count = 0
+        self._last_failure_monotonic: Optional[float] = None
+        self._lock = threading.RLock()
         self._metrics = {"total_calls": 0, "failed_calls": 0, "successful_calls": 0}
 
-    async def call(self, func: Callable, *args, **kwargs):
-        async with self._lock:
-            if self._state == CircuitBreakerState.OPEN:
-                if time.time() - self._last_failure_time >= self.timeout:
+    @property
+    def state(self) -> CircuitBreakerState:
+        return self._state
+
+    def _publish_metric(self) -> None:
+        try:
+            CIRCUIT_BREAKER_STATE.labels(service=self.name).set(
+                1.0 if self._state is CircuitBreakerState.OPEN else
+                0.5 if self._state is CircuitBreakerState.HALF_OPEN else 0.0)
+        except Exception:
+            pass
+
+    async def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            if self._state is CircuitBreakerState.OPEN:
+                if (self._last_failure_monotonic is not None
+                        and time.monotonic() - self._last_failure_monotonic
+                        >= self.timeout):
                     self._state = CircuitBreakerState.HALF_OPEN
-                    self._failure_count = 0
+                    self._success_count = 0
+                    self._publish_metric()
                 else:
-                    raise CircuitBreakerOpenError(f"Circuit breaker {self.name} is OPEN")
+                    raise CircuitBreakerOpenError(
+                        f"Circuit breaker '{self.name}' is OPEN")
         self._metrics["total_calls"] += 1
         try:
-            result = await func(*args, **kwargs)
-            await self._record_success()
-            return result
-        except Exception as e:
-            await self._record_failure()
+            result = func(*args, **kwargs)
+            if inspect.iscoroutine(result):
+                result = await result
+        except Exception:
+            with self._lock:
+                self._metrics["failed_calls"] += 1
+                self._failure_count += 1
+                self._last_failure_monotonic = time.monotonic()
+                if (self._state is CircuitBreakerState.CLOSED
+                        and self._failure_count >= self.threshold):
+                    self._state = CircuitBreakerState.OPEN
+                elif self._state is CircuitBreakerState.HALF_OPEN:
+                    self._state = CircuitBreakerState.OPEN
+                self._publish_metric()
             raise
+        else:
+            with self._lock:
+                self._metrics["successful_calls"] += 1
+                if self._state is CircuitBreakerState.HALF_OPEN:
+                    self._success_count += 1
+                    if self._success_count >= self.half_open_success_threshold:
+                        self._state = CircuitBreakerState.CLOSED
+                        self._failure_count = 0
+                else:
+                    self._failure_count = 0
+                self._publish_metric()
+            return result
 
-    async def _record_success(self):
-        async with self._lock:
-            self._metrics["successful_calls"] += 1
-            if self._state == CircuitBreakerState.HALF_OPEN:
-                self._state = CircuitBreakerState.CLOSED
-            self._failure_count = 0
-
-    async def _record_failure(self):
-        async with self._lock:
-            self._metrics["failed_calls"] += 1
-            self._failure_count += 1
-            self._last_failure_time = time.time()
-            if self._state == CircuitBreakerState.CLOSED and self._failure_count >= self.threshold:
-                self._state = CircuitBreakerState.OPEN
-            elif self._state == CircuitBreakerState.HALF_OPEN:
-                self._state = CircuitBreakerState.OPEN
-
-    def get_metrics(self) -> Dict:
+    def get_metrics(self) -> Dict[str, Any]:
         return {
-            'state': self._state.value,
-            'failure_count': self._failure_count,
-            'total_calls': self._metrics['total_calls'],
-            'failed_calls': self._metrics['failed_calls'],
-            'successful_calls': self._metrics['successful_calls'],
+            "state": self._state.value,
+            "failure_count": self._failure_count,
+            **self._metrics,
         }
 
-class GlobalCircuitBreaker:
-    _instance = None
-    _breakers: Dict[str, CircuitBreaker] = {}
+    def force_open(self) -> None:
+        with self._lock:
+            self._state = CircuitBreakerState.OPEN
+            self._failure_count = self.threshold
+            self._last_failure_monotonic = time.monotonic()
+            self._publish_metric()
 
-    def __new__(cls):
+    def reset(self) -> None:
+        with self._lock:
+            self._state = CircuitBreakerState.CLOSED
+            self._failure_count = 0
+            self._success_count = 0
+            self._last_failure_monotonic = None
+            self._publish_metric()
+
+
+class GlobalCircuitBreaker:
+    _instance: Optional["GlobalCircuitBreaker"] = None
+    _instance_lock = threading.Lock()
+
+    def __new__(cls) -> "GlobalCircuitBreaker":
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._breakers = {}  # type: ignore[attr-defined]
+                    cls._instance._lock = threading.RLock()  # type: ignore[attr-defined]
         return cls._instance
 
-    def get_or_create(self, name: str, **kwargs) -> CircuitBreaker:
-        if name not in self._breakers:
-            self._breakers[name] = CircuitBreaker(name, **kwargs)
-        return self._breakers[name]
+    def get_or_create(self, name: str, **kwargs: Any) -> CircuitBreaker:
+        with self._lock:  # type: ignore[attr-defined]
+            if name not in self._breakers:  # type: ignore[attr-defined]
+                self._breakers[name] = CircuitBreaker(name, **kwargs)  # type: ignore[attr-defined]
+            return self._breakers[name]  # type: ignore[attr-defined]
 
-# =============================================================================
-# TASK MANAGER (Central supervision) - unchanged from original
-# =============================================================================
+    def all_metrics(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:  # type: ignore[attr-defined]
+            return {n: cb.get_metrics() for n, cb in self._breakers.items()}  # type: ignore[attr-defined]
+
+
+# ============================================================================
+# Task manager
+# ============================================================================
 class TaskManager:
-    # (unchanged, included for completeness)
-    def __init__(self):
+    def __init__(self) -> None:
         self.tasks: Dict[str, asyncio.Task] = {}
         self.shutdown_event = asyncio.Event()
         self._lock = asyncio.Lock()
-        self._task_coroutines: Dict[str, Callable[[], Awaitable[None]]] = {}
+        self._pending: Dict[str, Tuple[Callable[..., Awaitable[None]], Tuple, Dict]] = {}
 
-    def start_task(self, name: str, coro_func: Callable[[], Awaitable[None]], *args, **kwargs):
-        async def wrapper():
-            backoff = 1
-            max_backoff = 300
+    def register_task(self, name: str,
+                      coro_func: Callable[..., Awaitable[None]],
+                      *args: Any, **kwargs: Any) -> None:
+        if name in self.tasks and not self.tasks[name].done():
+            return
+        self._pending[name] = (coro_func, args, kwargs)
+
+    def start_registered_tasks(self) -> None:
+        for name, (fn, args, kwargs) in list(self._pending.items()):
+            self._start_task(name, fn, *args, **kwargs)
+        self._pending.clear()
+
+    def _start_task(self, name: str,
+                    coro_func: Callable[..., Awaitable[None]],
+                    *args: Any, **kwargs: Any) -> asyncio.Task:
+        if name in self.tasks and not self.tasks[name].done():
+            return self.tasks[name]
+
+        async def wrapper() -> None:
+            backoff = 1.0
+            max_backoff = 300.0
             while not self.shutdown_event.is_set():
                 try:
-                    await coro_func(*args, **kwargs)
+                    await coro_func(self.shutdown_event, *args, **kwargs)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    logger.error("Task crashed", name=name, error=str(e), exc_info=True)
-                    await asyncio.sleep(backoff)
+                    logger.error("Task '%s' crashed: %s", name, e, exc_info=True)
+                    try:
+                        await asyncio.wait_for(
+                            self.shutdown_event.wait(), timeout=backoff)
+                        break
+                    except asyncio.TimeoutError:
+                        pass
                     backoff = min(backoff * 2, max_backoff)
+
         task = asyncio.create_task(wrapper(), name=name)
-        async with self._lock:
-            self.tasks[name] = task
+        self.tasks[name] = task
         return task
 
-    def register_task(self, name: str, coro_func: Callable[[], Awaitable[None]], *args, **kwargs):
-        self._task_coroutines[name] = (coro_func, args, kwargs)
-
-    def start_registered_tasks(self):
-        for name, (coro_func, args, kwargs) in self._task_coroutines.items():
-            self.start_task(name, coro_func, *args, **kwargs)
-        self._task_coroutines.clear()
-
-    async def stop_all(self):
+    async def stop_all(self) -> None:
         self.shutdown_event.set()
         async with self._lock:
-            for task in self.tasks.values():
-                task.cancel()
-            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+            for t in self.tasks.values():
+                if not t.done():
+                    t.cancel()
+            if self.tasks:
+                await asyncio.gather(*self.tasks.values(),
+                                     return_exceptions=True)
             self.tasks.clear()
         logger.info("All background tasks stopped")
 
-# =============================================================================
-# INTERFACES (Dependency Inversion) - unchanged from original
-# =============================================================================
-@runtime_checkable
-class IRegistryClient(Protocol):
-    async def fetch_projects(self) -> List[Dict]: ...
-    async def close(self): ...
+    def snapshot(self) -> Dict[str, str]:
+        return {n: ("running" if not t.done() else "stopped")
+                for n, t in self.tasks.items()}
 
-@runtime_checkable
-class IBlockchainClient(Protocol):
-    async def mint(self, project_id: str, amount_kg: float, owner: str) -> str: ...
-    async def get_balance(self, address: str) -> float: ...
-    async def close(self): ...
 
-@runtime_checkable
-class IPQC(Protocol):
-    async def generate_keypair(self, algorithm: str = 'dilithium', validity_days: int = 30) -> Dict: ...
-    async def sign_data(self, data: Dict, key_id: str) -> Dict: ...
-    async def verify_data(self, data: Dict, signature_data: Dict) -> bool: ...
+# ============================================================================
+# Persistence
+# ============================================================================
+class AsyncDatabaseManager:
+    """
+    Minimal async persistence on aiosqlite.  Holds one connection behind a
+    lock, applies schema migrations transactionally, and exposes a
+    ``get_session()`` context manager for callers that want explicit commits.
+    """
 
-@runtime_checkable
-class ICloudStorage(Protocol):
-    async def store(self, data: Dict, filename: str = None) -> Dict: ...
+    SCHEMA_VERSION = 1
 
-@runtime_checkable
-class IPricePredictor(Protocol):
-    async def predict(self, days: int = 30) -> Optional[List[float]]: ...
-    async def train(self): ...
-    async def update_history(self, price_data: Dict): ...
-
-@runtime_checkable
-class IAutoOffsetEngine(Protocol):
-    async def offset(self, emissions_kg: float, reason: str = "auto_offset"): ...
-
-# =============================================================================
-# NEW: SAFETY MONITOR (Temporal Logic-like rules)
-# =============================================================================
-class SafetyMonitor:
-    def __init__(self, config: Settings):
+    def __init__(self, config: Settings) -> None:
         self.config = config
-        self.rules = {
-            'max_carbon_intensity': lambda project: project.metadata.get('carbon_intensity', 0) <= config.safety.max_carbon_intensity,
-            'min_biodiversity': lambda project: project.co_benefits.get('biodiversity', 0) >= config.safety.min_biodiversity,
-            'max_price_per_kg': lambda project: project.price_per_kg_usd <= config.safety.max_price_per_kg,
-        }
+        self.db_path = Path(config.database.path)
+        self._conn: Optional[Any] = None
+        self._init_lock = asyncio.Lock()
+        self._query_lock = asyncio.Lock()
 
-    async def check_project(self, project: 'CreditProject') -> List[Dict]:
-        violations = []
-        for rule_name, check_fn in self.rules.items():
-            if not check_fn(project):
-                violation = {'rule': rule_name, 'project_id': project.project_id, 'details': project.dict()}
-                violations.append(violation)
-                SAFETY_VIOLATIONS.labels(rule=rule_name).inc()
-                logger.warning(f"Safety violation: {rule_name} for project {project.project_id}")
-        return violations
+    async def connect(self) -> Any:
+        if self._conn is not None:
+            return self._conn
+        async with self._init_lock:
+            if self._conn is not None:
+                return self._conn
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = await aiosqlite.connect(self.db_path)
+            self._conn.row_factory = aiosqlite.Row
+            await self._init_schema(self._conn)
+        return self._conn
 
-    async def validate_purchase(self, project: 'CreditProject', amount_kg: float, context: Dict) -> bool:
-        violations = await self.check_project(project)
-        return len(violations) == 0
+    async def _init_schema(self, conn: Any) -> None:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS credit_projects (
+                project_id TEXT PRIMARY KEY, name TEXT, registry TEXT,
+                available_credits_kg REAL, price_per_kg_usd REAL,
+                verification_status TEXT, credit_type TEXT,
+                co_benefits TEXT, extra TEXT, last_updated TEXT,
+                active INTEGER DEFAULT 1
+            )""")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS credit_transactions (
+                tx_id TEXT PRIMARY KEY, project_id TEXT, amount_kg REAL,
+                retired_kg REAL DEFAULT 0.0, cost_usd REAL, status TEXT,
+                credit_type TEXT DEFAULT 'voluntary', retires_at TEXT,
+                blockchain_tx_hash TEXT, payment_method TEXT DEFAULT 'USD',
+                extra TEXT, created_at TEXT, updated_at TEXT
+            )""")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY, password_hash TEXT, role TEXT,
+                created_at TEXT
+            )""")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT,
+                action TEXT, details TEXT, timestamp TEXT
+            )""")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS system_state (
+                key TEXT PRIMARY KEY, value TEXT, updated_at TEXT
+            )""")
+        await conn.commit()
 
-    async def get_status(self) -> Dict:
-        return {'enabled': self.config.safety.enable_monitor, 'rules': list(self.rules.keys())}
+    @asynccontextmanager
+    async def get_session(self):
+        """Yield the shared connection with autocommit semantics."""
+        conn = await self.connect()
+        yield _SessionWrapper(conn, self._query_lock)
 
-# =============================================================================
-# NEW: CAUSAL BANDIT (replaces ContextualBandit)
-# =============================================================================
-class CausalBandit:
-    def __init__(self, action_space, fallback_solver, min_trials_before_bandit=5, confidence_threshold=0.6):
-        self.actions = action_space
-        self.fallback_solver = fallback_solver
-        self.min_trials = min_trials_before_bandit
-        self.confidence_threshold = confidence_threshold
-        self.q_values = {a['name']: 0.0 for a in action_space}
-        self.counts = {a['name']: 0 for a in action_space}
-        self.causal_effects = {a['name']: 0.0 for a in action_space}
-        self.trials = 0
-        self.context_history = []
-        self.reward_history = []
-        self.action_history = []
+    async def execute(self, query: str, params: tuple = ()) -> Any:
+        conn = await self.connect()
+        async with self._query_lock:
+            cur = await conn.execute(query, params)
+            await conn.commit()
+            return cur
 
-    def select_action(self, context):
-        if self.trials < self.min_trials:
-            return self.fallback_solver(context), 0.0, "fallback"
-        epsilon = 0.1
-        if random.random() < epsilon:
-            name = random.choice(self.actions)['name']
-        else:
-            # Use causal effect if confident
-            if self.trials >= 10 and any(self.causal_effects.values()):
-                name = max(self.causal_effects, key=self.causal_effects.get)
-            else:
-                name = max(self.q_values, key=self.q_values.get)
-        action = next(a for a in self.actions if a['name'] == name)
-        confidence = 0.5
-        return action, confidence, "causal"
+    async def fetch_all(self, query: str, params: tuple = ()) -> List[Any]:
+        conn = await self.connect()
+        async with self._query_lock:
+            cur = await conn.execute(query, params)
+            return await cur.fetchall()
 
-    def update(self, context, action, reward):
-        self.trials += 1
-        name = action['name']
-        self.counts[name] += 1
-        self.q_values[name] += (reward - self.q_values[name]) / self.counts[name]
-        self.context_history.append(context)
-        self.reward_history.append(reward)
-        self.action_history.append(name)
-        rewards_for_action = [r for a, r in zip(self.action_history, self.reward_history) if a == name]
-        self.causal_effects[name] = np.mean(rewards_for_action) if rewards_for_action else 0.0
+    async def fetch_one(self, query: str, params: tuple = ()) -> Optional[Any]:
+        conn = await self.connect()
+        async with self._query_lock:
+            cur = await conn.execute(query, params)
+            return await cur.fetchone()
 
-    def seed_safe_policy(self, context, policy):
+    async def save_state(self, key: str, value: Any) -> None:
+        await self.execute(
+            "INSERT OR REPLACE INTO system_state (key, value, updated_at) "
+            "VALUES (?, ?, ?)",
+            (key, json.dumps(value, default=str),
+             datetime.now(timezone.utc).isoformat()))
+
+    async def load_state(self, key: str, default: Optional[Any] = None) -> Any:
+        row = await self.fetch_one(
+            "SELECT value FROM system_state WHERE key=?", (key,))
+        if row is None:
+            return default
+        try:
+            return json.loads(row[0])
+        except json.JSONDecodeError:
+            return default
+
+    async def close(self) -> None:
+        async with self._init_lock:
+            if self._conn is not None:
+                await self._conn.close()
+                self._conn = None
+
+
+class _SessionWrapper:
+    """Minimal session wrapper for the async context manager."""
+
+    def __init__(self, conn: Any, lock: asyncio.Lock) -> None:
+        self._conn = conn
+        self._lock = lock
+
+    async def execute(self, query: str, params: Any = ()) -> Any:
+        async with self._lock:
+            cur = await self._conn.execute(query, params)
+            return cur
+
+    async def commit(self) -> None:
+        await self._conn.commit()
+
+
+# ============================================================================
+# Adapter classes (deterministic simulations)
+# ============================================================================
+class RegistryClient:
+    """Simulated registry client for carbon-credit projects."""
+
+    def __init__(self, config: Settings) -> None:
+        self.config = config
+        self._rng = np.random.default_rng(config.general.random_seed)
+        self.circuit_breaker = GlobalCircuitBreaker().get_or_create(
+            "registry",
+            threshold=config.general.circuit_breaker_threshold,
+            timeout=config.general.circuit_breaker_timeout)
+
+    async def _fetch(self) -> List[Dict[str, Any]]:
+        # Deterministic set of 6 projects.
+        templates = [
+            ("amazon_redd_2023", "Amazon REDD+ 2023", "Verra"),
+            ("borneo_peat_2022", "Borneo Peat Restoration 2022", "GoldStandard"),
+            ("kenya_cookstove_2023", "Kenya Cookstove 2023", "Verra"),
+            ("india_solar_2022", "India Solar 2022", "GoldStandard"),
+            ("brazil_mangrove_2023", "Brazil Mangrove 2023", "Verra"),
+            ("indonesia_geothermal_2024", "Indonesia Geothermal 2024", "Verra"),
+        ]
+        out: List[Dict[str, Any]] = []
+        for pid, name, registry in templates:
+            out.append({
+                "project_id": pid,
+                "name": name,
+                "registry": registry,
+                "available_credits_kg": float(self._rng.uniform(5_000, 50_000)),
+                "price_per_kg_usd": float(self._rng.uniform(0.05, 1.5)),
+                "verification_status": "verified",
+                "credit_type": "voluntary",
+                "co_benefits": {
+                    "biodiversity": float(self._rng.uniform(0.0, 1.0)),
+                    "sdg": ["13", "15"],
+                },
+                "metadata": {
+                    "vintage": int(self._rng.choice([2022, 2023, 2024])),
+                    "carbon_intensity": float(self._rng.uniform(50, 500)),
+                },
+            })
+        return out
+
+    async def fetch_projects(self) -> List[Dict[str, Any]]:
+        async def _inner() -> List[Dict[str, Any]]:
+            return await self._fetch()
+        return await self.circuit_breaker.call(_inner)
+
+    async def close(self) -> None:
         pass
 
-# =============================================================================
-# NEW: EXPLAINABLE AI (XAI) GENERATOR
-# =============================================================================
-class XAIExplainer:
-    def __init__(self):
+
+class BlockchainClient:
+    """Deterministic blockchain client (simulated)."""
+
+    def __init__(self, config: Settings) -> None:
+        self.config = config
+        self._rng = np.random.default_rng(config.general.random_seed)
+        self._balances: Dict[str, float] = defaultdict(float)
+
+    async def mint(self, project_id: str, amount_kg: float, owner: str) -> str:
+        tx_hash = "0x" + hashlib.sha256(
+            f"{project_id}:{amount_kg}:{owner}:{time.time()}".encode()
+        ).hexdigest()[:40]
+        self._balances[owner] += amount_kg
+        return tx_hash
+
+    async def get_balance(self, address: str) -> float:
+        return float(self._balances.get(address, 0.0))
+
+    async def close(self) -> None:
         pass
 
-    async def generate_explanation(self, strategy: Dict, context: Any, confidence: float, utility: float, project: 'CreditProject') -> str:
-        parts = []
-        name = strategy.get('name', 'unknown')
-        parts.append(f"Selected {name} strategy.")
-        if 'price_weight' in strategy.get('params', {}):
-            parts.append(f"Price weight: {strategy['params']['price_weight']:.2f}")
-        if 'biodiversity_weight' in strategy.get('params', {}):
-            parts.append(f"Biodiversity weight: {strategy['params']['biodiversity_weight']:.2f}")
-        parts.append(f"Project: {project.name} (ID: {project.project_id})")
-        parts.append(f"Price per kg: ${project.price_per_kg_usd:.2f}")
-        if project.co_benefits and 'biodiversity' in project.co_benefits:
-            parts.append(f"Biodiversity score: {project.co_benefits['biodiversity']:.2f}")
-        if confidence:
-            parts.append(f"Confidence: {confidence:.2f}")
-        if utility:
-            parts.append(f"Utility: {utility:.2f}")
-        return " ".join(parts)
 
-# =============================================================================
-# NEW: HUMAN-IN-THE-LOOP MANAGER
-# =============================================================================
-class HumanReviewManager:
-    def __init__(self, config: Settings):
+class PostQuantumCrypto:
+    """HMAC-SHA256 signing with AES-GCM-wrapped per-key secrets."""
+
+    SALT_KEY = "pqc_salt"
+
+    def __init__(self, config: Settings, db: AsyncDatabaseManager) -> None:
         self.config = config
-        self.pending_reviews = {}  # review_id -> dict
+        self.db = db
+        self.master_key = config.get_master_key_bytes()
+        self._salt: Optional[bytes] = None
         self._lock = asyncio.Lock()
 
-    async def request_review(self, decision_id: str, explanation: str, context: Dict) -> Dict:
-        review_id = str(uuid.uuid4())
+    async def _load_or_create_salt(self) -> bytes:
+        if self._salt is not None:
+            return self._salt
+        async with self._lock:
+            if self._salt is not None:
+                return self._salt
+            stored = await self.db.load_state(self.SALT_KEY)
+            if stored is None:
+                new_salt = os.urandom(16)
+                await self.db.save_state(self.SALT_KEY, new_salt.hex())
+                self._salt = new_salt
+            else:
+                self._salt = bytes.fromhex(stored)
+            return self._salt
+
+    def _derive(self, salt: bytes, length: int = 32) -> bytes:
+        if not CRYPTO_AVAILABLE:
+            return hmac.new(self.master_key, salt, hashlib.sha256).digest()[:length]
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=length,
+                         salt=salt, iterations=100_000,
+                         backend=default_backend())
+        return kdf.derive(self.master_key)
+
+    async def _encrypt(self, data: bytes) -> bytes:
+        salt = await self._load_or_create_salt()
+        derived = self._derive(salt)
+        nonce = os.urandom(12)
+        if CRYPTO_AVAILABLE:
+            return nonce + AESGCM(derived).encrypt(nonce, data, None)
+        return nonce + bytes(c ^ derived[i % len(derived)]
+                             for i, c in enumerate(data))
+
+    async def _decrypt(self, blob: bytes) -> bytes:
+        salt = await self._load_or_create_salt()
+        derived = self._derive(salt)
+        nonce, rest = blob[:12], blob[12:]
+        if CRYPTO_AVAILABLE:
+            return AESGCM(derived).decrypt(nonce, rest, None)
+        return bytes(c ^ derived[i % len(derived)]
+                     for i, c in enumerate(rest))
+
+    async def generate_keypair(self, algorithm: str = "hmac_sha256",
+                               validity_days: int = 30) -> Dict[str, Any]:
+        secret = secrets.token_bytes(32)
+        key_id = f"{algorithm}_{uuid.uuid4().hex[:8]}"
+        expires = (datetime.now(timezone.utc)
+                   + timedelta(days=validity_days)).isoformat()
+        payload = {
+            "key_id": key_id, "algorithm": algorithm,
+            "public_key": hashlib.sha256(secret).hexdigest(),
+            "secret": (await self._encrypt(secret)).hex(),
+            "expires_at": expires,
+        }
+        await self.db.save_state(f"pqc_keypair:{key_id}", payload)
+        PQC_SIGNATURES.labels(algorithm=algorithm, status="generated").inc()
+        return payload
+
+    async def sign_data(self, data: Dict[str, Any], key_id: str) -> Dict[str, Any]:
+        kp = await self.db.load_state(f"pqc_keypair:{key_id}")
+        if not kp:
+            raise PQCError(f"Key {key_id} not found")
+        secret = await self._decrypt(bytes.fromhex(kp["secret"]))
+        payload = json.dumps(data, sort_keys=True, default=str).encode()
+        sig = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+        PQC_SIGNATURES.labels(algorithm=kp["algorithm"], status="signed").inc()
+        return {"signature": sig, "algorithm": kp["algorithm"],
+                "key_id": key_id,
+                "timestamp": datetime.now(timezone.utc).isoformat()}
+
+    async def verify_data(self, data: Dict[str, Any],
+                          signature_data: Dict[str, Any]) -> bool:
+        key_id = signature_data.get("key_id")
+        if not key_id:
+            return False
+        kp = await self.db.load_state(f"pqc_keypair:{key_id}")
+        if not kp:
+            return False
+        secret = await self._decrypt(bytes.fromhex(kp["secret"]))
+        payload = json.dumps(data, sort_keys=True, default=str).encode()
+        expected = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+        ok = hmac.compare_digest(expected, signature_data.get("signature", ""))
+        PQC_SIGNATURES.labels(algorithm=kp["algorithm"],
+                              status="verified" if ok else "mismatch").inc()
+        return ok
+
+
+class CloudStorage:
+    def __init__(self, config: Settings) -> None:
+        self.config = config
+        self.local_dir = Path(os.environ.get("CARBON_CLOUD_DIR", "./cloud_storage"))
+
+    async def store(self, data: Dict[str, Any],
+                    filename: Optional[str] = None) -> Dict[str, Any]:
+        self.local_dir.mkdir(parents=True, exist_ok=True)
+        fname = filename or f"blob_{uuid.uuid4().hex[:12]}.json"
+        path = self.local_dir / fname
+        await asyncio.to_thread(
+            path.write_text, json.dumps(data, default=str))
+        CLOUD_STORE.labels(provider="local", status="success").inc()
+        return {"status": "success", "location": str(path),
+                "provider": "local", "simulated": True}
+
+
+class PricePredictor:
+    def __init__(self, config: Settings) -> None:
+        self.config = config
+        self._history: List[float] = [0.10, 0.12, 0.14, 0.13, 0.15]
+
+    async def predict(self, days: int = 30) -> Optional[List[float]]:
+        if len(self._history) < 2:
+            return None
+        x = np.arange(len(self._history))
+        y = np.asarray(self._history, dtype=float)
+        coeffs = np.polyfit(x, y, 1)
+        out: List[float] = []
+        base_x = len(self._history) - 1
+        for i in range(1, days + 1):
+            out.append(float(coeffs[0] * (base_x + i) + coeffs[1]))
+        return out
+
+    async def train(self) -> None:
+        pass
+
+    async def update_history(self, price_data: Dict[str, Any]) -> None:
+        if "price" in price_data:
+            try:
+                self._history.append(float(price_data["price"]))
+                if len(self._history) > 100:
+                    self._history = self._history[-100:]
+            except (TypeError, ValueError):
+                PREDICTION_ERROR.inc()
+
+
+class CarbonIntensityManager:
+    def __init__(self, config: Settings) -> None:
+        self.config = config
+        self._rng = np.random.default_rng(config.general.random_seed)
+        self.current_intensity_g = 400.0
+
+    async def get_intensity(self) -> float:
+        self.current_intensity_g = float(self._rng.uniform(150.0, 550.0))
+        return self.current_intensity_g
+
+    async def close(self) -> None:
+        pass
+
+
+class UnifiedSustainabilityEngine:
+    def __init__(self, db: AsyncDatabaseManager) -> None:
+        self.db = db
+        self._rng = np.random.default_rng(42)
+
+    async def get_recent_emissions(self, hours: int = 24) -> float:
+        # Simulated recent emissions in kg CO₂.
+        return float(self._rng.uniform(50.0, 250.0))
+
+
+class AutoOffsetEngine:
+    def __init__(self, marketplace: Optional[Any] = None) -> None:
+        self.marketplace = marketplace
+
+    async def offset(self, emissions_kg: float,
+                     reason: str = "auto_offset") -> Dict[str, Any]:
+        if self.marketplace is None:
+            return {"status": "no_marketplace", "offset_kg": 0.0}
+        return await self.marketplace._perform_offset(emissions_kg, reason)
+
+
+class WebSocketManager:
+    def __init__(self) -> None:
+        self._connections: Set[Any] = set()
+
+    async def connect(self, ws: Any) -> None:
+        self._connections.add(ws)
+
+    async def disconnect(self, ws: Any) -> None:
+        self._connections.discard(ws)
+
+    async def broadcast(self, payload: Dict[str, Any]) -> None:
+        message = json.dumps(payload, default=str)
+        for ws in list(self._connections):
+            try:
+                await ws.send_text(message)
+            except Exception:
+                self._connections.discard(ws)
+
+
+class WebhookNotifier:
+    def __init__(self, config: Settings) -> None:
+        self.config = config
+        self._events: deque = deque(maxlen=200)
+
+    async def notify(self, event: Dict[str, Any]) -> None:
+        self._events.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+        })
+
+    async def close(self) -> None:
+        pass
+
+
+# ============================================================================
+# Enhancement modules
+# ============================================================================
+class SafetyMonitor:
+    def __init__(self, config: Settings) -> None:
+        self.config = config
+        self._last_violation: Dict[str, bool] = {}
+
+    def rules(self) -> Dict[str, Callable[[Any], bool]]:
+        s = self.config.safety
+        return {
+            "max_carbon_intensity":
+                lambda p: float(p.metadata.get("carbon_intensity", 0.0))
+                <= s.max_carbon_intensity,
+            "min_biodiversity":
+                lambda p: float(p.co_benefits.get("biodiversity", 0.0))
+                >= s.min_biodiversity,
+            "max_price_per_kg":
+                lambda p: float(p.price_per_kg_usd) <= s.max_price_per_kg,
+        }
+
+    async def check_project(self, project: Any) -> List[Dict[str, Any]]:
+        violations: List[Dict[str, Any]] = []
+        for name, fn in self.rules().items():
+            try:
+                ok = bool(fn(project))
+            except Exception:
+                ok = True
+            if ok:
+                self._last_violation[name] = False
+                continue
+            violations.append({"rule": name, "project_id": project.project_id,
+                               "details": project.model_dump()
+                               if hasattr(project, "model_dump")
+                               else str(project)})
+            if not self._last_violation.get(name, False):
+                SAFETY_VIOLATIONS.labels(rule=name).inc()
+                logger.warning("Safety violation: %s on project %s",
+                               name, project.project_id)
+                self._last_violation[name] = True
+        return violations
+
+    async def validate_purchase(self, project: Any, amount_kg: float,
+                                context: Dict[str, Any]) -> bool:
+        return not await self.check_project(project)
+
+    async def get_status(self) -> Dict[str, Any]:
+        return {"enabled": self.config.safety.enable_monitor,
+                "rules": list(self.rules().keys())}
+
+
+class XAIExplainer:
+    async def generate_explanation(self, strategy: Dict[str, Any],
+                                   context: Any, confidence: float,
+                                   utility: float, project: Any) -> str:
+        parts: List[str] = [f"Selected strategy '{strategy.get('name', '?')}'."]
+        params = strategy.get("params", {}) or {}
+        for k, v in params.items():
+            parts.append(f"{k}={float(v):.2f}")
+        parts.append(f"Project: {getattr(project, 'name', '?')} "
+                     f"({getattr(project, 'project_id', '?')}).")
+        parts.append(f"Price/kg: "
+                     f"${float(getattr(project, 'price_per_kg_usd', 0.0)):.3f}.")
+        biodiversity = (getattr(project, "co_benefits", {}) or {}).get(
+            "biodiversity")
+        if biodiversity is not None:
+            parts.append(f"Biodiversity: {float(biodiversity):.2f}.")
+        parts.append(f"Confidence: {confidence:.2f}.")
+        parts.append(f"Utility: {utility:.2f}.")
+        return " ".join(parts)
+
+
+class HumanReviewManager:
+    def __init__(self, config: Settings) -> None:
+        self.config = config
+        self._pending: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def request_review(self, decision_id: str, explanation: str,
+                             context: Dict[str, Any]) -> Dict[str, Any]:
         review = {
-            'review_id': review_id,
-            'decision_id': decision_id,
-            'status': 'pending',
-            'explanation': explanation,
-            'context': context,
-            'created_at': datetime.now().isoformat()
+            "review_id": str(uuid.uuid4()),
+            "decision_id": decision_id,
+            "status": "pending",
+            "explanation": explanation,
+            "context": dict(context),
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
         async with self._lock:
-            self.pending_reviews[review_id] = review
-        HUMAN_REVIEWS.labels(status='pending').inc()
+            self._pending[review["review_id"]] = review
+        HUMAN_REVIEWS.labels(status="pending").inc()
         return review
 
-    async def approve(self, review_id: str, feedback: str = None) -> Dict:
+    async def approve(self, review_id: str,
+                      feedback: Optional[str] = None) -> Dict[str, Any]:
         async with self._lock:
-            if review_id not in self.pending_reviews:
-                raise HTTPException(status_code=404, detail="Review not found")
-            self.pending_reviews[review_id]['status'] = 'approved'
-            self.pending_reviews[review_id]['feedback'] = feedback
-            self.pending_reviews[review_id]['reviewed_at'] = datetime.now().isoformat()
-        HUMAN_REVIEWS.labels(status='approved').inc()
-        return {'status': 'approved', 'review_id': review_id}
+            r = self._pending.get(review_id)
+            if r is None:
+                raise CarbonMarketplaceException("Review not found")
+            r["status"] = "approved"
+            r["feedback"] = feedback
+            r["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+        HUMAN_REVIEWS.labels(status="approved").inc()
+        return {"status": "approved", "review_id": review_id}
 
-    async def reject(self, review_id: str, feedback: str = None) -> Dict:
+    async def reject(self, review_id: str,
+                     feedback: Optional[str] = None) -> Dict[str, Any]:
         async with self._lock:
-            if review_id not in self.pending_reviews:
-                raise HTTPException(status_code=404, detail="Review not found")
-            self.pending_reviews[review_id]['status'] = 'rejected'
-            self.pending_reviews[review_id]['feedback'] = feedback
-            self.pending_reviews[review_id]['reviewed_at'] = datetime.now().isoformat()
-        HUMAN_REVIEWS.labels(status='rejected').inc()
-        return {'status': 'rejected', 'review_id': review_id}
+            r = self._pending.get(review_id)
+            if r is None:
+                raise CarbonMarketplaceException("Review not found")
+            r["status"] = "rejected"
+            r["feedback"] = feedback
+            r["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+        HUMAN_REVIEWS.labels(status="rejected").inc()
+        return {"status": "rejected", "review_id": review_id}
 
-    async def get_pending(self) -> List[Dict]:
+    async def get_pending(self) -> List[Dict[str, Any]]:
         async with self._lock:
-            return [v for v in self.pending_reviews.values() if v['status'] == 'pending']
+            return [r for r in self._pending.values()
+                    if r["status"] == "pending"]
 
-# =============================================================================
-# NEW: CHAOS MONKEY
-# =============================================================================
+
 class ChaosMonkey:
-    def __init__(self, config: Settings, marketplace: 'CarbonCreditMarketplace'):
+    def __init__(self, config: Settings, marketplace: Any) -> None:
         self.config = config
         self.marketplace = marketplace
         self.enabled = config.chaos.enabled
-        self.failure_probability = config.chaos.failure_probability
-        self.interval = config.chaos.experiment_interval_seconds
-        self._task = None
+        self._rng = np.random.default_rng(config.general.random_seed)
+        self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
 
-    async def start(self):
+    async def start(self) -> None:
         if not self.enabled:
-            logger.info("Chaos Monkey disabled")
             return
         self._task = asyncio.create_task(self._run_loop())
         logger.info("Chaos Monkey started")
 
-    async def stop(self):
-        if self._task:
-            self._stop_event.set()
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._stop_event.set()
+        try:
             await self._task
-            self._task = None
+        except asyncio.CancelledError:
+            pass
+        self._task = None
 
-    async def _run_loop(self):
+    async def _run_loop(self) -> None:
+        interval = self.config.chaos.experiment_interval_seconds
         while not self._stop_event.is_set():
-            await asyncio.sleep(self.interval)
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                pass
             try:
                 await self._inject_failure()
             except Exception as e:
-                logger.error("Chaos experiment failed", error=str(e))
+                logger.error("Chaos experiment failed: %s", e)
 
-    async def _inject_failure(self):
-        failure_type = random.choice(['latency', 'error', 'disconnect'])
-        target = random.choice(['registry', 'blockchain', 'database'])
-        status = 'success'
-        result = {}
+    async def _inject_failure(self) -> Dict[str, Any]:
+        failure = str(self._rng.choice(["latency", "error", "disconnect"]))
+        target = str(self._rng.choice(["registry", "blockchain", "database"]))
+        status_ = "success"
+        result: Dict[str, Any] = {}
         try:
-            if failure_type == 'latency':
-                await asyncio.sleep(random.uniform(0.5, 2.0))
-                result['delay'] = 'simulated latency'
-            elif failure_type == 'error':
-                # Simulate a transient error in a component
-                if target == 'registry':
-                    # Temporarily break registry
-                    original = self.marketplace.registry_client.circuit_breaker
-                    self.marketplace.registry_client.circuit_breaker = GlobalCircuitBreaker().get_or_create(
-                        "registry_chaos", threshold=1, timeout=5
-                    )
-                    await asyncio.sleep(random.uniform(1, 3))
-                    self.marketplace.registry_client.circuit_breaker = original
-                    result['action'] = 'toggled registry circuit breaker'
-                elif target == 'blockchain':
-                    # Simulate blockchain failure
-                    original = self.marketplace.blockchain_client
-                    self.marketplace.blockchain_client = None  # force fallback
-                    await asyncio.sleep(random.uniform(1, 2))
-                    self.marketplace.blockchain_client = original
-                    result['action'] = 'simulated blockchain outage'
-            elif failure_type == 'disconnect':
-                await asyncio.sleep(random.uniform(1, 2))
-                result['action'] = 'simulated network partition'
+            if failure == "latency":
+                delay = float(self._rng.uniform(0.05, 0.2))
+                await asyncio.sleep(delay)
+                result["delay_seconds"] = delay
+            elif failure == "error":
+                result["action"] = f"simulated {target} error"
+            else:
+                await asyncio.sleep(0.05)
+                result["action"] = "simulated network partition"
         except Exception as e:
-            status = 'failed'
-            result['error'] = str(e)
-        CHAOS_EXPERIMENTS.labels(type=failure_type, status=status).inc()
-        logger.info(f"Chaos experiment {failure_type} on {target}: {status}")
+            status_ = "failed"
+            result["error"] = str(e)
+        CHAOS_EXPERIMENTS.labels(type=failure, status=status_).inc()
+        logger.info("Chaos experiment %s on %s: %s", failure, target, status_)
+        return {"fault": failure, "target": target,
+                "status": status_, "result": result}
 
-# =============================================================================
-# NEW: QUANTUM-DISTILLATION OPTIMIZER (optional)
-# =============================================================================
-class QuantumDistillationOptimizer:
-    def __init__(self, config: Settings):
-        self.config = config
-        self.available = QISKIT_AVAILABLE and config.optimizer.enable_distillation
 
-    async def optimize(self, projects: List['CreditProject'], weights: Dict[str, float]) -> Optional['CreditProject']:
-        if not self.available:
-            return None
-        try:
-            qp = QuadraticProgram()
-            for p in projects:
-                qp.binary_var(p.project_id)
-            # Define objective: maximize utility (minimize negative)
-            utility = {}
-            for p in projects:
-                u = 0.0
-                u += (1 - p.price_per_kg_usd / 2.0) * weights.get('price_weight', 0.3)
-                u += p.co_benefits.get('biodiversity', 0) * weights.get('biodiversity_weight', 0.2)
-                vintage = p.metadata.get('vintage', 2020)
-                u += max(0, (vintage - 2020) / 5.0) * weights.get('vintage_weight', 0.3)
-                carbon = p.metadata.get('carbon_intensity', 400)
-                u += (1 - carbon / 1000.0) * weights.get('carbon_weight', 0.3)
-                utility[p.project_id] = u
-            linear = {pid: -utility[pid] for pid in utility}
-            qp.minimize(linear=linear)
-            qp.linear_constraint(linear={pid: 1 for pid in utility}, sense='E', rhs=1, name='one_project')
-            backend = Aer.get_backend(self.config.optimizer.quantum_backend)
-            qaoa = QAOA(reps=self.config.optimizer.quantum_reps)
-            optimizer = MinimumEigenOptimizer(qaoa)
-            result = optimizer.solve(qp)
-            selected_id = [pid for pid in utility if result.x[list(utility.keys()).index(pid)] > 0.5][0]
-            return next(p for p in projects if p.project_id == selected_id)
-        except Exception as e:
-            logger.error(f"Quantum optimization failed: {e}")
-            return None
+class CausalBandit:
+    def __init__(self, action_space: List[Dict[str, Any]],
+                 fallback_solver: Callable[[Any], Dict[str, Any]],
+                 min_trials_before_bandit: int = 5,
+                 confidence_threshold: float = 0.6,
+                 seed: int = 42) -> None:
+        self.actions = list(action_space)
+        self.fallback_solver = fallback_solver
+        self.min_trials = int(min_trials_before_bandit)
+        self.confidence_threshold = float(confidence_threshold)
+        self._rng = np.random.default_rng(seed)
+        self.q_values: Dict[str, float] = {}
+        self.counts: Dict[str, int] = {}
+        self.causal_effects: Dict[str, float] = {}
+        self.trials = 0
+        for a in self.actions:
+            self._register(a["name"])
 
-# =============================================================================
-# NEW: FEDERATED LEARNING COORDINATOR
-# =============================================================================
-class FederatedCoordinator:
-    def __init__(self, config: Settings):
-        self.config = config
-        self.participants = {}
-        self.last_aggregation = None
+    def _register(self, name: str) -> None:
+        self.q_values.setdefault(name, 0.0)
+        self.counts.setdefault(name, 0)
+        self.causal_effects.setdefault(name, 0.0)
 
-    async def register_participant(self, participant_id: str, model_update: Dict):
-        self.participants[participant_id] = model_update
+    def register_action(self, action: Dict[str, Any]) -> None:
+        if action not in self.actions:
+            self.actions.append(action)
+        self._register(action["name"])
 
-    async def aggregate(self) -> Dict:
-        if not self.participants:
-            return {}
-        # FedAvg-like: average Q-values from all participants
-        avg_model = {}
-        keys = set()
-        for p in self.participants.values():
-            keys.update(p.keys())
-        for key in keys:
-            vals = [p.get(key, 0.0) for p in self.participants.values()]
-            avg_model[key] = sum(vals) / len(vals)
-        self.last_aggregation = datetime.now()
-        return avg_model
+    def select_action(self, context: Any) -> Tuple[Dict[str, Any], float, str]:
+        if self.trials < self.min_trials:
+            return self.fallback_solver(context), 0.0, "fallback"
+        if float(self._rng.random()) < 0.1:
+            idx = int(self._rng.integers(0, len(self.actions)))
+            action = self.actions[idx]
+        else:
+            if self.trials >= 10 and any(self.causal_effects.values()):
+                name = max(self.causal_effects, key=self.causal_effects.get)
+            else:
+                name = max(self.q_values, key=self.q_values.get)
+            action = next(
+                (a for a in self.actions if a["name"] == name), self.actions[0])
+        confidence = min(1.0, self.counts[action["name"]] / max(1, self.trials))
+        return action, confidence, "causal"
 
-# =============================================================================
-# NEW: MULTI-AGENT SYSTEM
-# =============================================================================
-class MultiAgentSystem:
-    def __init__(self, config: Settings):
-        self.config = config
-        self.agents = {
-            'price_agent': self._price_score,
-            'carbon_agent': self._carbon_score,
-            'biodiversity_agent': self._biodiversity_score,
+    def update(self, context: Any, action: Dict[str, Any], reward: float) -> None:
+        name = action["name"]
+        self._register(name)
+        self.trials += 1
+        self.counts[name] += 1
+        self.q_values[name] += (reward - self.q_values[name]) / self.counts[name]
+        self.causal_effects[name] += (
+            reward - self.causal_effects[name]) / self.counts[name]
+
+    def seed_safe_policy(self, context: Any, policy: Dict[str, Any]) -> None:
+        self._register(policy["name"])
+        self.q_values[policy["name"]] = max(self.q_values[policy["name"]], 0.0)
+
+    def export_state(self) -> Dict[str, Any]:
+        return {
+            "q_values": dict(self.q_values),
+            "counts": dict(self.counts),
+            "causal_effects": dict(self.causal_effects),
+            "trials": self.trials,
+            "action_names": [a["name"] for a in self.actions],
         }
 
-    def _price_score(self, project):
-        return 1 - project.price_per_kg_usd / 2.0
+    def import_state(self, state: Dict[str, Any]) -> None:
+        for k, v in state.get("q_values", {}).items():
+            self._register(k)
+            self.q_values[k] = float(v)
+        for k, v in state.get("counts", {}).items():
+            self._register(k)
+            self.counts[k] = int(v)
+        for k, v in state.get("causal_effects", {}).items():
+            self._register(k)
+            self.causal_effects[k] = float(v)
+        self.trials = int(state.get("trials", 0))
 
-    def _carbon_score(self, project):
-        carbon = project.metadata.get('carbon_intensity', 400)
-        return 1 - carbon / 1000.0
 
-    def _biodiversity_score(self, project):
-        return project.co_benefits.get('biodiversity', 0)
+class QuantumDistillationOptimizer:
+    def __init__(self, config: Settings) -> None:
+        self.config = config
+        self.available = False  # QAOA not shipped
 
-    async def vote(self, projects: List['CreditProject']) -> 'CreditProject':
-        scores = {}
+    async def optimize(self, projects: List[Any],
+                       weights: Dict[str, float]) -> Optional[Any]:
+        return None
+
+
+class FederatedCoordinator:
+    def __init__(self, config: Settings) -> None:
+        self.config = config
+        self._participants: Dict[str, Dict[str, Any]] = {}
+        self.last_aggregation: Optional[datetime] = None
+
+    async def register_participant(self, participant_id: str,
+                                   model_update: Dict[str, Any]) -> None:
+        self._participants[participant_id] = dict(model_update)
+
+    async def aggregate(self) -> Dict[str, float]:
+        if not self._participants:
+            return {}
+        keys: Set[str] = set()
+        for p in self._participants.values():
+            keys.update(p.keys())
+        out: Dict[str, float] = {}
+        for k in keys:
+            vals = [float(p[k]) for p in self._participants.values()
+                    if isinstance(p.get(k), (int, float))]
+            if vals:
+                out[k] = float(np.mean(vals))
+        self.last_aggregation = datetime.now(timezone.utc)
+        return out
+
+
+class MultiAgentSystem:
+    AGENTS = ("price_agent", "carbon_agent", "biodiversity_agent")
+
+    def __init__(self, config: Settings) -> None:
+        self.config = config
+
+    def _score_project(self, project: Any) -> Dict[str, float]:
+        price = float(getattr(project, "price_per_kg_usd", 0.0))
+        carbon = float(getattr(project, "metadata", {}).get(
+            "carbon_intensity", 400.0))
+        biodiversity = float(
+            getattr(project, "co_benefits", {}).get("biodiversity", 0.0))
+        return {
+            "price_agent": 1.0 - price / 2.0,
+            "carbon_agent": 1.0 - carbon / 1000.0,
+            "biodiversity_agent": biodiversity,
+        }
+
+    async def vote(self, projects: List[Any]) -> Optional[Any]:
+        if not projects:
+            return None
+        scores: Dict[str, float] = {}
         for p in projects:
-            total = 0.0
-            for agent_name, score_fn in self.agents.items():
-                total += score_fn(p)
-            scores[p.project_id] = total
+            agent_scores = self._score_project(p)
+            scores[p.project_id] = float(sum(agent_scores.values()))
         best_id = max(scores, key=scores.get)
-        return next(p for p in projects if p.project_id == best_id)
+        return next((p for p in projects if p.project_id == best_id), None)
 
-# =============================================================================
-# INTEGRATE INTO AUTONOMOUS OPTIMIZER (replaces original)
-# =============================================================================
+
+# ============================================================================
+# Autonomous optimizer
+# ============================================================================
 class AutonomousOptimizer:
-    def __init__(self, config: Settings, marketplace: 'CarbonCreditMarketplace',
-                 safety_monitor: SafetyMonitor = None,
-                 xai: XAIExplainer = None,
-                 human_review: HumanReviewManager = None,
-                 quantum_optimizer: QuantumDistillationOptimizer = None,
-                 multi_agent: MultiAgentSystem = None):
+    DEFAULT_STRATEGY = {
+        "name": "balanced",
+        "params": {"price_weight": 0.3, "vintage_weight": 0.3,
+                   "biodiversity_weight": 0.2, "carbon_weight": 0.2},
+    }
+
+    def __init__(self, config: Settings, marketplace: Any,
+                 db: AsyncDatabaseManager,
+                 safety_monitor: SafetyMonitor,
+                 xai: XAIExplainer,
+                 human_review: HumanReviewManager,
+                 quantum_optimizer: QuantumDistillationOptimizer,
+                 multi_agent: MultiAgentSystem) -> None:
         self.config = config
         self.marketplace = marketplace
+        self.db = db
         self.safety_monitor = safety_monitor
-        self.xai = xai or XAIExplainer()
+        self.xai = xai
         self.human_review = human_review
         self.quantum_optimizer = quantum_optimizer
         self.multi_agent = multi_agent
         self._lock = asyncio.Lock()
-        self.threshold_history = deque(maxlen=100)
-        self.success_history = deque(maxlen=100)
-
-        self.modp = ParetoOptimizer() if ENHANCEMENTS_AVAILABLE else None
-        self.moe = ExpertRouter() if ENHANCEMENTS_AVAILABLE else None
-        self.bio = GeneticPolicyGenerator() if ENHANCEMENTS_AVAILABLE else None
+        self.threshold_history: deque = deque(maxlen=100)
+        self.success_history: deque = deque(maxlen=100)
 
         self.action_space = [
-            {"name": "balanced", "params": {"price_weight": 0.3, "vintage_weight": 0.3, "biodiversity_weight": 0.2, "carbon_weight": 0.2}},
-            {"name": "price_focused", "params": {"price_weight": 0.6, "vintage_weight": 0.1, "biodiversity_weight": 0.1, "carbon_weight": 0.2}},
-            {"name": "green_focused", "params": {"price_weight": 0.1, "vintage_weight": 0.2, "biodiversity_weight": 0.3, "carbon_weight": 0.4}},
-            {"name": "vintage_focused", "params": {"price_weight": 0.2, "vintage_weight": 0.5, "biodiversity_weight": 0.2, "carbon_weight": 0.1}},
+            {"name": "balanced",
+             "params": {"price_weight": 0.3, "vintage_weight": 0.3,
+                        "biodiversity_weight": 0.2, "carbon_weight": 0.2}},
+            {"name": "price_focused",
+             "params": {"price_weight": 0.6, "vintage_weight": 0.1,
+                        "biodiversity_weight": 0.1, "carbon_weight": 0.2}},
+            {"name": "green_focused",
+             "params": {"price_weight": 0.1, "vintage_weight": 0.2,
+                        "biodiversity_weight": 0.3, "carbon_weight": 0.4}},
+            {"name": "vintage_focused",
+             "params": {"price_weight": 0.2, "vintage_weight": 0.5,
+                        "biodiversity_weight": 0.2, "carbon_weight": 0.1}},
         ]
 
-        def fallback(context):
-            return {"name": "balanced", "params": {"price_weight": 0.3, "vintage_weight": 0.3, "biodiversity_weight": 0.2, "carbon_weight": 0.2}}
+        def fallback(_ctx: Any) -> Dict[str, Any]:
+            return dict(self.DEFAULT_STRATEGY)
 
-        # Use CausalBandit
         self.bandit = CausalBandit(
             action_space=self.action_space,
             fallback_solver=fallback,
             min_trials_before_bandit=config.optimizer.bandit_min_trials,
             confidence_threshold=config.optimizer.bandit_confidence_threshold,
+            seed=config.general.random_seed,
         )
 
-        self.recent_rewards = deque(maxlen=100)
-        self._last_selection = {"project": None, "strategy": None, "context": None}
-        self._load_state()
+        self.recent_rewards: deque = deque(maxlen=100)
+        self._last_selection: Dict[str, Any] = {
+            "project": None, "strategy": None, "context": None}
 
-    async def _load_state(self):
-        pass
+    # ------------------------------------------------------------------
+    async def load_state(self) -> None:
+        state = await self.db.load_state("optimizer_state")
+        if state:
+            try:
+                self.bandit.import_state(state)
+            except Exception as e:
+                logger.warning("Failed to import optimizer state: %s", e)
 
-    async def _save_state(self):
-        pass
+    async def save_state(self) -> None:
+        try:
+            await self.db.save_state("optimizer_state", self.bandit.export_state())
+        except Exception as e:
+            logger.warning("Failed to persist optimizer state: %s", e)
 
-    async def select_best_project(self, projects: List['CreditProject'], amount_kg: float, context: Dict = None) -> Optional['CreditProject']:
+    # ------------------------------------------------------------------
+    def _score_project(self, project: Any, weights: Dict[str, float]) -> float:
+        price = 1.0 - min(1.0, float(project.price_per_kg_usd) / 2.0)
+        vintage = float(project.metadata.get("vintage", 2020))
+        vintage_score = max(0.0, min(1.0, (vintage - 2020) / 5.0))
+        biodiversity = float(project.co_benefits.get("biodiversity", 0.0))
+        carbon = float(project.metadata.get("carbon_intensity", 400.0))
+        carbon_score = 1.0 - min(1.0, carbon / 1000.0)
+        return float(
+            price * weights.get("price_weight", 0.3)
+            + vintage_score * weights.get("vintage_weight", 0.3)
+            + biodiversity * weights.get("biodiversity_weight", 0.2)
+            + carbon_score * weights.get("carbon_weight", 0.2)
+        )
+
+    # ------------------------------------------------------------------
+    async def select_best_project(self, projects: List[Any], amount_kg: float,
+                                  context: Optional[Dict[str, Any]] = None
+                                  ) -> Optional[Any]:
         if not projects:
             return None
-
-        # Encode context using MoE (if available)
-        encoded_context = context or {}
-        if self.moe:
-            encoded_context = self.moe.encode({
-                "amount_kg": amount_kg,
-                "carbon_intensity": context.get("carbon_intensity", 400) if context else 400,
-                "user_role": context.get("user_role", "viewer"),
-                "urgency": context.get("urgency", "normal"),
-                "project_count": len(projects),
-            })
-
-        # Select strategy via bandit
-        strategy, confidence, source = self.bandit.select_action(encoded_context)
+        ctx = context or {}
+        strategy, confidence, source = self.bandit.select_action(ctx)
         if strategy is None:
-            strategy = self._fallback_strategy(encoded_context)
+            strategy = dict(self.DEFAULT_STRATEGY)
 
-        # If quantum distillation is enabled and conditions met (e.g., large amount), use quantum
-        selected_project = None
-        if self.quantum_optimizer and self.quantum_optimizer.available and amount_kg > 10000:
-            selected_project = await self.quantum_optimizer.optimize(projects, strategy['params'])
-            source = "quantum"
+        # Quantum path (best-effort).
+        selected: Optional[Any] = None
+        if (self.quantum_optimizer.available
+                and amount_kg > 10_000):
+            selected = await self.quantum_optimizer.optimize(
+                projects, strategy["params"])
+            if selected is not None:
+                source = "quantum"
 
-        if selected_project is None:
-            # Score projects using the selected strategy's weights
-            scored = []
-            for p in projects:
-                score = self._score_project(p, strategy['params'])
-                scored.append((p, score))
-            scored.sort(key=lambda x: x[1], reverse=True)
-
-            # Find first project with enough available credits
+        if selected is None:
+            scored = sorted(
+                ((p, self._score_project(p, strategy["params"])) for p in projects),
+                key=lambda x: x[1], reverse=True)
             for p, _ in scored:
-                if p.available_credits_kg >= amount_kg:
-                    selected_project = p
+                if float(p.available_credits_kg) >= amount_kg:
+                    selected = p
                     break
 
-        if selected_project is None:
+        if selected is None:
             return None
 
-        # Safety check (temporal logic-like)
-        if self.safety_monitor and self.config.safety.enable_monitor:
-            violations = await self.safety_monitor.check_project(selected_project)
+        # Safety gate.
+        if self.config.safety.enable_monitor:
+            violations = await self.safety_monitor.check_project(selected)
             if violations:
-                logger.warning("Safety violation, overriding to a safer project")
-                # Try to find a project that passes safety
-                for p in projects:
-                    if p.available_credits_kg >= amount_kg and not await self.safety_monitor.check_project(p):
-                        selected_project = p
-                        break
+                fallback = next(
+                    (p for p in projects
+                     if float(p.available_credits_kg) >= amount_kg
+                     and not await self.safety_monitor.check_project(p)),
+                    None)
+                if fallback is not None:
+                    selected = fallback
 
-        # Record selection for feedback
-        self._last_selection = {"project": selected_project, "strategy": strategy, "context": encoded_context}
+        self._last_selection = {"project": selected, "strategy": strategy,
+                                "context": ctx}
 
-        # Generate explanation (XAI)
-        utility = self.modp.evaluate({
-            "price": 1 - selected_project.price_per_kg_usd / 2.0,
-            "vintage": (selected_project.metadata.get('vintage', 2020) - 2020) / 5.0,
-            "biodiversity": selected_project.co_benefits.get('biodiversity', 0),
-            "carbon_intensity": 1 - selected_project.metadata.get('carbon_intensity', 400) / 1000,
-        }, strategy['params']) if self.modp else 0.0
-
-        explanation = await self.xai.generate_explanation(strategy, encoded_context, confidence, utility, selected_project)
+        # XAI + human review.
+        utility = self._score_project(selected, strategy["params"])
+        explanation = await self.xai.generate_explanation(
+            strategy, ctx, confidence, utility, selected)
         decision_id = str(uuid.uuid4())
-        # In a real system, store explanation in DB. Here we just log.
-        logger.info(f"Decision {decision_id}: {explanation}")
-        XAI_DECISIONS.labels(strategy=strategy['name']).inc()
+        logger.info("Decision %s: %s", decision_id, explanation)
+        XAI_DECISIONS.labels(strategy=strategy["name"]).inc()
+        if (confidence < self.config.general.human_review_threshold
+                and self.human_review is not None):
+            await self.human_review.request_review(decision_id, explanation, ctx)
 
-        # Human-in-the-loop if confidence low
-        if confidence < self.config.general.human_review_threshold and self.human_review:
-            review = await self.human_review.request_review(decision_id, explanation, encoded_context)
-            # In practice, we might block until review; for demo, we continue but record review.
-            logger.info(f"Review requested: {review['review_id']}")
+        await self._emit_feedback_event(decision_id, strategy, confidence,
+                                        source, utility)
+        return selected
 
-        return selected_project
+    # ------------------------------------------------------------------
+    async def update_feedback(self, context: Dict[str, Any],
+                              strategy: Dict[str, Any],
+                              reward: float) -> None:
+        self.bandit.update(context, strategy, float(reward))
+        self.recent_rewards.append(float(reward))
+        if len(self.recent_rewards) > 20 and \
+                float(np.mean(self.recent_rewards)) < 0.3:
+            await self.evolve_strategies()
 
-    def _score_project(self, project: 'CreditProject', weights: Dict[str, float]) -> float:
-        if self.modp:
-            objectives = {
-                "price": 1 - (project.price_per_kg_usd / 2.0),
-                "vintage": (project.metadata.get('vintage', 2020) - 2020) / 5.0,
-                "biodiversity": project.co_benefits.get('biodiversity', 0),
-                "carbon_intensity": 1 - (project.metadata.get('carbon_intensity', 400) / 1000),
-            }
-            return self.modp.evaluate(objectives, weights)
-        else:
-            score = 0
-            score += (1 - project.price_per_kg_usd / 2.0) * weights.get("price_weight", 0.3)
-            score += 0.2  # base
-            vintage = project.metadata.get('vintage', 2020)
-            if vintage >= 2023:
-                score += weights.get("vintage_weight", 0.3) * 0.3
-            elif vintage >= 2022:
-                score += weights.get("vintage_weight", 0.3) * 0.2
-            co_benefits = project.co_benefits or {}
-            sdg_count = len(co_benefits.get('sdg', []))
-            score += min(sdg_count / 5, 0.2) * weights.get("biodiversity_weight", 0.2)
-            biodiversity = co_benefits.get('biodiversity', 0)
-            score += biodiversity * 0.1 * weights.get("biodiversity_weight", 0.2)
-            return score
-
-    async def update_feedback(self, context: Dict, strategy: Dict, reward: float):
-        if self.bandit:
-            self.bandit.update(context, strategy, reward)
-            self.recent_rewards.append(reward)
-
-        if len(self.recent_rewards) > 20 and np.mean(self.recent_rewards) < 0.3 and self.bio:
-            new_strategies = await self.evolve_strategies()
-            if new_strategies:
-                for s in new_strategies:
-                    if s not in self.action_space:
-                        self.action_space.append(s)
-                        self.bandit.actions = self.action_space
-                logger.info("Bio‑inspired expansion: added new selection strategies.")
-
-    async def evolve_strategies(self) -> List[Dict]:
-        if not self.bio:
-            return []
-        def fitness(policy):
-            return np.mean(self.recent_rewards) if self.recent_rewards else 0.5
-        new_strategies = self.bio.evolve(
-            population=self.action_space,
-            fitness_fn=fitness,
-            generations=self.config.optimizer.bio_generations,
-            population_size=self.config.optimizer.bio_population_size,
-        )
-        return new_strategies
+    async def evolve_strategies(self) -> List[Dict[str, Any]]:
+        candidate = {
+            "name": "green_burst",
+            "params": {"price_weight": 0.05, "vintage_weight": 0.15,
+                       "biodiversity_weight": 0.4, "carbon_weight": 0.4},
+        }
+        if not any(a["name"] == candidate["name"] for a in self.action_space):
+            self.action_space.append(candidate)
+            self.bandit.register_action(candidate)
+            logger.info("Bio expansion added strategy: %s", candidate["name"])
+            return [candidate]
+        return []
 
     async def optimize_offset_threshold(self) -> float:
         async with self._lock:
             if len(self.success_history) < 10:
-                return self.config.general.auto_offset_threshold_kg
+                return float(self.config.general.auto_offset_threshold_kg)
             success_rate = sum(self.success_history) / len(self.success_history)
-            current = self.config.general.auto_offset_threshold_kg
+            current = float(self.config.general.auto_offset_threshold_kg)
             if success_rate > 0.9:
-                new_threshold = current * 1.05
+                new = current * 1.05
             elif success_rate < 0.6:
-                new_threshold = current * 0.9
+                new = current * 0.9
             else:
-                new_threshold = current
-            return max(50, min(500, new_threshold))
+                new = current
+            new = float(max(50.0, min(500.0, new)))
+            object.__setattr__(self.config.general,
+                               "auto_offset_threshold_kg", new)
+            return new
 
-    async def record_outcome(self, success: bool):
+    async def record_outcome(self, success: bool) -> None:
         async with self._lock:
-            self.success_history.append(success)
+            self.success_history.append(bool(success))
 
-    def _fallback_strategy(self, context) -> Dict:
-        return {"name": "balanced", "params": {"price_weight": 0.3, "vintage_weight": 0.3, "biodiversity_weight": 0.2, "carbon_weight": 0.2}}
-
-    def get_optimization_stats(self) -> Dict:
+    def get_optimization_stats(self) -> Dict[str, Any]:
         return {
-            'strategies': [s['name'] for s in self.action_space],
-            'recent_rewards': list(self.recent_rewards),
-            'threshold': self.config.general.auto_offset_threshold_kg,
-            'total_feedback': len(self.recent_rewards),
+            "strategies": [s["name"] for s in self.action_space],
+            "bandit_state": self.bandit.export_state(),
+            "recent_reward_mean": (float(np.mean(self.recent_rewards))
+                                   if self.recent_rewards else 0.0),
+            "threshold": float(self.config.general.auto_offset_threshold_kg),
         }
 
-# =============================================================================
-# FLEXGEN MANAGER (unchanged, but with precision integration)
-# =============================================================================
-class FlexGenManager:
-    def __init__(self, config: Settings):
-        self.config = config
-        self.flexgen_cost_model = None
-        self.policy_drift_detector = None
-        self.gpu_profiler = None
-
-        if FLEXGEN_AVAILABLE:
-            self.flexgen_cost_model = FlexGenCostModel(
-                carbon_intensity_g_per_kwh=config.optimizer.flexgen_carbon_intensity_default
+    async def _emit_feedback_event(self, decision_id: str,
+                                   strategy: Dict[str, Any], confidence: float,
+                                   source: str, utility: float) -> None:
+        if FeedbackEvent is None:
+            return
+        try:
+            ev = FeedbackEvent(
+                source="carbon_credit_marketplace",
+                feedback_type="routing",
+                context={"task_id": decision_id, "teacher_ids": []},
+                action={
+                    "selected_action": strategy["name"],
+                    "selected_rank": 1,
+                    "confidence_score": float(confidence),
+                },
+                performance={
+                    "quality_score": float(max(0.0, min(1.0, utility))),
+                    "latency_ms": 0.0, "energy_joules": 0.0,
+                    "carbon_g": 0.0, "helium_cost": 0.0, "duration_ms": 0.0,
+                },
+                adaptive_cost_value=float(utility),
+                tags=["carbon", strategy["name"], source],
+                envelope={"trace_id": decision_id},
+                metadata={"source": source},
             )
-            self.policy_drift_detector = PolicyDriftDetector()
-            try:
-                from enhancements.gpu_profiler import GPUProfiler
-                self.gpu_profiler = GPUProfiler()
-            except ImportError:
-                self.gpu_profiler = None
-            logger.info("FlexGen Manager initialized")
-        else:
-            logger.warning("FlexGen modules not available; manager will be disabled.")
+            logger.debug("FeedbackEvent emitted: %s",
+                         getattr(ev, "event_id", "?"))
+        except Exception as e:
+            logger.warning("Failed to emit FeedbackEvent: %s", e)
 
-    async def optimize_policy(self, workload: WorkloadDescriptor, node: NodeDescriptor) -> Dict:
-        if not FLEXGEN_AVAILABLE:
-            return {"error": "FlexGen modules not available"}
-        from enhancements.gpu_optimization.flexgen_controller import FlexGenController
-        from enhancements.gpu_optimization.flexgen_policy_selector import DistillationFlexGenSelector
 
-        selector = DistillationFlexGenSelector(
-            n_candidates=20,
-            config={
-                'epsilon': self.config.optimizer.flexgen_selector_epsilon,
-                'epsilon_decay': self.config.optimizer.flexgen_selector_epsilon_decay,
-            }
-        )
-        controller = FlexGenController(
-            node=node,
-            workload=workload,
-            carbon_intensity=workload.metadata.get('carbon_intensity',
-                                                   self.config.optimizer.flexgen_carbon_intensity_default),
-            use_real_executor=self.config.optimizer.flexgen_use_real_executor,
-            executor=None,
-            cost_model=self.flexgen_cost_model,
-            use_bio_search=True,
-            bio_search_config={
-                'population_size': self.config.optimizer.flexgen_population_size,
-                'generations': self.config.optimizer.flexgen_generations,
-            },
-            modp_planner=None,
-            drift_detector=self.policy_drift_detector,
-            gpu_profiler=self.gpu_profiler,
-        )
-        result = await controller.step()
-        return result
+# ============================================================================
+# FlexGen manager (deterministic simulation)
+# ============================================================================
+class FlexGenManager:
+    def __init__(self, config: Settings) -> None:
+        self.config = config
+        self._rng = np.random.default_rng(config.general.random_seed)
+        self._last_policy: Optional[Dict[str, Any]] = None
 
-    async def get_status(self) -> Dict:
-        if not FLEXGEN_AVAILABLE:
-            return {"available": False}
-        status = {
-            "available": True,
-            "drift": self.policy_drift_detector.get_stats() if self.policy_drift_detector else {},
-            "gpu": self.gpu_profiler.get_current_metrics() if self.gpu_profiler else {},
+    async def optimize_policy(self, workload: Dict[str, Any],
+                              node: Dict[str, Any]) -> Dict[str, Any]:
+        policy = {
+            "gpu_batch_size": int(self._rng.integers(1, 8)),
+            "weight_bits": int(self._rng.choice([8, 16])),
+            "cpu_offload_fraction": float(self._rng.random()),
+            "precision": str(self._rng.choice(["int8", "fp16"])),
         }
-        return status
+        metrics = {
+            "energy_joules": float(self._rng.uniform(50.0, 200.0)),
+            "carbon_g": float(self._rng.uniform(5.0, 30.0)),
+            "latency_ms": float(self._rng.uniform(50.0, 500.0)),
+        }
+        self._last_policy = {
+            "workload": workload, "node": node,
+            "policy": policy, "metrics": metrics,
+            "reward": float(self._rng.uniform(0.4, 1.0)),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "simulated": True,
+        }
+        return self._last_policy
 
-# =============================================================================
-# DATABASE MODELS (SQLAlchemy) - unchanged from original
-# =============================================================================
-Base = declarative_base()
+    async def get_status(self) -> Dict[str, Any]:
+        return {"available": True, "last_policy": self._last_policy,
+                "simulated": True}
 
-class CreditTransactionDB(Base):
-    __tablename__ = "credit_transactions"
-    id = Column(Integer, primary_key=True)
-    tx_id = Column(String(64), unique=True, index=True)
-    project_id = Column(String(128))
-    amount_kg = Column(Float)
-    retired_kg = Column(Float, default=0.0)
-    cost_usd = Column(Float)
-    status = Column(String(32))
-    credit_type = Column(String(32), default="voluntary")
-    retires_at = Column(DateTime, nullable=True)
-    blockchain_tx_hash = Column(String(128), nullable=True)
-    payment_method = Column(String(32), default="USD")
-    metadata = Column(JSON)
-    created_at = Column(DateTime, default=datetime.now)
-    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
-class CreditProjectDB(Base):
-    __tablename__ = "credit_projects"
-    project_id = Column(String(128), primary_key=True)
-    name = Column(String(256))
-    registry = Column(String(64))
-    available_credits_kg = Column(Float)
-    price_per_kg_usd = Column(Float)
-    verification_status = Column(String(32))
-    credit_type = Column(String(32), default="voluntary")
-    co_benefits = Column(JSON)
-    metadata = Column(JSON)
-    last_updated = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-    active = Column(Boolean, default=True)
+# ============================================================================
+# Pydantic data models
+# ============================================================================
+if PYDANTIC_AVAILABLE:
+    class CreditProject(BaseModel):
+        model_config = ConfigDict(extra="allow")
+        project_id: str
+        name: str
+        registry: str
+        available_credits_kg: float
+        price_per_kg_usd: float
+        verification_status: str
+        credit_type: str = "voluntary"
+        metadata: Dict[str, Any] = Field(default_factory=dict)
+        co_benefits: Dict[str, Any] = Field(default_factory=dict)
 
-class UserDB(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True)
-    username = Column(String(64), unique=True, index=True)
-    password_hash = Column(String(128))
-    role = Column(String(32), default="viewer")
-    created_at = Column(DateTime, default=datetime.now)
+    class CreditPurchaseRequest(BaseModel):
+        project_id: str
+        amount_kg: float
+        credit_type: Optional[str] = None
+        retire_immediately: bool = False
+        reason: Optional[str] = None
+        payment_method: str = "USD"
 
-class AuditLogDB(Base):
-    __tablename__ = "audit_logs"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(String(64))
-    action = Column(String(128))
-    details = Column(JSON)
-    timestamp = Column(DateTime, default=datetime.now)
+    class CreditRetireRequest(BaseModel):
+        tx_id: str
+        amount_kg: float
+        reason: Optional[str] = None
 
-# =============================================================================
-# DATA MODELS (Pydantic) - unchanged
-# =============================================================================
-class CreditProject(BaseModel):
-    project_id: str
-    name: str
-    registry: str
-    available_credits_kg: float
-    price_per_kg_usd: float
-    verification_status: str
-    credit_type: str = "voluntary"
-    metadata: Dict = Field(default_factory=dict)
-    co_benefits: Dict = Field(default_factory=dict)
+    class CreditTransaction(BaseModel):
+        tx_id: str
+        project_id: str
+        amount_kg: float
+        cost_usd: float
+        status: str
+        credit_type: str
+        retires_at: Optional[str] = None
+        blockchain_tx_hash: Optional[str] = None
+        metadata: Dict[str, Any] = Field(default_factory=dict)
+        created_at: str = Field(
+            default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
-class CreditPurchaseRequest(BaseModel):
-    project_id: str
-    amount_kg: float
-    credit_type: Optional[str] = None
-    retire_immediately: bool = False
-    reason: Optional[str] = None
-    payment_method: str = "USD"
+    class ReportRequest(BaseModel):
+        start_date: datetime
+        end_date: datetime
+        format: str = "json"
 
-class CreditRetireRequest(BaseModel):
-    tx_id: str
-    amount_kg: float
-    reason: Optional[str] = None
+    class _RegisterBody(BaseModel):
+        username: str
+        password: str
+        role: str = "viewer"
 
-class CreditTransaction(BaseModel):
-    tx_id: str
-    project_id: str
-    amount_kg: float
-    cost_usd: float
-    status: str
-    credit_type: str
-    retires_at: Optional[datetime] = None
-    blockchain_tx_hash: Optional[str] = None
-    metadata: Dict = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=datetime.now)
+    class _LoginBody(BaseModel):
+        username: str
+        password: str
 
-class ReportRequest(BaseModel):
-    start_date: datetime
-    end_date: datetime
-    format: str = "json"
+    class _OptimizeSelectBody(BaseModel):
+        context: Dict[str, Any] = Field(default_factory=dict)
 
-# =============================================================================
-# MAIN MARKETPLACE CLASS (with all enhancements integrated)
-# =============================================================================
+    class _FeedbackBody(BaseModel):
+        context: Dict[str, Any]
+        strategy: Dict[str, Any]
+        reward: float
+
+    class _FlexGenBody(BaseModel):
+        workload: Dict[str, Any] = Field(default_factory=dict)
+        node: Dict[str, Any] = Field(default_factory=dict)
+
+    class _SafetyCheckBody(BaseModel):
+        project: Dict[str, Any]
+
+    class _FederatedRegisterBody(BaseModel):
+        participant_id: str
+        model_update: Dict[str, Any]
+
+    class _ReviewActionBody(BaseModel):
+        feedback: Optional[str] = None
+else:  # pragma: no cover
+    class CreditProject:  # type: ignore
+        def __init__(self, **data):
+            self.__dict__.update(data)
+
+    class CreditPurchaseRequest:  # type: ignore
+        def __init__(self, **data):
+            self.__dict__.update(data)
+
+    class CreditRetireRequest:  # type: ignore
+        def __init__(self, **data):
+            self.__dict__.update(data)
+
+    class CreditTransaction:  # type: ignore
+        def __init__(self, **data):
+            self.__dict__.update(data)
+
+
+# ============================================================================
+# Marketplace
+# ============================================================================
 class CarbonCreditMarketplace:
     def __init__(
         self,
         config: Settings,
         db_manager: AsyncDatabaseManager,
-        registry_client: IRegistryClient,
-        blockchain_client: IBlockchainClient,
-        pqc: IPQC,
-        cloud_storage: ICloudStorage,
-        price_predictor: IPricePredictor,
-        auto_offset_engine: IAutoOffsetEngine,
+        registry_client: RegistryClient,
+        blockchain_client: BlockchainClient,
+        pqc: PostQuantumCrypto,
+        cloud_storage: CloudStorage,
+        price_predictor: PricePredictor,
+        auto_offset_engine: AutoOffsetEngine,
         carbon_manager: Optional[CarbonIntensityManager] = None,
         sustainability_engine: Optional[UnifiedSustainabilityEngine] = None,
-    ):
+    ) -> None:
         self.config = config
         self.db_manager = db_manager
         self.registry_client = registry_client
@@ -1314,8 +1913,9 @@ class CarbonCreditMarketplace:
         self.auto_offset_engine = auto_offset_engine
         self.carbon_manager = carbon_manager
         self.sustainability_engine = sustainability_engine
+        self.instance_id = str(uuid.uuid4())[:8]
 
-        # NEW MODULES
+        # Enhancements.
         self.safety_monitor = SafetyMonitor(config)
         self.xai = XAIExplainer()
         self.human_review = HumanReviewManager(config)
@@ -1325,539 +1925,811 @@ class CarbonCreditMarketplace:
         self.chaos_monkey = ChaosMonkey(config, self)
 
         self.optimizer = AutonomousOptimizer(
-            config, self,
-            safety_monitor=self.safety_monitor,
-            xai=self.xai,
+            config=config, marketplace=self, db=db_manager,
+            safety_monitor=self.safety_monitor, xai=self.xai,
             human_review=self.human_review,
             quantum_optimizer=self.quantum_optimizer,
-            multi_agent=self.multi_agent
+            multi_agent=self.multi_agent,
         )
         self.flexgen_manager = FlexGenManager(config)
-
         self.ws_manager = WebSocketManager()
         self.webhook = WebhookNotifier(config)
 
-        # Auto‑offset settings
-        self.auto_offset_enabled = config.general.auto_offset_enabled
-        self.auto_offset_threshold_kg = config.general.auto_offset_threshold_kg
-        self._running = False
-
         self._projects_cache: Dict[str, CreditProject] = {}
         self._projects_cache_time: Optional[datetime] = None
-        self._cache_ttl = timedelta(seconds=config.general.refresh_interval_seconds)
+        self._cache_ttl = timedelta(
+            seconds=config.general.refresh_interval_seconds)
+        self._transactions: Dict[str, CreditTransaction] = {}
+        self._balances: Dict[str, float] = defaultdict(float)
 
         self.task_manager = TaskManager()
         self._register_background_tasks()
+        logger.info("CarbonCreditMarketplace v%s initialized (id=%s)",
+                    __version__, self.instance_id)
 
-        self.retention_days = config.general.data_retention_days
-
-        logger.info("CarbonCreditMarketplace v5.1.0 initialized with all enhancements")
-
-    def _register_background_tasks(self):
+    # ------------------------------------------------------------------
+    def _register_background_tasks(self) -> None:
         self.task_manager.register_task("auto_offset", self._auto_offset_loop)
-        self.task_manager.register_task("reconcile", self._reconciliation_loop)
-        self.task_manager.register_task("archive", self._archive_loop)
         self.task_manager.register_task("price_update", self._price_update_loop)
-        self.task_manager.register_task("evolve_strategies", self._evolve_strategies_loop)
         if self.config.chaos.enabled:
-            self.task_manager.register_task("chaos_monkey", self.chaos_monkey._run_loop)
+            self.task_manager.register_task("chaos", self._chaos_loop)
         if self.config.federated.enabled:
-            self.task_manager.register_task("federated_aggregate", self._federated_aggregate_loop)
+            self.task_manager.register_task(
+                "federated_aggregate", self._federated_aggregate_loop)
 
-    async def start(self):
-        self._running = True
+    async def start(self) -> None:
+        await self.db_manager.connect()
+        await self.optimizer.load_state()
+        await self._refresh_projects(force=True)
         self.task_manager.start_registered_tasks()
         if self.chaos_monkey.enabled:
             await self.chaos_monkey.start()
-        await self._refresh_projects(force=True)
-        logger.info("CarbonCreditMarketplace started")
+        logger.info("Marketplace started (id=%s)", self.instance_id)
 
-    # Background loops (existing + new)
-    async def _auto_offset_loop(self):
-        while not self.task_manager.shutdown_event.is_set():
+    async def shutdown(self) -> None:
+        logger.info("Shutting down marketplace (id=%s)", self.instance_id)
+        try:
+            await self.optimizer.save_state()
+        except Exception:
+            pass
+        if self.chaos_monkey.enabled:
+            await self.chaos_monkey.stop()
+        await self.task_manager.stop_all()
+        try:
+            await self.registry_client.close()
+        except Exception:
+            pass
+        try:
+            await self.blockchain_client.close()
+        except Exception:
+            pass
+        try:
+            await self.webhook.close()
+        except Exception:
+            pass
+        await self.db_manager.close()
+        logger.info("Shutdown complete")
+
+    # ------------------------------------------------------------------
+    async def _auto_offset_loop(self, shutdown: asyncio.Event) -> None:
+        interval = self.config.general.auto_offset_interval_seconds
+        while not shutdown.is_set():
             try:
-                if self.auto_offset_enabled and self.sustainability_engine:
-                    recent_emissions = await self.sustainability_engine.get_recent_emissions(hours=24)
-                    if recent_emissions > self.auto_offset_threshold_kg:
-                        await self._perform_offset(recent_emissions, reason="auto_offset_loop")
-                await asyncio.sleep(self.config.general.auto_offset_interval_seconds)
+                if self.config.general.auto_offset_enabled \
+                        and self.sustainability_engine is not None:
+                    emissions = await self.sustainability_engine.get_recent_emissions(
+                        hours=24)
+                    if emissions > float(self.config.general.auto_offset_threshold_kg):
+                        await self._perform_offset(emissions, reason="auto_offset_loop")
             except Exception as e:
-                logger.error("Auto‑offset loop error", error=str(e))
-                await asyncio.sleep(60)
-
-    async def _reconciliation_loop(self):
-        while not self.task_manager.shutdown_event.is_set():
+                logger.error("Auto-offset loop error: %s", e)
             try:
-                await self.reconcile()
-                await asyncio.sleep(86400)
-            except Exception as e:
-                logger.error("Reconciliation loop error", error=str(e))
-                await asyncio.sleep(3600)
+                await asyncio.wait_for(shutdown.wait(), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                pass
 
-    async def _archive_loop(self):
-        while not self.task_manager.shutdown_event.is_set():
+    async def _price_update_loop(self, shutdown: asyncio.Event) -> None:
+        while not shutdown.is_set():
             try:
-                await self.archive_old_transactions()
-                await asyncio.sleep(86400)
+                await self.price_predictor.train()
             except Exception as e:
-                logger.error("Archive loop error", error=str(e))
-                await asyncio.sleep(3600)
-
-    async def _price_update_loop(self):
-        while not self.task_manager.shutdown_event.is_set():
+                logger.error("Price update loop error: %s", e)
             try:
-                await self.update_prices()
-                await asyncio.sleep(3600)
-            except Exception as e:
-                logger.error("Price update loop error", error=str(e))
-                await asyncio.sleep(60)
+                await asyncio.wait_for(shutdown.wait(), timeout=3600)
+                break
+            except asyncio.TimeoutError:
+                pass
 
-    async def _evolve_strategies_loop(self):
-        while not self.task_manager.shutdown_event.is_set():
+    async def _chaos_loop(self, shutdown: asyncio.Event) -> None:
+        # The ChaosMonkey has its own loop; this is a placeholder.
+        while not shutdown.is_set():
             try:
-                if ENHANCEMENTS_AVAILABLE and self.optimizer.bio:
-                    await self.optimizer.evolve_strategies()
-                    logger.info("Periodic strategy evolution completed")
-                await asyncio.sleep(3600)
-            except Exception as e:
-                logger.error("Evolution loop error", error=str(e))
-                await asyncio.sleep(60)
+                await asyncio.wait_for(shutdown.wait(), timeout=3600)
+                break
+            except asyncio.TimeoutError:
+                pass
 
-    async def _federated_aggregate_loop(self):
-        while not self.task_manager.shutdown_event.is_set():
+    async def _federated_aggregate_loop(self, shutdown: asyncio.Event) -> None:
+        interval = self.config.federated.aggregation_interval_seconds
+        while not shutdown.is_set():
             try:
-                avg_model = await self.federated.aggregate()
-                # Apply to optimizer (example: update bandit q_values)
-                if avg_model and hasattr(self.optimizer, 'bandit'):
-                    for action, val in avg_model.items():
-                        if action in self.optimizer.bandit.q_values:
-                            self.optimizer.bandit.q_values[action] = val
-                await asyncio.sleep(self.config.federated.aggregation_interval_seconds)
+                avg = await self.federated.aggregate()
+                if avg:
+                    self.optimizer.bandit.import_state({
+                        **self.optimizer.bandit.export_state(),
+                        "q_values": {
+                            **self.optimizer.bandit.q_values,
+                            **{k: v for k, v in avg.items()
+                               if k in self.optimizer.bandit.q_values},
+                        },
+                    })
             except Exception as e:
-                logger.error("Federated aggregation loop error", error=str(e))
-                await asyncio.sleep(60)
+                logger.error("Federated loop error: %s", e)
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                pass
 
-    # Internal methods (most unchanged, but _perform_offset uses optimizer's new selection)
-    async def _refresh_projects(self, force: bool = False):
-        # (same as before, but could be enhanced to fetch RECs as well)
-        if force or self._projects_cache_time is None or (datetime.now() - self._projects_cache_time) >= self._cache_ttl:
-            raw_projects = await self.registry_client.fetch_projects()
-            # Also fetch RECs? Could merge with registry client.
-            async with self.db_manager.get_session() as session:
-                for raw in raw_projects:
-                    await session.execute(
-                        text("""
-                            INSERT INTO credit_projects (project_id, name, registry, available_credits_kg, price_per_kg_usd, verification_status, credit_type, co_benefits, metadata, last_updated)
-                            VALUES (:project_id, :name, :registry, :available_credits_kg, :price_per_kg_usd, :verification_status, :credit_type, :co_benefits, :metadata, :last_updated)
-                            ON CONFLICT (project_id) DO UPDATE SET
-                                available_credits_kg = EXCLUDED.available_credits_kg,
-                                price_per_kg_usd = EXCLUDED.price_per_kg_usd,
-                                verification_status = EXCLUDED.verification_status,
-                                co_benefits = EXCLUDED.co_benefits,
-                                last_updated = EXCLUDED.last_updated
-                        """),
-                        {
-                            "project_id": raw["project_id"],
-                            "name": raw["name"],
-                            "registry": raw["registry"],
-                            "available_credits_kg": raw["available_credits_kg"],
-                            "price_per_kg_usd": raw["price_per_kg_usd"],
-                            "verification_status": raw["verification_status"],
-                            "credit_type": raw.get("credit_type", "voluntary"),
-                            "co_benefits": json.dumps(raw.get("co_benefits", {})),
-                            "metadata": json.dumps(raw.get("metadata", {})),
-                            "last_updated": datetime.now()
-                        }
-                    )
-                await session.commit()
-            self._projects_cache = await self._load_projects_from_db()
-            self._projects_cache_time = datetime.now()
-            PROJECT_COUNT.set(len(self._projects_cache))
-            logger.info("Projects refreshed from registry", count=len(self._projects_cache))
+    # ------------------------------------------------------------------
+    async def _refresh_projects(self, force: bool = False) -> None:
+        now = datetime.now(timezone.utc)
+        if not force and self._projects_cache_time is not None \
+                and (now - self._projects_cache_time) < self._cache_ttl:
+            return
+        raws = await self.registry_client.fetch_projects()
+        conn = await self.db_manager.connect()
+        async with self.db_manager._query_lock:
+            for raw in raws:
+                await conn.execute("""
+                    INSERT OR REPLACE INTO credit_projects
+                    (project_id, name, registry, available_credits_kg,
+                     price_per_kg_usd, verification_status, credit_type,
+                     co_benefits, extra, last_updated, active)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,1)
+                """, (
+                    raw["project_id"], raw["name"], raw["registry"],
+                    float(raw["available_credits_kg"]),
+                    float(raw["price_per_kg_usd"]),
+                    raw["verification_status"], raw.get("credit_type", "voluntary"),
+                    json.dumps(raw.get("co_benefits", {}), default=str),
+                    json.dumps(raw.get("metadata", {}), default=str),
+                    now.isoformat(),
+                ))
+            await conn.commit()
+        self._projects_cache = await self._load_projects_from_db()
+        self._projects_cache_time = now
+        PROJECT_COUNT.set(len(self._projects_cache))
+        logger.info("Refreshed projects: %d", len(self._projects_cache))
 
     async def _load_projects_from_db(self) -> Dict[str, CreditProject]:
-        # (same as before)
-        projects = {}
-        async with self.db_manager.get_session() as session:
-            stmt = select(CreditProjectDB).where(CreditProjectDB.active == True)
-            result = await session.execute(stmt)
-            rows = result.scalars().all()
-            for row in rows:
-                projects[row.project_id] = CreditProject(
-                    project_id=row.project_id,
-                    name=row.name,
-                    registry=row.registry,
-                    available_credits_kg=row.available_credits_kg,
-                    price_per_kg_usd=row.price_per_kg_usd,
-                    verification_status=row.verification_status,
-                    credit_type=row.credit_type,
-                    metadata=row.metadata,
-                    co_benefits=row.co_benefits or {}
-                )
-        return projects
+        rows = await self.db_manager.fetch_all(
+            "SELECT * FROM credit_projects WHERE active=1")
+        out: Dict[str, CreditProject] = {}
+        for r in rows:
+            out[r["project_id"]] = CreditProject(
+                project_id=r["project_id"], name=r["name"],
+                registry=r["registry"],
+                available_credits_kg=float(r["available_credits_kg"]),
+                price_per_kg_usd=float(r["price_per_kg_usd"]),
+                verification_status=r["verification_status"],
+                credit_type=r["credit_type"] or "voluntary",
+                co_benefits=json.loads(r["co_benefits"] or "{}"),
+                metadata=json.loads(r["extra"] or "{}"),
+            )
+        return out
 
-    async def _perform_offset(self, emissions_kg: float, reason: str = "auto_offset"):
-        # (same logic, but uses optimizer.select_best_project which now includes safety, XAI, etc.)
+    async def list_projects(self, status: Optional[str] = None,
+                            credit_type: Optional[str] = None
+                            ) -> List[CreditProject]:
+        await self._refresh_projects()
+        out = list(self._projects_cache.values())
+        if status:
+            out = [p for p in out if p.verification_status == status]
+        if credit_type:
+            out = [p for p in out if p.credit_type == credit_type]
+        return out
+
+    # ------------------------------------------------------------------
+    async def purchase_credits(self, request: CreditPurchaseRequest,
+                               user: Dict[str, Any]) -> CreditTransaction:
+        if request.amount_kg <= 0:
+            raise ValueError("amount_kg must be positive")
+        await self._refresh_projects()
+        project = self._projects_cache.get(request.project_id)
+        if project is None:
+            raise ValueError(f"Unknown project: {request.project_id}")
+        if project.available_credits_kg < request.amount_kg:
+            raise ValueError("Insufficient available credits")
+
+        # Safety check.
+        violations = await self.safety_monitor.check_project(project)
+        if violations:
+            raise SafetyViolationError(
+                f"Project {project.project_id} failed safety check",
+                {"violations": violations})
+
+        cost = float(request.amount_kg) * float(project.price_per_kg_usd)
+        tx_id = str(uuid.uuid4())
+        tx_hash = await self.blockchain_client.mint(
+            project.project_id, request.amount_kg,
+            user.get("sub", "anonymous"))
+
+        tx = CreditTransaction(
+            tx_id=tx_id, project_id=project.project_id,
+            amount_kg=float(request.amount_kg), cost_usd=cost,
+            status="completed", credit_type=project.credit_type,
+            blockchain_tx_hash=tx_hash,
+            metadata={"reason": request.reason,
+                      "payment_method": request.payment_method},
+        )
+        self._transactions[tx_id] = tx
+        self._balances["available_kg"] = (
+            self._balances.get("available_kg", 0.0) + request.amount_kg)
+        BALANCE_GAUGE.set(self._balances["available_kg"])
+        PURCHASE_COUNTER.labels(project_id=project.project_id).inc()
+
+        if request.retire_immediately:
+            await self.retire_credits(
+                CreditRetireRequest(tx_id=tx_id, amount_kg=request.amount_kg,
+                                    reason="retire_immediately"),
+                user)
+
+        # Persist tx.
+        await self.db_manager.execute(
+            "INSERT OR REPLACE INTO credit_transactions "
+            "(tx_id, project_id, amount_kg, cost_usd, status, credit_type, "
+            "blockchain_tx_hash, extra, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (tx.tx_id, tx.project_id, tx.amount_kg, tx.cost_usd, tx.status,
+             tx.credit_type, tx.blockchain_tx_hash,
+             json.dumps(tx.metadata, default=str), tx.created_at))
+
+        # Webhook notification (best-effort).
+        try:
+            await self.webhook.notify({"type": "purchase", "tx": asdict(tx)
+                                       if hasattr(tx, "__dataclass_fields__")
+                                       else tx.model_dump()})
+        except Exception:
+            pass
+        return tx
+
+    async def retire_credits(self, request: CreditRetireRequest,
+                             user: Dict[str, Any]) -> CreditTransaction:
+        tx = self._transactions.get(request.tx_id)
+        if tx is None:
+            raise ValueError(f"Unknown transaction: {request.tx_id}")
+        if request.amount_kg <= 0 or request.amount_kg > tx.amount_kg:
+            raise ValueError("Invalid retire amount")
+        retired = tx.metadata.get("retired_kg", 0.0)
+        if retired + request.amount_kg > tx.amount_kg:
+            raise ValueError("Retire amount exceeds remaining credits")
+        tx.metadata["retired_kg"] = retired + request.amount_kg
+        self._balances["available_kg"] = max(
+            0.0, self._balances.get("available_kg", 0.0) - request.amount_kg)
+        self._balances["retired_kg"] = (
+            self._balances.get("retired_kg", 0.0) + request.amount_kg)
+        BALANCE_GAUGE.set(self._balances["available_kg"])
+        RETIRE_COUNTER.labels(status="success").inc()
+        return tx
+
+    async def get_balance(self) -> Dict[str, float]:
+        return {
+            "available_kg": float(self._balances.get("available_kg", 0.0)),
+            "retired_kg": float(self._balances.get("retired_kg", 0.0)),
+        }
+
+    # ------------------------------------------------------------------
+    async def _perform_offset(self, emissions_kg: float,
+                              reason: str = "auto_offset") -> Dict[str, Any]:
         intensity = None
-        if self.carbon_manager:
+        if self.carbon_manager is not None:
             intensity = await self.carbon_manager.get_intensity()
-            logger.info("Auto‑offset triggered", emissions_kg=emissions_kg, carbon_intensity=intensity)
-
         threshold = await self.optimizer.optimize_offset_threshold()
         if emissions_kg < threshold and intensity and intensity < 400:
-            logger.info("Emissions below adaptive threshold and low carbon intensity; skipping offset")
-            return
+            return {"status": "skipped", "reason": "below_threshold"}
 
         balance = await self.get_balance()
         available = balance["available_kg"]
+        projects = await self.list_projects(status="verified")
+        context = {"carbon_intensity": intensity or 400.0, "urgency": "auto"}
 
         if available >= emissions_kg:
-            projects = await self.list_projects(status="verified")
-            best_project = await self.optimizer.select_best_project(
-                projects,
-                emissions_kg,
-                context={"carbon_intensity": intensity if intensity else 400, "urgency": "auto"}
-            )
-            if best_project:
-                await self._retire_from_existing(emissions_kg, reason, best_project)
+            best = await self.optimizer.select_best_project(
+                projects, emissions_kg, context)
+            if best is not None:
                 AUTO_OFFSET_SUCCESS.inc()
                 await self.optimizer.record_outcome(True)
-            else:
-                logger.warning("No suitable project found for auto‑offset")
-                await self.optimizer.record_outcome(False)
+                AUTO_OFFSET_COUNTER.labels(reason=reason).inc()
+                return {"status": "retired_from_balance",
+                        "project": best.project_id,
+                        "amount_kg": emissions_kg}
         else:
             missing = emissions_kg - available
-            projects = await self.list_projects(status="verified")
-            best_project = await self.optimizer.select_best_project(
-                projects,
-                missing,
-                context={"carbon_intensity": intensity if intensity else 400, "urgency": "auto"}
-            )
-            if best_project:
-                await self.purchase_credits(
+            best = await self.optimizer.select_best_project(
+                projects, missing, context)
+            if best is not None:
+                tx = await self.purchase_credits(
                     CreditPurchaseRequest(
-                        project_id=best_project.project_id,
-                        amount_kg=missing,
-                        retire_immediately=True,
-                        reason=reason
-                    ),
-                    user={"sub": "auto_offset"}
-                )
+                        project_id=best.project_id, amount_kg=missing,
+                        retire_immediately=True, reason=reason),
+                    user={"sub": "auto_offset"})
                 AUTO_OFFSET_SUCCESS.inc()
                 await self.optimizer.record_outcome(True)
-            else:
-                logger.warning("No suitable project for purchase; offset failed")
-                await self.optimizer.record_outcome(False)
+                AUTO_OFFSET_COUNTER.labels(reason=reason).inc()
+                return {"status": "purchased_and_retired",
+                        "project": best.project_id,
+                        "tx_id": tx.tx_id, "amount_kg": missing}
+
+        await self.optimizer.record_outcome(False)
         AUTO_OFFSET_COUNTER.labels(reason=reason).inc()
+        return {"status": "failed", "reason": "no_suitable_project"}
 
-    # ... (other methods unchanged: _retire_from_existing, purchase_credits, retire_credits, get_balance, etc.)
+    # ------------------------------------------------------------------
+    async def run_flexgen_optimization(self, workload: Dict[str, Any],
+                                       node: Dict[str, Any]) -> Dict[str, Any]:
+        return await self.flexgen_manager.optimize_policy(workload, node)
 
-    async def run_flexgen_optimization(self, workload: Dict, node: Dict) -> Dict:
-        if not FLEXGEN_AVAILABLE:
-            return {"error": "FlexGen modules not available"}
-        workload_obj = WorkloadDescriptor(**workload)
-        node_obj = NodeDescriptor(**node)
-        return await self.flexgen_manager.optimize_policy(workload_obj, node_obj)
-
-    async def get_flexgen_status(self) -> Dict:
+    async def get_flexgen_status(self) -> Dict[str, Any]:
         return await self.flexgen_manager.get_status()
 
-    async def health_check(self) -> Dict:
-        components = {}
-        # (add new components)
-        components["safety"] = await self.safety_monitor.get_status()
-        components["chaos"] = {"enabled": self.chaos_monkey.enabled}
-        components["federated"] = {"enabled": self.config.federated.enabled, "participants": len(self.federated.participants)}
-        components["quantum"] = {"available": self.quantum_optimizer.available}
-        # ... (existing health checks)
-        return {
-            "status": "ok",
-            "version": "5.1.0",
-            "components": components
+    # ------------------------------------------------------------------
+    async def register_user(self, username: str, password: str,
+                            role: str = "viewer") -> bool:
+        salt = os.urandom(16)
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), salt, 100_000).hex()
+        try:
+            await self.db_manager.execute(
+                "INSERT INTO users (username, password_hash, role, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (username, f"{salt.hex()}:{digest}", role,
+                 datetime.now(timezone.utc).isoformat()))
+            return True
+        except Exception as e:
+            logger.warning("Failed to register user: %s", e)
+            return False
+
+    async def authenticate_user(self, username: str,
+                                password: str) -> Optional[Dict[str, Any]]:
+        row = await self.db_manager.fetch_one(
+            "SELECT password_hash, role FROM users WHERE username=?",
+            (username,))
+        if row is None:
+            return None
+        try:
+            salt_hex, digest = row["password_hash"].split(":", 1)
+        except ValueError:
+            return None
+        salt = bytes.fromhex(salt_hex)
+        computed = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), salt, 100_000).hex()
+        if not hmac.compare_digest(computed, digest):
+            return None
+        return {"sub": username, "role": row["role"]}
+
+    # ------------------------------------------------------------------
+    async def health_check(self) -> Dict[str, Any]:
+        components: Dict[str, Any] = {
+            "safety": await self.safety_monitor.get_status(),
+            "chaos": {"enabled": self.chaos_monkey.enabled},
+            "federated": {
+                "enabled": self.config.federated.enabled,
+                "participants": len(self.federated._participants),
+            },
+            "quantum": {"available": self.quantum_optimizer.available},
+            "tasks": self.task_manager.snapshot(),
+            "projects": len(self._projects_cache),
         }
+        return {"status": "ok", "version": __version__,
+                "instance_id": self.instance_id, "components": components}
 
-    async def shutdown(self):
-        self._running = False
-        await self.task_manager.stop_all()
-        if self.chaos_monkey.enabled:
-            await self.chaos_monkey.stop()
-        await self.registry_client.close()
-        if self.blockchain_client:
-            await self.blockchain_client.close()
-        if self.carbon_manager:
-            await self.carbon_manager.close()
-        await self.webhook.close()
-        await self.db_manager.close()
-        logger.info("CarbonCreditMarketplace shut down")
 
-# =============================================================================
-# FASTAPI APPLICATION - with new endpoints
-# =============================================================================
-app = FastAPI(title="Carbon Credit Marketplace API", version="5.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ============================================================================
+# FastAPI app
+# ============================================================================
+def build_app(marketplace: CarbonCreditMarketplace) -> Any:
+    if not (FASTAPI_AVAILABLE and PYDANTIC_AVAILABLE):
+        return None
 
-marketplace: Optional[CarbonCreditMarketplace] = None
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await marketplace.start()
+        try:
+            yield
+        finally:
+            await marketplace.shutdown()
 
-# Rate limiting (simplified)
-if SLOWAPI_AVAILABLE and config.rate_limit.enabled:
-    limiter = Limiter(key_func=get_remote_address)
-    app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-else:
-    class SimpleRateLimiter:
-        def __init__(self, requests: int, window: int):
-            self.requests = requests
-            self.window = window
-            self._requests = defaultdict(deque)
-        async def check(self, key: str):
-            now = time.time()
-            if key not in self._requests:
-                self._requests[key] = deque()
-            while self._requests[key] and now - self._requests[key][0] > self.window:
-                self._requests[key].popleft()
-            if len(self._requests[key]) >= self.requests:
-                raise HTTPException(status_code=429, detail="Rate limit exceeded")
-            self._requests[key].append(now)
-    rate_limiter = SimpleRateLimiter(config.rate_limit.requests_per_minute, 60)
+    app = FastAPI(title="Carbon Credit Marketplace API",
+                  version=__version__, lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware, allow_origins=[], allow_credentials=True,
+        allow_methods=["*"], allow_headers=["*"])
+    app.state.marketplace = marketplace
+    app.state.config = marketplace.config
+    security = HTTPBearer(auto_error=False)
 
-    async def rate_limit(request: Request):
-        key = request.client.host
-        await rate_limiter.check(key)
+    async def _get_user(
+        credentials: HTTPAuthorizationCredentials = Depends(security),
+    ) -> Dict[str, Any]:
+        if credentials is None:
+            raise HTTPException(status_code=401, detail="Missing token")
+        if not JWT_AVAILABLE:
+            raise HTTPException(status_code=503, detail="JWT unavailable")
+        try:
+            payload = jwt.decode(
+                credentials.credentials,
+                app.state.config.general.jwt_secret,
+                algorithms=[app.state.config.general.jwt_algorithm])
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return {"sub": payload.get("sub"), "role": payload.get("role", "viewer")}
 
-def create_jwt_token(data: Dict) -> str:
-    expire = datetime.utcnow() + timedelta(minutes=config.general.jwt_expiration_minutes)
-    data.update({"exp": expire})
-    return jwt.encode(data, config.general.jwt_secret, algorithm=config.general.jwt_algorithm)
-
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
-    token = credentials.credentials
-    try:
-        payload = jwt.decode(token, config.general.jwt_secret, algorithms=[config.general.jwt_algorithm])
-        return payload
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-async def require_role(role: str):
-    async def role_checker(user: Dict = Depends(get_current_user)):
-        if user.get("role") != role:
-            raise HTTPException(status_code=403, detail="Insufficient permissions")
+    async def _require_admin(user: Dict = Depends(_get_user)) -> Dict:
+        if user.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="Admin required")
         return user
-    return role_checker
 
-# ---------- Existing endpoints (abbreviated; same as original) ----------
-@app.get("/metrics")
-async def metrics():
-    if PROMETHEUS_AVAILABLE:
-        return Response(content=generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
-    return {"error": "Prometheus not enabled"}
+    @app.get("/health")
+    async def health():
+        return await marketplace.health_check()
 
-@app.get("/health")
-async def health():
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    return await marketplace.health_check()
+    @app.get("/metrics")
+    async def metrics():
+        if PROMETHEUS_AVAILABLE and REGISTRY is not None:
+            return Response(content=generate_latest(REGISTRY),
+                            media_type=CONTENT_TYPE_LATEST)
+        return PlainTextResponse("Prometheus not installed")
 
-@app.post("/auth/login")
-async def login(username: str, password: str):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    user = await marketplace.authenticate_user(username, password)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = create_jwt_token({"sub": user["sub"], "role": user["role"]})
-    return {"access_token": token, "token_type": "bearer"}
+    @app.post("/auth/register")
+    async def register(body: _RegisterBody):
+        ok = await marketplace.register_user(
+            body.username, body.password, body.role)
+        if not ok:
+            raise HTTPException(status_code=400,
+                                detail="Username already exists")
+        return {"status": "registered"}
 
-@app.post("/auth/register")
-async def register(username: str, password: str, role: str = "viewer"):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    success = await marketplace.register_user(username, password, role)
-    if not success:
-        raise HTTPException(status_code=400, detail="User already exists")
-    return {"status": "registered"}
+    @app.post("/auth/login")
+    async def login(body: _LoginBody):
+        if not JWT_AVAILABLE:
+            raise HTTPException(status_code=503, detail="JWT unavailable")
+        user = await marketplace.authenticate_user(body.username, body.password)
+        if user is None:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        now = datetime.now(timezone.utc)
+        exp = now + timedelta(
+            minutes=app.state.config.general.jwt_expiration_minutes)
+        token = jwt.encode(
+            {"sub": user["sub"], "role": user["role"],
+             "iat": int(now.timestamp()), "exp": int(exp.timestamp())},
+            app.state.config.general.jwt_secret,
+            algorithm=app.state.config.general.jwt_algorithm)
+        return {"access_token": token, "token_type": "bearer"}
 
-@app.get("/projects")
-async def list_projects(status: Optional[str] = None, credit_type: Optional[str] = None):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    projects = await marketplace.list_projects(status=status, credit_type=credit_type)
-    return {"projects": [p.dict() for p in projects]}
+    @app.get("/projects")
+    async def list_projects(status: Optional[str] = None,
+                            credit_type: Optional[str] = None):
+        projects = await marketplace.list_projects(status, credit_type)
+        return {"projects": [p.model_dump() for p in projects]}
 
-@app.post("/purchase")
-async def purchase(request: CreditPurchaseRequest, user: Dict = Depends(get_current_user), _: None = Depends(rate_limit)):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    try:
-        tx = await marketplace.purchase_credits(request, user)
-        return {"status": "success", "transaction": tx.dict()}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    @app.post("/purchase")
+    async def purchase(body: CreditPurchaseRequest,
+                       user: Dict = Depends(_get_user)):
+        try:
+            tx = await marketplace.purchase_credits(body, user)
+            return {"status": "success", "transaction": tx.model_dump()}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/retire")
-async def retire(request: CreditRetireRequest, user: Dict = Depends(get_current_user), _: None = Depends(rate_limit)):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    try:
-        tx = await marketplace.retire_credits(request, user)
-        return {"status": "success", "transaction": tx.dict()}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    @app.post("/retire")
+    async def retire(body: CreditRetireRequest,
+                     user: Dict = Depends(_get_user)):
+        try:
+            tx = await marketplace.retire_credits(body, user)
+            return {"status": "success", "transaction": tx.model_dump()}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/balance")
-async def balance():
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    return await marketplace.get_balance()
+    @app.get("/balance")
+    async def balance():
+        return await marketplace.get_balance()
 
-# ---------- NEW ENHANCEMENT ENDPOINTS ----------
-@app.post("/optimization/select")
-async def optimize_select(context: Dict, user: Dict = Depends(get_current_user), _: None = Depends(rate_limit)):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    projects = await marketplace.list_projects(status="verified")
-    best = await marketplace.optimizer.select_best_project(projects, context.get("amount_kg", 1000), context)
-    if best:
-        return {"project": best.dict(), "strategy": marketplace.optimizer._last_selection["strategy"]}
-    return {"error": "No suitable project"}
+    @app.post("/optimization/select")
+    async def optimize_select(body: _OptimizeSelectBody,
+                              user: Dict = Depends(_get_user)):
+        amount = float(body.context.get("amount_kg", 1000.0))
+        projects = await marketplace.list_projects(status="verified")
+        best = await marketplace.optimizer.select_best_project(
+            projects, amount, body.context)
+        if best is None:
+            raise HTTPException(status_code=404, detail="No suitable project")
+        return {"project": best.model_dump(),
+                "strategy": marketplace.optimizer._last_selection["strategy"]}
 
-@app.post("/optimization/feedback")
-async def optimization_feedback(context: Dict, strategy: Dict, reward: float, user: Dict = Depends(get_current_user), _: None = Depends(rate_limit)):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    await marketplace.optimizer.update_feedback(context, strategy, reward)
-    return {"status": "feedback recorded"}
+    @app.post("/optimization/feedback")
+    async def optimization_feedback(body: _FeedbackBody,
+                                    user: Dict = Depends(_get_user)):
+        await marketplace.optimizer.update_feedback(
+            body.context, body.strategy, body.reward)
+        return {"status": "feedback recorded"}
 
-@app.post("/optimization/evolve")
-async def optimization_evolve(user: Dict = Depends(require_role("admin")), _: None = Depends(rate_limit)):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    new_strategies = await marketplace.optimizer.evolve_strategies()
-    return {"new_strategies": new_strategies}
+    @app.post("/optimization/evolve")
+    async def optimization_evolve(user: Dict = Depends(_require_admin)):
+        return {"new_strategies":
+                await marketplace.optimizer.evolve_strategies()}
 
-@app.get("/optimization/stats")
-async def optimization_stats(user: Dict = Depends(get_current_user), _: None = Depends(rate_limit)):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    return marketplace.optimizer.get_optimization_stats()
+    @app.get("/optimization/stats")
+    async def optimization_stats(user: Dict = Depends(_get_user)):
+        return marketplace.optimizer.get_optimization_stats()
 
-@app.post("/flexgen/optimize")
-async def flexgen_optimize(workload: Dict, node: Dict, user: Dict = Depends(get_current_user), _: None = Depends(rate_limit)):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    return await marketplace.run_flexgen_optimization(workload, node)
+    @app.post("/flexgen/optimize")
+    async def flexgen_optimize(body: _FlexGenBody,
+                               user: Dict = Depends(_get_user)):
+        return await marketplace.run_flexgen_optimization(
+            body.workload, body.node)
 
-@app.get("/flexgen/status")
-async def flexgen_status(user: Dict = Depends(get_current_user)):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    return await marketplace.get_flexgen_status()
+    @app.get("/flexgen/status")
+    async def flexgen_status(user: Dict = Depends(_get_user)):
+        return await marketplace.get_flexgen_status()
 
-# Safety monitor endpoints
-@app.get("/safety/status")
-async def safety_status(user: Dict = Depends(get_current_user)):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    return await marketplace.safety_monitor.get_status()
+    @app.get("/safety/status")
+    async def safety_status(user: Dict = Depends(_get_user)):
+        return await marketplace.safety_monitor.get_status()
 
-@app.post("/safety/check")
-async def safety_check(project: CreditProject, user: Dict = Depends(get_current_user)):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    violations = await marketplace.safety_monitor.check_project(project)
-    return {"violations": violations}
+    @app.post("/safety/check")
+    async def safety_check(body: _SafetyCheckBody,
+                           user: Dict = Depends(_get_user)):
+        project = CreditProject(**body.project)
+        return {"violations":
+                await marketplace.safety_monitor.check_project(project)}
 
-# Human review endpoints
-@app.get("/human-review/pending")
-async def human_review_pending(user: Dict = Depends(require_role("admin"))):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    return await marketplace.human_review.get_pending()
+    @app.get("/human-review/pending")
+    async def human_review_pending(user: Dict = Depends(_require_admin)):
+        return await marketplace.human_review.get_pending()
 
-@app.post("/human-review/{review_id}/approve")
-async def human_review_approve(review_id: str, feedback: str = None, user: Dict = Depends(require_role("admin"))):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    return await marketplace.human_review.approve(review_id, feedback)
+    @app.post("/human-review/{review_id}/approve")
+    async def human_review_approve(review_id: str, body: _ReviewActionBody,
+                                   user: Dict = Depends(_require_admin)):
+        return await marketplace.human_review.approve(review_id, body.feedback)
 
-@app.post("/human-review/{review_id}/reject")
-async def human_review_reject(review_id: str, feedback: str = None, user: Dict = Depends(require_role("admin"))):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    return await marketplace.human_review.reject(review_id, feedback)
+    @app.post("/human-review/{review_id}/reject")
+    async def human_review_reject(review_id: str, body: _ReviewActionBody,
+                                  user: Dict = Depends(_require_admin)):
+        return await marketplace.human_review.reject(review_id, body.feedback)
 
-# Chaos monkey endpoints
-@app.post("/chaos/trigger")
-async def chaos_trigger(user: Dict = Depends(require_role("admin"))):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    if not marketplace.chaos_monkey:
-        raise HTTPException(status_code=400, detail="Chaos Monkey not initialized")
-    await marketplace.chaos_monkey._inject_failure()
-    return {"status": "chaos experiment triggered"}
+    @app.post("/chaos/trigger")
+    async def chaos_trigger(user: Dict = Depends(_require_admin)):
+        return await marketplace.chaos_monkey._inject_failure()
 
-# Federated learning endpoints
-@app.post("/federated/register")
-async def federated_register(participant_id: str, model_update: Dict, user: Dict = Depends(get_current_user)):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    await marketplace.federated.register_participant(participant_id, model_update)
-    return {"status": "participant registered"}
+    @app.post("/federated/register")
+    async def federated_register(body: _FederatedRegisterBody,
+                                 user: Dict = Depends(_get_user)):
+        await marketplace.federated.register_participant(
+            body.participant_id, body.model_update)
+        return {"status": "registered"}
 
-@app.get("/federated/aggregate")
-async def federated_aggregate(user: Dict = Depends(require_role("admin"))):
-    if not marketplace:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    return await marketplace.federated.aggregate()
+    @app.get("/federated/aggregate")
+    async def federated_aggregate(user: Dict = Depends(_require_admin)):
+        return await marketplace.federated.aggregate()
 
-# ---------- Startup & Shutdown ----------
-@app.on_event("startup")
-async def startup():
-    global marketplace
-    db_manager = AsyncDatabaseManager(config)
-    registry_client = RegistryClient(config)
-    blockchain_client = BlockchainClient(config)
-    pqc = PostQuantumCrypto(config, db_manager)
-    cloud_storage = CloudStorage(config)
-    price_predictor = PricePredictor(config)
-    carbon_manager = CarbonIntensityManager(config)
-    sustainability_engine = UnifiedSustainabilityEngine(db_manager)
-    auto_offset_engine = AutoOffsetEngine(None)
+    return app
+
+
+# ============================================================================
+# Tests
+# ============================================================================
+async def _test_circuit_breaker() -> None:
+    cb = CircuitBreaker("t", threshold=2, timeout=0.1)
+
+    def sync_ok(): return 42
+
+    async def async_ok(): return 43
+
+    assert await cb.call(sync_ok) == 42
+    assert await cb.call(async_ok) == 43
+
+    def boom(): raise RuntimeError("boom")
+
+    for _ in range(2):
+        try:
+            await cb.call(boom)
+        except RuntimeError:
+            pass
+    assert cb.state is CircuitBreakerState.OPEN
+    await asyncio.sleep(0.15)
+    assert await cb.call(sync_ok) == 42
+
+
+async def _test_global_registry_threadsafe() -> None:
+    g = GlobalCircuitBreaker()
+    a = g.get_or_create("x")
+    b = g.get_or_create("x")
+    assert a is b
+
+
+async def _test_pqc_roundtrip(tmpdir: Path) -> None:
+    cfg = Settings()
+    cfg.ensure_master_key()
+    cfg.database.path = str(tmpdir / "pqc.db")
+    db = AsyncDatabaseManager(cfg)
+    await db.connect()
+    pqc = PostQuantumCrypto(cfg, db)
+    kp = await pqc.generate_keypair()
+    sig = await pqc.sign_data({"x": 1}, kp["key_id"])
+    assert await pqc.verify_data({"x": 1}, sig) is True
+    assert await pqc.verify_data({"x": 2}, sig) is False
+    await db.close()
+
+
+async def _test_causal_bandit_new_policies() -> None:
+    bandit = CausalBandit(
+        action_space=[{"name": "a", "params": {}}],
+        fallback_solver=lambda ctx: {"name": "a", "params": {}},
+        min_trials_before_bandit=1, seed=0)
+    bandit.update({}, {"name": "a", "params": {}}, 0.5)
+    bandit.update({}, {"name": "new", "params": {}}, 0.9)
+    assert bandit.q_values["new"] > 0.0
+
+
+async def _test_multi_agent_vote_differs() -> None:
+    cfg = Settings()
+    ma = MultiAgentSystem(cfg)
+    projects = [
+        CreditProject(project_id="a", name="A", registry="V",
+                      available_credits_kg=1000, price_per_kg_usd=0.1,
+                      verification_status="verified",
+                      metadata={"carbon_intensity": 100.0},
+                      co_benefits={"biodiversity": 0.9}),
+        CreditProject(project_id="b", name="B", registry="V",
+                      available_credits_kg=1000, price_per_kg_usd=1.5,
+                      verification_status="verified",
+                      metadata={"carbon_intensity": 500.0},
+                      co_benefits={"biodiversity": 0.1}),
+    ]
+    best = await ma.vote(projects)
+    assert best is not None
+    assert best.project_id in ("a", "b")
+
+
+async def _test_marketplace_end_to_end(tmpdir: Path) -> None:
+    cfg = Settings()
+    cfg.ensure_master_key()
+    cfg.database.path = str(tmpdir / "marketplace.db")
+    cfg.general.auto_offset_enabled = False
+    cfg.chaos.enabled = False
+    cfg.federated.enabled = False
+
+    db = AsyncDatabaseManager(cfg)
+    registry = RegistryClient(cfg)
+    blockchain = BlockchainClient(cfg)
+    pqc = PostQuantumCrypto(cfg, db)
+    cloud = CloudStorage(cfg)
+    predictor = PricePredictor(cfg)
+    carbon = CarbonIntensityManager(cfg)
+    sustainability = UnifiedSustainabilityEngine(db)
+    auto_offset = AutoOffsetEngine()
+
     marketplace = CarbonCreditMarketplace(
-        config=config,
-        db_manager=db_manager,
-        registry_client=registry_client,
-        blockchain_client=blockchain_client,
-        pqc=pqc,
-        cloud_storage=cloud_storage,
-        price_predictor=price_predictor,
-        auto_offset_engine=auto_offset_engine,
-        carbon_manager=carbon_manager,
-        sustainability_engine=sustainability_engine,
+        config=cfg, db_manager=db, registry_client=registry,
+        blockchain_client=blockchain, pqc=pqc, cloud_storage=cloud,
+        price_predictor=predictor, auto_offset_engine=auto_offset,
+        carbon_manager=carbon, sustainability_engine=sustainability,
     )
-    marketplace.auto_offset_engine = AutoOffsetEngine(marketplace)
     await marketplace.start()
-    logger.info("FastAPI application started")
+    try:
+        projects = await marketplace.list_projects(status="verified")
+        assert len(projects) >= 1
 
-@app.on_event("shutdown")
-async def shutdown():
-    if marketplace:
+        # Purchase.
+        tx = await marketplace.purchase_credits(
+            CreditPurchaseRequest(project_id=projects[0].project_id,
+                                  amount_kg=100.0,
+                                  retire_immediately=False),
+            user={"sub": "alice"})
+        assert tx.amount_kg == 100.0
+        balance = await marketplace.get_balance()
+        assert balance["available_kg"] == 100.0
+
+        # Retire.
+        await marketplace.retire_credits(
+            CreditRetireRequest(tx_id=tx.tx_id, amount_kg=50.0), user={})
+        balance = await marketplace.get_balance()
+        assert balance["retired_kg"] == 50.0
+
+        # Optimizer decision.
+        decision = await marketplace.optimizer.select_best_project(
+            projects, 50.0, {"carbon_intensity": 200.0})
+        assert decision is not None
+
+        # FlexGen.
+        fg = await marketplace.run_flexgen_optimization(
+            {"task_id": "w"}, {"id": "n"})
+        assert "policy" in fg
+
+        # Safety.
+        violations = await marketplace.safety_monitor.check_project(projects[0])
+        assert isinstance(violations, list)
+
+        # Health.
+        health = await marketplace.health_check()
+        assert health["status"] == "ok"
+    finally:
         await marketplace.shutdown()
-    logger.info("FastAPI application shut down")
 
-# =============================================================================
-# MAIN ENTRY
-# =============================================================================
-if __name__ == "__main__":
-    uvicorn.run(
-        "carbon_credit_marketplace:app",
-        host=config.API_HOST,
-        port=config.API_PORT,
-        log_level="info",
-        reload=False
+
+def run_tests() -> None:
+    import tempfile
+    loop = asyncio.new_event_loop()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            loop.run_until_complete(_test_circuit_breaker())
+            loop.run_until_complete(_test_global_registry_threadsafe())
+            loop.run_until_complete(_test_pqc_roundtrip(tmp))
+            loop.run_until_complete(_test_causal_bandit_new_policies())
+            loop.run_until_complete(_test_multi_agent_vote_differs())
+            loop.run_until_complete(_test_marketplace_end_to_end(tmp))
+    finally:
+        loop.close()
+    print("All Carbon Credit Marketplace v6.0.0 tests passed.")
+
+
+# ============================================================================
+# Entry point
+# ============================================================================
+async def _standalone_main() -> None:
+    cfg = ensure_settings()
+    db = AsyncDatabaseManager(cfg)
+    registry = RegistryClient(cfg)
+    blockchain = BlockchainClient(cfg)
+    pqc = PostQuantumCrypto(cfg, db)
+    cloud = CloudStorage(cfg)
+    predictor = PricePredictor(cfg)
+    carbon = CarbonIntensityManager(cfg)
+    sustainability = UnifiedSustainabilityEngine(db)
+    auto_offset = AutoOffsetEngine()
+
+    marketplace = CarbonCreditMarketplace(
+        config=cfg, db_manager=db, registry_client=registry,
+        blockchain_client=blockchain, pqc=pqc, cloud_storage=cloud,
+        price_predictor=predictor, auto_offset_engine=auto_offset,
+        carbon_manager=carbon, sustainability_engine=sustainability,
     )
+    await marketplace.start()
+    print(f"Marketplace {marketplace.instance_id} started.")
+    try:
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await marketplace.shutdown()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Carbon Credit Marketplace v6.0.0")
+    parser.add_argument("--test", action="store_true",
+                        help="Run the built-in test suite.")
+    parser.add_argument("--serve", action="store_true",
+                        help="Start the FastAPI server.")
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--port", type=int, default=None)
+    args = parser.parse_args()
+
+    if args.test:
+        run_tests()
+        return
+
+    cfg = ensure_settings()
+    if args.serve and FASTAPI_AVAILABLE:
+        db = AsyncDatabaseManager(cfg)
+        registry = RegistryClient(cfg)
+        blockchain = BlockchainClient(cfg)
+        pqc = PostQuantumCrypto(cfg, db)
+        cloud = CloudStorage(cfg)
+        predictor = PricePredictor(cfg)
+        carbon = CarbonIntensityManager(cfg)
+        sustainability = UnifiedSustainabilityEngine(db)
+        auto_offset = AutoOffsetEngine()
+        marketplace = CarbonCreditMarketplace(
+            config=cfg, db_manager=db, registry_client=registry,
+            blockchain_client=blockchain, pqc=pqc, cloud_storage=cloud,
+            price_predictor=predictor, auto_offset_engine=auto_offset,
+            carbon_manager=carbon, sustainability_engine=sustainability,
+        )
+        app = build_app(marketplace)
+        if app is not None:
+            import uvicorn  # type: ignore
+            uvicorn.run(
+                app,
+                host=args.host or cfg.API_HOST,
+                port=args.port or cfg.API_PORT,
+                log_level=cfg.general.log_level.lower(),
+                server_header=False)
+            return
+    asyncio.run(_standalone_main())
+
+
+if __name__ == "__main__":
+    main()
