@@ -1,317 +1,401 @@
 #!/usr/bin/env python3
 # File: src/enhancements/expert_router_harvester_v3_0.py
 """
-Expert Router with Photosynthetic Harvester Awareness – v3.1 (Enterprise Quantum+)
+Expert Router with Photosynthetic Harvester Awareness — v3.2 (Single-File Enhanced)
 
-ENHANCEMENTS OVER v3.0:
-- Added CausalBandit (replaces ContextualBandit) for causal RL on routing decisions.
-- Added SafetyMonitor with temporal logic rules for routing safety.
-- Added XAIExplainer for human-readable routing rationale.
-- Added FederatedRouterCoordinator with simulated differential privacy.
-- Added MultiAgentRouter for expert bidding and emergent role specialisation.
-- Added CarbonOffsetBroker for external carbon markets and RECs.
-- Added ChaosMonkey for resilience testing.
-- Added HumanReviewManager for human-in-the-loop with active learning.
-- Added QuantumDistillationOptimizer (optional) for quantum-assisted routing.
-- Integrated adaptive precision switching via FlexGen into routing decision pipeline.
-- Retained all v3.0 features (PQC, cloud storage, Vault, DB migrations, bandit/MoE/MODP/bio).
+Public API preserved:
+    ExpertRouterWithHarvester, CausalBandit, SafetyMonitor, XAIExplainer,
+    FederatedRouterCoordinator, MultiAgentRouter, CarbonOffsetBroker,
+    ChaosMonkey, HumanReviewManager, QuantumDistillationOptimizer,
+    FlexGenManager, PostQuantumCrypto, MultiCloudStorage, VaultManager,
+    RateLimiter, CircuitBreaker, GlobalCircuitBreaker, AsyncDatabaseManager,
+    RouterConfig, all sub-configs, and the exception hierarchy.
 
-NEW IN v3.0 (retained):
-- Dependency inversion with interfaces (Protocols) for all major components.
-- Global circuit breaker registry with configurable thresholds.
-- Health check aggregation across all components.
-- Async database persistence with migrations.
-- Rate limiting on API endpoints.
-- Retry decorators for all external calls (tenacity).
-- Grouped configuration using nested Pydantic models.
-- Audit logging for compliance.
-- OpenTelemetry support for distributed tracing.
+Key fixes over v3.1:
+- `await self.bandit.update(...)` bug fixed (bandit.update is sync).
+- AsyncDatabaseManager uses aiosqlite directly; migrations run in an explicit
+  `init()` awaited from the router's `start()`.
+- `_save_state` is now an async method awaited from routing/feedback paths.
+- PQC performs real ECDSA signing (or Dilithium when pqcrypto is available).
+- CausalBandit is a real linear contextual bandit (Bayesian linear regression).
+- SafetyMonitor exposes snapshot/restore for chaos.
+- XAIExplainer returns a structured dict.
+- FederatedRouterCoordinator weights by sample count and scales DP noise to
+  sensitivity/epsilon.
+- MultiAgentRouter is thread-safe and dedupes reputation updates.
+- CarbonOffsetBroker is thread-safe; computes emission from energy, not cost.
+- ChaosMonkey has named faults, seeded RNG, snapshot/restore.
+- HumanReviewManager has TTL, capacity, and audit log.
+- QuantumDistillationOptimizer tries `qiskit_optimization` and falls back to
+  classical scoring.
+- FlexGenManager raises NotImplementedYetError when FlexGen is missing.
+- FastAPI app built via `create_app()` with lifespan and auth on admin endpoints.
+- Real component factory; `main()` and FastAPI share wiring.
+- `asyncio.ensure_future` removed from `__init__`.
+- `RouterConfig.dict()` handled for Pydantic v1/v2 and dataclasses.
+- Harvester bonus now reduces cost (correct sign).
+- PQC master_key defaults to a random per-instance key when empty.
 """
 
+from __future__ import annotations
+
 import asyncio
+import contextlib
+import contextvars
 import hashlib
+import inspect
 import json
 import logging
+import logging.handlers  # noqa: F401
+import math
 import os
+import random
+import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Union, Protocol, runtime_checkable, Callable, Tuple
-import contextvars
-from pathlib import Path
-from collections import deque, defaultdict
 from enum import Enum
-import random
+from pathlib import Path
+from typing import (
+    Any, AsyncIterator, Callable, Deque, Dict, List, Optional, Protocol, Set,
+    Tuple, Union, runtime_checkable,
+)
+
 import numpy as np
 
-# ============================================================
-# ENHANCED MODULES IMPORTS (with graceful fallback)
-# ============================================================
+# -----------------------------------------------------------------------------
+# Optional imports
+# -----------------------------------------------------------------------------
 try:
-    from enhancements.bio_inspired import GeneticPolicyGenerator
-    from enhancements.moe_system import ExpertRouter as MoEExpertRouter
-    from enhancements.MODP import ParetoOptimizer
-    from enhancements.contextual_bandit import ContextualBandit
+    import structlog  # noqa: F401
+    logger = structlog.get_logger(__name__)
+except ImportError:
+    logger = logging.getLogger(__name__)
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            handlers=[
+                logging.handlers.RotatingFileHandler(
+                    "router.log", maxBytes=10 * 1024 * 1024, backupCount=5
+                ),
+                logging.StreamHandler(),
+            ],
+        )
+
+try:
+    from pydantic import BaseModel, Field, field_validator
+    from pydantic_settings import BaseSettings, SettingsConfigDict  # noqa: F401
+    PYDANTIC_AVAILABLE = True
+    try:
+        from pydantic import __version__ as _pyd_version  # type: ignore
+        PYDANTIC_V2 = _pyd_version.startswith("2")
+    except Exception:
+        PYDANTIC_V2 = True
+except ImportError:
+    PYDANTIC_AVAILABLE = False
+    PYDANTIC_V2 = False
+
+try:
+    from tenacity import (  # noqa: F401
+        retry, stop_after_attempt, wait_exponential,
+        retry_if_exception_type, before_sleep_log,
+    )
+    TENACITY_AVAILABLE = True
+except ImportError:
+    TENACITY_AVAILABLE = False
+
+try:
+    from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
+try:
+    from sqlalchemy import (  # noqa: F401
+        Boolean, Column, DateTime, Float, Integer, JSON, String, Text, text,
+    )
+    from sqlalchemy.ext.asyncio import (  # noqa: F401
+        AsyncSession, async_sessionmaker, create_async_engine,
+    )
+    from sqlalchemy.ext.declarative import declarative_base  # noqa: F401
+    from sqlalchemy.pool import NullPool  # noqa: F401
+    SQLALCHEMY_AVAILABLE = True
+except ImportError:
+    SQLALCHEMY_AVAILABLE = False
+
+try:
+    import aiosqlite
+    AIOSQLITE_AVAILABLE = True
+except ImportError:
+    AIOSQLITE_AVAILABLE = False
+
+try:
+    from pqcrypto.sign import dilithium, falcon, sphincs  # noqa: F401
+    PQC_AVAILABLE = True
+except ImportError:
+    PQC_AVAILABLE = False
+
+try:
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC  # noqa: F401
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, NoEncryption, PrivateFormat, PublicFormat,
+        load_pem_private_key, load_pem_public_key,
+    )
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+
+try:
+    from hvac import Client as VaultClient  # noqa: F401
+    VAULT_AVAILABLE = True
+except ImportError:
+    VAULT_AVAILABLE = False
+
+try:
+    import boto3  # noqa: F401
+    from botocore.exceptions import ClientError  # noqa: F401
+    AWS_AVAILABLE = True
+except ImportError:
+    AWS_AVAILABLE = False
+
+try:
+    from azure.storage.blob import BlobServiceClient  # noqa: F401
+    AZURE_AVAILABLE = True
+except ImportError:
+    AZURE_AVAILABLE = False
+
+try:
+    from google.cloud import storage  # noqa: F401
+    GCP_AVAILABLE = True
+except ImportError:
+    GCP_AVAILABLE = False
+
+try:
+    from fastapi import (
+        Depends, FastAPI, HTTPException, Request,
+    )
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+    import uvicorn  # noqa: F401
+    FASTAPI_AVAILABLE = True
+except ImportError:
+    FASTAPI_AVAILABLE = False
+
+try:
+    import jwt as pyjwt
+    JWT_AVAILABLE = True
+except ImportError:
+    JWT_AVAILABLE = False
+
+try:
+    from opentelemetry import trace  # noqa: F401
+    from opentelemetry.sdk.trace import TracerProvider  # noqa: F401
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor  # noqa: F401
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter  # noqa: F401
+    OTEL_AVAILABLE = True
+except ImportError:
+    OTEL_AVAILABLE = False
+
+# Qiskit — try new module layout first, then legacy.
+try:
+    from qiskit_optimization import QuadraticProgram
+    from qiskit_optimization.algorithms import MinimumEigenOptimizer
+    try:
+        from qiskit_algorithms import QAOA
+    except ImportError:
+        from qiskit.algorithms import QAOA  # legacy
+    QISKIT_AVAILABLE = True
+    QISKIT_LEGACY = False
+except ImportError:
+    try:
+        from qiskit.optimization import QuadraticProgram  # type: ignore
+        from qiskit.optimization.algorithms import MinimumEigenOptimizer  # type: ignore
+        from qiskit.algorithms import QAOA  # type: ignore
+        QISKIT_AVAILABLE = True
+        QISKIT_LEGACY = True
+    except ImportError:
+        QISKIT_AVAILABLE = False
+        QISKIT_LEGACY = False
+
+
+# -----------------------------------------------------------------------------
+# Enhancement modules (guarded)
+# -----------------------------------------------------------------------------
+try:
+    from enhancements.bio_inspired import GeneticPolicyGenerator  # type: ignore
+    from enhancements.moe_system import ExpertRouter as MoEExpertRouter  # type: ignore
+    from enhancements.MODP import ParetoOptimizer  # type: ignore
+    from enhancements.contextual_bandit import ContextualBandit  # type: ignore
     ENHANCEMENTS_AVAILABLE = True
 except ImportError:
     ENHANCEMENTS_AVAILABLE = False
-    class GeneticPolicyGenerator:
-        def __init__(self, *args, **kwargs): pass
+
+    class GeneticPolicyGenerator:  # type: ignore[no-redef]
+        def __init__(self, *a, **k): pass
         def evolve(self, population, fitness_fn, generations=10, population_size=20):
             return population[0] if population else {}
-    class MoEExpertRouter:
-        def __init__(self, *args, **kwargs): pass
-        def encode(self, context): return [0.0]*5
+
+    class MoEExpertRouter:  # type: ignore[no-redef]
+        def __init__(self, *a, **k): pass
+        def encode(self, context):
+            if isinstance(context, dict):
+                vals = [float(v) for v in context.values() if isinstance(v, (int, float))]
+            else:
+                vals = [float(v) for v in context]
+            while len(vals) < 8:
+                vals.append(0.0)
+            return vals[:8]
         def select(self, encoded): return "default"
-    class ParetoOptimizer:
-        def __init__(self, *args, **kwargs): pass
+
+    class ParetoOptimizer:  # type: ignore[no-redef]
+        def __init__(self, *a, **k): pass
         def evaluate(self, objectives, weights):
-            return sum(objectives.get(k, 0) * weights.get(k, 1) for k in objectives)
-    class ContextualBandit:
-        def __init__(self, action_space, fallback_solver, *args, **kwargs):
+            return sum(objectives.get(k, 0.0) * weights.get(k, 1.0) for k in objectives)
+
+    class ContextualBandit:  # type: ignore[no-redef]
+        def __init__(self, action_space, fallback_solver, *a, **k):
             self.actions = action_space
         def select_action(self, context):
             return self.actions[0], 0.0, "fallback"
         def update(self, context, action, reward): pass
         def seed_safe_policy(self, context, policy): pass
 
-# ============================================================
-# FLEXGEN MODULES (with fallback)
-# ============================================================
+
 try:
-    from enhancements.gpu_optimization.flexgen_policy import FlexGenPolicy, generate_candidate_policies
-    from enhancements.gpu_optimization.flexgen_controller import FlexGenController
-    from enhancements.gpu_optimization.flexgen_cost_model import FlexGenCostModel
-    from enhancements.gpu_optimization.policy_drift_detector import PolicyDriftDetector
-    from enhancements.schemas.node_descriptor import NodeDescriptor
-    from enhancements.schemas.workload_descriptor import WorkloadDescriptor
+    from enhancements.gpu_optimization.flexgen_policy import (  # type: ignore
+        FlexGenPolicy, generate_candidate_policies,
+    )
+    from enhancements.gpu_optimization.flexgen_controller import FlexGenController  # type: ignore
+    from enhancements.gpu_optimization.flexgen_cost_model import FlexGenCostModel  # type: ignore
+    from enhancements.gpu_optimization.policy_drift_detector import PolicyDriftDetector  # type: ignore
+    from enhancements.schemas.node_descriptor import NodeDescriptor  # type: ignore
+    from enhancements.schemas.workload_descriptor import WorkloadDescriptor  # type: ignore
     FLEXGEN_AVAILABLE = True
 except ImportError:
     FLEXGEN_AVAILABLE = False
-    class FlexGenPolicy: pass
-    def generate_candidate_policies(n=20): return []
-    class FlexGenController:
-        def __init__(self, *args, **kwargs): pass
+
+    class FlexGenPolicy: pass  # type: ignore[no-redef]
+    def generate_candidate_policies(n=20): return []  # noqa: E704
+
+    class FlexGenController:  # type: ignore[no-redef]
+        def __init__(self, *a, **k): pass
         async def step(self): return {}
-    class FlexGenCostModel:
-        def __init__(self, *args, **kwargs): pass
-    class PolicyDriftDetector:
-        def __init__(self, *args, **kwargs): pass
+
+    class FlexGenCostModel:  # type: ignore[no-redef]
+        def __init__(self, *a, **k): pass
+
+    class PolicyDriftDetector:  # type: ignore[no-redef]
+        def __init__(self, *a, **k): pass
         def get_stats(self): return {}
-    class NodeDescriptor: pass
-    class WorkloadDescriptor: pass
 
-# ============================================================
-# Optional imports with fallback
-# ============================================================
+    class NodeDescriptor: pass  # type: ignore[no-redef]
+    class WorkloadDescriptor: pass  # type: ignore[no-redef]
+
+
+# -----------------------------------------------------------------------------
+# Green Agent base components (guarded)
+# -----------------------------------------------------------------------------
 try:
-    from pydantic import BaseModel, Field, field_validator, ValidationInfo
-    from pydantic_settings import BaseSettings, SettingsConfigDict
-    PYDANTIC_AVAILABLE = True
+    from ..expert_router import ExpertRouter  # type: ignore
+    from ..expert_registry import ExpertProfile, ExpertRegistry  # type: ignore
+    from ..bio_inspired import PhotosyntheticHarvester  # type: ignore
+    from ..sustainability_cost import SustainabilityCostFunction  # type: ignore
+    from ..database.manager import DatabaseManager  # type: ignore
+    from ..task_manager import TaskManager  # type: ignore
 except ImportError:
-    try:
-        from pydantic import BaseModel, Field, field_validator, ValidationInfo
-        PYDANTIC_AVAILABLE = True
-    except ImportError:
-        PYDANTIC_AVAILABLE = False
 
-try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
-    TENACITY_AVAILABLE = True
-except ImportError:
-    TENACITY_AVAILABLE = False
-
-try:
-    from prometheus_client import Counter, Histogram, Gauge, CollectorRegistry
-    PROMETHEUS_AVAILABLE = True
-except ImportError:
-    PROMETHEUS_AVAILABLE = False
-
-try:
-    from sqlalchemy import Column, String, Float, DateTime, Integer, JSON, Text, Boolean, create_engine, text
-    from sqlalchemy.ext.declarative import declarative_base
-    from sqlalchemy.orm import sessionmaker, async_sessionmaker
-    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-    from sqlalchemy.pool import NullPool
-    SQLALCHEMY_AVAILABLE = True
-except ImportError:
-    SQLALCHEMY_AVAILABLE = False
-
-try:
-    from pqcrypto.sign import dilithium, falcon, sphincs
-    PQC_AVAILABLE = True
-except ImportError:
-    PQC_AVAILABLE = False
-
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.backends import default_backend
-
-try:
-    from hvac import Client as VaultClient
-    VAULT_AVAILABLE = True
-except ImportError:
-    VAULT_AVAILABLE = False
-
-try:
-    import boto3
-    from botocore.exceptions import ClientError
-    AWS_AVAILABLE = True
-except ImportError:
-    AWS_AVAILABLE = False
-
-try:
-    from azure.storage.blob import BlobServiceClient
-    AZURE_AVAILABLE = True
-except ImportError:
-    AZURE_AVAILABLE = False
-
-try:
-    from google.cloud import storage
-    GCP_AVAILABLE = True
-except ImportError:
-    GCP_AVAILABLE = False
-
-try:
-    from fastapi import FastAPI, Depends, HTTPException, status, Request
-    from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-    from fastapi.middleware.cors import CORSMiddleware
-    import uvicorn
-    FASTAPI_AVAILABLE = True
-except ImportError:
-    FASTAPI_AVAILABLE = False
-
-try:
-    from jose import JWTError, jwt
-    from jose.constants import ALGORITHMS
-    JOSE_AVAILABLE = True
-except ImportError:
-    JOSE_AVAILABLE = False
-
-try:
-    from opentelemetry import trace
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-    OTEL_AVAILABLE = True
-except ImportError:
-    OTEL_AVAILABLE = False
-
-try:
-    import qiskit
-    from qiskit.optimization import QuadraticProgram
-    from qiskit.optimization.algorithms import MinimumEigenOptimizer
-    from qiskit.algorithms import QAOA
-    from qiskit import Aer
-    QISKIT_AVAILABLE = True
-except ImportError:
-    QISKIT_AVAILABLE = False
-
-# ============================================================
-# Import base classes (with fallback stubs)
-# ============================================================
-try:
-    from ..expert_router import ExpertRouter
-    from ..expert_registry import ExpertProfile, ExpertRegistry
-    from ..bio_inspired import PhotosyntheticHarvester
-    from ..sustainability_cost import SustainabilityCostFunction
-    from ..database.manager import DatabaseManager
-    from ..task_manager import TaskManager
-except ImportError:
-    class ExpertRouter:
-        def __init__(self, *args, **kwargs):
+    class ExpertRouter:  # type: ignore[no-redef]
+        def __init__(self, *a, **k):
             self.registry = None
         def get_candidate_experts(self, task, context):
             return []
-    class ExpertProfile:
-        def __init__(self, expert_id=None, domain="", usage_count=0, accuracy_score=0.5,
-                     last_used=None, photosynthetic_harvester_flag=False, **kwargs):
+
+    class ExpertProfile:  # type: ignore[no-redef]
+        def __init__(
+            self, expert_id: Optional[str] = None, domain: str = "",
+            usage_count: int = 0, accuracy_score: float = 0.5,
+            last_used: Optional[datetime] = None,
+            photosynthetic_harvester_flag: bool = False, **kwargs: Any,
+        ):
             self.expert_id = expert_id or str(uuid.uuid4())
             self.domain = domain
             self.usage_count = usage_count
             self.accuracy_score = accuracy_score
             self.last_used = last_used
             self.photosynthetic_harvester_flag = photosynthetic_harvester_flag
-    class ExpertRegistry: pass
-    class PhotosyntheticHarvester: pass
-    class SustainabilityCostFunction:
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class ExpertRegistry:  # type: ignore[no-redef]
+        pass
+
+    class PhotosyntheticHarvester:  # type: ignore[no-redef]
+        pass
+
+    class SustainabilityCostFunction:  # type: ignore[no-redef]
         async def compute_multiple(self, experts, context):
             return {e.expert_id: 1.0 for e in experts}
-    class DatabaseManager: pass
-    class TaskManager: pass
 
-# ============================================================
-# Structured logging
-# ============================================================
-correlation_id_var = contextvars.ContextVar('correlation_id', default=str(uuid.uuid4())[:8])
+    class DatabaseManager:  # type: ignore[no-redef]
+        pass
+
+    class TaskManager:  # type: ignore[no-redef]
+        pass
+
+
+# -----------------------------------------------------------------------------
+# Structured logging with correlation IDs
+# -----------------------------------------------------------------------------
+correlation_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "correlation_id", default=""
+)
+
+
+def _get_correlation_id() -> str:
+    cid = correlation_id_var.get()
+    if not cid:
+        cid = str(uuid.uuid4())[:8]
+        correlation_id_var.set(cid)
+    return cid
+
 
 class CorrelationIdFilter(logging.Filter):
-    def filter(self, record):
-        record.correlation_id = correlation_id_var.get()
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.correlation_id = _get_correlation_id()
         return True
 
-logger = logging.getLogger(__name__)
-logger.addFilter(CorrelationIdFilter())
+
+if isinstance(logger, logging.Logger):
+    logger.addFilter(CorrelationIdFilter())
 
 audit_logger = logging.getLogger("audit")
-audit_handler = logging.FileHandler('routing_audit.log')
-audit_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
-audit_logger.addHandler(audit_handler)
+if not audit_logger.handlers:
+    try:
+        _ah = logging.handlers.RotatingFileHandler(
+            "routing_audit.log", maxBytes=10 * 1024 * 1024, backupCount=5
+        )
+    except Exception:
+        _ah = logging.StreamHandler()
+    _ah.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+    audit_logger.addHandler(_ah)
 audit_logger.setLevel(logging.INFO)
 
-# ============================================================
-# Prometheus metrics
-# ============================================================
-if PROMETHEUS_AVAILABLE:
-    REGISTRY = CollectorRegistry()
-    ROUTER_REQUESTS = Counter('router_requests_total', 'Total routing requests', registry=REGISTRY)
-    HARVESTER_BONUS = Counter('router_harvester_bonus_applied_total', 'Harvester bonus applied', registry=REGISTRY)
-    SELECTED_COST = Histogram('router_selected_cost', 'Cost of selected expert', registry=REGISTRY)
-    SELECTED_BONUS_FACTOR = Histogram('router_selected_bonus_factor', 'Bonus factor applied', registry=REGISTRY)
-    ROUTER_LATENCY = Histogram('router_latency_seconds', 'Routing latency', registry=REGISTRY)
-    CIRCUIT_BREAKER_STATE = Gauge('router_circuit_breaker_state', 'Circuit breaker state', ['name'], registry=REGISTRY)
-    RATE_LIMITER_THROTTLE = Counter('router_rate_limiter_throttle', 'Rate limiter throttles', registry=REGISTRY)
-    PQC_SIGNATURES = Counter('router_pqc_signatures_total', 'PQC signatures', ['algorithm', 'status'], registry=REGISTRY)
-    CLOUD_STORAGE = Counter('router_cloud_storage_operations_total', 'Cloud storage ops', ['provider', 'operation', 'status'], registry=REGISTRY)
-    VAULT_OPERATIONS = Counter('router_vault_operations_total', 'Vault operations', ['operation', 'status'], registry=REGISTRY)
-    HEALTH_SCORE = Gauge('router_health_score', 'Overall health score', registry=REGISTRY)
-    # NEW metrics
-    SAFETY_VIOLATIONS = Counter('router_safety_violations_total', 'Safety violations', ['rule'], registry=REGISTRY)
-    CHAOS_EXPERIMENTS = Counter('router_chaos_experiments_total', 'Chaos experiments', ['type', 'status'], registry=REGISTRY)
-    HUMAN_REVIEWS = Counter('router_human_reviews_total', 'Human reviews', ['status'], registry=REGISTRY)
-    XAI_DECISIONS = Counter('router_xai_decisions_total', 'XAI decisions', ['policy'], registry=REGISTRY)
-    CARBON_OFFSETS = Counter('router_carbon_offsets_total', 'Carbon offsets purchased', ['status'], registry=REGISTRY)
-    FEDERATED_PARTICIPANTS = Gauge('router_federated_participants', 'Federated participants', registry=REGISTRY)
-else:
-    class DummyMetric:
-        def labels(self, **kwargs): return self
-        def inc(self, **kwargs): pass
-        def set(self, **kwargs): pass
-        def observe(self, **kwargs): pass
-    ROUTER_REQUESTS = DummyMetric()
-    HARVESTER_BONUS = DummyMetric()
-    SELECTED_COST = DummyMetric()
-    SELECTED_BONUS_FACTOR = DummyMetric()
-    ROUTER_LATENCY = DummyMetric()
-    CIRCUIT_BREAKER_STATE = DummyMetric()
-    RATE_LIMITER_THROTTLE = DummyMetric()
-    PQC_SIGNATURES = DummyMetric()
-    CLOUD_STORAGE = DummyMetric()
-    VAULT_OPERATIONS = DummyMetric()
-    HEALTH_SCORE = DummyMetric()
-    SAFETY_VIOLATIONS = DummyMetric()
-    CHAOS_EXPERIMENTS = DummyMetric()
-    HUMAN_REVIEWS = DummyMetric()
-    XAI_DECISIONS = DummyMetric()
-    CARBON_OFFSETS = DummyMetric()
-    FEDERATED_PARTICIPANTS = DummyMetric()
 
-# ============================================================
-# Custom Exceptions
-# ============================================================
-class RouterError(Exception): pass
+# =============================================================================
+# Exceptions
+# =============================================================================
+class RouterError(Exception):
+    """Base exception for the router."""
+
+
 class CostFunctionError(RouterError): pass
 class RegistryError(RouterError): pass
 class CircuitBreakerOpenError(RouterError): pass
@@ -320,47 +404,118 @@ class SignatureError(RouterError): pass
 class HealthCheckError(RouterError): pass
 class SafetyViolationError(RouterError): pass
 class ChaosExperimentError(RouterError): pass
+class NotImplementedYetError(RouterError): pass
 
-# ============================================================
-# INTERFACES
-# ============================================================
-@runtime_checkable
-class ICostFunction(Protocol):
-    async def compute_multiple(self, experts: List[ExpertProfile], context: Dict) -> Dict[str, float]: ...
 
-@runtime_checkable
-class IRegistry(Protocol):
-    def get_expert(self, expert_id: str) -> Optional[ExpertProfile]: ...
-    def get_all_active_experts(self) -> List[ExpertProfile]: ...
+# =============================================================================
+# Metrics — single registry with memoized handles
+# =============================================================================
+class _NoopMetric:
+    def labels(self, *a, **k): return self
+    def inc(self, *a, **k): return None
+    def set(self, *a, **k): return None
+    def observe(self, *a, **k): return None
 
-@runtime_checkable
-class IHarvester(Protocol):
-    async def get_energy_bonus(self, expert: ExpertProfile, context: Dict) -> float: ...
 
-@runtime_checkable
-class IPQC(Protocol):
-    async def sign_routing_decision(self, decision_data: Dict) -> Dict: ...
-    def get_quantum_status(self) -> Dict: ...
+class _MetricsRegistry:
+    def __init__(self) -> None:
+        self.enabled = PROMETHEUS_AVAILABLE
+        self.registry = CollectorRegistry() if self.enabled else None
+        self._counters: Dict[str, Any] = {}
+        self._gauges: Dict[str, Any] = {}
+        self._histograms: Dict[str, Any] = {}
+        self._lock = threading.RLock()
 
-@runtime_checkable
-class ICloudStorage(Protocol):
-    async def store(self, data: Dict, filename: str = None) -> Dict: ...
-    def get_status(self) -> Dict: ...
+    def counter(self, name: str, doc: str = "", labels: Optional[List[str]] = None):
+        if not self.enabled:
+            return _NoopMetric()
+        with self._lock:
+            if name not in self._counters:
+                self._counters[name] = Counter(name, doc, labels or [], registry=self.registry)
+            return self._counters[name]
 
-@runtime_checkable
-class IVault(Protocol):
-    async def store_secret(self, path: str, data: Dict): ...
-    async def get_secret(self, path: str) -> Optional[Dict]: ...
+    def gauge(self, name: str, doc: str = "", labels: Optional[List[str]] = None):
+        if not self.enabled:
+            return _NoopMetric()
+        with self._lock:
+            if name not in self._gauges:
+                self._gauges[name] = Gauge(name, doc, labels or [], registry=self.registry)
+            return self._gauges[name]
 
-@runtime_checkable
-class IAsyncDatabase(Protocol):
-    async def save_routing_decision(self, decision: Dict): ...
-    async def health_check(self) -> Dict: ...
-    async def close(self): ...
+    def histogram(self, name: str, doc: str = "", labels: Optional[List[str]] = None):
+        if not self.enabled:
+            return _NoopMetric()
+        with self._lock:
+            if name not in self._histograms:
+                self._histograms[name] = Histogram(name, doc, labels or [], registry=self.registry)
+            return self._histograms[name]
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+
+METRICS = _MetricsRegistry()
+ROUTER_REQUESTS = METRICS.counter("router_requests_total", "Routing requests")
+HARVESTER_BONUS = METRICS.counter("router_harvester_bonus_total", "Harvester bonus applied")
+SELECTED_COST = METRICS.histogram("router_selected_cost", "Selected expert cost")
+SELECTED_BONUS_FACTOR = METRICS.histogram("router_selected_bonus_factor", "Bonus factor applied")
+ROUTER_LATENCY = METRICS.histogram("router_latency_seconds", "Routing latency (s)")
+CIRCUIT_BREAKER_STATE = METRICS.gauge(
+    "router_circuit_breaker_state", "CB state", ["name"]
+)
+RATE_LIMITER_THROTTLE = METRICS.counter("router_rate_limiter_throttle_total", "Throttles")
+PQC_SIGNATURES = METRICS.counter(
+    "router_pqc_signatures_total", "PQC signatures", ["algorithm", "status"]
+)
+CLOUD_STORAGE = METRICS.counter(
+    "router_cloud_storage_total", "Cloud storage ops",
+    ["provider", "operation", "status"],
+)
+VAULT_OPERATIONS = METRICS.counter(
+    "router_vault_operations_total", "Vault ops", ["operation", "status"]
+)
+HEALTH_SCORE = METRICS.gauge("router_health_score", "Health score")
+SAFETY_VIOLATIONS = METRICS.counter(
+    "router_safety_violations_total", "Safety violations", ["rule"]
+)
+CHAOS_EXPERIMENTS = METRICS.counter(
+    "router_chaos_experiments_total", "Chaos experiments", ["fault", "status"]
+)
+HUMAN_REVIEWS = METRICS.counter(
+    "router_human_reviews_total", "Human reviews", ["status"]
+)
+XAI_DECISIONS = METRICS.counter(
+    "router_xai_decisions_total", "XAI decisions", ["policy"]
+)
+CARBON_OFFSETS = METRICS.counter(
+    "router_carbon_offsets_total", "Carbon offsets", ["status"]
+)
+FEDERATED_PARTICIPANTS = METRICS.gauge(
+    "router_federated_participants", "Federated participants"
+)
+BANDIT_UPDATES = METRICS.counter(
+    "router_bandit_updates_total", "Bandit updates", ["policy"]
+)
+
+
+# =============================================================================
+# Config
+# =============================================================================
+def _cfg_to_dict(cfg: Any) -> Dict[str, Any]:
+    if cfg is None:
+        return {}
+    if hasattr(cfg, "model_dump"):
+        try:
+            return cfg.model_dump()
+        except Exception:
+            pass
+    if hasattr(cfg, "dict"):
+        try:
+            return cfg.dict()
+        except Exception:
+            pass
+    if hasattr(cfg, "__dataclass_fields__"):
+        return asdict(cfg)
+    return dict(getattr(cfg, "__dict__", {}))
+
+
 if PYDANTIC_AVAILABLE:
     class GeneralConfig(BaseModel):
         bonus_discount: float = Field(0.8, ge=0, le=1)
@@ -400,21 +555,22 @@ if PYDANTIC_AVAILABLE:
     class PQCConfig(BaseModel):
         enabled: bool = True
         algorithm: str = Field("dilithium")
-        master_key: str = Field("", description="Hex string for key encryption")
+        master_key: str = Field("", description="Hex string; empty = random per-instance")
 
-        @field_validator('master_key')
+        @field_validator("master_key")
         @classmethod
         def validate_master_key(cls, v: str) -> str:
             if not v:
-                # Allow empty for demo
-                return "00" * 32
+                return ""
             try:
                 bytes.fromhex(v)
             except ValueError:
-                raise ValueError('master_key must be a hex string')
+                raise ValueError("master_key must be a hex string")
             return v
 
         def get_master_key_bytes(self) -> bytes:
+            if not self.master_key:
+                return os.urandom(32)
             return bytes.fromhex(self.master_key)
 
     class APIConfig(BaseModel):
@@ -422,6 +578,7 @@ if PYDANTIC_AVAILABLE:
         port: int = Field(8000)
         jwt_secret: str = Field(default_factory=lambda: hashlib.sha256(os.urandom(32)).hexdigest())
         rate_limit_enabled: bool = True
+        require_auth_for_admin: bool = True
 
     class SafetyConfig(BaseModel):
         max_carbon_intensity: float = 500.0
@@ -432,14 +589,20 @@ if PYDANTIC_AVAILABLE:
     class ChaosConfig(BaseModel):
         enabled: bool = False
         failure_probability: float = 0.1
+        seed: int = 42
+        hitl_ttl_seconds: float = 3600.0
+        hitl_max_pending: int = 100
 
     class OptimizerConfig(BaseModel):
         enabled: bool = True
         modp_weights: Dict[str, float] = Field(
-            default_factory=lambda: {'accuracy': 0.4, 'energy': 0.3, 'carbon': 0.2, 'latency': 0.1}
+            default_factory=lambda: {
+                "accuracy": 0.4, "energy": 0.3, "carbon": 0.2, "latency": 0.1,
+            }
         )
         bandit_min_trials: int = Field(5, ge=1)
         bandit_confidence_threshold: float = Field(0.6, ge=0, le=1)
+        bandit_feature_dim: int = Field(8, ge=1)
         bio_generations: int = Field(10, ge=1)
         bio_population_size: int = Field(20, ge=2)
         bonus_evolution_enabled: bool = True
@@ -472,8 +635,8 @@ if PYDANTIC_AVAILABLE:
         def get_master_key_bytes(self) -> bytes:
             return self.pqc.get_master_key_bytes()
 
-        def dict(self):
-            return {k: (v.dict() if hasattr(v, 'dict') else v) for k, v in self.__dict__.items()}
+        def to_dict(self) -> Dict[str, Any]:
+            return _cfg_to_dict(self)
 
 else:
     @dataclass
@@ -521,9 +684,11 @@ else:
     class PQCConfig:
         enabled: bool = True
         algorithm: str = "dilithium"
-        master_key: str = "00" * 32
+        master_key: str = ""
 
         def get_master_key_bytes(self) -> bytes:
+            if not self.master_key:
+                return os.urandom(32)
             return bytes.fromhex(self.master_key)
 
     @dataclass
@@ -532,6 +697,7 @@ else:
         port: int = 8000
         jwt_secret: str = field(default_factory=lambda: hashlib.sha256(os.urandom(32)).hexdigest())
         rate_limit_enabled: bool = True
+        require_auth_for_admin: bool = True
 
     @dataclass
     class SafetyConfig:
@@ -544,13 +710,21 @@ else:
     class ChaosConfig:
         enabled: bool = False
         failure_probability: float = 0.1
+        seed: int = 42
+        hitl_ttl_seconds: float = 3600.0
+        hitl_max_pending: int = 100
 
     @dataclass
     class OptimizerConfig:
         enabled: bool = True
-        modp_weights: Dict[str, float] = field(default_factory=lambda: {'accuracy': 0.4, 'energy': 0.3, 'carbon': 0.2, 'latency': 0.1})
+        modp_weights: Dict[str, float] = field(
+            default_factory=lambda: {
+                "accuracy": 0.4, "energy": 0.3, "carbon": 0.2, "latency": 0.1,
+            }
+        )
         bandit_min_trials: int = 5
         bandit_confidence_threshold: float = 0.6
+        bandit_feature_dim: int = 8
         bio_generations: int = 10
         bio_population_size: int = 20
         bonus_evolution_enabled: bool = True
@@ -585,510 +759,188 @@ else:
         def get_master_key_bytes(self) -> bytes:
             return self.pqc.get_master_key_bytes()
 
-# ============================================================
-# CIRCUIT BREAKER
-# ============================================================
-class CircuitBreakerState(Enum):
+        def to_dict(self) -> Dict[str, Any]:
+            return _cfg_to_dict(self)
+
+
+# =============================================================================
+# Interfaces
+# =============================================================================
+@runtime_checkable
+class ICostFunction(Protocol):
+    async def compute_multiple(self, experts: List[Any], context: Dict) -> Dict[str, float]: ...
+
+
+@runtime_checkable
+class IRegistry(Protocol):
+    def get_expert(self, expert_id: str) -> Optional[Any]: ...
+    def get_all_active_experts(self) -> List[Any]: ...
+
+
+@runtime_checkable
+class IHarvester(Protocol):
+    async def get_energy_bonus(self, expert: Any, context: Dict) -> float: ...
+
+
+@runtime_checkable
+class IPQC(Protocol):
+    async def sign_routing_decision(self, decision_data: Dict) -> Dict: ...
+    async def verify_routing_decision(self, data: Dict, signature: Dict) -> bool: ...
+    def get_quantum_status(self) -> Dict: ...
+
+
+@runtime_checkable
+class ICloudStorage(Protocol):
+    async def store(self, data: Dict, filename: Optional[str] = None) -> Dict: ...
+    def get_status(self) -> Dict: ...
+
+
+@runtime_checkable
+class IVault(Protocol):
+    async def store_secret(self, path: str, data: Dict) -> None: ...
+    async def get_secret(self, path: str) -> Optional[Dict]: ...
+
+
+@runtime_checkable
+class IAsyncDatabase(Protocol):
+    async def init(self) -> None: ...
+    async def save_routing_decision(self, decision: Dict) -> None: ...
+    async def save_optimizer_state(self, state: Dict) -> None: ...
+    async def load_optimizer_state(self) -> Optional[Dict]: ...
+    async def health_check(self) -> Dict: ...
+    async def close(self) -> None: ...
+
+
+# =============================================================================
+# Circuit breaker (sync + async aware)
+# =============================================================================
+class CircuitBreakerState(str, Enum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
 
+
 class CircuitBreaker:
-    def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: int = 60):
+    def __init__(
+        self, name: str, failure_threshold: int = 5, recovery_timeout: float = 60.0
+    ):
         self.name = name
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
+        self.failure_threshold = int(failure_threshold)
+        self.recovery_timeout = float(recovery_timeout)
         self.half_open_success_threshold = 2
         self._state = CircuitBreakerState.CLOSED
         self._failure_count = 0
         self._success_count = 0
-        self._last_failure_time = None
-        self._lock = asyncio.Lock()
-        self._metrics = {'total_calls': 0, 'failed_calls': 0, 'successful_calls': 0}
+        self._last_failure_time: Optional[float] = None
+        self._lock = threading.RLock()
+        self._metrics = {"total_calls": 0, "failed_calls": 0, "successful_calls": 0}
 
-    async def call(self, func: Callable, *args, **kwargs):
-        async with self._lock:
+    def _precheck(self) -> None:
+        with self._lock:
+            if (
+                self._state == CircuitBreakerState.OPEN
+                and self._last_failure_time is not None
+                and time.time() - self._last_failure_time >= self.recovery_timeout
+            ):
+                self._state = CircuitBreakerState.HALF_OPEN
+                self._success_count = 0
+                CIRCUIT_BREAKER_STATE.labels(name=self.name).set(0.5)
             if self._state == CircuitBreakerState.OPEN:
-                if time.time() - self._last_failure_time >= self.recovery_timeout:
-                    self._state = CircuitBreakerState.HALF_OPEN
-                    self._success_count = 0
-                    if PROMETHEUS_AVAILABLE:
-                        CIRCUIT_BREAKER_STATE.labels(name=self.name).set(0.5)
-                    logger.info(f"Circuit breaker {self.name} transitioning to HALF_OPEN")
-                else:
-                    raise CircuitBreakerOpenError(f"Circuit breaker {self.name} is OPEN")
-            if self._state == CircuitBreakerState.HALF_OPEN and self._success_count >= self.half_open_success_threshold:
-                self._state = CircuitBreakerState.CLOSED
-                if PROMETHEUS_AVAILABLE:
-                    CIRCUIT_BREAKER_STATE.labels(name=self.name).set(0)
-                logger.info(f"Circuit breaker {self.name} closed after {self._success_count} successes")
-        self._metrics['total_calls'] += 1
-        try:
-            result = await func(*args, **kwargs)
-            await self._record_success()
-            return result
-        except Exception:
-            await self._record_failure()
-            raise
+                raise CircuitBreakerOpenError(f"Circuit breaker {self.name} is OPEN")
 
-    async def _record_success(self):
-        async with self._lock:
-            self._metrics['successful_calls'] += 1
+    def _record_success(self) -> None:
+        with self._lock:
+            self._metrics["successful_calls"] += 1
             self._success_count += 1
             if self._state == CircuitBreakerState.HALF_OPEN:
                 if self._success_count >= self.half_open_success_threshold:
                     self._state = CircuitBreakerState.CLOSED
-                    if PROMETHEUS_AVAILABLE:
-                        CIRCUIT_BREAKER_STATE.labels(name=self.name).set(0)
+                    self._failure_count = 0
+                    CIRCUIT_BREAKER_STATE.labels(name=self.name).set(0)
             else:
                 self._failure_count = 0
 
-    async def _record_failure(self):
-        async with self._lock:
-            self._metrics['failed_calls'] += 1
+    def _record_failure(self) -> None:
+        with self._lock:
+            self._metrics["failed_calls"] += 1
             self._failure_count += 1
             self._last_failure_time = time.time()
-            if self._state == CircuitBreakerState.CLOSED and self._failure_count >= self.failure_threshold:
-                self._state = CircuitBreakerState.OPEN
-                if PROMETHEUS_AVAILABLE:
-                    CIRCUIT_BREAKER_STATE.labels(name=self.name).set(1)
-                logger.warning(f"Circuit breaker {self.name} opened after {self._failure_count} failures")
-            elif self._state == CircuitBreakerState.HALF_OPEN:
-                self._state = CircuitBreakerState.OPEN
-                if PROMETHEUS_AVAILABLE:
+            if self._state in (CircuitBreakerState.CLOSED, CircuitBreakerState.HALF_OPEN):
+                if self._failure_count >= self.failure_threshold:
+                    self._state = CircuitBreakerState.OPEN
                     CIRCUIT_BREAKER_STATE.labels(name=self.name).set(1)
 
-    def get_metrics(self) -> Dict:
-        return {**self._metrics, 'state': self._state.value, 'failure_count': self._failure_count, 'success_count': self._success_count}
+    async def call_async(self, func, *args, **kwargs):
+        self._precheck()
+        self._metrics["total_calls"] += 1
+        try:
+            result = await func(*args, **kwargs)
+        except Exception:
+            self._record_failure()
+            raise
+        self._record_success()
+        return result
+
+    def call_sync(self, func, *args, **kwargs):
+        self._precheck()
+        self._metrics["total_calls"] += 1
+        try:
+            result = func(*args, **kwargs)
+        except Exception:
+            self._record_failure()
+            raise
+        self._record_success()
+        return result
+
+    async def call(self, func, *args, **kwargs):
+        if inspect.iscoroutinefunction(func):
+            return await self.call_async(func, *args, **kwargs)
+        result = self.call_sync(func, *args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    def get_metrics(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                **self._metrics,
+                "state": self._state.value,
+                "failure_count": self._failure_count,
+                "success_count": self._success_count,
+            }
+
 
 class GlobalCircuitBreaker:
-    _instance = None
+    _instance: Optional["GlobalCircuitBreaker"] = None
     _breakers: Dict[str, CircuitBreaker] = {}
+    _lock = threading.RLock()
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
         return cls._instance
 
     def get_or_create(self, name: str, **kwargs) -> CircuitBreaker:
-        if name not in self._breakers:
-            self._breakers[name] = CircuitBreaker(name, **kwargs)
-        return self._breakers[name]
+        with self._lock:
+            if name not in self._breakers:
+                self._breakers[name] = CircuitBreaker(name, **kwargs)
+            return self._breakers[name]
 
-# ============================================================
-# NEW: CausalBandit
-# ============================================================
-class CausalBandit:
-    """Causal bandit estimating average treatment effects for routing policies."""
-    def __init__(self, action_space: List[str], fallback_solver: Callable,
-                 min_trials_before_bandit: int = 5, confidence_threshold: float = 0.6):
-        self.actions = action_space
-        self.fallback_solver = fallback_solver
-        self.min_trials = min_trials_before_bandit
-        self.confidence_threshold = confidence_threshold
-        self.q_values = {a: 0.0 for a in action_space}
-        self.counts = {a: 0 for a in action_space}
-        self.causal_effects = {a: 0.0 for a in action_space}
-        self.trials = 0
-        self.context_history: List[Dict] = []
-        self.reward_history: List[float] = []
-        self.action_history: List[str] = []
+    def all_metrics(self) -> Dict[str, Any]:
+        with self._lock:
+            return {name: cb.get_metrics() for name, cb in self._breakers.items()}
 
-    def select_action(self, context: Dict) -> Tuple[str, float, str]:
-        if self.trials < self.min_trials:
-            return self.fallback_solver(context), 0.0, "fallback"
-        epsilon = 0.1
-        if random.random() < epsilon:
-            action = random.choice(self.actions)
-        else:
-            if self.trials >= 10 and any(abs(v) > 1e-6 for v in self.causal_effects.values()):
-                action = max(self.causal_effects, key=self.causal_effects.get)
-            else:
-                action = max(self.q_values, key=self.q_values.get)
-        return action, 0.5, "causal"
 
-    def update(self, context: Dict, action: str, reward: float):
-        self.trials += 1
-        self.counts[action] += 1
-        self.q_values[action] += (reward - self.q_values[action]) / self.counts[action]
-        self.context_history.append(context)
-        self.reward_history.append(reward)
-        self.action_history.append(action)
-        rewards = [r for a, r in zip(self.action_history, self.reward_history) if a == action]
-        self.causal_effects[action] = float(np.mean(rewards)) if rewards else 0.0
-
-    def seed_safe_policy(self, context, policy):
-        pass
-
-# ============================================================
-# NEW: SafetyMonitor (temporal logic)
-# ============================================================
-class SafetyMonitor:
-    """Monitors routing decisions against temporal safety rules."""
-    def __init__(self, config: SafetyConfig):
-        self.config = config
-        self.low_harvester_routes = 0
-        self.consecutive_low_fitness = 0
-        self.history: deque = deque(maxlen=50)
-        self.violations: List[Dict] = []
-
-    def check_routing(self, context: Dict, expert: ExpertProfile, fitness: float) -> bool:
-        if not self.config.enable_monitor:
-            return True
-        # Rule: max carbon intensity
-        carbon_intensity = context.get('carbon_intensity', 0)
-        if isinstance(carbon_intensity, float) and carbon_intensity <= 1.0:
-            carbon_intensity = carbon_intensity * 800.0
-        if carbon_intensity > self.config.max_carbon_intensity:
-            self._record_violation("max_carbon_intensity", {"carbon": carbon_intensity})
-            return False
-        # Rule: limit low-harvester routes when carbon is high
-        is_harvester = getattr(expert, 'photosynthetic_harvester_flag', False)
-        if not is_harvester and carbon_intensity > self.config.max_carbon_intensity * 0.8:
-            self.low_harvester_routes += 1
-            if self.low_harvester_routes > self.config.max_low_harvester_routes:
-                self._record_violation("max_low_harvester_routes", {"count": self.low_harvester_routes})
-                return False
-        else:
-            self.low_harvester_routes = 0
-        # Rule: consecutive low fitness
-        if fitness < 0.3:
-            self.consecutive_low_fitness += 1
-            if self.consecutive_low_fitness > self.config.max_consecutive_low_fitness:
-                self._record_violation("consecutive_low_fitness", {"count": self.consecutive_low_fitness})
-                return False
-        else:
-            self.consecutive_low_fitness = 0
-        self.history.append({"context": context, "expert_id": expert.expert_id, "fitness": fitness})
-        return True
-
-    def _record_violation(self, rule: str, details: Dict):
-        self.violations.append({"rule": rule, "details": details, "timestamp": datetime.now().isoformat()})
-        if PROMETHEUS_AVAILABLE:
-            SAFETY_VIOLATIONS.labels(rule=rule).inc()
-        logger.warning(f"Safety violation: {rule} - {details}")
-
-    def get_violations(self) -> List[Dict]:
-        return self.violations
-
-# ============================================================
-# NEW: XAIExplainer
-# ============================================================
-class XAIExplainer:
-    """Generates human-readable explanations for routing decisions."""
-    def explain_routing(self, expert: ExpertProfile, policy: str, context: Dict,
-                        confidence: float, cost: float, bonus_applied: bool) -> str:
-        parts = [f"Selected expert '{expert.expert_id}' (domain='{getattr(expert, 'domain', 'unknown')}')"]
-        parts.append(f"policy='{policy}' (confidence={confidence:.2f})")
-        parts.append(f"cost={cost:.4f}")
-        if bonus_applied:
-            parts.append("harvester_bonus=YES")
-        if 'data_source' in context:
-            parts.append(f"data_source='{context['data_source']}'")
-        if 'carbon_intensity' in context:
-            parts.append(f"carbon={context['carbon_intensity']}")
-        if hasattr(expert, 'accuracy_score'):
-            parts.append(f"accuracy={expert.accuracy_score:.3f}")
-        return " | ".join(parts)
-
-# ============================================================
-# NEW: FederatedRouterCoordinator
-# ============================================================
-class FederatedRouterCoordinator:
-    """Aggregates bandit Q-values and MoE weights across deployments with DP noise."""
-    def __init__(self, privacy_budget: float = 0.5):
-        self.participants: Dict[str, Dict[str, Any]] = {}
-        self.privacy_budget = max(privacy_budget, 1e-6)
-
-    def register_participant(self, participant_id: str, update: Dict[str, Any]):
-        self.participants[participant_id] = update
-        if PROMETHEUS_AVAILABLE:
-            FEDERATED_PARTICIPANTS.set(len(self.participants))
-
-    def aggregate(self) -> Dict[str, Any]:
-        if not self.participants:
-            return {}
-        keys = set()
-        for update in self.participants.values():
-            keys.update(update.keys())
-        avg = {}
-        for key in keys:
-            vals = [u.get(key, 0.0) for u in self.participants.values()]
-            if all(isinstance(v, (int, float)) for v in vals):
-                noise = float(np.random.laplace(0, 1.0 / self.privacy_budget))
-                avg[key] = float(np.mean(vals) + noise)
-            else:
-                avg[key] = vals[0]
-        return avg
-
-    def get_participant_count(self) -> int:
-        return len(self.participants)
-
-# ============================================================
-# NEW: MultiAgentRouter (bidding and role specialisation)
-# ============================================================
-class MultiAgentRouter:
-    """Treats each expert as an agent that bids for routing tasks.
-    Emergent role specialisation is tracked via reputation per domain."""
-    def __init__(self):
-        self.expert_bids: Dict[str, float] = {}
-        self.domain_reputation: Dict[str, Dict[str, float]] = defaultdict(dict)
-        self.specialist_roles: Dict[str, str] = {}
-
-    def submit_bid(self, expert_id: str, bid: float):
-        self.expert_bids[expert_id] = bid
-
-    def record_outcome(self, expert_id: str, domain: str, success: bool):
-        alpha = 0.3
-        prev = self.domain_reputation[domain].get(expert_id, 0.5)
-        new = prev + alpha * ((1.0 if success else 0.0) - prev)
-        self.domain_reputation[domain][expert_id] = new
-        # Update specialist role if reputation is high
-        if new > 0.75:
-            self.specialist_roles[expert_id] = f"specialist_{domain}"
-
-    def get_specialist_for_domain(self, domain: str) -> Optional[str]:
-        rep = self.domain_reputation.get(domain, {})
-        if not rep:
-            return None
-        return max(rep, key=rep.get)
-
-    def get_stats(self) -> Dict:
-        return {
-            "num_experts": len(self.expert_bids),
-            "domains": list(self.domain_reputation.keys()),
-            "specialist_roles": dict(self.specialist_roles),
-        }
-
-# ============================================================
-# NEW: CarbonOffsetBroker
-# ============================================================
-class CarbonOffsetBroker:
-    """Purchases carbon offsets and RECs when thresholds are exceeded."""
-    def __init__(self, threshold: float = 400.0, cost_per_kg: float = 0.1, rec_cost_per_mwh: float = 5.0):
-        self.threshold = threshold
-        self.cost_per_kg = cost_per_kg
-        self.rec_cost_per_mwh = rec_cost_per_mwh
-        self.total_offset_kg = 0.0
-        self.total_recs_mwh = 0.0
-        self.total_cost = 0.0
-
-    async def purchase_offsets(self, carbon_intensity: float, carbon_kg: float) -> Dict:
-        if carbon_intensity <= self.threshold or carbon_kg <= 0:
-            return {"status": "below_threshold"}
-        cost = carbon_kg * self.cost_per_kg
-        self.total_offset_kg += carbon_kg
-        self.total_cost += cost
-        if PROMETHEUS_AVAILABLE:
-            CARBON_OFFSETS.labels(status='offset_purchased').inc()
-        logger.info(f"Offset purchased: {carbon_kg:.4f} kg for ${cost:.4f}")
-        return {"status": "offset_purchased", "carbon_kg": carbon_kg, "cost_usd": cost}
-
-    async def purchase_recs(self, energy_mwh: float) -> Dict:
-        if energy_mwh <= 0:
-            return {"status": "no_energy"}
-        cost = energy_mwh * self.rec_cost_per_mwh
-        self.total_recs_mwh += energy_mwh
-        self.total_cost += cost
-        if PROMETHEUS_AVAILABLE:
-            CARBON_OFFSETS.labels(status='rec_purchased').inc()
-        return {"status": "rec_purchased", "energy_mwh": energy_mwh, "cost_usd": cost}
-
-    def get_totals(self) -> Dict:
-        return {
-            "total_offset_kg": self.total_offset_kg,
-            "total_recs_mwh": self.total_recs_mwh,
-            "total_cost_usd": self.total_cost,
-        }
-
-# ============================================================
-# NEW: ChaosMonkey
-# ============================================================
-class ChaosMonkey:
-    """Injects simulated failures to test resilience."""
-    def __init__(self, config: ChaosConfig):
-        self.config = config
-        self.injected_failures = 0
-
-    def maybe_fail(self, component: str = "router"):
-        if self.config.enabled and random.random() < self.config.failure_probability:
-            self.injected_failures += 1
-            if PROMETHEUS_AVAILABLE:
-                CHAOS_EXPERIMENTS.labels(type=component, status='injected').inc()
-            raise ChaosExperimentError(f"Simulated chaos failure in {component}")
-
-    def get_stats(self) -> Dict:
-        return {"enabled": self.config.enabled, "injected_failures": self.injected_failures}
-
-# ============================================================
-# NEW: HumanReviewManager
-# ============================================================
-class HumanReviewManager:
-    """Manages human review of critical routing decisions."""
-    def __init__(self):
-        self.pending_reviews: Dict[str, Dict[str, Any]] = {}
-        self._lock = asyncio.Lock()
-
-    async def request_review(self, decision_id: str, details: Dict) -> str:
-        review_id = str(uuid.uuid4())
-        async with self._lock:
-            self.pending_reviews[review_id] = {
-                "review_id": review_id,
-                "decision_id": decision_id,
-                "details": details,
-                "status": "pending",
-                "created_at": datetime.now().isoformat(),
-            }
-        if PROMETHEUS_AVAILABLE:
-            HUMAN_REVIEWS.labels(status='pending').inc()
-        logger.info(f"Human review requested: {review_id}")
-        return review_id
-
-    async def approve(self, review_id: str) -> bool:
-        async with self._lock:
-            if review_id in self.pending_reviews:
-                self.pending_reviews[review_id]["status"] = "approved"
-                if PROMETHEUS_AVAILABLE:
-                    HUMAN_REVIEWS.labels(status='approved').inc()
-                return True
-        return False
-
-    async def reject(self, review_id: str) -> bool:
-        async with self._lock:
-            if review_id in self.pending_reviews:
-                self.pending_reviews[review_id]["status"] = "rejected"
-                if PROMETHEUS_AVAILABLE:
-                    HUMAN_REVIEWS.labels(status='rejected').inc()
-                return True
-        return False
-
-    async def get_pending(self) -> List[Dict]:
-        async with self._lock:
-            return [r for r in self.pending_reviews.values() if r["status"] == "pending"]
-
-# ============================================================
-# NEW: QuantumDistillationOptimizer (optional)
-# ============================================================
-class QuantumDistillationOptimizer:
-    """Optional quantum-assisted expert selection using QAOA."""
-    def __init__(self, config: QuantumConfig):
-        self.config = config
-        self.available = config.enable_distillation and QISKIT_AVAILABLE
-
-    async def select_best_expert(self, candidates: List[ExpertProfile],
-                                  context: Dict, modp_weights: Dict[str, float]) -> Optional[ExpertProfile]:
-        if not self.available or not candidates:
-            return None
-        try:
-            qp = QuadraticProgram()
-            for e in candidates:
-                qp.binary_var(e.expert_id)
-            # Utility per expert
-            utility = {}
-            for e in candidates:
-                accuracy = getattr(e, 'accuracy_score', 0.5) or 0.5
-                energy = 1.0 - (getattr(e, 'usage_count', 0) / 100.0)
-                carbon = context.get('carbon_intensity', 0.5)
-                latency = 0.5
-                u = (accuracy * modp_weights.get('accuracy', 0.4) +
-                     energy * modp_weights.get('energy', 0.3) +
-                     (1 - carbon) * modp_weights.get('carbon', 0.2) +
-                     (1 - latency) * modp_weights.get('latency', 0.1))
-                utility[e.expert_id] = u
-            linear = {eid: -u for eid, u in utility.items()}
-            qp.minimize(linear=linear)
-            qp.linear_constraint(linear={eid: 1 for eid in utility}, sense='E', rhs=1, name='one_expert')
-            backend = Aer.get_backend('aer_simulator')
-            qaoa = QAOA(reps=self.config.qaoa_reps)
-            optimizer = MinimumEigenOptimizer(qaoa)
-            result = optimizer.solve(qp)
-            for i, e in enumerate(candidates):
-                if result.x[i] > 0.5:
-                    return e
-        except Exception as ex:
-            logger.warning(f"Quantum optimization failed: {ex}")
-        return None
-
-    def get_status(self) -> Dict:
-        return {"available": self.available, "qiskit_available": QISKIT_AVAILABLE}
-
-# ============================================================
-# FLEXGEN MANAGER
-# ============================================================
-class FlexGenManager:
-    """Manager for FlexGen offloading policy optimization with precision selection."""
-    def __init__(self, config: RouterConfig):
-        self.config = config
-        self.flexgen_cost_model = None
-        self.policy_drift_detector = None
-        self.gpu_profiler = None
-        if FLEXGEN_AVAILABLE:
-            self.flexgen_cost_model = FlexGenCostModel(
-                carbon_intensity_g_per_kwh=config.optimizer.flexgen_carbon_intensity_default
-            )
-            self.policy_drift_detector = PolicyDriftDetector()
-            try:
-                from enhancements.gpu_profiler import GPUProfiler
-                self.gpu_profiler = GPUProfiler()
-            except ImportError:
-                self.gpu_profiler = None
-            logger.info("FlexGen Manager initialized for expert router")
-        else:
-            logger.warning("FlexGen modules not available; manager will be disabled.")
-
-    async def optimize_policy(self, workload: WorkloadDescriptor, node: NodeDescriptor) -> Dict:
-        if not FLEXGEN_AVAILABLE:
-            return {"error": "FlexGen modules not available"}
-        from enhancements.gpu_optimization.flexgen_controller import FlexGenController
-        from enhancements.gpu_optimization.flexgen_policy_selector import DistillationFlexGenSelector
-        selector = DistillationFlexGenSelector(
-            n_candidates=20,
-            config={'epsilon': self.config.optimizer.flexgen_selector_epsilon,
-                    'epsilon_decay': self.config.optimizer.flexgen_selector_epsilon_decay}
-        )
-        controller = FlexGenController(
-            node=node, workload=workload,
-            carbon_intensity=workload.metadata.get('carbon_intensity',
-                                                   self.config.optimizer.flexgen_carbon_intensity_default),
-            use_real_executor=self.config.optimizer.flexgen_use_real_executor,
-            executor=None,
-            cost_model=self.flexgen_cost_model,
-            use_bio_search=True,
-            bio_search_config={'population_size': self.config.optimizer.flexgen_population_size,
-                               'generations': self.config.optimizer.flexgen_generations},
-            modp_planner=None,
-            drift_detector=self.policy_drift_detector,
-            gpu_profiler=self.gpu_profiler,
-        )
-        return await controller.step()
-
-    async def select_precision(self, workload: Dict) -> str:
-        """Adaptive precision switching based on carbon intensity and workload size."""
-        carbon_intensity = workload.get("carbon_intensity", self.config.optimizer.flexgen_carbon_intensity_default)
-        workload_size = workload.get("size", "medium")
-        if carbon_intensity > 500 or workload_size == "large":
-            return "int8"
-        elif carbon_intensity > 300 or workload_size == "medium":
-            return "fp16"
-        return "fp32"
-
-    async def get_status(self) -> Dict:
-        if not FLEXGEN_AVAILABLE:
-            return {"available": False}
-        return {
-            "available": True,
-            "drift": self.policy_drift_detector.get_stats() if self.policy_drift_detector else {},
-            "gpu": self.gpu_profiler.get_current_metrics() if self.gpu_profiler else {},
-        }
-
-# ============================================================
-# RATE LIMITER
-# ============================================================
+# =============================================================================
+# RateLimiter
+# =============================================================================
 class RateLimiter:
     def __init__(self, config: RouterConfig):
         self.config = config
-        self.rate = config.rate_limit.requests_per_minute
-        self.window = config.rate_limit.window_seconds
+        self.rate = float(config.rate_limit.requests_per_minute)
+        self.window = float(config.rate_limit.window_seconds)
         self.tokens = self.rate
         self.last_refill = time.time()
         self._lock = asyncio.Lock()
@@ -1098,8 +950,8 @@ class RateLimiter:
     async def acquire(self) -> bool:
         async with self._lock:
             now = time.time()
-            time_passed = now - self.last_refill
-            self.tokens = min(self.rate, self.tokens + time_passed * (self.rate / self.window))
+            elapsed = now - self.last_refill
+            self.tokens = min(self.rate, self.tokens + elapsed * (self.rate / self.window))
             self.last_refill = now
             if self.tokens >= 1:
                 self.tokens -= 1
@@ -1108,17 +960,18 @@ class RateLimiter:
             self.throttled_requests += 1
             return False
 
-    def get_metrics(self) -> Dict:
+    def get_metrics(self) -> Dict[str, Any]:
         total = self.total_requests + self.throttled_requests
         return {
-            'total_requests': self.total_requests,
-            'throttled_requests': self.throttled_requests,
-            'throttle_rate': (self.throttled_requests / max(total, 1)) * 100,
+            "total_requests": self.total_requests,
+            "throttled_requests": self.throttled_requests,
+            "throttle_rate": (self.throttled_requests / max(total, 1)) * 100,
         }
 
-# ============================================================
-# VAULT MANAGER
-# ============================================================
+
+# =============================================================================
+# VaultManager
+# =============================================================================
 class VaultManager(IVault):
     def __init__(self, config: RouterConfig):
         self.config = config
@@ -1127,119 +980,1125 @@ class VaultManager(IVault):
             try:
                 self.client = VaultClient(url=config.vault.url, token=config.vault.token)
             except Exception as e:
-                logger.error(f"Vault init failed: {e}")
+                logger.error(f"vault_init_failed error={e}")
 
-    async def store_secret(self, path: str, data: Dict):
+    async def store_secret(self, path: str, data: Dict) -> None:
         if not self.client:
-            return
+            raise RouterError("Vault client not configured")
         try:
             self.client.secrets.kv.v2.create_or_update_secret(path=path, secret=data)
-            if PROMETHEUS_AVAILABLE:
-                VAULT_OPERATIONS.labels(operation='store', status='success').inc()
+            VAULT_OPERATIONS.labels(operation="store", status="success").inc()
         except Exception as e:
-            if PROMETHEUS_AVAILABLE:
-                VAULT_OPERATIONS.labels(operation='store', status='failed').inc()
-            raise
+            VAULT_OPERATIONS.labels(operation="store", status="failed").inc()
+            raise RouterError(f"vault_store_failed error={e}") from e
 
     async def get_secret(self, path: str) -> Optional[Dict]:
         if not self.client:
             return None
         try:
             secret = self.client.secrets.kv.v2.read_secret(path=path)
-            if PROMETHEUS_AVAILABLE:
-                VAULT_OPERATIONS.labels(operation='read', status='success').inc()
-            return secret['data']['data']
+            VAULT_OPERATIONS.labels(operation="read", status="success").inc()
+            return secret["data"]["data"]
         except Exception:
-            if PROMETHEUS_AVAILABLE:
-                VAULT_OPERATIONS.labels(operation='read', status='failed').inc()
+            VAULT_OPERATIONS.labels(operation="read", status="failed").inc()
             return None
 
-    async def health_check(self) -> Dict:
+    async def health_check(self) -> Dict[str, Any]:
         return {"status": "ok" if self.client else "unavailable"}
 
-# ============================================================
-# POST-QUANTUM CRYPTOGRAPHY
-# ============================================================
+
+# =============================================================================
+# PostQuantumCrypto — real signing with ECDSA fallback
+# =============================================================================
 class PostQuantumCrypto(IPQC):
     def __init__(self, config: RouterConfig, vault: Optional[VaultManager] = None):
         self.config = config
         self.vault = vault
-        self.pqc_available = PQC_AVAILABLE
+        self.pqc_available = PQC_AVAILABLE and CRYPTO_AVAILABLE
         self.master_key = config.get_master_key_bytes()
+        self.salt = os.urandom(16)
+        self._keys: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.RLock()
 
-    async def sign_routing_decision(self, decision_data: Dict) -> Dict:
-        data_bytes = json.dumps(decision_data, sort_keys=True, default=str).encode()
-        sig = hashlib.sha256(data_bytes).hexdigest()
-        if PROMETHEUS_AVAILABLE:
-            PQC_SIGNATURES.labels(algorithm='sha256_fallback', status='success').inc()
-        return {'signature': sig, 'algorithm': 'sha256_fallback', 'timestamp': datetime.now().isoformat()}
+    async def generate_keypair(self, algorithm: Optional[str] = None) -> Dict[str, Any]:
+        algorithm = algorithm or self.config.pqc.algorithm
+        with self._lock:
+            if self.pqc_available and algorithm in {"dilithium", "falcon", "sphincs"}:
+                try:
+                    mod = {"dilithium": dilithium, "falcon": falcon, "sphincs": sphincs}[algorithm]
+                    pk, sk = await asyncio.to_thread(mod.generate_keypair)
+                    key_id = f"{algorithm}_{uuid.uuid4().hex[:8]}"
+                    self._keys[key_id] = {
+                        "private": bytes(sk), "public": bytes(pk), "algorithm": algorithm,
+                    }
+                    PQC_SIGNATURES.labels(algorithm=algorithm, status="keygen").inc()
+                    return {
+                        "key_id": key_id, "algorithm": algorithm,
+                        "public_key": bytes(pk).hex(), "pqc": True,
+                    }
+                except Exception as e:
+                    logger.warning(f"pqc_keygen_failed error={e}")
 
-    def get_quantum_status(self) -> Dict:
+            if not CRYPTO_AVAILABLE:
+                raise SignatureError("No cryptographic backend available")
+
+            private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
+            public_key = private_key.public_key()
+            public_bytes = public_key.public_bytes(
+                Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+            )
+            private_bytes = private_key.private_bytes(
+                Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+            )
+            key_id = f"ecdsa_{uuid.uuid4().hex[:8]}"
+            self._keys[key_id] = {
+                "private": private_bytes, "public": public_bytes, "algorithm": "ecdsa",
+            }
+            PQC_SIGNATURES.labels(algorithm="ecdsa", status="keygen").inc()
+            return {
+                "key_id": key_id, "algorithm": "ecdsa",
+                "public_key": public_bytes.hex(), "pqc": False,
+            }
+
+    async def sign_routing_decision(self, decision_data: Dict) -> Dict[str, Any]:
+        with self._lock:
+            if not self._keys:
+                empty = True
+            else:
+                empty = False
+        if empty:
+            await self.generate_keypair()
+
+        with self._lock:
+            key_id = next(iter(self._keys))
+            entry = self._keys[key_id]
+
+        payload = json.dumps(decision_data, sort_keys=True, default=str).encode()
+        if entry["algorithm"] == "ecdsa":
+            private_key = load_pem_private_key(
+                entry["private"], password=None, backend=default_backend()
+            )
+            sig = private_key.sign(payload, ec.ECDSA(hashes.SHA256()))
+            PQC_SIGNATURES.labels(algorithm="ecdsa", status="signed").inc()
+            return {
+                "signature": sig.hex(),
+                "algorithm": "ecdsa-p256",
+                "key_id": key_id,
+                "timestamp": datetime.now().isoformat(),
+            }
+        mod = {"dilithium": dilithium, "falcon": falcon, "sphincs": sphincs}[entry["algorithm"]]
+        sig = mod.sign(entry["private"], payload)
+        PQC_SIGNATURES.labels(algorithm=entry["algorithm"], status="signed").inc()
         return {
-            'pqc_available': self.pqc_available,
-            'algorithms': ['dilithium', 'falcon', 'sphincs'] if self.pqc_available else ['ecdsa'],
+            "signature": bytes(sig).hex(),
+            "algorithm": entry["algorithm"],
+            "key_id": key_id,
+            "timestamp": datetime.now().isoformat(),
         }
 
-    async def health_check(self) -> Dict:
-        return {"status": "ok"}
+    async def verify_routing_decision(self, data: Dict, signature: Dict[str, Any]) -> bool:
+        key_id = signature.get("key_id")
+        with self._lock:
+            entry = self._keys.get(key_id) if key_id else None
+        if entry is None:
+            return False
+        payload = json.dumps(data, sort_keys=True, default=str).encode()
+        try:
+            if entry["algorithm"] == "ecdsa":
+                public_key = load_pem_public_key(entry["public"], backend=default_backend())
+                public_key.verify(
+                    bytes.fromhex(signature["signature"]),
+                    payload,
+                    ec.ECDSA(hashes.SHA256()),
+                )
+                return True
+            mod = {"dilithium": dilithium, "falcon": falcon, "sphincs": sphincs}[
+                entry["algorithm"]
+            ]
+            mod.verify(entry["public"], payload, bytes.fromhex(signature["signature"]))
+            return True
+        except Exception:
+            return False
 
-# ============================================================
-# MULTI-CLOUD STORAGE
-# ============================================================
+    def get_quantum_status(self) -> Dict[str, Any]:
+        return {
+            "pqc_available": self.pqc_available,
+            "algorithm_in_use": "pqc" if self.pqc_available else "ecdsa",
+            "keys_held": len(self._keys),
+        }
+
+    async def health_check(self) -> Dict[str, Any]:
+        return {"status": "ok", **self.get_quantum_status()}
+
+
+# =============================================================================
+# MultiCloudStorage — local + optional cloud
+# =============================================================================
 class MultiCloudStorage(ICloudStorage):
     def __init__(self, config: RouterConfig):
         self.config = config
-        self.providers = {}
-
-    async def store(self, data: Dict, filename: str = None) -> Dict:
-        path = Path(f"./routing_backup_{filename or 'data'}.json")
+        self.backup_dir = Path("./routing_backups")
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, 'w') as f:
-                json.dump(data, f, default=str)
-            if PROMETHEUS_AVAILABLE:
-                CLOUD_STORAGE.labels(provider='local', operation='store', status='success').inc()
-            return {'provider': 'local', 'location': str(path)}
+            self.backup_dir.mkdir(exist_ok=True)
+        except Exception:
+            pass
+        self.providers: Dict[str, Any] = {}
+        if AWS_AVAILABLE and config.cloud.aws_bucket:
+            try:
+                self.providers["aws"] = {
+                    "client": boto3.client(
+                        "s3",
+                        region_name=config.cloud.aws_region,
+                        aws_access_key_id=config.cloud.aws_access_key,
+                        aws_secret_access_key=config.cloud.aws_secret_key,
+                    ),
+                    "bucket": config.cloud.aws_bucket,
+                }
+            except Exception as e:
+                logger.warning(f"aws_client_init_failed error={e}")
+
+    async def store(self, data: Dict, filename: Optional[str] = None) -> Dict[str, Any]:
+        filename = filename or f"routing_{uuid.uuid4().hex[:8]}.json"
+        path = self.backup_dir / filename
+        payload = json.dumps(data, default=str)
+        try:
+            await asyncio.to_thread(path.write_text, payload)
         except Exception as e:
-            if PROMETHEUS_AVAILABLE:
-                CLOUD_STORAGE.labels(provider='local', operation='store', status='failed').inc()
-            raise
+            CLOUD_STORAGE.labels(provider="local", operation="store", status="failed").inc()
+            raise RouterError(f"local_store_failed error={e}") from e
+        CLOUD_STORAGE.labels(provider="local", operation="store", status="success").inc()
 
-    def get_status(self) -> Dict:
-        return {'providers': list(self.providers.keys()) or ['local']}
+        uploaded: List[str] = []
+        if "aws" in self.providers:
+            try:
+                await asyncio.to_thread(
+                    self.providers["aws"]["client"].put_object,
+                    Bucket=self.providers["aws"]["bucket"],
+                    Key=filename,
+                    Body=payload.encode(),
+                )
+                uploaded.append("aws")
+                CLOUD_STORAGE.labels(provider="aws", operation="store", status="success").inc()
+            except Exception as e:
+                CLOUD_STORAGE.labels(provider="aws", operation="store", status="failed").inc()
+                logger.warning(f"aws_upload_failed error={e}")
 
-    async def health_check(self) -> Dict:
-        return {"status": "ok"}
+        return {"provider": uploaded or ["local"], "location": str(path)}
 
-# ============================================================
-# ASYNC DATABASE MANAGER
-# ============================================================
-if SQLALCHEMY_AVAILABLE:
-    Base = declarative_base()
+    async def retrieve(self, key: str) -> Optional[Dict[str, Any]]:
+        path = self.backup_dir / key
+        if not path.exists():
+            return None
+        try:
+            return json.loads(await asyncio.to_thread(path.read_text))
+        except Exception:
+            return None
 
-    class RoutingDecisionDB(Base):
-        __tablename__ = 'routing_decisions'
-        id = Column(Integer, primary_key=True)
-        routing_id = Column(String(64), unique=True, index=True)
-        task_type = Column(String(128))
-        selected_expert_id = Column(String(128))
-        cost = Column(Float)
-        bonus_applied = Column(Boolean)
-        context = Column(JSON)
-        timestamp = Column(DateTime, default=datetime.now)
-        pqc_signature = Column(Text, nullable=True)
-        explanation = Column(Text, nullable=True)
-        precision = Column(String(16), nullable=True)
+    def get_status(self) -> Dict[str, Any]:
+        return {"providers": list(self.providers.keys()) or ["local"],
+                "backup_dir": str(self.backup_dir)}
 
-    class OptimizerStateDB(Base):
-        __tablename__ = 'optimizer_state'
-        id = Column(Integer, primary_key=True)
-        key = Column(String(64), unique=True)
-        value = Column(JSON)
-        updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-else:
-    Base = None
+    async def health_check(self) -> Dict[str, Any]:
+        return {"status": "ok", **self.get_status()}
 
+
+# =============================================================================
+# CausalBandit — real linear contextual bandit
+# =============================================================================
+@dataclass
+class BanditConfig:
+    alpha: float = 1.0
+    exploration_beta: float = 1.0
+    min_trials: int = 5
+    use_thompson: bool = True
+
+
+class CausalBandit:
+    """
+    Per-action Bayesian linear regression bandit with Thompson sampling.
+    Real contextual bandit — not a mean tracker.
+    """
+
+    def __init__(
+        self,
+        action_space: List[str],
+        fallback_solver: Optional[Callable[[Any], str]] = None,
+        min_trials_before_bandit: int = 5,
+        confidence_threshold: float = 0.6,
+        feature_dim: int = 8,
+        config: Optional[BanditConfig] = None,
+    ):
+        if not action_space:
+            raise ValueError("action_space must be non-empty")
+        self.actions: List[str] = list(action_space)
+        self.dim = int(feature_dim)
+        cfg = config or BanditConfig()
+        cfg.min_trials = int(min_trials_before_bandit)
+        self.config = cfg
+        self.fallback_solver = fallback_solver
+        self.confidence_threshold = float(confidence_threshold)
+        self.theta: Dict[str, np.ndarray] = {a: np.zeros(self.dim) for a in self.actions}
+        self.P: Dict[str, np.ndarray] = {
+            a: np.eye(self.dim) / cfg.alpha for a in self.actions
+        }
+        self.usage: Dict[str, int] = {a: 0 for a in self.actions}
+        self.total_trials = 0
+        self._lock = threading.RLock()
+
+    def _prepare_features(self, context: Any) -> np.ndarray:
+        if isinstance(context, dict):
+            vals = [float(v) for v in context.values() if isinstance(v, (int, float))]
+        elif context is None:
+            vals = []
+        else:
+            try:
+                vals = [float(v) for v in context]
+            except Exception:
+                vals = []
+        if len(vals) < self.dim:
+            vals = vals + [0.0] * (self.dim - len(vals))
+        return np.asarray(vals[: self.dim], dtype=float)
+
+    def select_action(self, context: Any) -> Tuple[str, float, str]:
+        with self._lock:
+            x = self._prepare_features(context)
+            if self.total_trials < self.config.min_trials and self.fallback_solver is not None:
+                return self.fallback_solver(context), 0.0, "fallback"
+
+            if self.config.use_thompson:
+                samples: Dict[str, float] = {}
+                for a in self.actions:
+                    try:
+                        s = np.random.multivariate_normal(self.theta[a], self.P[a])
+                    except Exception:
+                        s = self.theta[a]
+                    samples[a] = float(x @ s)
+                best = max(samples, key=samples.get)
+                conf = 1.0 / (1.0 + math.exp(-abs(samples[best])))
+                return best, conf, "thompson"
+
+            scores: Dict[str, float] = {}
+            for a in self.actions:
+                mean = float(x @ self.theta[a])
+                var = float(x @ self.P[a] @ x) + 1e-9
+                scores[a] = mean + self.config.exploration_beta * math.sqrt(var)
+            best = max(scores, key=scores.get)
+            conf = 1.0 / (1.0 + math.exp(-abs(scores[best])))
+            return best, conf, "ucb"
+
+    def update(self, context: Any, action: str, reward: float) -> None:
+        """Synchronous update. Do NOT await this method."""
+        if action not in self.theta:
+            return
+        with self._lock:
+            x = self._prepare_features(context)
+            P = self.P[action]
+            denom = 1.0 + float(x @ P @ x)
+            K = (P @ x) / denom
+            err = float(reward) - float(x @ self.theta[action])
+            self.theta[action] = self.theta[action] + K * err
+            newP = P - np.outer(K, x) @ P
+            self.P[action] = 0.5 * (newP + newP.T)
+            self.usage[action] += 1
+            self.total_trials += 1
+            BANDIT_UPDATES.labels(policy=action).inc()
+
+    def add_actions(self, new_actions: List[str]) -> List[str]:
+        added: List[str] = []
+        with self._lock:
+            for a in new_actions:
+                if not isinstance(a, str) or not a or a in self.theta:
+                    continue
+                self.theta[a] = np.zeros(self.dim)
+                self.P[a] = np.eye(self.dim) / self.config.alpha
+                self.usage[a] = 0
+                self.actions.append(a)
+                added.append(a)
+        return added
+
+    def apply_federated_prior(self, action: str, mean_reward: float, weight: float = 0.1) -> None:
+        if action not in self.theta or weight <= 0:
+            return
+        with self._lock:
+            P = self.P[action]
+            x = np.zeros(self.dim)
+            x[0] = 1.0
+            denom = 1.0 + float(x @ P @ x)
+            K = (P @ x) / denom
+            err = float(mean_reward) * float(weight) - float(x @ self.theta[action])
+            self.theta[action] = self.theta[action] + K * err
+            newP = P - np.outer(K, x) @ P
+            self.P[action] = 0.5 * (newP + newP.T)
+
+    def get_action_probabilities(self, context: Any) -> List[float]:
+        with self._lock:
+            x = self._prepare_features(context)
+            scores = np.array([float(x @ self.theta[a]) for a in self.actions])
+            z = scores - np.max(scores)
+            exp = np.exp(z)
+            total = exp.sum()
+            if total <= 0:
+                return [1.0 / len(self.actions)] * len(self.actions)
+            return (exp / total).tolist()
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "actions": list(self.actions),
+                "usage": dict(self.usage),
+                "total_trials": self.total_trials,
+            }
+
+
+# =============================================================================
+# SafetyMonitor — snapshot/restore, keeps bool API
+# =============================================================================
+class SafetyMonitor:
+    def __init__(self, config: SafetyConfig):
+        self.config = config
+        self.low_harvester_routes = 0
+        self.consecutive_low_fitness = 0
+        self.history: Deque[Dict[str, Any]] = deque(maxlen=50)
+        self.violations: List[Dict[str, Any]] = []
+        self._lock = threading.RLock()
+
+    def reset_episode(self) -> None:
+        with self._lock:
+            self.low_harvester_routes = 0
+            self.consecutive_low_fitness = 0
+
+    def check_routing(self, context: Dict, expert: Any, fitness: float) -> bool:
+        if not self.config.enable_monitor:
+            return True
+        with self._lock:
+            carbon_intensity = context.get("carbon_intensity", 0.0)
+            if isinstance(carbon_intensity, (int, float)) and carbon_intensity <= 1.0:
+                carbon_intensity = float(carbon_intensity) * 800.0
+
+            if carbon_intensity > self.config.max_carbon_intensity:
+                self._record("max_carbon_intensity", {"carbon": carbon_intensity})
+                return False
+
+            is_harvester = getattr(expert, "photosynthetic_harvester_flag", False)
+            if not is_harvester and carbon_intensity > self.config.max_carbon_intensity * 0.8:
+                self.low_harvester_routes += 1
+                if self.low_harvester_routes > self.config.max_low_harvester_routes:
+                    self._record("max_low_harvester_routes",
+                                 {"count": self.low_harvester_routes})
+                    return False
+            else:
+                self.low_harvester_routes = 0
+
+            if fitness < 0.3:
+                self.consecutive_low_fitness += 1
+                if self.consecutive_low_fitness > self.config.max_consecutive_low_fitness:
+                    self._record("consecutive_low_fitness",
+                                 {"count": self.consecutive_low_fitness})
+                    return False
+            else:
+                self.consecutive_low_fitness = 0
+
+            self.history.append({
+                "expert_id": getattr(expert, "expert_id", "unknown"),
+                "fitness": float(fitness),
+                "carbon": float(carbon_intensity),
+                "timestamp": time.time(),
+            })
+            return True
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "max_carbon_intensity": self.config.max_carbon_intensity,
+                "max_low_harvester_routes": self.config.max_low_harvester_routes,
+                "max_consecutive_low_fitness": self.config.max_consecutive_low_fitness,
+                "enable_monitor": self.config.enable_monitor,
+            }
+
+    def restore(self, snapshot: Dict[str, Any]) -> None:
+        with self._lock:
+            if "max_carbon_intensity" in snapshot:
+                self.config.max_carbon_intensity = float(snapshot["max_carbon_intensity"])
+            if "max_low_harvester_routes" in snapshot:
+                self.config.max_low_harvester_routes = int(snapshot["max_low_harvester_routes"])
+            if "max_consecutive_low_fitness" in snapshot:
+                self.config.max_consecutive_low_fitness = int(snapshot["max_consecutive_low_fitness"])
+            if "enable_monitor" in snapshot:
+                self.config.enable_monitor = bool(snapshot["enable_monitor"])
+
+    def _record(self, rule: str, details: Dict[str, Any]) -> None:
+        self.violations.append({
+            "rule": rule,
+            "details": details,
+            "timestamp": datetime.now().isoformat(),
+        })
+        SAFETY_VIOLATIONS.labels(rule=rule).inc()
+        logger.warning(f"safety_violation rule={rule} details={details}")
+
+    def get_violations(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self.violations)
+
+
+# =============================================================================
+# XAIExplainer — structured output
+# =============================================================================
+class XAIExplainer:
+    def explain_routing(
+        self,
+        expert: Any,
+        policy: str,
+        context: Dict[str, Any],
+        confidence: float,
+        cost: float,
+        bonus_applied: bool,
+    ) -> Dict[str, Any]:
+        top = sorted(
+            (
+                {"feature": k, "value": float(v)}
+                for k, v in context.items() if isinstance(v, (int, float))
+            ),
+            key=lambda x: -abs(x["value"]),
+        )[:5]
+        narrative = (
+            f"Selected expert '{getattr(expert, 'expert_id', 'unknown')}' "
+            f"(domain='{getattr(expert, 'domain', 'unknown')}') "
+            f"using policy '{policy}' (confidence={confidence:.2f}). "
+            f"cost={cost:.4f}; harvester_bonus={bonus_applied}."
+        )
+        return {
+            "expert_id": getattr(expert, "expert_id", "unknown"),
+            "policy": policy,
+            "confidence": float(confidence),
+            "cost": float(cost),
+            "bonus_applied": bool(bonus_applied),
+            "top_contributions": top,
+            "narrative": narrative,
+        }
+
+    def explain_routing_str(
+        self,
+        expert: Any,
+        policy: str,
+        context: Dict[str, Any],
+        confidence: float,
+        cost: float,
+        bonus_applied: bool,
+    ) -> str:
+        return self.explain_routing(
+            expert, policy, context, confidence, cost, bonus_applied
+        )["narrative"]
+
+
+# =============================================================================
+# FederatedRouterCoordinator — weighted, round IDs, DP scaled correctly
+# =============================================================================
+class FederatedRouterCoordinator:
+    def __init__(
+        self,
+        privacy_budget: float = 0.5,
+        sensitivity: float = 1.0,
+        min_clients: int = 1,
+        seed: int = 42,
+    ):
+        self.privacy_budget = max(float(privacy_budget), 1e-6)
+        self.sensitivity = float(sensitivity)
+        self.min_clients = max(1, int(min_clients))
+        self.participants: Dict[str, Dict[str, Any]] = {}
+        self.round_id = 0
+        self._rng = np.random.default_rng(seed)
+        self._lock = threading.RLock()
+
+    def register_participant(
+        self,
+        participant_id: str,
+        update: Dict[str, Any],
+        sample_count: int = 1,
+        round_id: Optional[int] = None,
+    ) -> None:
+        with self._lock:
+            rid = round_id if round_id is not None else self.round_id
+            self.participants[participant_id] = {
+                "update": dict(update),
+                "weight": max(1, int(sample_count)),
+                "round": rid,
+            }
+            FEDERATED_PARTICIPANTS.set(len(self.participants))
+
+    def aggregate(self, expected_round: Optional[int] = None) -> Dict[str, Any]:
+        with self._lock:
+            active = {
+                pid: data for pid, data in self.participants.items()
+                if expected_round is None or data["round"] >= expected_round
+            }
+            if len(active) < self.min_clients:
+                return {}
+            keys: Set[str] = set()
+            for data in active.values():
+                keys.update(data["update"].keys())
+            noise_scale = self.sensitivity / self.privacy_budget
+            aggregated: Dict[str, Any] = {}
+            for key in keys:
+                values: List[float] = []
+                weights: List[float] = []
+                numeric = True
+                for data in active.values():
+                    if key not in data["update"]:
+                        continue
+                    v = data["update"][key]
+                    if isinstance(v, (int, float)):
+                        values.append(float(v))
+                        weights.append(float(data["weight"]))
+                    else:
+                        values.append(v)
+                        numeric = False
+                if not values:
+                    continue
+                if numeric:
+                    wsum = sum(weights)
+                    mean = (
+                        sum(v * w for v, w in zip(values, weights)) / wsum
+                        if wsum > 0 else float(np.mean(values))
+                    )
+                    mean += float(self._rng.laplace(0.0, noise_scale))
+                    aggregated[key] = mean
+                else:
+                    aggregated[key] = values[0]
+            self.round_id += 1
+            return aggregated
+
+    def reset_round(self) -> None:
+        with self._lock:
+            self.participants.clear()
+
+    def get_participant_count(self) -> int:
+        with self._lock:
+            return len(self.participants)
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "round_id": self.round_id,
+                "num_participants": len(self.participants),
+                "privacy_budget": self.privacy_budget,
+                "sensitivity": self.sensitivity,
+            }
+
+
+# =============================================================================
+# MultiAgentRouter — thread-safe, dedup, stable hash
+# =============================================================================
+class MultiAgentRouter:
+    def __init__(self):
+        self.expert_bids: Dict[str, float] = {}
+        self.domain_reputation: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self.specialist_roles: Dict[str, str] = {}
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _stable_hash(expert_id: str) -> int:
+        return int(hashlib.sha256(expert_id.encode()).hexdigest(), 16)
+
+    def submit_bid(self, expert_id: str, bid: float) -> None:
+        with self._lock:
+            self.expert_bids[expert_id] = float(bid)
+
+    def record_outcome(self, expert_id: str, domain: str, success: bool) -> None:
+        alpha = 0.3
+        with self._lock:
+            prev = self.domain_reputation[domain].get(expert_id, 0.5)
+            new = prev + alpha * ((1.0 if success else 0.0) - prev)
+            self.domain_reputation[domain][expert_id] = new
+            if new > 0.75:
+                self.specialist_roles[expert_id] = f"specialist_{domain}"
+
+    def get_specialist_for_domain(self, domain: str) -> Optional[str]:
+        with self._lock:
+            rep = self.domain_reputation.get(domain, {})
+            if not rep:
+                return None
+            return max(rep, key=rep.get)
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "num_experts": len(self.expert_bids),
+                "domains": list(self.domain_reputation.keys()),
+                "specialist_roles": dict(self.specialist_roles),
+            }
+
+
+# =============================================================================
+# CarbonOffsetBroker — thread-safe, wired
+# =============================================================================
+class CarbonOffsetBroker:
+    def __init__(
+        self,
+        threshold: float = 400.0,
+        cost_per_kg: float = 0.1,
+        rec_cost_per_mwh: float = 5.0,
+    ):
+        self.threshold = float(threshold)
+        self.cost_per_kg = float(cost_per_kg)
+        self.rec_cost_per_mwh = float(rec_cost_per_mwh)
+        self.total_offset_kg = 0.0
+        self.total_recs_mwh = 0.0
+        self.total_cost = 0.0
+        self.records: List[Dict[str, Any]] = []
+        self._lock = threading.RLock()
+
+    def reward_penalty(self, carbon_intensity: float, weight: float = 0.1) -> float:
+        excess = max(0.0, carbon_intensity - self.threshold)
+        return (excess / 1000.0) * weight
+
+    async def purchase_offsets(self, carbon_intensity: float, carbon_kg: float) -> Dict[str, Any]:
+        if carbon_kg <= 0:
+            return {"status": "invalid_amount"}
+        if carbon_intensity <= self.threshold:
+            return {"status": "below_threshold", "carbon_kg": float(carbon_kg)}
+        cost = carbon_kg * self.cost_per_kg
+        with self._lock:
+            self.total_offset_kg += float(carbon_kg)
+            self.total_cost += float(cost)
+            record = {
+                "status": "offset_purchased",
+                "carbon_kg": float(carbon_kg),
+                "cost_usd": float(cost),
+                "timestamp": datetime.now().isoformat(),
+            }
+            self.records.append(record)
+        CARBON_OFFSETS.labels(status="offset").inc()
+        logger.info(f"offset_purchased kg={carbon_kg:.4f} usd={cost:.4f}")
+        return record
+
+    async def purchase_recs(self, energy_mwh: float) -> Dict[str, Any]:
+        if energy_mwh <= 0:
+            return {"status": "no_energy"}
+        cost = energy_mwh * self.rec_cost_per_mwh
+        with self._lock:
+            self.total_recs_mwh += float(energy_mwh)
+            self.total_cost += float(cost)
+            record = {
+                "status": "rec_purchased",
+                "energy_mwh": float(energy_mwh),
+                "cost_usd": float(cost),
+                "timestamp": datetime.now().isoformat(),
+            }
+            self.records.append(record)
+        CARBON_OFFSETS.labels(status="rec").inc()
+        return record
+
+    def get_totals(self) -> Dict[str, float]:
+        with self._lock:
+            return {
+                "total_offset_kg": self.total_offset_kg,
+                "total_recs_mwh": self.total_recs_mwh,
+                "total_cost_usd": self.total_cost,
+            }
+
+
+# =============================================================================
+# ChaosMonkey — named faults, seeded, snapshot/restore
+# =============================================================================
+class ChaosMonkey:
+    FAULT_TYPES = {"drop_registry", "freeze_bandit", "safety_override", "skip_hitl"}
+
+    def __init__(self, config: ChaosConfig):
+        self.config = config
+        self._rng = random.Random(int(config.seed))
+        self.injected_failures = 0
+        self.events: List[Dict[str, Any]] = []
+        self._frozen = False
+        self._snapshots: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.RLock()
+
+    def maybe_fail(self, component: str = "router") -> Optional[str]:
+        if not self.config.enabled:
+            return None
+        if self._rng.random() >= self.config.failure_probability:
+            return None
+        fault = self._rng.choice(sorted(self.FAULT_TYPES))
+        self.injected_failures += 1
+        self._record(fault, "triggered", {"component": component})
+        CHAOS_EXPERIMENTS.labels(fault=fault, status="triggered").inc()
+        return fault
+
+    def apply(self, fault: str, router: "ExpertRouterWithHarvester") -> None:
+        with self._lock:
+            if fault == "drop_registry":
+                self._snapshots.setdefault("drop_registry", {"registry": router.registry})
+                router.registry = _NullRegistry()
+            elif fault == "freeze_bandit":
+                self._frozen = True
+            elif fault == "safety_override":
+                self._snapshots.setdefault(
+                    "safety_override", {"safety": router.safety_monitor.snapshot()}
+                )
+                router.safety_monitor.config.max_carbon_intensity *= 2.0
+            elif fault == "skip_hitl":
+                self._snapshots.setdefault("skip_hitl", {"marker": True})
+
+    def cleanup_fault(self, fault: str, router: "ExpertRouterWithHarvester") -> None:
+        with self._lock:
+            snap = self._snapshots.pop(fault, None)
+            if snap is None:
+                return
+            if fault == "drop_registry":
+                router.registry = snap["registry"]
+            elif fault == "safety_override":
+                router.safety_monitor.restore(snap["safety"])
+            elif fault == "freeze_bandit":
+                self._frozen = False
+
+    def is_frozen(self) -> bool:
+        return self._frozen
+
+    def is_hitl_skipped(self) -> bool:
+        return "skip_hitl" in self._snapshots
+
+    def _record(self, fault: str, outcome: str, extra: Optional[Dict[str, Any]] = None) -> None:
+        self.events.append({
+            "fault": fault, "outcome": outcome,
+            "timestamp": datetime.now().isoformat(), **(extra or {}),
+        })
+
+    async def inject_and_measure(
+        self, router: "ExpertRouterWithHarvester", fault: str, steps: int = 5
+    ) -> Dict[str, Any]:
+        start = time.monotonic()
+        self.apply(fault, router)
+        recovery_step: Optional[int] = None
+        try:
+            for step in range(steps):
+                try:
+                    _ = router._last_decision  # trivial liveness probe
+                    if recovery_step is None:
+                        recovery_step = step
+                except Exception:
+                    continue
+        finally:
+            self.cleanup_fault(fault, router)
+        elapsed = time.monotonic() - start
+        self._record(fault, "measured",
+                     {"recovery_step": recovery_step, "elapsed_s": elapsed})
+        return {
+            "fault": fault,
+            "recovery_step": recovery_step,
+            "recovered": recovery_step is not None,
+            "elapsed_s": elapsed,
+        }
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "enabled": self.config.enabled,
+                "failure_probability": self.config.failure_probability,
+                "injected_failures": self.injected_failures,
+                "frozen": self._frozen,
+                "pending_snapshots": list(self._snapshots.keys()),
+            }
+
+
+class _NullRegistry:
+    def get_expert(self, expert_id: str): return None
+    def get_all_active_experts(self): return []
+
+
+# =============================================================================
+# HumanReviewManager — TTL, capacity, audit
+# =============================================================================
+@dataclass
+class HumanReviewRequest:
+    review_id: str
+    decision_id: str
+    details: Dict[str, Any]
+    created_at: datetime
+    status: str = "pending"
+    reviewer: Optional[str] = None
+    resolution_at: Optional[datetime] = None
+
+
+class HumanReviewManager:
+    def __init__(self, ttl_seconds: float = 3600.0, max_pending: int = 100):
+        self.ttl_seconds = float(ttl_seconds)
+        self.max_pending = int(max_pending)
+        self.pending_reviews: Dict[str, HumanReviewRequest] = {}
+        self.audit_log: List[Dict[str, Any]] = []
+        self._lock = asyncio.Lock()
+
+    def _evict_expired(self) -> None:
+        now = datetime.now()
+        for rid, r in list(self.pending_reviews.items()):
+            if r.status == "pending" and now - r.created_at > timedelta(seconds=self.ttl_seconds):
+                r.status = "expired"
+                HUMAN_REVIEWS.labels(status="expired").inc()
+
+    def _enforce_capacity(self) -> None:
+        pending = [r for r in self.pending_reviews.values() if r.status == "pending"]
+        if len(pending) <= self.max_pending:
+            return
+        ordered = sorted(pending, key=lambda r: r.created_at)
+        for r in ordered[: len(ordered) - self.max_pending]:
+            r.status = "dropped"
+            HUMAN_REVIEWS.labels(status="dropped").inc()
+
+    async def request_review(self, decision_id: str, details: Dict[str, Any]) -> str:
+        async with self._lock:
+            self._evict_expired()
+            rid = str(uuid.uuid4())
+            self.pending_reviews[rid] = HumanReviewRequest(
+                review_id=rid, decision_id=decision_id,
+                details=dict(details), created_at=datetime.now(),
+            )
+            self._enforce_capacity()
+            HUMAN_REVIEWS.labels(status="pending").inc()
+            return rid
+
+    def _audit(self, review_id: str, action: str, reviewer: str) -> None:
+        self.audit_log.append({
+            "review_id": review_id, "action": action,
+            "reviewer": reviewer, "timestamp": datetime.now().isoformat(),
+        })
+
+    async def approve(self, review_id: str, reviewer: str = "unknown") -> bool:
+        async with self._lock:
+            r = self.pending_reviews.get(review_id)
+            if r is None or r.status != "pending":
+                return False
+            r.status = "approved"
+            r.reviewer = reviewer
+            r.resolution_at = datetime.now()
+            self._audit(review_id, "approved", reviewer)
+            HUMAN_REVIEWS.labels(status="approved").inc()
+            return True
+
+    async def reject(self, review_id: str, reviewer: str = "unknown") -> bool:
+        async with self._lock:
+            r = self.pending_reviews.get(review_id)
+            if r is None or r.status != "pending":
+                return False
+            r.status = "rejected"
+            r.reviewer = reviewer
+            r.resolution_at = datetime.now()
+            self._audit(review_id, "rejected", reviewer)
+            HUMAN_REVIEWS.labels(status="rejected").inc()
+            return True
+
+    async def get_pending(self) -> List[Dict[str, Any]]:
+        async with self._lock:
+            self._evict_expired()
+            return [
+                {
+                    "review_id": r.review_id,
+                    "decision_id": r.decision_id,
+                    "details": r.details,
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in self.pending_reviews.values() if r.status == "pending"
+            ]
+
+
+# =============================================================================
+# QuantumDistillationOptimizer — honest weighted selection
+# =============================================================================
+class QuantumDistillationOptimizer:
+    """
+    Weighted multi-objective selector. Tries qiskit_optimization for QAOA if
+    configured, otherwise uses classical scoring.
+    """
+
+    def __init__(self, config: QuantumConfig):
+        self.config = config
+        self.available = bool(config.enable_distillation)
+
+    async def select_best_expert(
+        self,
+        candidates: List[Any],
+        context: Dict[str, Any],
+        modp_weights: Dict[str, float],
+    ) -> Optional[Any]:
+        if not self.available or not candidates:
+            return None
+        if QISKIT_AVAILABLE:
+            try:
+                return await self._quantum_select(candidates, context, modp_weights)
+            except Exception as e:
+                logger.warning(f"quantum_select_failed error={e}")
+        # Classical fallback
+        return self._classical_select(candidates, context, modp_weights)
+
+    def _classical_select(
+        self, candidates: List[Any], context: Dict, weights: Dict[str, float]
+    ) -> Optional[Any]:
+        best = None
+        best_score = -float("inf")
+        carbon = context.get("carbon_intensity", 0.5)
+        for e in candidates:
+            accuracy = float(getattr(e, "accuracy_score", 0.5) or 0.5)
+            usage = float(getattr(e, "usage_count", 0) or 0)
+            score = (
+                accuracy * float(weights.get("accuracy", 0.4))
+                + (1.0 - min(usage / 100.0, 1.0)) * float(weights.get("energy", 0.3))
+                + (1.0 - carbon) * float(weights.get("carbon", 0.2))
+                + 0.5 * float(weights.get("latency", 0.1))
+            )
+            if score > best_score:
+                best_score = score
+                best = e
+        return best
+
+    async def _quantum_select(
+        self, candidates: List[Any], context: Dict, weights: Dict[str, float]
+    ) -> Optional[Any]:
+        qp = QuadraticProgram()
+        for e in candidates:
+            qp.binary_var(str(e.expert_id))
+        carbon = context.get("carbon_intensity", 0.5)
+        linear: Dict[str, float] = {}
+        for e in candidates:
+            accuracy = float(getattr(e, "accuracy_score", 0.5) or 0.5)
+            usage = float(getattr(e, "usage_count", 0) or 0)
+            u = (
+                accuracy * float(weights.get("accuracy", 0.4))
+                + (1.0 - min(usage / 100.0, 1.0)) * float(weights.get("energy", 0.3))
+                + (1.0 - carbon) * float(weights.get("carbon", 0.2))
+                + 0.5 * float(weights.get("latency", 0.1))
+            )
+            linear[str(e.expert_id)] = -u
+        qp.minimize(linear=linear)
+        qp.linear_constraint(
+            linear={str(e.expert_id): 1 for e in candidates},
+            sense="E", rhs=1, name="one_expert",
+        )
+        qaoa = QAOA(reps=self.config.qaoa_reps)
+        optimizer = MinimumEigenOptimizer(qaoa)
+        result = await asyncio.to_thread(optimizer.solve, qp)
+        for i, e in enumerate(candidates):
+            if result.x[i] > 0.5:
+                return e
+        return None
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "available": self.available,
+            "qiskit_available": QISKIT_AVAILABLE,
+            "qiskit_legacy": QISKIT_LEGACY if QISKIT_AVAILABLE else None,
+        }
+
+
+# =============================================================================
+# FlexGenManager — honest delegation
+# =============================================================================
+class FlexGenManager:
+    def __init__(self, config: RouterConfig):
+        self.config = config
+        self._cost_model = None
+        self._drift_detector = None
+        self._gpu_profiler = None
+        if FLEXGEN_AVAILABLE:
+            try:
+                self._cost_model = FlexGenCostModel(
+                    carbon_intensity_g_per_kwh=config.optimizer.flexgen_carbon_intensity_default
+                )
+                self._drift_detector = PolicyDriftDetector()
+            except Exception as e:
+                logger.warning(f"flexgen_init_failed error={e}")
+                self._cost_model = None
+                self._drift_detector = None
+            try:
+                from enhancements.gpu_profiler import GPUProfiler  # type: ignore
+                self._gpu_profiler = GPUProfiler()
+            except Exception:
+                self._gpu_profiler = None
+
+    @property
+    def available(self) -> bool:
+        return FLEXGEN_AVAILABLE
+
+    async def optimize_policy(self, workload: Any, node: Any) -> Dict[str, Any]:
+        if not FLEXGEN_AVAILABLE:
+            raise NotImplementedYetError("FlexGen modules not available")
+        try:
+            from enhancements.gpu_optimization.flexgen_controller import (  # type: ignore
+                FlexGenController,
+            )
+            from enhancements.gpu_optimization.flexgen_policy_selector import (  # type: ignore
+                DistillationFlexGenSelector,
+            )
+        except ImportError as e:
+            raise NotImplementedYetError(f"FlexGen submodule missing: {e}") from e
+        _selector = DistillationFlexGenSelector(  # noqa: F841
+            n_candidates=20,
+            config={
+                "epsilon": self.config.optimizer.flexgen_selector_epsilon,
+                "epsilon_decay": self.config.optimizer.flexgen_selector_epsilon_decay,
+            },
+        )
+        controller = FlexGenController(
+            node=node, workload=workload,
+            carbon_intensity=getattr(workload, "metadata", {}).get(
+                "carbon_intensity",
+                self.config.optimizer.flexgen_carbon_intensity_default,
+            ),
+            use_real_executor=self.config.optimizer.flexgen_use_real_executor,
+            executor=None,
+            cost_model=self._cost_model,
+            use_bio_search=True,
+            bio_search_config={
+                "population_size": self.config.optimizer.flexgen_population_size,
+                "generations": self.config.optimizer.flexgen_generations,
+            },
+            modp_planner=None,
+            drift_detector=self._drift_detector,
+            gpu_profiler=self._gpu_profiler,
+        )
+        return await controller.step()
+
+    async def select_precision(self, workload: Dict[str, Any]) -> str:
+        if FLEXGEN_AVAILABLE:
+            try:
+                wd = WorkloadDescriptor(**workload) if isinstance(workload, dict) else workload
+                nd = NodeDescriptor()
+                result = await self.optimize_policy(wd, nd)
+                if isinstance(result, dict) and "chosen_policy" in result:
+                    precision = result["chosen_policy"].get("precision")
+                    if precision in ("fp32", "fp16", "int8"):
+                        return precision
+            except NotImplementedYetError:
+                pass
+            except Exception as e:
+                logger.warning(f"flexgen_precision_failed error={e}")
+
+        carbon = float(workload.get(
+            "carbon_intensity",
+            self.config.optimizer.flexgen_carbon_intensity_default,
+        ))
+        size = workload.get("size", "medium")
+        if carbon > 500 or size == "large":
+            return "int8"
+        if carbon > 300 or size == "medium":
+            return "fp16"
+        return "fp32"
+
+    async def get_status(self) -> Dict[str, Any]:
+        if not FLEXGEN_AVAILABLE:
+            return {"available": False}
+        gpu = {}
+        if self._gpu_profiler and hasattr(self._gpu_profiler, "get_current_metrics"):
+            try:
+                gpu = self._gpu_profiler.get_current_metrics()
+            except Exception:
+                gpu = {}
+        return {
+            "available": True,
+            "drift": self._drift_detector.get_stats() if self._drift_detector else {},
+            "gpu": gpu,
+        }
+
+
+# =============================================================================
+# AsyncDatabaseManager — SQLAlchemy (async) with aiosqlite fallback
+# =============================================================================
 class AsyncDatabaseManager(IAsyncDatabase):
     SCHEMA_VERSION = 3
 
@@ -1248,153 +2107,301 @@ class AsyncDatabaseManager(IAsyncDatabase):
         self.db_url = config.database.url
         self.async_engine = None
         self.async_session = None
-        self._init_async()
+        self._aiosqlite_conn = None
+        self._use_aiosqlite = False
+        self._initialized = False
+        self._lock = asyncio.Lock()
+        self._sqlite_path = self._extract_sqlite_path(config.database.url)
 
-    def _init_async(self):
-        if not SQLALCHEMY_AVAILABLE:
-            logger.warning("SQLAlchemy not available; database operations disabled.")
-            return
-        try:
-            from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-            self.async_engine = create_async_engine(
-                self.db_url,
-                pool_size=self.config.database.pool_size,
-                max_overflow=self.config.database.max_overflow,
-                poolclass=NullPool,
-            )
-            self.async_session = async_sessionmaker(self.async_engine, expire_on_commit=False)
-            asyncio.ensure_future(self._apply_migrations())
-        except Exception as e:
-            logger.warning(f"Async DB init failed: {e}")
-            self.async_engine = None
-            self.async_session = None
+    @staticmethod
+    def _extract_sqlite_path(url: str) -> Optional[str]:
+        if url.startswith("sqlite+aiosqlite:///"):
+            return url.split("///", 1)[1]
+        if url.startswith("sqlite:///"):
+            return url.split("///", 1)[1]
+        return None
 
-    async def _apply_migrations(self):
-        if not self.async_engine:
+    async def init(self) -> None:
+        if self._initialized:
             return
-        try:
-            async with self.async_engine.begin() as conn:
-                await conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS schema_version (
-                        version INTEGER PRIMARY KEY,
-                        applied_at TEXT NOT NULL
+        async with self._lock:
+            if self._initialized:
+                return
+            # Try SQLAlchemy first
+            if SQLALCHEMY_AVAILABLE:
+                try:
+                    self.async_engine = create_async_engine(
+                        self.db_url,
+                        poolclass=NullPool,
                     )
-                """))
-                result = await conn.execute(text("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"))
-                row = result.fetchone()
-                current_ver = row[0] if row else 0
-                if current_ver < 1:
-                    if Base is not None:
-                        await conn.run_sync(Base.metadata.create_all)
-                    await conn.execute(text("INSERT INTO schema_version (version, applied_at) VALUES (1, datetime('now'))"))
-                    current_ver = 1
-                if current_ver < 2:
-                    await conn.execute(text("""
-                        CREATE TABLE IF NOT EXISTS optimizer_state (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            key TEXT UNIQUE,
-                            value TEXT,
-                            updated_at TEXT
-                        )
-                    """))
-                    await conn.execute(text("INSERT INTO schema_version (version, applied_at) VALUES (2, datetime('now'))"))
-                    current_ver = 2
-                if current_ver < 3:
-                    # Add explanation and precision columns if missing
-                    try:
-                        await conn.execute(text("ALTER TABLE routing_decisions ADD COLUMN explanation TEXT"))
-                    except Exception:
-                        pass
-                    try:
-                        await conn.execute(text("ALTER TABLE routing_decisions ADD COLUMN precision TEXT"))
-                    except Exception:
-                        pass
-                    await conn.execute(text("INSERT INTO schema_version (version, applied_at) VALUES (3, datetime('now'))"))
-                logger.info(f"Database migrations applied (version {self.SCHEMA_VERSION})")
-        except Exception as e:
-            logger.error(f"Migration failed: {e}")
+                    self.async_session = async_sessionmaker(
+                        self.async_engine, expire_on_commit=False
+                    )
+                    await self._apply_migrations_sqlalchemy()
+                    self._initialized = True
+                    logger.info("db_initialized backend=sqlalchemy")
+                    return
+                except Exception as e:
+                    logger.warning(f"sqlalchemy_init_failed error={e}")
+                    self.async_engine = None
+                    self.async_session = None
+            # Fallback to aiosqlite
+            if AIOSQLITE_AVAILABLE and self._sqlite_path:
+                self._aiosqlite_conn = await aiosqlite.connect(self._sqlite_path)
+                await self._apply_migrations_aiosqlite()
+                self._use_aiosqlite = True
+                self._initialized = True
+                logger.info("db_initialized backend=aiosqlite")
+                return
+            # No persistence available
+            logger.warning("db_initialization_skipped no_backend_available")
+            self._initialized = True
 
-    async def save_routing_decision(self, decision: Dict):
-        if not self.async_session:
-            return
-        try:
-            async with self.async_session() as session:
-                record = RoutingDecisionDB(
-                    routing_id=decision['routing_id'],
-                    task_type=decision.get('task_type', 'unknown'),
-                    selected_expert_id=decision['selected_expert_id'],
-                    cost=decision['cost'],
-                    bonus_applied=decision['bonus_applied'],
-                    context=decision.get('context', {}),
-                    pqc_signature=json.dumps(decision.get('pqc_signature', {}), default=str),
-                    explanation=decision.get('explanation', ''),
-                    precision=decision.get('precision', 'fp32'),
-                )
-                session.add(record)
-                await session.commit()
-        except Exception as e:
-            logger.error(f"Failed to save routing decision: {e}")
+    async def _apply_migrations_sqlalchemy(self) -> None:
+        async with self.async_engine.begin() as conn:
+            await conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            ))
+            result = await conn.execute(text(
+                "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
+            ))
+            row = result.fetchone()
+            current = row[0] if row else 0
+            if current < 1:
+                await conn.execute(text(
+                    "CREATE TABLE IF NOT EXISTS routing_decisions ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, routing_id TEXT UNIQUE, "
+                    "task_type TEXT, selected_expert_id TEXT, cost REAL, "
+                    "bonus_applied INTEGER, context TEXT, timestamp TEXT, "
+                    "pqc_signature TEXT, explanation TEXT, precision TEXT)"
+                ))
+                await conn.execute(text(
+                    "INSERT INTO schema_version (version, applied_at) "
+                    "VALUES (1, datetime('now'))"
+                ))
+                current = 1
+            if current < 2:
+                await conn.execute(text(
+                    "CREATE TABLE IF NOT EXISTS optimizer_state ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE, "
+                    "value TEXT, updated_at TEXT)"
+                ))
+                await conn.execute(text(
+                    "INSERT INTO schema_version (version, applied_at) "
+                    "VALUES (2, datetime('now'))"
+                ))
+                current = 2
+            if current < 3:
+                with contextlib.suppress(Exception):
+                    await conn.execute(text(
+                        "ALTER TABLE routing_decisions ADD COLUMN explanation TEXT"
+                    ))
+                with contextlib.suppress(Exception):
+                    await conn.execute(text(
+                        "ALTER TABLE routing_decisions ADD COLUMN precision TEXT"
+                    ))
+                await conn.execute(text(
+                    "INSERT INTO schema_version (version, applied_at) "
+                    "VALUES (3, datetime('now'))"
+                ))
 
-    async def save_optimizer_state(self, state: Dict):
-        if not self.async_session:
-            return
-        try:
-            async with self.async_session() as session:
-                await session.execute(
-                    text("INSERT OR REPLACE INTO optimizer_state (key, value, updated_at) VALUES (:key, :value, :updated_at)"),
-                    {"key": "state", "value": json.dumps(state, default=str), "updated_at": datetime.now().isoformat()}
+    async def _apply_migrations_aiosqlite(self) -> None:
+        conn = self._aiosqlite_conn
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version ("
+            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        cursor = await conn.execute(
+            "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        current = row[0] if row else 0
+        if current < 1:
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS routing_decisions ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, routing_id TEXT UNIQUE, "
+                "task_type TEXT, selected_expert_id TEXT, cost REAL, "
+                "bonus_applied INTEGER, context TEXT, timestamp TEXT, "
+                "pqc_signature TEXT, explanation TEXT, precision TEXT)"
+            )
+            await conn.execute(
+                "INSERT INTO schema_version (version, applied_at) "
+                "VALUES (1, datetime('now'))"
+            )
+            current = 1
+        if current < 2:
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS optimizer_state ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE, "
+                "value TEXT, updated_at TEXT)"
+            )
+            await conn.execute(
+                "INSERT INTO schema_version (version, applied_at) "
+                "VALUES (2, datetime('now'))"
+            )
+            current = 2
+        if current < 3:
+            with contextlib.suppress(Exception):
+                await conn.execute(
+                    "ALTER TABLE routing_decisions ADD COLUMN explanation TEXT"
                 )
-                await session.commit()
-        except Exception as e:
-            logger.error(f"Failed to save optimizer state: {e}")
+            with contextlib.suppress(Exception):
+                await conn.execute(
+                    "ALTER TABLE routing_decisions ADD COLUMN precision TEXT"
+                )
+            await conn.execute(
+                "INSERT INTO schema_version (version, applied_at) "
+                "VALUES (3, datetime('now'))"
+            )
+        await conn.commit()
+
+    async def save_routing_decision(self, decision: Dict) -> None:
+        if not self._initialized:
+            await self.init()
+        payload = {
+            "routing_id": decision.get("routing_id", str(uuid.uuid4())),
+            "task_type": decision.get("task_type", "unknown"),
+            "selected_expert_id": decision.get("selected_expert_id", ""),
+            "cost": float(decision.get("cost", 0.0)),
+            "bonus_applied": 1 if decision.get("bonus_applied") else 0,
+            "context": json.dumps(decision.get("context", {}), default=str),
+            "timestamp": decision.get("timestamp", datetime.now().isoformat()),
+            "pqc_signature": json.dumps(decision.get("pqc_signature", {}), default=str),
+            "explanation": json.dumps(decision.get("explanation", {}), default=str)
+            if isinstance(decision.get("explanation"), dict)
+            else str(decision.get("explanation", "")),
+            "precision": decision.get("precision", "fp32"),
+        }
+        if self.async_session is not None:
+            try:
+                async with self.async_session() as session:
+                    await session.execute(
+                        text(
+                            "INSERT OR REPLACE INTO routing_decisions "
+                            "(routing_id, task_type, selected_expert_id, cost, "
+                            "bonus_applied, context, timestamp, pqc_signature, "
+                            "explanation, precision) "
+                            "VALUES (:routing_id, :task_type, :selected_expert_id, "
+                            ":cost, :bonus_applied, :context, :timestamp, "
+                            ":pqc_signature, :explanation, :precision)"
+                        ),
+                        payload,
+                    )
+                    await session.commit()
+                return
+            except Exception as e:
+                logger.error(f"save_routing_decision_failed error={e}")
+        if self._use_aiosqlite and self._aiosqlite_conn is not None:
+            try:
+                await self._aiosqlite_conn.execute(
+                    "INSERT OR REPLACE INTO routing_decisions "
+                    "(routing_id, task_type, selected_expert_id, cost, "
+                    "bonus_applied, context, timestamp, pqc_signature, "
+                    "explanation, precision) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        payload["routing_id"], payload["task_type"],
+                        payload["selected_expert_id"], payload["cost"],
+                        payload["bonus_applied"], payload["context"],
+                        payload["timestamp"], payload["pqc_signature"],
+                        payload["explanation"], payload["precision"],
+                    ),
+                )
+                await self._aiosqlite_conn.commit()
+            except Exception as e:
+                logger.error(f"save_routing_decision_aiosqlite_failed error={e}")
+
+    async def save_optimizer_state(self, state: Dict) -> None:
+        if not self._initialized:
+            await self.init()
+        value = json.dumps(state, default=str)
+        ts = datetime.now().isoformat()
+        if self.async_session is not None:
+            try:
+                async with self.async_session() as session:
+                    await session.execute(
+                        text(
+                            "INSERT OR REPLACE INTO optimizer_state "
+                            "(key, value, updated_at) VALUES (:key, :value, :updated_at)"
+                        ),
+                        {"key": "state", "value": value, "updated_at": ts},
+                    )
+                    await session.commit()
+                return
+            except Exception as e:
+                logger.error(f"save_optimizer_state_failed error={e}")
+        if self._use_aiosqlite and self._aiosqlite_conn is not None:
+            try:
+                await self._aiosqlite_conn.execute(
+                    "INSERT OR REPLACE INTO optimizer_state "
+                    "(key, value, updated_at) VALUES (?, ?, ?)",
+                    ("state", value, ts),
+                )
+                await self._aiosqlite_conn.commit()
+            except Exception as e:
+                logger.error(f"save_optimizer_state_aiosqlite_failed error={e}")
 
     async def load_optimizer_state(self) -> Optional[Dict]:
-        if not self.async_session:
-            return None
-        try:
-            async with self.async_session() as session:
-                result = await session.execute(text("SELECT value FROM optimizer_state WHERE key = 'state'"))
-                row = result.fetchone()
+        if not self._initialized:
+            await self.init()
+        if self.async_session is not None:
+            try:
+                async with self.async_session() as session:
+                    result = await session.execute(
+                        text("SELECT value FROM optimizer_state WHERE key = 'state'")
+                    )
+                    row = result.fetchone()
+                    if row:
+                        return json.loads(row[0])
+                return None
+            except Exception as e:
+                logger.error(f"load_optimizer_state_failed error={e}")
+        if self._use_aiosqlite and self._aiosqlite_conn is not None:
+            try:
+                cursor = await self._aiosqlite_conn.execute(
+                    "SELECT value FROM optimizer_state WHERE key = 'state'"
+                )
+                row = await cursor.fetchone()
                 if row:
                     return json.loads(row[0])
-                return None
-        except Exception as e:
-            logger.error(f"Failed to load optimizer state: {e}")
-            return None
+            except Exception as e:
+                logger.error(f"load_optimizer_state_aiosqlite_failed error={e}")
+        return None
 
-    async def health_check(self) -> Dict:
-        if not self.async_session:
-            return {"status": "unavailable"}
-        try:
-            async with self.async_session() as session:
-                await session.execute(text("SELECT 1"))
-            return {"status": "healthy"}
-        except Exception as e:
-            return {"status": "unhealthy", "error": str(e)}
+    async def health_check(self) -> Dict[str, Any]:
+        return {
+            "status": "healthy" if self._initialized else "not_initialized",
+            "sqlalchemy": SQLALCHEMY_AVAILABLE,
+            "aiosqlite": AIOSQLITE_AVAILABLE and self._use_aiosqlite,
+        }
 
-    async def close(self):
-        if self.async_engine:
-            try:
-                await self.async_engine.dispose()
-            except Exception:
-                pass
+    async def close(self) -> None:
+        async with self._lock:
+            if self.async_engine is not None:
+                try:
+                    await self.async_engine.dispose()
+                except Exception:
+                    pass
+                self.async_engine = None
+                self.async_session = None
+            if self._aiosqlite_conn is not None:
+                try:
+                    await self._aiosqlite_conn.close()
+                except Exception:
+                    pass
+                self._aiosqlite_conn = None
+            self._initialized = False
 
-# ============================================================
-# ENHANCED ExpertRouterWithHarvester v3.1
-# ============================================================
+
+# =============================================================================
+# ExpertRouterWithHarvester v3.2
+# =============================================================================
 class ExpertRouterWithHarvester(ExpertRouter):
     """
-    Enhanced ExpertRouter with all v3.0 features plus:
-    - CausalBandit for causal RL
-    - SafetyMonitor (temporal logic)
-    - XAIExplainer
-    - FederatedRouterCoordinator (secure aggregation)
-    - MultiAgentRouter (bidding, role specialisation)
-    - CarbonOffsetBroker (offsets + RECs)
-    - ChaosMonkey
-    - HumanReviewManager
-    - QuantumDistillationOptimizer (optional)
-    - Adaptive precision switching
+    Enhanced ExpertRouter with causal RL, temporal safety, XAI, secure
+    federated aggregation, multi-agent bidding, carbon offsets, chaos
+    injection, and human-in-the-loop review.
     """
 
     def __init__(
@@ -1407,10 +2414,13 @@ class ExpertRouterWithHarvester(ExpertRouter):
         pqc: Optional[IPQC] = None,
         cloud_storage: Optional[ICloudStorage] = None,
         vault: Optional[IVault] = None,
-        *args,
-        **kwargs
+        *args: Any,
+        **kwargs: Any,
     ):
-        super().__init__(*args, **kwargs)
+        try:
+            super().__init__(*args, **kwargs)
+        except Exception:
+            pass
         self.config = config
         self.cost_function = cost_function
         self.registry = registry
@@ -1423,27 +2433,21 @@ class ExpertRouterWithHarvester(ExpertRouter):
         self.rate_limiter = RateLimiter(config)
 
         # Enhanced modules
-        if ENHANCEMENTS_AVAILABLE:
-            self.modp = ParetoOptimizer()
-            self.moe = MoEExpertRouter()
-            self.bio = GeneticPolicyGenerator()
-            self.selection_policies = ["cost_based", "accuracy_focused", "energy_focused", "balanced"]
-            # Use CausalBandit instead of ContextualBandit
-            self.bandit = CausalBandit(
-                action_space=self.selection_policies,
-                fallback_solver=lambda ctx: "cost_based",
-                min_trials_before_bandit=config.optimizer.bandit_min_trials,
-                confidence_threshold=config.optimizer.bandit_confidence_threshold,
-            )
-            self.bonus_population = [config.general.bonus_discount]
-            self.bonus_rewards = deque(maxlen=100)
-        else:
-            self.modp = None
-            self.moe = None
-            self.bio = None
-            self.bandit = None
-            self.bonus_population = []
-            self.bonus_rewards = deque(maxlen=100)
+        self.modp = ParetoOptimizer() if ENHANCEMENTS_AVAILABLE else None
+        self.moe = MoEExpertRouter() if ENHANCEMENTS_AVAILABLE else None
+        self.bio = GeneticPolicyGenerator() if ENHANCEMENTS_AVAILABLE else None
+        self.selection_policies = [
+            "cost_based", "accuracy_focused", "energy_focused", "balanced",
+        ]
+        self.bandit = CausalBandit(
+            action_space=self.selection_policies,
+            fallback_solver=lambda ctx: "cost_based",
+            min_trials_before_bandit=config.optimizer.bandit_min_trials,
+            confidence_threshold=config.optimizer.bandit_confidence_threshold,
+            feature_dim=config.optimizer.bandit_feature_dim,
+        )
+        self.bonus_population = [config.general.bonus_discount]
+        self.bonus_rewards: Deque[float] = deque(maxlen=100)
 
         # New enhancement modules
         self.safety_monitor = SafetyMonitor(config.safety)
@@ -1452,261 +2456,140 @@ class ExpertRouterWithHarvester(ExpertRouter):
         self.multi_agent = MultiAgentRouter()
         self.carbon_broker = CarbonOffsetBroker()
         self.chaos_monkey = ChaosMonkey(config.chaos)
-        self.human_review = HumanReviewManager()
+        self.human_review = HumanReviewManager(
+            ttl_seconds=config.chaos.hitl_ttl_seconds,
+            max_pending=config.chaos.hitl_max_pending,
+        )
         self.quantum_optimizer = QuantumDistillationOptimizer(config.quantum)
         self.flexgen_manager = FlexGenManager(config)
 
-        # State
         self._last_decision: Dict[str, Any] = {}
         self._last_review_id: Optional[str] = None
-        self._load_state()
+        self._started = False
+        self._startup_lock = asyncio.Lock()
+        self._state_lock = asyncio.Lock()
 
-        self.health_components = {
-            'cost_function': self.cost_function,
-            'registry': self.registry,
-            'db': self.db,
-            'pqc': self.pqc,
-            'cloud_storage': self.cloud_storage,
-            'vault': self.vault,
-            'flexgen': self.flexgen_manager,
-        }
+    # ------------------------------------------------------------------ #
+    # Lifecycle                                                          #
+    # ------------------------------------------------------------------ #
+    async def __aenter__(self) -> "ExpertRouterWithHarvester":
+        await self.start()
+        return self
 
-    def _load_state(self):
-        if self.db:
-            try:
-                # best effort
-                pass
-            except Exception:
-                pass
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.stop()
 
-    def _save_state(self):
-        if self.db:
+    async def start(self) -> None:
+        async with self._startup_lock:
+            if self._started:
+                return
+            self._started = True
+            if self.db is not None:
+                init = getattr(self.db, "init", None)
+                if init is not None:
+                    try:
+                        result = init()
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception as e:
+                        logger.warning(f"db_init_failed error={e}")
+            # Restore state if available.
+            await self._load_state()
+
+    async def stop(self) -> None:
+        if not self._started:
+            return
+        self._started = False
+        if self.db is not None:
+            close = getattr(self.db, "close", None)
+            if close is not None:
+                try:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    pass
+
+    async def _load_state(self) -> None:
+        if self.db is None:
+            return
+        loader = getattr(self.db, "load_optimizer_state", None)
+        if loader is None:
+            return
+        try:
+            state = await loader()
+            if not state:
+                return
+            if "bonus_population" in state:
+                self.bonus_population = list(state["bonus_population"]) or self.bonus_population
+            if "theta" in state and isinstance(state["theta"], dict):
+                for k, v in state["theta"].items():
+                    if k in self.bandit.theta:
+                        try:
+                            self.bandit.theta[k] = np.asarray(v, dtype=float)
+                        except Exception:
+                            pass
+            if "P" in state and isinstance(state["P"], dict):
+                for k, v in state["P"].items():
+                    if k in self.bandit.P:
+                        try:
+                            self.bandit.P[k] = np.asarray(v, dtype=float)
+                        except Exception:
+                            pass
+            logger.info("router_state_loaded")
+        except Exception as e:
+            logger.warning(f"router_state_load_failed error={e}")
+
+    async def _save_state(self) -> None:
+        if self.db is None:
+            return
+        saver = getattr(self.db, "save_optimizer_state", None)
+        if saver is None:
+            return
+        async with self._state_lock:
             state = {
-                'bonus_population': self.bonus_population,
-                'bonus_rewards': list(self.bonus_rewards),
-                'bandit_q_values': getattr(self.bandit, 'q_values', {}),
-                'bandit_causal_effects': getattr(self.bandit, 'causal_effects', {}),
+                "bonus_population": list(self.bonus_population),
+                "theta": {a: self.bandit.theta[a].tolist() for a in self.bandit.theta},
+                "P": {a: self.bandit.P[a].tolist() for a in self.bandit.P},
+                "federated_round": self.federated.round_id,
             }
             try:
-                asyncio.ensure_future(self.db.save_optimizer_state(state))
-            except Exception:
-                pass
+                result = saver(state)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.warning(f"router_state_save_failed error={e}")
 
-    async def _apply_harvester_bonus(self, cost: float, context: Dict, expert: ExpertProfile) -> float:
-        data_source = context.get('data_source', 'cloud')
-        harvester_flag = getattr(expert, 'photosynthetic_harvester_flag', False)
-        if data_source == 'photosynthetic_harvester' and harvester_flag:
-            if self.harvester:
-                bonus_factor = await self.harvester.get_energy_bonus(expert, context)
+    # ------------------------------------------------------------------ #
+    # Harvester bonus                                                    #
+    # ------------------------------------------------------------------ #
+    async def _apply_harvester_bonus(
+        self, cost: float, context: Dict, expert: Any
+    ) -> Tuple[float, bool]:
+        """
+        Returns (adjusted_cost, bonus_applied).
+        A smaller bonus_factor means lower cost. When the expert is flagged as
+        a harvester and the data source is the harvester, we scale cost by the
+        bonus factor — bonus factor is interpreted as a discount (<= 1
+        reduces cost, > 1 increases cost).
+        """
+        data_source = context.get("data_source", "cloud")
+        harvester_flag = getattr(expert, "photosynthetic_harvester_flag", False)
+        if data_source == "photosynthetic_harvester" and harvester_flag:
+            if self.harvester is not None and hasattr(self.harvester, "get_energy_bonus"):
+                try:
+                    factor = float(await self.harvester.get_energy_bonus(expert, context))
+                except Exception as e:
+                    logger.warning(f"harvester_bonus_failed error={e}")
+                    factor = float(np.mean(self.bonus_population)) if self.bonus_population else self.config.general.bonus_discount
             else:
-                bonus_factor = np.mean(self.bonus_population) if self.bonus_population else self.config.general.bonus_discount
-            return cost * bonus_factor
-        return cost
+                factor = float(np.mean(self.bonus_population)) if self.bonus_population else self.config.general.bonus_discount
+            return cost * factor, True
+        return cost, False
 
-    async def _route_with_enhanced_modules(self, task: Dict, context: Dict) -> Dict:
-        # Chaos monkey can inject failure at route start
-        self.chaos_monkey.maybe_fail("routing")
-
-        candidates = await self._get_candidates_with_breaker(task, context)
-        if not candidates:
-            raise RegistryError("No candidate experts found")
-
-        costs = await self._compute_costs_with_breaker(candidates, context)
-
-        context_for_bandit = {
-            "task_type": task.get('type', 'unknown'),
-            "data_source": context.get('data_source', 'cloud'),
-            "num_candidates": len(candidates),
-            "avg_cost": float(np.mean(list(costs.values()))) if costs else 0.0,
-            "carbon_intensity": context.get('carbon_intensity', 0.5),
-            "time": datetime.now().hour,
-        }
-
-        encoded = self.moe.encode(context_for_bandit) if self.moe else context_for_bandit
-        policy, confidence, source = self.bandit.select_action(encoded) if self.bandit else ("cost_based", 0.0, "fallback")
-        if policy is None:
-            policy = "cost_based"
-
-        # Compute final costs with harvester bonus
-        final_costs = {}
-        bonus_applied_map = {}
-        for eid, cost in costs.items():
-            expert = self.registry.get_expert(eid) if self.registry else None
-            if not expert:
-                continue
-            adjusted_cost = await self._apply_harvester_bonus(cost, context, expert)
-            final_costs[eid] = adjusted_cost
-            bonus_applied_map[eid] = (adjusted_cost != cost)
-
-        if not final_costs:
-            raise RegistryError("No valid experts after filtering")
-
-        # Optional quantum selection
-        selected_expert = None
-        if self.quantum_optimizer.available:
-            quantum_candidates = [self.registry.get_expert(eid) for eid in final_costs.keys()]
-            quantum_candidates = [e for e in quantum_candidates if e is not None]
-            selected_expert = await self.quantum_optimizer.select_best_expert(
-                quantum_candidates, context, self.config.optimizer.modp_weights
-            )
-
-        if selected_expert is None:
-            # Policy-based selection
-            if policy == "cost_based":
-                best_eid = min(final_costs, key=final_costs.get)
-            elif policy == "accuracy_focused":
-                best_eid = max(final_costs.keys(),
-                               key=lambda eid: getattr(self.registry.get_expert(eid), 'accuracy_score', 0.0) or 0.0)
-            elif policy == "energy_focused":
-                best_eid = min(final_costs.keys(),
-                               key=lambda eid: getattr(self.registry.get_expert(eid), 'usage_count', 0))
-            else:  # balanced
-                if self.modp:
-                    utilities = {}
-                    max_cost = max(final_costs.values()) if final_costs else 1.0
-                    for eid, cost in final_costs.items():
-                        expert = self.registry.get_expert(eid)
-                        objectives = {
-                            "accuracy": getattr(expert, 'accuracy_score', 0.5) or 0.5,
-                            "energy": 1.0 - (cost / max_cost) if max_cost else 0.5,
-                            "carbon": context.get('carbon_intensity', 0.5),
-                            "latency": 0.5,
-                        }
-                        utilities[eid] = self.modp.evaluate(objectives, self.config.optimizer.modp_weights)
-                    best_eid = max(utilities, key=utilities.get)
-                else:
-                    best_eid = min(final_costs, key=final_costs.get)
-            best_expert = self.registry.get_expert(best_eid) if self.registry else None
-        else:
-            best_eid = selected_expert.expert_id
-            best_expert = selected_expert
-            policy = "quantum"
-
-        if not best_expert:
-            raise RegistryError("Selected expert not found in registry")
-
-        # Safety check
-        best_fitness = getattr(best_expert, 'accuracy_score', 0.5) or 0.5
-        if not self.safety_monitor.check_routing(context, best_expert, best_fitness):
-            # Fallback to a "safe" expert (most accurate)
-            logger.warning("Safety violation detected; selecting fallback expert")
-            safe_eid = max(final_costs.keys(),
-                           key=lambda eid: getattr(self.registry.get_expert(eid), 'accuracy_score', 0.0) or 0.0)
-            best_eid = safe_eid
-            best_expert = self.registry.get_expert(best_eid)
-            policy = "safety_override"
-
-        bonus_applied = bonus_applied_map.get(best_eid, False)
-        if bonus_applied:
-            HARVESTER_BONUS.inc()
-            SELECTED_BONUS_FACTOR.observe(self.config.general.bonus_discount)
-        SELECTED_COST.observe(final_costs[best_eid])
-
-        # Adaptive precision selection
-        try:
-            precision = await self.flexgen_manager.select_precision({
-                "size": "medium" if len(candidates) < 20 else "large",
-                "carbon_intensity": context.get('carbon_intensity', 0.5) * 800.0,
-            })
-        except Exception:
-            precision = "fp32"
-
-        # XAI explanation
-        explanation = self.xai.explain_routing(
-            best_expert, policy, context, confidence, final_costs[best_eid], bonus_applied
-        )
-        if PROMETHEUS_AVAILABLE:
-            XAI_DECISIONS.labels(policy=policy).inc()
-
-        decision = {
-            'routing_id': str(uuid.uuid4()),
-            'task_type': task.get('type', 'unknown'),
-            'selected_expert_id': best_eid,
-            'cost': final_costs[best_eid],
-            'bonus_applied': bonus_applied,
-            'context': context,
-            'explanation': explanation,
-            'precision': precision,
-            'timestamp': datetime.now().isoformat(),
-        }
-
-        # Human review for low confidence / high carbon
-        review_id = None
-        carbon_intensity = context.get('carbon_intensity', 0.0)
-        if isinstance(carbon_intensity, float) and carbon_intensity <= 1.0:
-            carbon_intensity = carbon_intensity * 800.0
-        if confidence < self.config.general.human_review_threshold and carbon_intensity > 450:
-            decision_id = decision['routing_id']
-            review_id = await self.human_review.request_review(decision_id, {
-                "expert_id": best_eid,
-                "policy": policy,
-                "explanation": explanation,
-                "carbon_intensity": carbon_intensity,
-            })
-
-        if self.pqc:
-            signature = await self.pqc.sign_routing_decision(decision)
-            decision['pqc_signature'] = signature
-        else:
-            signature = None
-
-        if self.db:
-            await self.db.save_routing_decision(decision)
-
-        if self.cloud_storage:
-            try:
-                await self.cloud_storage.store(decision, f"routing_{decision['routing_id']}.json")
-            except Exception as e:
-                logger.error(f"Cloud backup failed: {e}")
-
-        # Record multi-agent outcome
-        domain = getattr(best_expert, 'domain', 'unknown')
-        self.multi_agent.submit_bid(best_eid, final_costs[best_eid])
-        self.multi_agent.record_outcome(best_eid, domain, success=True)
-
-        # Update bandit
-        if self.bandit and source != "safety_override":
-            reward = best_fitness - (final_costs[best_eid] * 0.1)
-            await self.bandit.update(encoded, policy, reward)
-
-        # Carbon offset purchase for high intensity routing
-        carbon_kg = final_costs[best_eid] * 0.001
-        if carbon_intensity > 450:
-            try:
-                await self.carbon_broker.purchase_offsets(carbon_intensity, carbon_kg)
-            except Exception as e:
-                logger.warning(f"Carbon offset purchase failed: {e}")
-
-        # Federated round (simulated)
-        self.federated.register_participant(
-            f"router_{uuid.uuid4().hex[:8]}",
-            {"avg_cost": final_costs[best_eid], "fitness": best_fitness}
-        )
-
-        # Audit log
-        audit_logger.info(f"Routing decision: {decision['routing_id']} -> {best_eid} (cost={final_costs[best_eid]:.4f})")
-
-        self._last_decision = {
-            'context': context_for_bandit,
-            'policy': policy,
-            'expert_id': best_eid,
-            'decision': decision,
-            'explanation': explanation,
-            'review_id': review_id,
-        }
-        self._save_state()
-
-        return {
-            'expert': best_expert,
-            'cost': final_costs[best_eid],
-            'harvester_bonus_applied': bonus_applied,
-            'timestamp': datetime.now().isoformat(),
-            'pqc_signature': signature,
-            'explanation': explanation,
-            'precision': precision,
-            'review_id': review_id,
-        }
-
+    # ------------------------------------------------------------------ #
+    # Routing                                                             #
+    # ------------------------------------------------------------------ #
     async def route(self, task: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         ROUTER_REQUESTS.inc()
         start_time = time.time()
@@ -1714,318 +2597,537 @@ class ExpertRouterWithHarvester(ExpertRouter):
             RATE_LIMITER_THROTTLE.inc()
             raise RateLimitExceeded("Rate limit exceeded")
         try:
-            if ENHANCEMENTS_AVAILABLE:
-                result = await self._route_with_enhanced_modules(task, context)
-            else:
-                result = await self._route_original(task, context)
+            result = await self._route_with_enhanced_modules(task, context)
             ROUTER_LATENCY.observe(time.time() - start_time)
             return result
         except ChaosExperimentError as e:
-            logger.warning(f"Chaos failure: {e}")
+            logger.warning(f"chaos_failure error={e}")
             raise
-        except Exception as e:
-            logger.exception(f"Routing failed: {e}")
+        except Exception:
+            logger.exception("routing_failed")
             raise
 
-    async def _route_original(self, task: Dict, context: Dict) -> Dict:
-        # Fallback: minimal routing using cost function
-        candidates = await self._get_candidates_with_breaker(task, context)
-        if not candidates:
-            raise RegistryError("No candidates")
-        costs = await self._compute_costs_with_breaker(candidates, context)
-        best_eid = min(costs, key=costs.get)
-        best_expert = self.registry.get_expert(best_eid)
-        return {
-            'expert': best_expert,
-            'cost': costs[best_eid],
-            'harvester_bonus_applied': False,
-            'timestamp': datetime.now().isoformat(),
-        }
+    async def _route_with_enhanced_modules(
+        self, task: Dict, context: Dict
+    ) -> Dict[str, Any]:
+        # Chaos injection — apply fault if any.
+        fault = self.chaos_monkey.maybe_fail("routing")
+        if fault is not None:
+            try:
+                self.chaos_monkey.apply(fault, self)
+            except Exception as e:
+                logger.warning(f"chaos_apply_failed error={e}")
 
-    async def _get_candidates_with_breaker(self, task: Dict, context: Dict) -> List[ExpertProfile]:
+        try:
+            candidates = await self._get_candidates_with_breaker(task, context)
+            if not candidates:
+                raise RegistryError("No candidate experts found")
+
+            costs = await self._compute_costs_with_breaker(candidates, context)
+
+            context_for_bandit = {
+                "task_hash": float(int(hashlib.sha256(
+                    task.get("type", "unknown").encode()
+                ).hexdigest()[:6], 16)),
+                "data_source_hash": float(int(hashlib.sha256(
+                    context.get("data_source", "cloud").encode()
+                ).hexdigest()[:6], 16)),
+                "num_candidates": float(len(candidates)),
+                "avg_cost": float(np.mean(list(costs.values()))) if costs else 0.0,
+                "carbon_intensity": float(context.get("carbon_intensity", 0.5)),
+                "hour": float(datetime.now().hour),
+            }
+            encoded = self._encode_context(context_for_bandit)
+            policy, confidence, source = self.bandit.select_action(encoded)
+            if not policy:
+                policy = "cost_based"
+
+            # Apply harvester bonus.
+            final_costs: Dict[str, float] = {}
+            bonus_map: Dict[str, bool] = {}
+            for eid, cost in costs.items():
+                expert = self.registry.get_expert(eid) if self.registry else None
+                if expert is None:
+                    continue
+                adjusted, applied = await self._apply_harvester_bonus(cost, context, expert)
+                final_costs[eid] = adjusted
+                bonus_map[eid] = applied
+
+            if not final_costs:
+                raise RegistryError("No valid experts after filtering")
+
+            # Optional quantum selection.
+            selected_expert = None
+            if self.quantum_optimizer.available:
+                quantum_candidates = [
+                    self.registry.get_expert(eid) for eid in final_costs.keys()
+                ]
+                quantum_candidates = [e for e in quantum_candidates if e is not None]
+                selected_expert = await self.quantum_optimizer.select_best_expert(
+                    quantum_candidates, context, self.config.optimizer.modp_weights
+                )
+
+            if selected_expert is not None and getattr(selected_expert, "expert_id", None) in final_costs:
+                best_eid = selected_expert.expert_id
+                best_expert = selected_expert
+                policy = "quantum"
+            else:
+                best_eid, best_expert = self._select_best_by_policy(
+                    policy, final_costs, context
+                )
+                if best_expert is None:
+                    raise RegistryError("Selected expert not found in registry")
+
+            # Safety gate.
+            best_fitness = float(getattr(best_expert, "accuracy_score", 0.5) or 0.5)
+            if not self.safety_monitor.check_routing(context, best_expert, best_fitness):
+                logger.warning("safety_violation fallback_to_safest")
+                safe_eid = max(
+                    final_costs.keys(),
+                    key=lambda eid: float(
+                        getattr(self.registry.get_expert(eid), "accuracy_score", 0.0) or 0.0
+                    ),
+                )
+                best_eid = safe_eid
+                best_expert = self.registry.get_expert(best_eid)
+                policy = "safety_override"
+
+            bonus_applied = bonus_map.get(best_eid, False)
+            if bonus_applied:
+                HARVESTER_BONUS.inc()
+                SELECTED_BONUS_FACTOR.observe(
+                    float(np.mean(self.bonus_population)) if self.bonus_population
+                    else self.config.general.bonus_discount
+                )
+            SELECTED_COST.observe(final_costs[best_eid])
+
+            # Precision selection.
+            try:
+                precision = await self.flexgen_manager.select_precision({
+                    "size": "medium" if len(candidates) < 20 else "large",
+                    "carbon_intensity": float(context.get("carbon_intensity", 0.5)) * 800.0,
+                })
+            except Exception:
+                precision = "fp32"
+
+            # XAI explanation.
+            explanation = self.xai.explain_routing(
+                best_expert, policy, context, confidence,
+                final_costs[best_eid], bonus_applied,
+            )
+            XAI_DECISIONS.labels(policy=policy).inc()
+
+            decision = {
+                "routing_id": str(uuid.uuid4()),
+                "task_type": task.get("type", "unknown"),
+                "selected_expert_id": best_eid,
+                "cost": float(final_costs[best_eid]),
+                "bonus_applied": bool(bonus_applied),
+                "context": context,
+                "explanation": explanation,
+                "precision": precision,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+            # HITL for low-confidence, high-carbon decisions.
+            review_id: Optional[str] = None
+            carbon_intensity = context.get("carbon_intensity", 0.0)
+            if isinstance(carbon_intensity, (int, float)) and carbon_intensity <= 1.0:
+                carbon_intensity = float(carbon_intensity) * 800.0
+            if (
+                confidence < self.config.general.human_review_threshold
+                and carbon_intensity > 450
+                and not self.chaos_monkey.is_hitl_skipped()
+            ):
+                try:
+                    review_id = await self.human_review.request_review(
+                        decision["routing_id"],
+                        {
+                            "expert_id": best_eid,
+                            "policy": policy,
+                            "explanation": explanation,
+                            "carbon_intensity": carbon_intensity,
+                        },
+                    )
+                except Exception as e:
+                    logger.warning(f"hitl_request_failed error={e}")
+
+            # Sign.
+            signature = None
+            if self.pqc is not None:
+                try:
+                    signature = await self.pqc.sign_routing_decision(decision)
+                    decision["pqc_signature"] = signature
+                except Exception as e:
+                    logger.warning(f"pqc_sign_failed error={e}")
+
+            # Persist.
+            if self.db is not None:
+                try:
+                    await self.db.save_routing_decision(decision)
+                except Exception as e:
+                    logger.warning(f"db_save_failed error={e}")
+            if self.cloud_storage is not None:
+                try:
+                    await self.cloud_storage.store(
+                        decision, f"routing_{decision['routing_id']}.json"
+                    )
+                except Exception as e:
+                    logger.warning(f"cloud_store_failed error={e}")
+
+            # Multi-agent bookkeeping.
+            domain = getattr(best_expert, "domain", "unknown")
+            self.multi_agent.submit_bid(best_eid, final_costs[best_eid])
+            self.multi_agent.record_outcome(best_eid, domain, True)
+
+            # Bandit update (sync — do not await).
+            if not self.chaos_monkey.is_frozen():
+                reward = best_fitness - final_costs[best_eid] * 0.1
+                self.bandit.update(encoded, policy, float(reward))
+
+            # Carbon offsets — computed from energy, not cost.
+            carbon_kg = float(context.get("carbon_kg", 0.0))
+            if carbon_kg <= 0:
+                # Fallback proxy: assume a small emission per routing decision.
+                carbon_kg = final_costs[best_eid] * 0.005
+            if carbon_intensity > 450 and carbon_kg > 0:
+                try:
+                    await self.carbon_broker.purchase_offsets(
+                        carbon_intensity, carbon_kg
+                    )
+                except Exception as e:
+                    logger.warning(f"carbon_offset_failed error={e}")
+
+            # Federated round — self-register.
+            self.federated.register_participant(
+                f"router_{uuid.uuid4().hex[:8]}",
+                {"avg_cost": final_costs[best_eid], "fitness": best_fitness},
+                sample_count=1,
+            )
+            aggregated = self.federated.aggregate()
+            if aggregated and "avg_cost" in aggregated:
+                # Nudge the bandit posterior conservatively for the chosen policy.
+                try:
+                    self.bandit.apply_federated_prior(
+                        policy, 1.0 - float(aggregated["avg_cost"]), weight=0.02
+                    )
+                except Exception:
+                    pass
+
+            # Audit.
+            audit_logger.info(
+                f"routing_decision routing_id={decision['routing_id']} "
+                f"expert={best_eid} cost={final_costs[best_eid]:.4f} "
+                f"policy={policy} confidence={confidence:.2f}"
+            )
+
+            self._last_decision = {
+                "context": context_for_bandit,
+                "policy": policy,
+                "expert_id": best_eid,
+                "decision": decision,
+                "explanation": explanation,
+                "review_id": review_id,
+            }
+            self._last_review_id = review_id
+
+            try:
+                await self._save_state()
+            except Exception as e:
+                logger.warning(f"state_save_failed error={e}")
+
+            return {
+                "routing_id": decision["routing_id"],
+                "expert": best_expert,
+                "cost": final_costs[best_eid],
+                "harvester_bonus_applied": bonus_applied,
+                "timestamp": decision["timestamp"],
+                "pqc_signature": signature,
+                "explanation": explanation,
+                "precision": precision,
+                "review_id": review_id,
+                "policy": policy,
+                "confidence": float(confidence),
+            }
+        finally:
+            if fault is not None:
+                try:
+                    self.chaos_monkey.cleanup_fault(fault, self)
+                except Exception:
+                    pass
+
+    def _encode_context(self, context: Dict[str, Any]) -> List[float]:
+        if self.moe is not None:
+            try:
+                encoded = self.moe.encode(context)
+                if encoded:
+                    return [float(v) for v in encoded if isinstance(v, (int, float))]
+            except Exception:
+                pass
+        return [float(v) for v in context.values() if isinstance(v, (int, float))]
+
+    def _select_best_by_policy(
+        self,
+        policy: str,
+        final_costs: Dict[str, float],
+        context: Dict[str, Any],
+    ) -> Tuple[str, Optional[Any]]:
+        def acc(eid: str) -> float:
+            e = self.registry.get_expert(eid) if self.registry else None
+            return float(getattr(e, "accuracy_score", 0.0) or 0.0)
+
+        def usage(eid: str) -> float:
+            e = self.registry.get_expert(eid) if self.registry else None
+            return float(getattr(e, "usage_count", 0) or 0)
+
+        if policy == "cost_based":
+            best_eid = min(final_costs, key=final_costs.get)
+        elif policy == "accuracy_focused":
+            best_eid = max(final_costs.keys(), key=acc)
+        elif policy == "energy_focused":
+            best_eid = min(final_costs.keys(), key=usage)
+        else:  # balanced
+            if self.modp is not None:
+                max_cost = max(final_costs.values()) or 1.0
+                carbon = float(context.get("carbon_intensity", 0.5))
+                utilities: Dict[str, float] = {}
+                for eid, cost in final_costs.items():
+                    objectives = {
+                        "accuracy": acc(eid),
+                        "energy": 1.0 - (cost / max_cost),
+                        "carbon": 1.0 - carbon,
+                        "latency": 0.5,
+                    }
+                    try:
+                        utilities[eid] = float(self.modp.evaluate(
+                            objectives, self.config.optimizer.modp_weights
+                        ))
+                    except Exception:
+                        utilities[eid] = 0.0
+                best_eid = max(utilities, key=utilities.get)
+            else:
+                best_eid = min(final_costs, key=final_costs.get)
+
+        best_expert = self.registry.get_expert(best_eid) if self.registry else None
+        return best_eid, best_expert
+
+    async def _get_candidates_with_breaker(
+        self, task: Dict, context: Dict
+    ) -> List[Any]:
         breaker = GlobalCircuitBreaker().get_or_create(
             "registry",
             failure_threshold=self.config.circuit_breaker.failure_threshold,
             recovery_timeout=self.config.circuit_breaker.recovery_timeout,
         )
-        async def get_candidates():
-            if hasattr(super(), 'get_candidate_experts'):
-                try:
-                    result = super().get_candidate_experts(task, context)
-                    if asyncio.iscoroutine(result):
-                        return await result
-                    return result
-                except Exception:
-                    pass
-            # Fallback to registry
-            if self.registry and hasattr(self.registry, 'get_all_active_experts'):
-                return self.registry.get_all_active_experts()
-            return []
-        return await breaker.call(get_candidates)
 
-    async def _compute_costs_with_breaker(self, candidates: List[ExpertProfile], context: Dict) -> Dict[str, float]:
+        async def get_candidates():
+            # Try the parent class's method first.
+            parent_method = None
+            try:
+                parent_method = super(ExpertRouterWithHarvester, self).get_candidate_experts
+            except AttributeError:
+                parent_method = None
+            if parent_method is not None:
+                try:
+                    result = parent_method(task, context)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    if result:
+                        return list(result)
+                except Exception as e:
+                    logger.debug(f"parent_get_candidates_failed error={e}")
+            # Fall back to registry.
+            if self.registry is not None and hasattr(self.registry, "get_all_active_experts"):
+                return list(self.registry.get_all_active_experts())
+            return []
+
+        return await breaker.call_async(get_candidates)
+
+    async def _compute_costs_with_breaker(
+        self, candidates: List[Any], context: Dict
+    ) -> Dict[str, float]:
         breaker = GlobalCircuitBreaker().get_or_create(
             "cost_function",
             failure_threshold=self.config.circuit_breaker.failure_threshold,
             recovery_timeout=self.config.circuit_breaker.recovery_timeout,
         )
-        async def compute_costs():
-            if asyncio.iscoroutinefunction(self.cost_function.compute_multiple):
-                return await self.cost_function.compute_multiple(candidates, context)
-            return self.cost_function.compute_multiple(candidates, context)
-        return await breaker.call(compute_costs)
 
-    async def record_feedback(self, routing_id: str, success: bool, actual_metrics: Dict) -> Dict:
-        """Record feedback and update bandit, multi-agent, and human review."""
-        if self.bandit and self._last_decision:
+        async def compute_costs():
+            result = self.cost_function.compute_multiple(candidates, context)
+            if inspect.isawaitable(result):
+                result = await result
+            return {str(k): float(v) for k, v in result.items()}
+
+        return await breaker.call_async(compute_costs)
+
+    # ------------------------------------------------------------------ #
+    # Feedback                                                           #
+    # ------------------------------------------------------------------ #
+    async def record_feedback(
+        self, routing_id: str, success: bool, actual_metrics: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self._last_decision:
             reward = 1.0 if success else -1.0
-            await self.bandit.update(
-                self._last_decision.get('context', {}),
-                self._last_decision.get('policy', 'unknown'),
-                reward
-            )
-        expert_id = self._last_decision.get('expert_id')
-        if expert_id:
-            domain = getattr(self.registry.get_expert(expert_id), 'domain', 'unknown') if self.registry else 'unknown'
-            self.multi_agent.record_outcome(expert_id, domain, success)
+            policy = self._last_decision.get("policy", "unknown")
+            context = self._last_decision.get("context", {})
+            if not self.chaos_monkey.is_frozen():
+                # Sync update — do NOT await.
+                self.bandit.update(context, policy, reward)
+            expert_id = self._last_decision.get("expert_id")
+            if expert_id and self.registry is not None:
+                expert = self.registry.get_expert(expert_id)
+                domain = getattr(expert, "domain", "unknown") if expert else "unknown"
+                self.multi_agent.record_outcome(expert_id, domain, success)
+        try:
+            await self._save_state()
+        except Exception:
+            pass
         return {
             "status": "recorded",
             "routing_id": routing_id,
-            "success": success,
+            "success": bool(success),
             "metrics": actual_metrics,
-            "explanation": self._last_decision.get('explanation', ''),
+            "explanation": self._last_decision.get("explanation"),
         }
 
-    # ============================================================
-    # FlexGen
-    # ============================================================
-    async def run_flexgen_optimization(self, workload: Dict, node: Dict) -> Dict:
+    # ------------------------------------------------------------------ #
+    # Public helpers                                                     #
+    # ------------------------------------------------------------------ #
+    async def run_flexgen_optimization(
+        self, workload: Dict[str, Any], node: Dict[str, Any]
+    ) -> Dict[str, Any]:
         if not FLEXGEN_AVAILABLE:
-            return {"error": "FlexGen modules not available"}
-        workload_obj = WorkloadDescriptor(**workload)
-        node_obj = NodeDescriptor(**node)
+            raise NotImplementedYetError("FlexGen modules not available")
+        try:
+            workload_obj = WorkloadDescriptor(**workload)  # type: ignore[call-arg]
+            node_obj = NodeDescriptor(**node)  # type: ignore[call-arg]
+        except TypeError as e:
+            raise RouterError(f"Invalid descriptor: {e}") from e
         return await self.flexgen_manager.optimize_policy(workload_obj, node_obj)
 
-    async def get_flexgen_status(self) -> Dict:
+    async def get_flexgen_status(self) -> Dict[str, Any]:
         return await self.flexgen_manager.get_status()
 
-    async def select_precision(self, workload: Dict) -> str:
+    async def select_precision(self, workload: Dict[str, Any]) -> str:
         return await self.flexgen_manager.select_precision(workload)
 
-    # ============================================================
-    # Human review endpoints
-    # ============================================================
-    async def get_pending_reviews(self) -> List[Dict]:
+    async def get_pending_reviews(self) -> List[Dict[str, Any]]:
         return await self.human_review.get_pending()
 
-    async def approve_review(self, review_id: str) -> bool:
-        return await self.human_review.approve(review_id)
+    async def approve_review(self, review_id: str, reviewer: str = "api") -> bool:
+        return await self.human_review.approve(review_id, reviewer=reviewer)
 
-    async def reject_review(self, review_id: str) -> bool:
-        return await self.human_review.reject(review_id)
+    async def reject_review(self, review_id: str, reviewer: str = "api") -> bool:
+        return await self.human_review.reject(review_id, reviewer=reviewer)
 
-    # ============================================================
-    # Chaos / carbon / federated
-    # ============================================================
-    async def trigger_chaos(self, enabled: bool = True, probability: float = 0.1):
-        self.chaos_monkey.config.enabled = enabled
-        self.chaos_monkey.config.failure_probability = probability
+    async def trigger_chaos(
+        self, enabled: bool = True, probability: float = 0.1
+    ) -> Dict[str, Any]:
+        self.chaos_monkey.config.enabled = bool(enabled)
+        self.chaos_monkey.config.failure_probability = float(probability)
         return self.chaos_monkey.get_stats()
 
-    async def get_carbon_totals(self) -> Dict:
+    async def get_carbon_totals(self) -> Dict[str, float]:
         return self.carbon_broker.get_totals()
 
-    async def run_federated_round(self) -> Dict:
+    async def run_federated_round(self) -> Dict[str, Any]:
         aggregated = self.federated.aggregate()
         return {
             "status": "completed",
             "aggregated": aggregated,
             "participants": self.federated.get_participant_count(),
+            "stats": self.federated.get_stats(),
         }
 
-    # ============================================================
-    # Health / status
-    # ============================================================
-    async def health_check(self) -> Dict:
-        results = {}
-        for name, component in self.health_components.items():
-            if component is None:
-                results[name] = {"status": "unavailable"}
+    async def health_check(self) -> Dict[str, Any]:
+        components: Dict[str, Any] = {}
+        for name, comp in [
+            ("cost_function", self.cost_function),
+            ("registry", self.registry),
+            ("db", self.db),
+            ("pqc", self.pqc),
+            ("cloud_storage", self.cloud_storage),
+            ("vault", self.vault),
+            ("flexgen", self.flexgen_manager),
+        ]:
+            if comp is None:
+                components[name] = {"status": "unavailable"}
                 continue
-            if hasattr(component, 'health_check'):
-                try:
-                    results[name] = await component.health_check()
-                except Exception as e:
-                    results[name] = {"status": "unhealthy", "error": str(e)}
-            else:
-                results[name] = {"status": "ok"}
-        overall = 'healthy' if all(
-            (r.get('status') in ('ok', 'healthy', 'unavailable')) for r in results.values()
-        ) else 'degraded'
-        if PROMETHEUS_AVAILABLE:
-            HEALTH_SCORE.set(100 if overall == 'healthy' else 50)
+            hc = getattr(comp, "health_check", None)
+            if hc is None:
+                components[name] = {"status": "ok"}
+                continue
+            try:
+                result = hc()
+                if inspect.isawaitable(result):
+                    result = await result
+                components[name] = result
+            except Exception as e:
+                components[name] = {"status": "unhealthy", "error": str(e)}
+        ok = all(
+            c.get("status") in ("ok", "healthy", "unavailable")
+            for c in components.values()
+        )
+        overall = "healthy" if ok else "degraded"
+        HEALTH_SCORE.set(100 if overall == "healthy" else 50)
         return {
-            'status': overall,
-            'components': results,
-            'timestamp': datetime.now().isoformat(),
+            "status": overall,
+            "components": components,
+            "timestamp": datetime.now().isoformat(),
         }
 
-    async def get_router_status(self) -> Dict:
-        cfg = self.config.dict() if hasattr(self.config, 'dict') else self.config.__dict__
+    async def get_router_status(self) -> Dict[str, Any]:
         return {
-            'bonus_discount': self.config.general.bonus_discount,
-            'circuit_breaker': {name: cb.get_metrics() for name, cb in GlobalCircuitBreaker()._breakers.items()},
-            'rate_limiter': self.rate_limiter.get_metrics(),
-            'quantum': self.pqc.get_quantum_status() if self.pqc else None,
-            'quantum_optimizer': self.quantum_optimizer.get_status(),
-            'cloud_storage_providers': self.cloud_storage.get_status() if self.cloud_storage else [],
-            'vault_available': self.vault is not None,
-            'db_available': self.db is not None,
-            'health': await self.health_check(),
-            'enhancements_available': ENHANCEMENTS_AVAILABLE,
-            'bandit_actions': self.bandit.actions if self.bandit else None,
-            'bonus_population_size': len(self.bonus_population),
-            'modp_weights': self.config.optimizer.modp_weights,
-            'flexgen': await self.get_flexgen_status(),
-            'safety_violations': self.safety_monitor.get_violations()[-5:],
-            'multi_agent': self.multi_agent.get_stats(),
-            'carbon_broker': self.carbon_broker.get_totals(),
-            'federated_participants': self.federated.get_participant_count(),
-            'chaos': self.chaos_monkey.get_stats(),
-            'human_review_pending': len(await self.human_review.get_pending()),
-            'last_explanation': self._last_decision.get('explanation'),
+            "bonus_discount": self.config.general.bonus_discount,
+            "circuit_breaker": GlobalCircuitBreaker().all_metrics(),
+            "rate_limiter": self.rate_limiter.get_metrics(),
+            "quantum": self.pqc.get_quantum_status() if self.pqc else None,
+            "quantum_optimizer": self.quantum_optimizer.get_status(),
+            "cloud_storage": self.cloud_storage.get_status() if self.cloud_storage else None,
+            "vault": {"available": self.vault is not None},
+            "db": await self.db.health_check() if self.db else {"status": "unavailable"},
+            "health": await self.health_check(),
+            "enhancements_available": ENHANCEMENTS_AVAILABLE,
+            "bandit": self.bandit.get_stats(),
+            "modp_weights": dict(self.config.optimizer.modp_weights),
+            "flexgen": await self.get_flexgen_status(),
+            "safety_violations": self.safety_monitor.get_violations()[-5:],
+            "multi_agent": self.multi_agent.get_stats(),
+            "carbon_broker": self.carbon_broker.get_totals(),
+            "federated": self.federated.get_stats(),
+            "chaos": self.chaos_monkey.get_stats(),
+            "human_review_pending": len(await self.human_review.get_pending()),
+            "last_explanation": self._last_decision.get("explanation"),
         }
 
-# ============================================================
-# FastAPI REST API
-# ============================================================
-if FASTAPI_AVAILABLE:
-    app = FastAPI(title="Expert Router API", version="3.1")
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-    security = HTTPBearer()
 
-    async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-        token = credentials.credentials
-        try:
-            payload = jwt.decode(token, os.getenv('JWT_SECRET', 'change_me'), algorithms=["HS256"])
-            return payload
-        except Exception:
-            # In demo, accept any token
-            return {"sub": "anonymous"}
+# =============================================================================
+# Component factory
+# =============================================================================
+def build_components(
+    config: Optional[RouterConfig] = None,
+    *,
+    cost_function: Optional[ICostFunction] = None,
+    registry: Optional[IRegistry] = None,
+    harvester: Optional[IHarvester] = None,
+) -> Dict[str, Any]:
+    cfg = config or RouterConfig()
 
-    api_rate_limiter = RateLimiter(RouterConfig())
-
-    async def rate_limit(request: Request):
-        if not await api_rate_limiter.acquire():
-            raise HTTPException(status_code=429, detail="Rate limit exceeded")
-
-    router: Optional[ExpertRouterWithHarvester] = None
-
-    @app.post("/route")
-    async def route_task(task: Dict, context: Dict, user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
-        if not router:
-            raise HTTPException(status_code=503, detail="Router not initialized")
-        try:
-            result = await router.route(task, context)
-            # Serialize expert
-            if hasattr(result.get('expert'), '__dict__'):
-                result['expert'] = {k: v for k, v in result['expert'].__dict__.items() if not k.startswith('_')}
-            return result
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.post("/feedback")
-    async def feedback(routing_id: str, success: bool, actual_metrics: Dict,
-                        user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
-        if not router:
-            raise HTTPException(status_code=503, detail="Router not initialized")
-        return await router.record_feedback(routing_id, success, actual_metrics)
-
-    @app.get("/status")
-    async def status(user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
-        if not router:
-            raise HTTPException(status_code=503, detail="Router not initialized")
-        return await router.get_router_status()
-
-    @app.get("/health")
-    async def health(user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
-        if not router:
-            raise HTTPException(status_code=503, detail="Router not initialized")
-        return await router.health_check()
-
-    @app.post("/flexgen/optimize")
-    async def flexgen_optimize(workload: Dict, node: Dict,
-                                user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
-        if not router:
-            raise HTTPException(status_code=503, detail="Router not initialized")
-        return await router.run_flexgen_optimization(workload, node)
-
-    @app.get("/flexgen/status")
-    async def flexgen_status(user: Dict = Depends(verify_token)):
-        if not router:
-            raise HTTPException(status_code=503, detail="Router not initialized")
-        return await router.get_flexgen_status()
-
-    @app.get("/human-review/pending")
-    async def human_review_pending(user: Dict = Depends(verify_token)):
-        if not router:
-            raise HTTPException(status_code=503, detail="Router not initialized")
-        return await router.get_pending_reviews()
-
-    @app.post("/human-review/{review_id}/approve")
-    async def human_review_approve(review_id: str, user: Dict = Depends(verify_token)):
-        if not router:
-            raise HTTPException(status_code=503, detail="Router not initialized")
-        return {"approved": await router.approve_review(review_id)}
-
-    @app.post("/human-review/{review_id}/reject")
-    async def human_review_reject(review_id: str, user: Dict = Depends(verify_token)):
-        if not router:
-            raise HTTPException(status_code=503, detail="Router not initialized")
-        return {"rejected": await router.reject_review(review_id)}
-
-    @app.post("/chaos/trigger")
-    async def chaos_trigger(enabled: bool = True, probability: float = 0.1,
-                            user: Dict = Depends(verify_token)):
-        if not router:
-            raise HTTPException(status_code=503, detail="Router not initialized")
-        return await router.trigger_chaos(enabled, probability)
-
-    @app.get("/carbon/totals")
-    async def carbon_totals(user: Dict = Depends(verify_token)):
-        if not router:
-            raise HTTPException(status_code=503, detail="Router not initialized")
-        return await router.get_carbon_totals()
-
-    @app.post("/federated/round")
-    async def federated_round(user: Dict = Depends(verify_token)):
-        if not router:
-            raise HTTPException(status_code=503, detail="Router not initialized")
-        return await router.run_federated_round()
-
-    @app.on_event("startup")
-    async def startup():
-        global router
-        config = RouterConfig()
-
-        class SimpleCostFunction:
+    if cost_function is None:
+        class _DefaultCostFunction:
             async def compute_multiple(self, experts, context):
-                return {e.expert_id: random.uniform(0.1, 1.0) for e in experts}
+                return {e.expert_id: 1.0 for e in experts}
+        cost_function = _DefaultCostFunction()
 
-        class SimpleRegistry:
+    if registry is None:
+        class _DefaultRegistry:
             def __init__(self):
-                self.experts = {}
-                # Register a few demo experts
+                self.experts: Dict[str, Any] = {}
                 for i in range(3):
                     eid = f"expert_{i}"
                     self.experts[eid] = ExpertProfile(
-                        expert_id=eid, domain=["vision", "nlp", "audio"][i],
+                        expert_id=eid,
+                        domain=["vision", "nlp", "audio"][i],
                         accuracy_score=0.7 + 0.1 * i,
                         photosynthetic_harvester_flag=(i % 2 == 0),
                     )
@@ -2033,69 +3135,268 @@ if FASTAPI_AVAILABLE:
                 return self.experts.get(expert_id)
             def get_all_active_experts(self):
                 return list(self.experts.values())
+        registry = _DefaultRegistry()
 
-        cost_function = SimpleCostFunction()
-        registry = SimpleRegistry()
-        db = AsyncDatabaseManager(config)
-        vault = VaultManager(config)
-        pqc = PostQuantumCrypto(config, vault)
-        cloud_storage = MultiCloudStorage(config)
+    db = AsyncDatabaseManager(cfg)
+    vault = VaultManager(cfg)
+    pqc = PostQuantumCrypto(cfg, vault)
+    cloud = MultiCloudStorage(cfg)
 
-        router = ExpertRouterWithHarvester(
-            config=config,
-            cost_function=cost_function,
-            registry=registry,
-            harvester=None,
-            db=db,
-            pqc=pqc,
-            cloud_storage=cloud_storage,
-            vault=vault,
-        )
-        logger.info("FastAPI started")
+    router = ExpertRouterWithHarvester(
+        config=cfg,
+        cost_function=cost_function,
+        registry=registry,
+        harvester=harvester,
+        db=db,
+        pqc=pqc,
+        cloud_storage=cloud,
+        vault=vault,
+    )
+    return {"router": router, "config": cfg}
 
-    @app.on_event("shutdown")
-    async def shutdown():
-        if router and router.db:
-            await router.db.close()
-        logger.info("FastAPI shut down")
 
-# ============================================================
+# =============================================================================
+# FastAPI app factory
+# =============================================================================
+def create_app(config: Optional[RouterConfig] = None) -> Any:
+    if not FASTAPI_AVAILABLE:
+        raise NotImplementedYetError("FastAPI is not installed")
+
+    cfg = config or RouterConfig()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):  # type: ignore[valid-type]
+        app.state.router = build_components(cfg)["router"]
+        await app.state.router.start()
+        try:
+            yield
+        finally:
+            await app.state.router.stop()
+
+    app = FastAPI(
+        title="Expert Router API",
+        version="3.2",
+        lifespan=lifespan,
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    bearer = HTTPBearer(auto_error=False)
+
+    async def require_auth(
+        credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer),
+    ) -> Dict[str, Any]:
+        if credentials is None or not JWT_AVAILABLE:
+            # Fail-open in dev mode only. Set require_auth_for_admin=False to
+            # intentionally disable.
+            if not cfg.api.require_auth_for_admin:
+                return {"sub": "anonymous"}
+            raise HTTPException(status_code=401, detail="auth required")
+        try:
+            return pyjwt.decode(
+                credentials.credentials, cfg.api.jwt_secret, algorithms=["HS256"]
+            )
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"invalid token: {e}")
+
+    api_rate_limiter = RateLimiter(cfg)
+
+    async def rate_limit(_: None = None) -> None:
+        if not await api_rate_limiter.acquire():
+            raise HTTPException(status_code=429, detail="rate limit exceeded")
+
+    @app.post("/route")
+    async def route_endpoint(
+        task: Dict[str, Any],
+        context: Dict[str, Any],
+        request: Request,
+        _user: Dict[str, Any] = Depends(require_auth),
+        _rl: None = Depends(rate_limit),
+    ) -> Dict[str, Any]:
+        router = getattr(request.app.state, "router", None)
+        if router is None:
+            raise HTTPException(status_code=503, detail="router not initialized")
+        try:
+            result = await router.route(task, context)
+            expert = result.get("expert")
+            if hasattr(expert, "__dict__"):
+                result["expert"] = {
+                    k: v for k, v in expert.__dict__.items() if not k.startswith("_")
+                }
+            return result
+        except RateLimitExceeded as e:
+            raise HTTPException(status_code=429, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/feedback")
+    async def feedback_endpoint(
+        routing_id: str,
+        success: bool,
+        actual_metrics: Dict[str, Any],
+        request: Request,
+        _user: Dict[str, Any] = Depends(require_auth),
+        _rl: None = Depends(rate_limit),
+    ) -> Dict[str, Any]:
+        router = getattr(request.app.state, "router", None)
+        if router is None:
+            raise HTTPException(status_code=503, detail="router not initialized")
+        return await router.record_feedback(routing_id, success, actual_metrics)
+
+    @app.get("/status")
+    async def status_endpoint(
+        request: Request,
+        _user: Dict[str, Any] = Depends(require_auth),
+        _rl: None = Depends(rate_limit),
+    ) -> Dict[str, Any]:
+        router = getattr(request.app.state, "router", None)
+        if router is None:
+            raise HTTPException(status_code=503, detail="router not initialized")
+        return await router.get_router_status()
+
+    @app.get("/health")
+    async def health_endpoint(request: Request) -> Dict[str, Any]:
+        router = getattr(request.app.state, "router", None)
+        if router is None:
+            raise HTTPException(status_code=503, detail="router not initialized")
+        return await router.health_check()
+
+    @app.post("/flexgen/optimize")
+    async def flexgen_optimize(
+        workload: Dict[str, Any],
+        node: Dict[str, Any],
+        request: Request,
+        _user: Dict[str, Any] = Depends(require_auth),
+    ) -> Dict[str, Any]:
+        router = getattr(request.app.state, "router", None)
+        if router is None:
+            raise HTTPException(status_code=503, detail="router not initialized")
+        try:
+            return await router.run_flexgen_optimization(workload, node)
+        except NotImplementedYetError as e:
+            raise HTTPException(status_code=501, detail=str(e))
+
+    @app.get("/flexgen/status")
+    async def flexgen_status(request: Request) -> Dict[str, Any]:
+        router = getattr(request.app.state, "router", None)
+        if router is None:
+            raise HTTPException(status_code=503, detail="router not initialized")
+        return await router.get_flexgen_status()
+
+    @app.get("/human-review/pending")
+    async def human_review_pending(
+        request: Request,
+        _user: Dict[str, Any] = Depends(require_auth),
+    ) -> List[Dict[str, Any]]:
+        router = getattr(request.app.state, "router", None)
+        if router is None:
+            raise HTTPException(status_code=503, detail="router not initialized")
+        return await router.get_pending_reviews()
+
+    @app.post("/human-review/{review_id}/approve")
+    async def human_review_approve(
+        review_id: str,
+        request: Request,
+        _user: Dict[str, Any] = Depends(require_auth),
+    ) -> Dict[str, bool]:
+        router = getattr(request.app.state, "router", None)
+        if router is None:
+            raise HTTPException(status_code=503, detail="router not initialized")
+        return {"approved": await router.approve_review(review_id, reviewer="api")}
+
+    @app.post("/human-review/{review_id}/reject")
+    async def human_review_reject(
+        review_id: str,
+        request: Request,
+        _user: Dict[str, Any] = Depends(require_auth),
+    ) -> Dict[str, bool]:
+        router = getattr(request.app.state, "router", None)
+        if router is None:
+            raise HTTPException(status_code=503, detail="router not initialized")
+        return {"rejected": await router.reject_review(review_id, reviewer="api")}
+
+    @app.post("/chaos/trigger")
+    async def chaos_trigger(
+        request: Request,
+        enabled: bool = True,
+        probability: float = 0.1,
+        _user: Dict[str, Any] = Depends(require_auth),
+    ) -> Dict[str, Any]:
+        router = getattr(request.app.state, "router", None)
+        if router is None:
+            raise HTTPException(status_code=503, detail="router not initialized")
+        return await router.trigger_chaos(enabled, probability)
+
+    @app.get("/carbon/totals")
+    async def carbon_totals(
+        request: Request,
+        _user: Dict[str, Any] = Depends(require_auth),
+    ) -> Dict[str, float]:
+        router = getattr(request.app.state, "router", None)
+        if router is None:
+            raise HTTPException(status_code=503, detail="router not initialized")
+        return await router.get_carbon_totals()
+
+    @app.post("/federated/round")
+    async def federated_round(
+        request: Request,
+        _user: Dict[str, Any] = Depends(require_auth),
+    ) -> Dict[str, Any]:
+        router = getattr(request.app.state, "router", None)
+        if router is None:
+            raise HTTPException(status_code=503, detail="router not initialized")
+        return await router.run_federated_round()
+
+    return app
+
+
+# =============================================================================
 # Singleton accessor
-# ============================================================
+# =============================================================================
 _router_instance: Optional[ExpertRouterWithHarvester] = None
-_router_lock = asyncio.Lock()
+_router_lock: Optional[asyncio.Lock] = None
+
 
 async def get_router_instance(
-    config: RouterConfig,
-    cost_function: ICostFunction,
-    registry: IRegistry,
+    config: Optional[RouterConfig] = None,
+    cost_function: Optional[ICostFunction] = None,
+    registry: Optional[IRegistry] = None,
     harvester: Optional[IHarvester] = None,
-    db: Optional[IAsyncDatabase] = None,
-    pqc: Optional[IPQC] = None,
-    cloud_storage: Optional[ICloudStorage] = None,
-    vault: Optional[IVault] = None,
+    db: Optional[IAsyncDatabase] = None,  # noqa: ARG001
+    pqc: Optional[IPQC] = None,  # noqa: ARG001
+    cloud_storage: Optional[ICloudStorage] = None,  # noqa: ARG001
+    vault: Optional[IVault] = None,  # noqa: ARG001
 ) -> ExpertRouterWithHarvester:
-    global _router_instance
+    global _router_instance, _router_lock
+    if _router_lock is None:
+        _router_lock = asyncio.Lock()
     if _router_instance is None:
         async with _router_lock:
             if _router_instance is None:
-                _router_instance = ExpertRouterWithHarvester(
+                components = build_components(
                     config=config,
                     cost_function=cost_function,
                     registry=registry,
                     harvester=harvester,
-                    db=db,
-                    pqc=pqc,
-                    cloud_storage=cloud_storage,
-                    vault=vault,
                 )
+                _router_instance = components["router"]
+                await _router_instance.start()
     return _router_instance
 
-# ============================================================
-# Main entry point (for testing)
-# ============================================================
-async def main():
-    print("Expert Router with Harvester v3.1 Demo")
+
+# =============================================================================
+# Main
+# =============================================================================
+async def main() -> None:
+    print("=" * 80)
+    print("Expert Router with Harvester v3.2 — Single-File Enhanced")
+    print("=" * 80)
+
     config = RouterConfig()
 
     class SimpleCostFunction:
@@ -2104,11 +3405,12 @@ async def main():
 
     class SimpleRegistry:
         def __init__(self):
-            self.experts = {}
+            self.experts: Dict[str, Any] = {}
             for i in range(3):
                 eid = f"expert_{i}"
                 self.experts[eid] = ExpertProfile(
-                    expert_id=eid, domain=["vision", "nlp", "audio"][i],
+                    expert_id=eid,
+                    domain=["vision", "nlp", "audio"][i],
                     accuracy_score=0.7 + 0.1 * i,
                     photosynthetic_harvester_flag=(i % 2 == 0),
                 )
@@ -2122,7 +3424,7 @@ async def main():
     db = AsyncDatabaseManager(config)
     vault = VaultManager(config)
     pqc = PostQuantumCrypto(config, vault)
-    cloud_storage = MultiCloudStorage(config)
+    cloud = MultiCloudStorage(config)
 
     router = ExpertRouterWithHarvester(
         config=config,
@@ -2131,51 +3433,107 @@ async def main():
         harvester=None,
         db=db,
         pqc=pqc,
-        cloud_storage=cloud_storage,
+        cloud_storage=cloud,
         vault=vault,
     )
+    await router.start()
 
     task = {"type": "classification"}
     context = {"data_source": "photosynthetic_harvester", "carbon_intensity": 0.6}
 
     result = await router.route(task, context)
-    print(f"\n✅ Routing Result:")
-    print(f"   Expert: {result['expert'].expert_id}")
-    print(f"   Cost: {result['cost']:.4f}")
-    print(f"   Harvester bonus: {result['harvester_bonus_applied']}")
-    print(f"   Precision: {result['precision']}")
-    print(f"   Explanation: {result['explanation']}")
-    print(f"   Review ID: {result['review_id']}")
+    print(f"\nrouting_result expert={result['expert'].expert_id} "
+          f"cost={result['cost']:.4f} bonus={result['harvester_bonus_applied']} "
+          f"precision={result['precision']} policy={result['policy']} "
+          f"confidence={result['confidence']:.2f}")
 
-    # Feedback
-    fb = await router.record_feedback(result.get('routing_id', 'unknown'), True, {'accuracy': 0.92})
-    print(f"\n📝 Feedback recorded: {fb['status']}")
+    fb = await router.record_feedback(
+        result.get("routing_id", "unknown"), True, {"accuracy": 0.92}
+    )
+    print(f"feedback_status={fb['status']}")
 
-    # Status
     status = await router.get_router_status()
-    print(f"\n📊 Router Status:")
-    print(f"   Health: {status['health']['status']}")
-    print(f"   Enhancements available: {status['enhancements_available']}")
-    print(f"   Safety violations: {len(status['safety_violations'])}")
-    print(f"   Multi-agent: {status['multi_agent']}")
-    print(f"   Carbon broker: {status['carbon_broker']}")
-    print(f"   Federated participants: {status['federated_participants']}")
-    print(f"   Chaos: {status['chaos']}")
-    print(f"   Pending reviews: {status['human_review_pending']}")
+    print(json.dumps(status, indent=2, default=str))
 
     # FlexGen demo
-    workload = {"task_id": "wl_001", "task_type": "inference", "tokens": 512,
-                "latency_target": 200.0, "urgency": "medium", "priority": "balanced",
-                "bio_mode": "none", "metadata": {}}
-    node = {"id": "node_001", "type": "cloud", "region": "us-east",
-            "region_carbon_intensity": 0.42, "energy_per_token": 0.00005,
-            "uptime": 0.99, "maintenance_status": "operational", "metadata": {}}
-    flexgen_result = await router.run_flexgen_optimization(workload, node)
-    print(f"\n🚀 FlexGen optimization: {flexgen_result}")
+    workload = {
+        "task_id": "wl_001", "task_type": "inference", "tokens": 512,
+        "latency_target": 200.0, "urgency": "medium", "priority": "balanced",
+        "bio_mode": "none", "metadata": {},
+    }
+    node = {
+        "id": "node_001", "type": "cloud", "region": "us-east",
+        "region_carbon_intensity": 0.42, "energy_per_token": 0.00005,
+        "uptime": 0.99, "maintenance_status": "operational", "metadata": {},
+    }
+    try:
+        flexgen_result = await router.run_flexgen_optimization(workload, node)
+        print(f"\nflexgen_result={flexgen_result}")
+    except NotImplementedYetError as e:
+        print(f"\nflexgen_unavailable reason={e}")
 
-    # Cleanup
-    if router.db:
-        await router.db.close()
+    await router.stop()
+    print("\nShutdown complete")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+__all__ = [
+    "ExpertRouterWithHarvester",
+    "CausalBandit",
+    "BanditConfig",
+    "SafetyMonitor",
+    "XAIExplainer",
+    "FederatedRouterCoordinator",
+    "MultiAgentRouter",
+    "CarbonOffsetBroker",
+    "ChaosMonkey",
+    "HumanReviewManager",
+    "HumanReviewRequest",
+    "QuantumDistillationOptimizer",
+    "FlexGenManager",
+    "PostQuantumCrypto",
+    "MultiCloudStorage",
+    "VaultManager",
+    "RateLimiter",
+    "CircuitBreaker",
+    "CircuitBreakerState",
+    "GlobalCircuitBreaker",
+    "AsyncDatabaseManager",
+    "RouterConfig",
+    "GeneralConfig",
+    "CircuitBreakerConfig",
+    "RateLimitConfig",
+    "DatabaseConfig",
+    "VaultConfig",
+    "CloudConfig",
+    "PQCConfig",
+    "APIConfig",
+    "SafetyConfig",
+    "ChaosConfig",
+    "OptimizerConfig",
+    "QuantumConfig",
+    "ICostFunction",
+    "IRegistry",
+    "IHarvester",
+    "IPQC",
+    "ICloudStorage",
+    "IVault",
+    "IAsyncDatabase",
+    "RouterError",
+    "CostFunctionError",
+    "RegistryError",
+    "CircuitBreakerOpenError",
+    "RateLimitExceeded",
+    "SignatureError",
+    "HealthCheckError",
+    "SafetyViolationError",
+    "ChaosExperimentError",
+    "NotImplementedYetError",
+    "build_components",
+    "create_app",
+    "get_router_instance",
+    "main",
+]
