@@ -1,33 +1,51 @@
 """
-Distillation-based FlexGen Policy Selector (Enhanced v2).
+Distillation-based FlexGen Policy Selector (Enhanced v3).
 
-Single-file integration of all ten Green Agent enhancements:
+Single-file integration of all ten Green Agent enhancements.
 
-  1. Quantum-Distillation Integration      -> QuantumInspiredTeacher blended into ensemble
-  2. Causal RL for Policy Adaptation       -> CausalCounterfactualEstimator, logged per step
-  3. Federated Green Learning              -> FederatedAggregator + export/import weights
-  4. Multi-Agent Coordination              -> EmergentRoleRegistry + role-weighted teacher votes
-  5. Temporal Logic / Formal Verification  -> optional shield hook, monitor hook
-  6. Explainable AI                        -> DecisionExplainer with attributions & counterfactuals
-  7. Adaptive Precision Switching          -> precision-aware state, rule teacher reads precision
-  8. Carbon Markets / RECs                 -> carbon price, REC availability in state and rule teacher
-  9. Resilience / Chaos Testing            -> CircuitBreaker, atomic persistence, teacher fallback
- 10. HITL / Active Learning                -> UncertaintyEstimator, HITL gate, prioritized replay
-
-Everything lives in this file. No new modules required.
-Backward compatible: legacy signature preserved.
+CHANGELOG v2 -> v3
+- PrecisionLevel now imported from .flexgen_policy (canonical). Fallback
+  local definition only used if the import fails.
+- _candidate_set_hash uses SHA-256 over a stable serialization (was Python
+  hash(), which is process-salted).
+- FlexGenStatefulQTeacher._ensure_n_actions preserves archived columns on
+  shrink and restores them on growth; archive is pruned on confirm.
+- CausalCounterfactualEstimator._ensure_actions now pads/truncates A and b
+  instead of resetting, preserving learned structure across action-count
+  changes.
+- DistillationStudent.predict_proba is now side-effect free; resize happens
+  explicitly via ensure_shape().
+- _LinearSoftmaxModel.from_json validates shapes.
+- QuantumInspiredTeacher._simulate guards against empty feature vectors and
+  short vectors.
+- PrioritizedReplayBuffer returns importance-sampling weights alongside the
+  batch for unbiased updates.
+- FederatedAggregator validates shapes and tracks an RDP budget.
+- EmergentRoleRegistry gains epsilon-greedy role sampling and a snapshot API.
+- DecisionExplainer produces per-candidate attributions, not just teacher
+  weights.
+- DistillationFlexGenSelector.update now:
+    * applies Q-teacher updates using a lightweight state adapter,
+    * falls back to teacher_probs.size when candidates is None,
+    * persists both student and Q-teacher,
+    * reconstructs FlexGenState-compatible feature updates.
+- Non-blocking HITL option: publish the request and return immediately with
+  a default decision; the caller can reconcile later.
+- get_stats now exposes teacher failures, role snapshot, DP state.
+- All original signatures preserved.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
 import random
 import tempfile
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -41,11 +59,32 @@ from ..async_message_queue import AsyncMessageQueue
 from ..schemas.feedback_event import FeedbackEvent
 from ..logger import logger
 
+# ---------------------------------------------------------------------------
+# Canonical PrecisionLevel + PRECISION_ORDER (Enhancement 7).
+# Prefer the definition from flexgen_policy to avoid two-enum divergence.
+# ---------------------------------------------------------------------------
+try:
+    from .flexgen_policy import (  # type: ignore
+        PrecisionLevel,
+        PRECISION_ORDER as _CANONICAL_PRECISION_ORDER,
+    )
+    _PRECISION_ORDER = [p.value for p in _CANONICAL_PRECISION_ORDER]
+except ImportError:  # pragma: no cover
+    class PrecisionLevel(str, Enum):
+        FP32 = "fp32"
+        BF16 = "bf16"
+        FP16 = "fp16"
+        FP8 = "fp8"
+        INT8 = "int8"
+        INT4 = "int4"
+
+    _PRECISION_ORDER = [p.value for p in PrecisionLevel]
+
 
 # ===========================================================================
-# Schema versioning (Enhancements 1, 2, 3)
+# Schema versioning
 # ===========================================================================
-STATE_SCHEMA_VERSION = "flexgen_state_v2"
+STATE_SCHEMA_VERSION = "flexgen_state_v3"
 STATE_FEATURE_FIELDS: Tuple[str, ...] = (
     "tokens_norm",
     "latency_target_norm",
@@ -55,7 +94,6 @@ STATE_FEATURE_FIELDS: Tuple[str, ...] = (
     "carbon_intensity_norm",
     "recent_success_rate",
     "avg_reward",
-    # v2 additions
     "carbon_price_norm",
     "rec_available_norm",
     "hour_sin",
@@ -76,27 +114,11 @@ NORMALIZATION_BOUNDS: Dict[str, float] = {
 
 
 # ===========================================================================
-# Precision levels (Enhancement 7)
-# ===========================================================================
-class PrecisionLevel(str, Enum):
-    FP32 = "fp32"
-    BF16 = "bf16"
-    FP16 = "fp16"
-    FP8 = "fp8"
-    INT8 = "int8"
-    INT4 = "int4"
-
-
-_PRECISION_ORDER = [p.value for p in PrecisionLevel]
-
-
-# ===========================================================================
 # State
 # ===========================================================================
 @dataclass
 class FlexGenState:
-    """State for the distillation agent (schema v2, backwards-compatible)."""
-    # v1 core
+    """State for the distillation agent (schema v3)."""
     tokens: float
     latency_target: float
     gpu_memory_gb: float
@@ -105,12 +127,12 @@ class FlexGenState:
     carbon_intensity: float
     recent_success_rate: float
     avg_reward: float
-    # v2 additions (all optional, defaults keep v1 callers working)
+    # v2+ additions
     carbon_price_per_kg: float = 0.0
     rec_kwh_available: float = 0.0
     hour_of_day: float = 12.0
     precision_hint: Optional[str] = None
-    # Kept for controller compatibility (previous file passed policy_idx).
+    # Controller compatibility
     policy_idx: int = 0
 
     @property
@@ -121,7 +143,9 @@ class FlexGenState:
         hour_rad = (self.hour_of_day % 24.0) / 24.0 * 2.0 * math.pi
         precision_idx = 0.0
         if self.precision_hint is not None and self.precision_hint in _PRECISION_ORDER:
-            precision_idx = _PRECISION_ORDER.index(self.precision_hint) / max(len(_PRECISION_ORDER) - 1, 1)
+            precision_idx = _PRECISION_ORDER.index(self.precision_hint) / max(
+                len(_PRECISION_ORDER) - 1, 1
+            )
         features = [
             min(self.tokens / NORMALIZATION_BOUNDS["tokens"], 1.0),
             min(self.latency_target / NORMALIZATION_BOUNDS["latency_target"], 1.0),
@@ -155,12 +179,40 @@ class FlexGenState:
         data.pop("_schema", None)
         return cls(**data)
 
+    @classmethod
+    def from_feature_vector(cls, vec: np.ndarray) -> "FlexGenState":
+        """
+        Inverse of to_feature_vector — used for Q-teacher updates that receive
+        only the vector. Lossy but structurally consistent.
+        """
+        v = np.asarray(vec, dtype=np.float64).ravel()
+        if v.size < len(STATE_FEATURE_FIELDS):
+            v = np.pad(v, (0, len(STATE_FEATURE_FIELDS) - v.size))
+        hour_rad = math.atan2(float(v[10]), float(v[11]))
+        hour = ((hour_rad / (2 * math.pi)) % 1.0) * 24.0
+        precision_idx = int(round(v[13] * max(len(_PRECISION_ORDER) - 1, 1)))
+        precision_idx = max(0, min(len(_PRECISION_ORDER) - 1, precision_idx))
+        return cls(
+            tokens=float(v[0]) * NORMALIZATION_BOUNDS["tokens"],
+            latency_target=float(v[1]) * NORMALIZATION_BOUNDS["latency_target"],
+            gpu_memory_gb=float(v[2]) * NORMALIZATION_BOUNDS["gpu_memory_gb"],
+            cpu_memory_gb=float(v[3]) * NORMALIZATION_BOUNDS["cpu_memory_gb"],
+            disk_bandwidth_gbps=float(v[4]) * NORMALIZATION_BOUNDS["disk_bandwidth_gbps"],
+            carbon_intensity=float(v[5]) * NORMALIZATION_BOUNDS["carbon_intensity"],
+            recent_success_rate=float(v[6]),
+            avg_reward=float(v[7]),
+            carbon_price_per_kg=float(v[8]) * NORMALIZATION_BOUNDS["carbon_price"],
+            rec_kwh_available=float(v[9]) * NORMALIZATION_BOUNDS["rec_kwh"],
+            hour_of_day=hour,
+            precision_hint=_PRECISION_ORDER[precision_idx],
+        )
+
 
 # ===========================================================================
 # Teachers
 # ===========================================================================
 class Teacher:
-    """Abstract teacher with role tagging (Enhancement 4)."""
+    """Abstract teacher with role tagging."""
     name: str = "teacher"
     role: str = "exploiter"
 
@@ -171,12 +223,8 @@ class Teacher:
         raise NotImplementedError
 
 
-# -- Rule-based (enhanced for carbon price and precision) -------------------
 class FlexGenRuleBasedTeacher(Teacher):
-    """
-    Candidate-aware heuristic. Now reads carbon price, REC availability,
-    precision level, mixed precision, block size, and latency headroom.
-    """
+    """Candidate-aware heuristic that reads carbon price, REC, precision, and headroom."""
 
     name = "rule"
     role = "safety_officer"
@@ -187,34 +235,27 @@ class FlexGenRuleBasedTeacher(Teacher):
             return np.zeros(0)
         scores = np.ones(n, dtype=np.float64) * 0.5
 
-        # Carbon-stress: prefer offload and low bits.
         carbon_stress = min(1.0, state.carbon_intensity / 600.0)
         price_stress = min(1.0, state.carbon_price_per_kg / 0.2)
         rec_relief = min(1.0, state.rec_kwh_available / 20.0)
 
         for i, pol in enumerate(candidates):
             s = 1.0
-            # Weight device preference under carbon stress.
             if pol.weight_device == "cpu":
                 s += 0.3 * carbon_stress
             if pol.weight_device == "disk":
                 s -= 0.15 * (1.0 - carbon_stress)
-            # Low latency target -> prefer GPU.
             if state.latency_target < 200 and pol.weight_device == "gpu":
                 s += 0.3
-            # Precision-aware (Enhancement 7).
             pol_prec = getattr(pol, "precision_level", None)
             if pol_prec in ("int4", "int8", "fp8") and (carbon_stress > 0.5 or price_stress > 0.5):
                 s += 0.25 * max(carbon_stress, price_stress)
             if rec_relief > 0.5 and pol_prec in ("fp16", "bf16", "fp32"):
-                # RECs available -> we can afford higher precision.
                 s += 0.15 * rec_relief
             if getattr(pol, "mixed_precision", False):
                 s += 0.1
-            # Memory-aware fallback.
             if state.gpu_memory_gb < 8 and pol.weight_bits <= 8:
                 s += 0.2
-            # Block size efficiency nudge.
             if pol.block_size in (16, 32):
                 s += 0.05
             scores[i] = max(0.05, s)
@@ -229,13 +270,8 @@ class FlexGenRuleBasedTeacher(Teacher):
         return 0.3
 
 
-# -- Historical ML teacher (unchanged interface, safe loads) ----------------
 class FlexGenHistoricalMLTeacher(Teacher):
-    """
-    Trained classifier placeholder. Loads via JSON to avoid pickle.
-    Expected format: {"schema": "...", "classes": int, "weights": [[...]], "bias": [...]}
-    or falls back to a scikit-learn model loaded externally and passed in.
-    """
+    """Loads a portable linear-softmax model from JSON (no pickle)."""
 
     name = "historical"
     role = "exploiter"
@@ -276,9 +312,13 @@ class FlexGenHistoricalMLTeacher(Teacher):
 
 
 class _LinearSoftmaxModel:
-    """Portable linear softmax replacement for pickled sklearn models."""
+    """Portable linear softmax with input-shape validation."""
 
     def __init__(self, weights: np.ndarray, bias: np.ndarray):
+        if weights.ndim != 2:
+            raise ValueError("weights must be 2D")
+        if bias.ndim != 1 or bias.shape[0] != weights.shape[1]:
+            raise ValueError("bias shape must match weights.shape[1]")
         self.weights = weights
         self.bias = bias
 
@@ -298,18 +338,29 @@ class _LinearSoftmaxModel:
         }
 
     def predict_proba(self, x: np.ndarray) -> np.ndarray:
+        if x.shape[-1] != self.weights.shape[0]:
+            # Pad or truncate to fit the model. This prevents crashes when the
+            # state schema changes between runs.
+            d = self.weights.shape[0]
+            if x.shape[-1] < d:
+                x = np.pad(x, ((0, 0), (0, d - x.shape[-1])))
+            else:
+                x = x[..., :d]
         logits = x @ self.weights + self.bias
         logits = logits - logits.max(axis=-1, keepdims=True)
         e = np.exp(logits)
         return e / e.sum(axis=-1, keepdims=True)
 
 
-# -- Q-teacher (fixed amnesia, safe persistence) ----------------------------
 class FlexGenStatefulQTeacher(Teacher):
     """
-    Linear Q-learning teacher. Fixes:
-      - Amnesia under candidate-count shrink/grow (archive preserved).
-      - JSON write on every update (now periodic + atomic).
+    Linear Q-learning teacher with:
+
+      - archive-preserving candidate-count changes,
+      - explicit remove_archive() for committed columns,
+      - periodic atomic JSON persistence,
+      - add_state_update() for controller-side updates that only have the
+        feature vector.
     """
 
     name = "q"
@@ -341,9 +392,7 @@ class FlexGenStatefulQTeacher(Teacher):
             with open(self.weights_path, "r") as f:
                 payload = json.load(f)
             if payload.get("schema") != STATE_SCHEMA_VERSION:
-                logger.warning(
-                    "Q-teacher weights schema mismatch; ignoring persisted file."
-                )
+                logger.warning("Q-teacher schema mismatch; ignoring persisted file.")
                 return
             loaded = np.asarray(payload["weights"], dtype=np.float64)
             f_dim, n_act = loaded.shape
@@ -378,21 +427,37 @@ class FlexGenStatefulQTeacher(Teacher):
     def _ensure_n_actions(self, n_actions: int) -> None:
         if n_actions == self.n_actions:
             return
-        # Archive the columns we're about to drop (avoid amnesia).
         if n_actions < self.n_actions:
+            # Archive dropped columns so we can restore them if the count grows.
             for j in range(n_actions, self.n_actions):
                 self._archived_columns[j] = self.weights[:, j].copy()
         new_weights = np.zeros((self.feature_dim, n_actions))
         min_act = min(self.n_actions, n_actions)
         new_weights[:, :min_act] = self.weights[:, :min_act]
-        # Restore archived columns when growing back.
         if n_actions > self.n_actions:
             for j in range(self.n_actions, n_actions):
                 if j in self._archived_columns:
-                    new_weights[:, j] = self._archived_columns[j]
+                    new_weights[:, j] = self._archived_columns.pop(j)
         self.weights = new_weights
         self.n_actions = n_actions
         self._dirty = True
+
+    def commit_archive(self, keep_top_k: Optional[int] = None) -> int:
+        """
+        Explicitly discard archived columns. If keep_top_k is provided, keep
+        only the K most-recently-archived columns. Returns the number removed.
+        """
+        if keep_top_k is None:
+            removed = len(self._archived_columns)
+            self._archived_columns.clear()
+            return removed
+        keys = sorted(self._archived_columns.keys())
+        if len(keys) <= keep_top_k:
+            return 0
+        to_drop = keys[:-keep_top_k]
+        for k in to_drop:
+            self._archived_columns.pop(k, None)
+        return len(to_drop)
 
     def predict(self, state: FlexGenState, candidates: Sequence[FlexGenPolicy]) -> np.ndarray:
         n = len(candidates)
@@ -418,7 +483,23 @@ class FlexGenStatefulQTeacher(Teacher):
         self._dirty = True
         self._save()
 
-    # -- federated (Enhancement 3) -------------------------------------
+    def update_from_vector(self, state_vec: np.ndarray, action: int, reward: float) -> None:
+        """Controller-friendly update path that avoids re-encoding the state."""
+        self._ensure_n_actions(self.n_actions)  # no-op guard
+        if not (0 <= action < self.n_actions):
+            return
+        x = np.asarray(state_vec, dtype=np.float64).ravel()
+        if x.size < self.feature_dim:
+            x = np.pad(x, (0, self.feature_dim - x.size))
+        elif x.size > self.feature_dim:
+            x = x[: self.feature_dim]
+        q_current = float(np.dot(x, self.weights[:, action]))
+        self.weights[:, action] += self.lr * (reward - q_current) * x
+        self._update_count += 1
+        self._dirty = True
+        self._save()
+
+    # -- federated -----------------------------------------------------
     def export_weights(self) -> Dict[str, Any]:
         return {
             "schema": STATE_SCHEMA_VERSION,
@@ -441,29 +522,30 @@ class FlexGenStatefulQTeacher(Teacher):
         self._save(force=True)
 
 
-# -- Quantum-inspired teacher (Enhancement 1) -------------------------------
 class QuantumInspiredTeacher(Teacher):
-    """
-    Quantum-inspired teacher using a small parameterized state-vector
-    simulation. Produces a candidate distribution modulated by the state.
-    Deterministic given the seed; blends a quantum interference prior with a
-    carbon-aware policy prior.
-    """
+    """Quantum-inspired teacher with a small parameterized state-vector simulation."""
 
     name = "quantum"
     role = "carbon_broker"
 
     def __init__(self, n_qubits: int = 5, seed: int = 0):
-        self.n_qubits = n_qubits
+        self.n_qubits = max(1, int(n_qubits))
         self.rng = np.random.default_rng(seed)
-        self._params = self.rng.normal(size=(n_qubits, 2)) * 0.5
+        self._params = self.rng.normal(size=(self.n_qubits, 2)) * 0.5
 
     def _simulate(self, features: np.ndarray, n_candidates: int) -> np.ndarray:
+        if n_candidates <= 0:
+            return np.zeros(0)
+        feat = np.asarray(features, dtype=np.float64).ravel()
+        if feat.size == 0:
+            feat = np.zeros(self.n_qubits, dtype=np.float64)
         dim = 1 << self.n_qubits
         state = np.zeros(dim, dtype=np.complex128)
         state[0] = 1.0
         for q in range(self.n_qubits):
-            theta = float(self._params[q, 0] * features[q % len(features)] + self._params[q, 1])
+            theta = float(
+                self._params[q, 0] * feat[q % feat.size] + self._params[q, 1]
+            )
             c, s = math.cos(theta / 2), math.sin(theta / 2)
             new = state.copy()
             step = 1 << q
@@ -498,16 +580,18 @@ class QuantumInspiredTeacher(Teacher):
 
 
 # ===========================================================================
-# Student with temperature, gradient clip, federated export/import
+# Student
 # ===========================================================================
 class DistillationStudent:
     """
     Linear softmax student with:
-      - Baseline subtraction and L2 regularization
-      - Temperature-scaled softmax
-      - Gradient clipping
-      - Federated export/import
-      - Schema-versioned persistence (JSON, not pickle)
+
+      - baseline-subtracted advantage,
+      - L2 regularization,
+      - temperature-scaled softmax,
+      - gradient clipping,
+      - federated export/import,
+      - side-effect-free predict (v3): shape is resized explicitly.
     """
 
     def __init__(
@@ -531,35 +615,38 @@ class DistillationStudent:
         self.baseline_alpha = 0.1
         self.counter = 0
 
-    def _resize(self, n_classes: int) -> None:
-        if n_classes == self.n_classes:
-            return
-        new_weights = np.zeros((self.feature_dim, n_classes))
-        new_biases = np.zeros(n_classes)
-        min_classes = min(self.n_classes, n_classes)
-        new_weights[:, :min_classes] = self.weights[:, :min_classes]
-        new_biases[:min_classes] = self.biases[:min_classes]
-        self.weights = new_weights
-        self.biases = new_biases
-        self.n_classes = n_classes
-
-    def _ensure_feature_dim(self, dim: int) -> None:
-        if dim == self.feature_dim:
-            return
-        new_weights = np.zeros((dim, self.n_classes))
-        min_dim = min(dim, self.feature_dim)
-        new_weights[:min_dim, :] = self.weights[:min_dim, :]
-        self.weights = new_weights
-        self.feature_dim = dim
+    def ensure_shape(self, feature_dim: int, n_classes: int) -> None:
+        """Explicit, side-effect-only-when-needed resize."""
+        if feature_dim != self.feature_dim:
+            new_w = np.zeros((feature_dim, self.n_classes))
+            min_dim = min(feature_dim, self.feature_dim)
+            new_w[:min_dim, :] = self.weights[:min_dim, :]
+            self.weights = new_w
+            self.feature_dim = feature_dim
+        if n_classes != self.n_classes:
+            new_w = np.zeros((self.feature_dim, n_classes))
+            new_b = np.zeros(n_classes)
+            min_c = min(self.n_classes, n_classes)
+            new_w[:, :min_c] = self.weights[:, :min_c]
+            new_b[:min_c] = self.biases[:min_c]
+            self.weights = new_w
+            self.biases = new_b
+            self.n_classes = n_classes
 
     def predict_proba(self, state_vector: np.ndarray, num_classes: int) -> np.ndarray:
-        self._ensure_feature_dim(len(state_vector))
-        self._resize(num_classes)
-        logits = state_vector @ self.weights + self.biases
+        """
+        Side-effect free (v3). If shapes do not match, returns a uniform
+        distribution rather than silently mutating the model. Call
+        ensure_shape() first to change dimensions.
+        """
+        x = np.asarray(state_vector, dtype=np.float64).ravel()
+        if x.size != self.feature_dim or num_classes != self.n_classes:
+            return np.ones(max(num_classes, 1)) / max(num_classes, 1)
+        logits = x @ self.weights + self.biases
         logits = logits / self.temperature
         logits = logits - logits.max()
-        exp_logits = np.exp(logits)
-        return exp_logits / exp_logits.sum()
+        e = np.exp(logits)
+        return e / e.sum()
 
     def update(
         self,
@@ -570,18 +657,21 @@ class DistillationStudent:
         distill_weight: float = 0.7,
         rl_weight: float = 0.3,
     ) -> None:
-        current_probs = self.predict_proba(state_vector, len(teacher_probs))
-        self.baseline = self.baseline_alpha * reward + (1 - self.baseline_alpha) * self.baseline
+        n = len(teacher_probs)
+        self.ensure_shape(len(state_vector), n)
+        current_probs = self.predict_proba(state_vector, n)
+        self.baseline = (
+            self.baseline_alpha * reward + (1 - self.baseline_alpha) * self.baseline
+        )
         advantage = reward - self.baseline
 
         grad_distill = -(teacher_probs - current_probs)
-        one_hot = np.zeros(self.n_classes)
-        if 0 <= action < self.n_classes:
+        one_hot = np.zeros(n)
+        if 0 <= action < n:
             one_hot[action] = 1.0
         grad_rl = -advantage * (one_hot - current_probs)
         grad = distill_weight * grad_distill + rl_weight * grad_rl
 
-        # Gradient clip (Enhancement 9).
         norm = float(np.linalg.norm(grad))
         if norm > self.grad_clip:
             grad = grad * (self.grad_clip / (norm + 1e-12))
@@ -590,7 +680,7 @@ class DistillationStudent:
         self.biases -= self.lr * grad
         self.counter += 1
 
-    # -- federated (Enhancement 3) -------------------------------------
+    # -- federated -----------------------------------------------------
     def export_weights(self) -> Dict[str, Any]:
         return {
             "schema": STATE_SCHEMA_VERSION,
@@ -614,7 +704,7 @@ class DistillationStudent:
 
 
 # ===========================================================================
-# Prioritized replay with candidate-set hash (fixes stale-target bug)
+# Prioritized replay with importance sampling
 # ===========================================================================
 @dataclass
 class ReplaySample:
@@ -630,15 +720,18 @@ class ReplaySample:
 
 class PrioritizedReplayBuffer:
     """
-    Replay buffer that tags each sample with the candidate-set hash.
-    On sample, samples are rejected if the current candidate set hash does
-    not match, preventing silent training on stale index spaces.
+    Replay buffer tagged with candidate-set hashes; sampling returns
+    importance-sampling weights alongside the batch (v3).
     """
 
-    def __init__(self, max_size: int = 2000, alpha: float = 0.6, eps: float = 1e-4):
+    def __init__(self, max_size: int = 2000, alpha: float = 0.6, eps: float = 1e-4,
+                 beta_start: float = 0.4, beta_end: float = 1.0):
         self.buffer: deque = deque(maxlen=max_size)
         self.alpha = alpha
         self.eps = eps
+        self.beta_start = beta_start
+        self.beta_end = beta_end
+        self._sample_count = 0
 
     def push(
         self,
@@ -671,39 +764,47 @@ class PrioritizedReplayBuffer:
         self,
         batch_size: int,
         current_hash: Optional[str] = None,
-    ) -> List[ReplaySample]:
+    ) -> Tuple[List[ReplaySample], np.ndarray]:
         if not self.buffer:
-            return []
+            return [], np.zeros(0)
         candidates = list(self.buffer)
         if current_hash is not None:
             filtered = [s for s in candidates if s.candidate_hash == current_hash]
             if filtered:
                 candidates = filtered
             else:
-                # No matching samples; return empty rather than poison the student.
-                return []
+                return [], np.zeros(0)
         priorities = np.array([max(s.priority, self.eps) ** self.alpha for s in candidates])
         probs = priorities / priorities.sum()
         k = min(batch_size, len(candidates))
         idx = np.random.choice(len(candidates), size=k, replace=False, p=probs)
-        return [candidates[i] for i in idx]
+
+        # Importance sampling weights.
+        self._sample_count += 1
+        beta = min(self.beta_end, self.beta_start +
+                   (self.beta_end - self.beta_start) * self._sample_count / 1000.0)
+        n = len(candidates)
+        is_weights = (n * probs[idx]) ** (-beta)
+        is_weights = is_weights / max(is_weights.max(), 1e-12)
+        return [candidates[i] for i in idx], is_weights
 
 
 # ===========================================================================
-# Causal counterfactual estimator (Enhancement 2)
+# Causal counterfactual estimator
 # ===========================================================================
 class CausalCounterfactualEstimator:
     """
-    Ridge-regression structural causal model over (state, action, reward).
-    Produces per-action counterfactual reward estimates.
+    Ridge-regression structural causal model with padding-based action resize
+    (v3) so growing or shrinking candidate sets does not throw away knowledge.
     """
 
     def __init__(self, state_dim: int, n_actions: int, ridge: float = 1e-3):
         self.state_dim = state_dim
         self.n_actions = n_actions
         self.ridge = ridge
-        self._A = np.eye(state_dim + n_actions + 1) * ridge
-        self._b = np.zeros(state_dim + n_actions + 1)
+        d = state_dim + n_actions + 1
+        self._A = np.eye(d) * ridge
+        self._b = np.zeros(d)
         self._n = 0
 
     def _features(self, s: np.ndarray, a: int) -> np.ndarray:
@@ -714,10 +815,28 @@ class CausalCounterfactualEstimator:
     def _ensure_actions(self, n_actions: int) -> None:
         if n_actions == self.n_actions:
             return
-        self._A = np.eye(self.state_dim + n_actions + 1) * self.ridge
-        self._b = np.zeros(self.state_dim + n_actions + 1)
+        old_d = self.state_dim + self.n_actions + 1
+        new_d = self.state_dim + n_actions + 1
+        new_A = np.eye(new_d) * self.ridge
+        new_b = np.zeros(new_d)
+        # Copy the state-block, then as many action one-hots as fit.
+        state_block = min(self.state_dim, self.state_dim)
+        new_A[:state_block, :state_block] = self._A[:state_block, :state_block]
+        new_b[:state_block] = self._b[:state_block]
+        a_old = self.n_actions
+        a_new = n_actions
+        a_min = min(a_old, a_new)
+        off_old = self.state_dim
+        off_new = self.state_dim
+        new_A[off_new:off_new + a_min, off_new:off_new + a_min] = \
+            self._A[off_old:off_old + a_min, off_old:off_old + a_min]
+        new_b[off_new:off_new + a_min] = self._b[off_old:off_old + a_min]
+        # Copy intercept (last index).
+        new_A[-1, -1] = self._A[-1, -1]
+        new_b[-1] = self._b[-1]
+        self._A = new_A
+        self._b = new_b
         self.n_actions = n_actions
-        self._n = 0
 
     def update(self, state: np.ndarray, action: int, reward: float) -> None:
         x = self._features(state, action)
@@ -740,8 +859,46 @@ class CausalCounterfactualEstimator:
 
 
 # ===========================================================================
-# Federated aggregator (Enhancement 3)
+# Federated aggregator with shape validation + RDP budget
 # ===========================================================================
+class SimpleRDPAccountant:
+    """RDP accountant for the federated aggregation path."""
+
+    def __init__(self, target_delta: float = 1e-5, max_epsilon: float = 10.0):
+        self.target_delta = target_delta
+        self.max_epsilon = max_epsilon
+        self.steps = 0
+        self.orders = [1 + x / 10.0 for x in range(1, 100)]
+        self.rdp = np.zeros(len(self.orders))
+
+    def step(self, sigma: float, q: float = 1.0) -> None:
+        if sigma <= 0:
+            return
+        self.steps += 1
+        for i, o in enumerate(self.orders):
+            self.rdp[i] += (o * q * q) / (2 * sigma * sigma)
+
+    def epsilon(self) -> float:
+        if self.steps == 0:
+            return 0.0
+        eps = [
+            self.rdp[i] + math.log(1.0 / self.target_delta) / (self.orders[i] - 1)
+            for i in range(len(self.orders)) if self.orders[i] > 1
+        ]
+        return float(min(eps)) if eps else float("inf")
+
+    def budget_exceeded(self) -> bool:
+        return self.epsilon() > self.max_epsilon
+
+    def get_state(self) -> Dict[str, Any]:
+        return {
+            "steps": self.steps,
+            "epsilon": self.epsilon(),
+            "delta": self.target_delta,
+            "budget_exceeded": self.budget_exceeded(),
+        }
+
+
 @dataclass
 class FederatedUpdate:
     node_id: str
@@ -752,19 +909,57 @@ class FederatedUpdate:
 
 
 class FederatedAggregator:
-    """
-    Carbon-weighted FedAvg for student weights. Lower-carbon nodes with more
-    samples contribute more.
-    """
+    """Carbon-weighted FedAvg with shape validation and RDP budget."""
 
-    def __init__(self, dp_sigma: float = 1e-3, staleness_s: float = 3600.0):
+    def __init__(self, dp_sigma: float = 1e-3, staleness_s: float = 3600.0,
+                 target_delta: float = 1e-5, max_epsilon: float = 10.0):
         self.dp_sigma = dp_sigma
         self.staleness_s = staleness_s
         self._updates: Dict[str, FederatedUpdate] = {}
         self._global: Optional[Dict[str, np.ndarray]] = None
+        self._shapes: Dict[str, Tuple[int, ...]] = {}
+        self.accountant = SimpleRDPAccountant(target_delta=target_delta,
+                                              max_epsilon=max_epsilon)
+        self.rejected: List[Dict[str, Any]] = []
 
-    def submit(self, update: FederatedUpdate) -> None:
+    def submit(self, update: FederatedUpdate) -> bool:
+        for k, v in update.weights.items():
+            if not isinstance(v, np.ndarray) or v.size == 0:
+                return False
+            if k in self._shapes and v.shape != self._shapes[k]:
+                self.rejected.append({
+                    "node_id": update.node_id,
+                    "key": k,
+                    "expected": self._shapes[k],
+                    "got": v.shape,
+                    "t": time.time(),
+                })
+                logger.warning(
+                    f"Rejected federated update from {update.node_id}: "
+                    f"shape mismatch on {k}"
+                )
+                return False
+            self._shapes.setdefault(k, v.shape)
+        if self.accountant.budget_exceeded():
+            logger.warning(
+                f"DP budget exceeded (eps={self.accountant.epsilon():.3f}); "
+                f"skipping federated update"
+            )
+            return False
+        if self.dp_sigma > 0:
+            noisy = {
+                k: v + np.random.normal(0.0, self.dp_sigma, size=v.shape)
+                for k, v in update.weights.items()
+            }
+            self.accountant.step(self.dp_sigma, q=1.0)
+            update = FederatedUpdate(
+                node_id=update.node_id, weights=noisy,
+                n_samples=update.n_samples,
+                carbon_intensity=update.carbon_intensity,
+                timestamp=update.timestamp,
+            )
         self._updates[update.node_id] = update
+        return True
 
     def _fresh(self) -> List[FederatedUpdate]:
         now = time.time()
@@ -782,20 +977,24 @@ class FederatedAggregator:
         keys = fresh[0].weights.keys()
         agg: Dict[str, np.ndarray] = {}
         for k in keys:
-            stacked = np.stack([u.weights[k] for u in fresh], axis=0)
-            blended = np.tensordot(weights, stacked, axes=([0], [0]))
-            if self.dp_sigma > 0:
-                blended = blended + np.random.normal(0.0, self.dp_sigma, size=blended.shape)
-            agg[k] = blended
+            try:
+                stacked = np.stack([u.weights[k] for u in fresh], axis=0)
+            except (KeyError, ValueError):
+                continue
+            agg[k] = np.tensordot(weights, stacked, axes=([0], [0]))
         self._global = agg
         return agg
 
     def global_weights(self) -> Optional[Dict[str, np.ndarray]]:
         return self._global
 
+    def get_dp_state(self) -> Dict[str, Any]:
+        return {**self.accountant.get_state(),
+                "rejected_updates": len(self.rejected)}
+
 
 # ===========================================================================
-# Emergent role registry (Enhancement 4)
+# Emergent role registry
 # ===========================================================================
 class AgentRole(str, Enum):
     EXPLORER = "explorer"
@@ -806,31 +1005,63 @@ class AgentRole(str, Enum):
 
 
 class EmergentRoleRegistry:
-    """Decay-weighted performance tracker per role."""
+    """
+    Decay-weighted performance tracker per role with epsilon-greedy sampling
+    and full snapshot support (v3).
+    """
 
-    def __init__(self, decay: float = 0.95):
+    def __init__(self, decay: float = 0.95, exploration: float = 0.1,
+                 rng: Optional[random.Random] = None):
         self.decay = decay
+        self.exploration = exploration
+        self.rng = rng or random.Random(0)
         self._scores: Dict[AgentRole, float] = {r: 1.0 for r in AgentRole}
+        self._counts: Dict[AgentRole, int] = {r: 0 for r in AgentRole}
+        self._successes: Dict[AgentRole, int] = {r: 0 for r in AgentRole}
 
     def record(self, role: AgentRole, success: bool, reward: float) -> None:
         for r in self._scores:
             self._scores[r] *= self.decay
-        signal = reward if success else -abs(reward) * 0.5
+        signal = abs(reward) if success else -abs(reward) * 0.5
         self._scores[role] += signal
+        self._counts[role] += 1
+        if success:
+            self._successes[role] += 1
+
+    def success_rate(self, role: AgentRole) -> float:
+        c = self._counts[role]
+        return (self._successes[role] / c) if c > 0 else 0.5
 
     def weights(self) -> Dict[AgentRole, float]:
         total = sum(max(v, 1e-6) for v in self._scores.values())
         return {r: max(v, 1e-6) / total for r, v in self._scores.items()}
 
+    def dominant_role(self) -> AgentRole:
+        return max(self._scores, key=self._scores.get)
+
+    def sample_role(self) -> AgentRole:
+        if self.rng.random() < self.exploration:
+            return self.rng.choice(list(AgentRole))
+        return self.dominant_role()
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "scores": {r.value: round(v, 4) for r, v in self._scores.items()},
+            "counts": {r.value: c for r, c in self._counts.items()},
+            "success_rates": {r.value: round(self.success_rate(r), 4) for r in AgentRole},
+            "dominant": self.dominant_role().value,
+        }
+
 
 # ===========================================================================
-# XAI explainer (Enhancement 6)
+# XAI explainer
 # ===========================================================================
 @dataclass
 class Explanation:
     decision_id: str
     chosen_idx: int
     teacher_attributions: Dict[str, float]
+    per_candidate_attribution: List[Dict[str, Any]]
     counterfactuals: List[Dict[str, Any]]
     rationale: str
     confidence: float
@@ -841,7 +1072,10 @@ class Explanation:
 
 
 class DecisionExplainer:
-    """Builds attribution + counterfactual rationale for each decision."""
+    """
+    Produces per-candidate attributions, teacher contributions, counterfactual
+    alternatives, and a natural-language rationale (v3).
+    """
 
     def explain(
         self,
@@ -861,15 +1095,29 @@ class DecisionExplainer:
             teacher_contributions.items(), key=lambda kv: kv[1], reverse=True
         )[:2]
         reason_bits = ", ".join(f"{k}={v:.2f}" for k, v in top_teachers)
+
+        # v3: per-candidate attribution surface.
+        per_cand: List[Dict[str, Any]] = []
+        n = len(teacher_probs)
+        for i in range(n):
+            per_cand.append({
+                "idx": i,
+                "teacher_prob": float(teacher_probs[i]) if i < n else 0.0,
+                "student_prob": float(student_probs[i]) if i < len(student_probs) else 0.0,
+                "counterfactual_reward": float(counterfactuals.get(i, 0.0)),
+            })
+
         rationale = (
             f"Chose candidate #{chosen_idx} (teacher confidence={conf:.2f}, "
             f"student prob={float(student_probs[chosen_idx]):.2f}, uncertainty={uncertainty:.2f}). "
-            f"Top teacher contributions: {reason_bits}."
+            f"Top teacher contributions: {reason_bits}. "
+            f"Counterfactuals: {len(cf_list)}."
         )
         return Explanation(
             decision_id=f"dec-{int(time.time()*1000)}",
             chosen_idx=chosen_idx,
             teacher_attributions=teacher_contributions,
+            per_candidate_attribution=per_cand,
             counterfactuals=cf_list,
             rationale=rationale,
             confidence=conf,
@@ -878,7 +1126,7 @@ class DecisionExplainer:
 
 
 # ===========================================================================
-# Uncertainty + HITL + circuit breaker (Enhancements 9, 10)
+# Uncertainty + HITL + circuit breaker
 # ===========================================================================
 class UncertaintyEstimator:
     """Entropy of teacher probs + reward variance."""
@@ -910,27 +1158,46 @@ class UncertaintyEstimator:
 
 
 class HumanInTheLoopGate:
-    """Async approval gate with timeout and audit trail."""
+    """
+    Async approval gate. Two modes:
+      - 'block' (default)   : awaits the approver up to timeout_s.
+      - 'publish_only' (v3) : fires the request and returns the default
+                              decision immediately. The caller reconciles later.
+    """
 
     def __init__(
         self,
         approver: Optional[Callable[[Dict[str, Any]], bool]] = None,
         timeout_s: float = 2.0,
         auto_approve_on_timeout: bool = True,
+        mode: str = "block",
+        publisher: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self.approver = approver
         self.timeout_s = timeout_s
         self.auto_approve_on_timeout = auto_approve_on_timeout
+        self.mode = mode
+        self.publisher = publisher
         self.audit: List[Dict[str, Any]] = []
 
     async def request(self, payload: Dict[str, Any]) -> bool:
+        if self.mode == "publish_only":
+            if self.publisher is not None:
+                try:
+                    self.publisher(payload)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(f"HITL publisher failed: {exc}")
+            self.audit.append({"approved": None, "mode": "publish_only", **payload})
+            return self.auto_approve_on_timeout
+
         if self.approver is None:
             self.audit.append({"approved": True, "reason": "no_approver", **payload})
             return True
         loop = asyncio.get_running_loop()
         try:
             ok = await asyncio.wait_for(
-                loop.run_in_executor(None, self.approver, payload), timeout=self.timeout_s
+                loop.run_in_executor(None, self.approver, payload),
+                timeout=self.timeout_s,
             )
         except asyncio.TimeoutError:
             ok = self.auto_approve_on_timeout
@@ -946,6 +1213,8 @@ class CircuitBreaker:
         self.recovery_time_s = recovery_time_s
         self._failures = 0
         self._open_until = 0.0
+        self.total_failures = 0
+        self.total_successes = 0
 
     def allow(self) -> bool:
         return time.time() >= self._open_until
@@ -953,26 +1222,25 @@ class CircuitBreaker:
     def record(self, success: bool) -> None:
         if success:
             self._failures = 0
+            self.total_successes += 1
         else:
             self._failures += 1
+            self.total_failures += 1
             if self._failures >= self.failure_threshold:
                 self._open_until = time.time() + self.recovery_time_s
                 self._failures = 0
 
 
 # ===========================================================================
-# Helper utilities
+# Helpers
 # ===========================================================================
 def _align_probs(probs: np.ndarray, n: int) -> np.ndarray:
-    """
-    Align a probability vector of arbitrary length to n classes without the
-    np.resize cyclic-repeat bug.
-    """
+    """Align a probability vector to n classes without cyclic repetition."""
     if n <= 0:
         return np.zeros(0)
     if probs.size == 0:
         return np.ones(n) / n
-    out = np.ones(n, dtype=np.float64) * (1.0 / max(n, 1))  # uniform prior
+    out = np.ones(n, dtype=np.float64) * (1.0 / max(n, 1))
     k = min(probs.size, n)
     out[:k] = probs[:k]
     s = out.sum()
@@ -980,8 +1248,11 @@ def _align_probs(probs: np.ndarray, n: int) -> np.ndarray:
 
 
 def _candidate_set_hash(candidates: Sequence[FlexGenPolicy]) -> str:
+    """Stable SHA-256 over a canonical serialization (v3)."""
+    if not candidates:
+        return "empty"
     payload = "|".join(json.dumps(c.to_dict(), sort_keys=True) for c in candidates)
-    return str(hash(payload) & 0xFFFFFFFF)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def _atomic_json_write(path: str, payload: Dict[str, Any]) -> None:
@@ -1006,7 +1277,7 @@ def _atomic_json_write(path: str, payload: Dict[str, Any]) -> None:
 # ===========================================================================
 class DistillationFlexGenSelector:
     """
-    Multi-teacher on-policy distillation selector.
+    Multi-teacher on-policy distillation selector (v3).
     Variable candidate count, schema-versioned persistence, ten enhancements.
     """
 
@@ -1016,7 +1287,6 @@ class DistillationFlexGenSelector:
         config: Optional[Dict] = None,
         message_queue: Optional[AsyncMessageQueue] = None,
         persistence_path: Optional[str] = None,
-        # Enhancement flags
         enable_quantum_teacher: bool = True,
         enable_causal: bool = True,
         enable_federated: bool = True,
@@ -1024,11 +1294,13 @@ class DistillationFlexGenSelector:
         enable_xai: bool = True,
         enable_hitl: bool = True,
         enable_resilience: bool = True,
-        # Enhancement hooks
-        safety_shield: Optional[Callable[[int, Sequence[Dict[str, Any]]], Tuple[int, bool, Dict[str, bool]]]] = None,
+        safety_shield: Optional[
+            Callable[[int, Sequence[Dict[str, Any]]], Tuple[int, bool, Dict[str, bool]]]
+        ] = None,
         temporal_monitor: Optional[Callable[[Dict[str, Any]], Dict[str, bool]]] = None,
         hitl_approver: Optional[Callable[[Dict[str, Any]], bool]] = None,
-        # Reproducibility
+        hitl_mode: str = "block",
+        hitl_publisher: Optional[Callable[[Dict[str, Any]], None]] = None,
         seed: Optional[int] = None,
     ):
         self.config = config or {}
@@ -1038,7 +1310,7 @@ class DistillationFlexGenSelector:
         self.rng = random.Random(seed if seed is not None else 0)
         self.seed = seed
 
-        # Teachers ------------------------------------------------------
+        # Teachers
         self.rule_teacher = FlexGenRuleBasedTeacher()
         self.historical_teacher = FlexGenHistoricalMLTeacher(
             model_path=self.config.get("historical_model_path")
@@ -1050,14 +1322,16 @@ class DistillationFlexGenSelector:
             weights_path=self.config.get("q_weights_path"),
             save_every=self.config.get("q_save_every", 50),
         )
-        self.teachers: List[Teacher] = [self.rule_teacher, self.historical_teacher, self.q_teacher]
+        self.teachers: List[Teacher] = [
+            self.rule_teacher, self.historical_teacher, self.q_teacher,
+        ]
         if enable_quantum_teacher:
             self.quantum_teacher = QuantumInspiredTeacher(seed=seed or 0)
             self.teachers.append(self.quantum_teacher)
         else:
             self.quantum_teacher = None
 
-        # Student -------------------------------------------------------
+        # Student + replay
         self.student = DistillationStudent(
             feature_dim=self.feature_dim,
             n_classes=n_candidates,
@@ -1070,29 +1344,39 @@ class DistillationFlexGenSelector:
             max_size=self.config.get("replay_size", 2000)
         )
 
-        # Enhancement modules -------------------------------------------
+        # Enhancement modules
         self.causal = (
             CausalCounterfactualEstimator(self.feature_dim, n_candidates)
             if enable_causal else None
         )
         self.federated = FederatedAggregator() if enable_federated else None
-        self.roles = EmergentRoleRegistry() if enable_multi_agent else None
+        self.roles = (
+            EmergentRoleRegistry(rng=random.Random(seed or 0))
+            if enable_multi_agent else None
+        )
         self.explainer = DecisionExplainer() if enable_xai else None
         self.uncertainty = UncertaintyEstimator() if enable_hitl else None
-        self.hitl = HumanInTheLoopGate(approver=hitl_approver) if enable_hitl else None
+        self.hitl = (
+            HumanInTheLoopGate(
+                approver=hitl_approver,
+                mode=hitl_mode,
+                publisher=hitl_publisher,
+            )
+            if enable_hitl else None
+        )
         self.breaker = CircuitBreaker() if enable_resilience else None
 
-        # Hooks ---------------------------------------------------------
+        # Hooks
         self.safety_shield = safety_shield
         self.temporal_monitor = temporal_monitor
 
-        # Schedule ------------------------------------------------------
+        # Schedule
         self.epsilon = self.config.get("epsilon", 0.1)
         self.epsilon_decay = self.config.get("epsilon_decay", 0.999)
         self.train_every = self.config.get("train_every", 10)
         self.counter = 0
 
-        # Caches --------------------------------------------------------
+        # Caches
         self.last_teacher_probs: Optional[np.ndarray] = None
         self.last_student_probs: Optional[np.ndarray] = None
         self.last_explanation: Optional[Explanation] = None
@@ -1104,7 +1388,7 @@ class DistillationFlexGenSelector:
             self._load_student()
 
     # ------------------------------------------------------------------
-    # Persistence (safe + versioned)
+    # Persistence
     # ------------------------------------------------------------------
     def _load_student(self) -> None:
         try:
@@ -1116,6 +1400,8 @@ class DistillationFlexGenSelector:
             self.student.import_weights(payload)
             self.epsilon = payload.get("epsilon", self.epsilon)
             self.counter = payload.get("counter", 0)
+            if "q_teacher" in payload:
+                self.q_teacher.import_weights(payload["q_teacher"])
             logger.info(f"Loaded student from {self.persistence_path}")
         except Exception as exc:  # noqa: BLE001
             logger.error(f"Failed to load student: {exc}")
@@ -1127,6 +1413,10 @@ class DistillationFlexGenSelector:
         payload["epsilon"] = self.epsilon
         payload["counter"] = self.counter
         try:
+            payload["q_teacher"] = self.q_teacher.export_weights()
+        except Exception:
+            pass
+        try:
             _atomic_json_write(self.persistence_path, payload)
         except Exception as exc:  # noqa: BLE001
             logger.error(f"Student save failed: {exc}")
@@ -1134,7 +1424,12 @@ class DistillationFlexGenSelector:
     # ------------------------------------------------------------------
     # Teacher ensemble
     # ------------------------------------------------------------------
-    def _safe_predict(self, teacher: Teacher, state: FlexGenState, candidates: Sequence[FlexGenPolicy]) -> Optional[np.ndarray]:
+    def _safe_predict(
+        self,
+        teacher: Teacher,
+        state: FlexGenState,
+        candidates: Sequence[FlexGenPolicy],
+    ) -> Optional[np.ndarray]:
         if self.breaker and not self.breaker.allow():
             return None
         try:
@@ -1193,10 +1488,6 @@ class DistillationFlexGenSelector:
         state: FlexGenState,
         exploration: bool = True,
     ) -> Tuple[int, np.ndarray, np.ndarray]:
-        """
-        Choose an index into the candidate list.
-        Returns (action_idx, state_vec, teacher_probs).
-        """
         state_vec = state.to_feature_vector()
         n = len(candidates)
         if n == 0:
@@ -1205,57 +1496,58 @@ class DistillationFlexGenSelector:
         teacher_probs, contributions = self._ensemble_teacher_probs(state, candidates)
         student_probs = self.student.predict_proba(state_vec, n)
 
-        # Choose action.
         if exploration and self.rng.random() < self.epsilon:
             action_idx = self.rng.randint(0, n - 1)
         else:
             combined = 0.8 * student_probs + 0.2 * teacher_probs
             action_idx = int(np.argmax(combined))
 
-        # Safety shield (Enhancement 5).
+        # Safety shield
         safety_ok = True
         stl_verdict: Dict[str, bool] = {}
         if self.safety_shield is not None:
             try:
                 candidate_dicts = [c.to_dict() for c in candidates]
-                action_idx, safety_ok, stl_verdict = self.safety_shield(action_idx, candidate_dicts)
+                action_idx, safety_ok, stl_verdict = self.safety_shield(
+                    action_idx, candidate_dicts
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"Safety shield failed: {exc}")
 
-        # Temporal monitor (Enhancement 5).
+        # Temporal monitor
         if self.temporal_monitor is not None:
             try:
-                stl_verdict = {**stl_verdict, **self.temporal_monitor({"candidate_idx": action_idx})}
+                stl_verdict = {
+                    **stl_verdict,
+                    **self.temporal_monitor({"candidate_idx": action_idx}),
+                }
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"Temporal monitor failed: {exc}")
 
-        # Uncertainty (Enhancement 10).
+        # Uncertainty
         uncertainty_score = 0.0
         is_uncertain = False
         if self.uncertainty is not None:
             is_uncertain, uncertainty_score = self.uncertainty.score(teacher_probs)
 
-        # HITL (Enhancement 10).
+        # HITL
         if self.hitl is not None and (is_uncertain or not safety_ok):
-            approved = await self.hitl.request(
-                {
-                    "reason": "high_uncertainty" if is_uncertain else "safety_violation",
-                    "candidate_idx": action_idx,
-                    "uncertainty": uncertainty_score,
-                    "num_candidates": n,
-                }
-            )
+            approved = await self.hitl.request({
+                "reason": "high_uncertainty" if is_uncertain else "safety_violation",
+                "candidate_idx": action_idx,
+                "uncertainty": uncertainty_score,
+                "num_candidates": n,
+            })
             if not approved:
-                # Fall back to lowest-bit policy.
                 action_idx = int(np.argmin([c.weight_bits for c in candidates]))
 
-        # Causal counterfactuals (Enhancement 2).
+        # Causal counterfactuals
         counterfactuals: Dict[int, float] = {}
         if self.causal is not None:
             self.causal._ensure_actions(n)
             counterfactuals = self.causal.counterfactuals(state_vec, n)
 
-        # XAI (Enhancement 6).
+        # XAI
         explanation: Optional[Explanation] = None
         if self.explainer is not None:
             explanation = self.explainer.explain(
@@ -1267,7 +1559,7 @@ class DistillationFlexGenSelector:
                 uncertainty=uncertainty_score,
             )
 
-        # Cache.
+        # Cache
         self.last_teacher_probs = teacher_probs
         self.last_student_probs = student_probs
         self.last_explanation = explanation
@@ -1276,7 +1568,6 @@ class DistillationFlexGenSelector:
         self.last_counterfactuals = counterfactuals
 
         self.epsilon = max(0.01, self.epsilon * self.epsilon_decay)
-
         return action_idx, state_vec, teacher_probs
 
     # ------------------------------------------------------------------
@@ -1291,7 +1582,13 @@ class DistillationFlexGenSelector:
         teacher_probs: np.ndarray,
         candidates: Optional[Sequence[FlexGenPolicy]] = None,
     ) -> None:
-        candidate_hash = _candidate_set_hash(candidates) if candidates else "unknown"
+        # v3: derive candidate hash from teacher_probs when candidates missing.
+        if candidates is not None:
+            candidate_hash = _candidate_set_hash(candidates)
+        else:
+            size_hint = len(teacher_probs) if teacher_probs is not None else 0
+            candidate_hash = f"size:{size_hint}"
+
         self.replay_buffer.push(
             state_vec=state_vec,
             action=action_idx,
@@ -1302,57 +1599,53 @@ class DistillationFlexGenSelector:
         )
         self.counter += 1
 
-        # Q-teacher online update (Enhancement 2/legacy).
-        # Rebuild a minimal FlexGenState-like call requires state fields; skip
-        # here and let the controller call q_teacher.update directly if needed.
+        # Q-teacher online update via the vector-friendly path (v3).
+        try:
+            self.q_teacher.update_from_vector(state_vec, action_idx, reward)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Q-teacher update failed: {exc}")
 
-        # Causal update.
+        # Causal update
         if self.causal is not None:
             self.causal.update(state_vec, action_idx, reward)
 
-        # Uncertainty history.
+        # Uncertainty history
         if self.uncertainty is not None:
             self.uncertainty.observe(reward)
 
-        # Role registry update (Enhancement 4).
+        # Role registry update
         if self.roles is not None:
             role = AgentRole.EXPLOITER
             if self.last_teacher_contributions:
-                role = max(
-                    self.last_teacher_contributions,
-                    key=self.last_teacher_contributions.get,
-                )
+                top = max(self.last_teacher_contributions,
+                          key=self.last_teacher_contributions.get)
                 try:
-                    role = AgentRole(role)
+                    role = AgentRole(top)
                 except ValueError:
                     role = AgentRole.EXPLOITER
             self.roles.record(role, success=reward > 0.5, reward=reward)
 
-        # Federated submit (Enhancement 3) — only if node id provided.
-        if self.federated is not None and candidates is not None:
-            # Use feature-space weight as a stand-in; the controller is expected
-            # to attach a node id via submit_federated_update() for real use.
-            pass
-
-        # Train student periodically.
+        # Train student periodically (with importance weights)
         if self.counter % self.train_every == 0 and len(self.replay_buffer) >= 8:
-            batch = self.replay_buffer.sample(8, current_hash=candidate_hash)
-            for s in batch:
+            batch, is_weights = self.replay_buffer.sample(
+                8, current_hash=candidate_hash
+            )
+            for s, w in zip(batch, is_weights if len(is_weights) else []):
                 self.student.update(
                     s.state_vec,
                     s.teacher_probs,
-                    s.reward,
+                    s.reward * float(w),
                     s.action,
                     distill_weight=self.config.get("distill_weight", 0.7),
                     rl_weight=self.config.get("rl_weight", 0.3),
                 )
 
-        # Periodic student save.
+        # Periodic student save
         if self.persistence_path and self.counter % 100 == 0:
             self._save_student()
 
     # ------------------------------------------------------------------
-    # Federated helpers (Enhancement 3)
+    # Federated helpers
     # ------------------------------------------------------------------
     def export_weights(self) -> Dict[str, Any]:
         return {
@@ -1366,7 +1659,9 @@ class DistillationFlexGenSelector:
         if "q_teacher" in payload:
             self.q_teacher.import_weights(payload["q_teacher"])
 
-    def submit_federated_update(self, node_id: str, n_samples: int, carbon_intensity: float) -> Optional[Dict[str, np.ndarray]]:
+    def submit_federated_update(
+        self, node_id: str, n_samples: int, carbon_intensity: float,
+    ) -> Optional[Dict[str, np.ndarray]]:
         if self.federated is None:
             return None
         self.federated.submit(
@@ -1402,12 +1697,13 @@ class DistillationFlexGenSelector:
             "n_classes": self.student.n_classes,
             "last_uncertainty": self.last_uncertainty,
             "teacher_contributions": dict(self.last_teacher_contributions),
-            "role_weights": (
-                {r.value: w for r, w in self.roles.weights().items()}
-                if self.roles else {}
-            ),
+            "role_snapshot": self.roles.snapshot() if self.roles else {},
             "circuit_open": (self.breaker is not None and not self.breaker.allow()),
+            "circuit_failures": (self.breaker.total_failures if self.breaker else 0),
             "hitl_audit_size": (len(self.hitl.audit) if self.hitl else 0),
+            "federated_dp": (
+                self.federated.get_dp_state() if self.federated else {}
+            ),
             "last_explanation": (
                 self.last_explanation.to_dict() if self.last_explanation else None
             ),
