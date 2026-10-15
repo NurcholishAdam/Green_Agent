@@ -1,5 +1,5 @@
 """
-FlexGen Controller — End-to-end closed-loop policy selection (enhanced v2).
+FlexGen Controller — End-to-end closed-loop policy selection (enhanced v3).
 
 Single-file integration of all ten Green Agent enhancements:
   1. Quantum-Distillation Integration
@@ -13,9 +13,21 @@ Single-file integration of all ten Green Agent enhancements:
   9. Resilience Engineering and Chaos Testing as First-Class Citizens
  10. Human-in-the-Loop for Critical Decisions with Active Learning
 
-Everything lives in this file. Each enhancement is a self-contained class
-with a clean interface, and FlexGenController wires them into a single
-closed loop.
+CHANGELOG v2 -> v3
+- TemporalLogicMonitor: correct G / F / U semantics + per-formula horizon.
+- SafetyShield: screens *candidate* metrics, not just history.
+- EmergentRoleRegistry: credit goes to the *winning* role; adds exploration.
+- MultiAgentCoordinator: weights by role success-rate + tie-break randomness.
+- CausalCounterfactualEstimator: proper (s,a)->(r,s') SCM with joint solve.
+- FederatedAggregator: shape validation + per-client DP + RDP budget.
+- PrecisionController: monotonic level selection; HardwareAwarePolicyAdapter
+  carries precision through to the reconstructed policy.
+- CarbonMarketClient: correct peak-hour pricing; async API hook + cache.
+- RECInventory: correct FIFO consumption with expiry.
+- FlexGenController.step: parallel candidate execution with bounded
+  concurrency; real next-state for the causal model; no in-place mutation
+  of pareto_candidates; feedback carbon intensity is now consistent.
+- Removed NumPy-2.0-deprecated .ptp(); uses max-min.
 """
 
 from __future__ import annotations
@@ -84,18 +96,16 @@ except ImportError:
 # ===========================================================================
 class QuantumDistillationTeacher:
     """
-    Quantum-inspired teacher that produces soft policy targets.
+    Quantum-inspired teacher producing soft policy targets.
 
-    A lightweight quantum-circuit-style simulator is used to produce
-    interference-weighted probabilities over candidate indices. In a real
-    deployment this would delegate to a quantum simulator or QPU; here we
-    implement a deterministic state-vector simulation for reproducibility.
+    Deterministic state-vector simulation for reproducibility.
+    Handles feature vectors that are shorter than n_qubits, longer, or empty.
     """
 
     def __init__(self, n_qubits: int = 5, seed: int = 0):
-        self.n_qubits = n_qubits
+        self.n_qubits = max(1, int(n_qubits))
         self.rng = np.random.default_rng(seed)
-        self._circuit_params = self.rng.normal(size=(n_qubits, 3))
+        self._circuit_params = self.rng.normal(size=(self.n_qubits, 3))
 
     def _apply_ry(self, state: np.ndarray, theta: float, qubit: int) -> np.ndarray:
         c, s = math.cos(theta / 2), math.sin(theta / 2)
@@ -110,14 +120,18 @@ class QuantumDistillationTeacher:
         return new
 
     def _simulate(self, feature_vec: np.ndarray, n_candidates: int) -> np.ndarray:
+        if n_candidates <= 0:
+            return np.zeros(0)
+        feat = np.asarray(feature_vec, dtype=np.float64).ravel()
+        if feat.size == 0:
+            feat = np.zeros(self.n_qubits, dtype=np.float64)
         dim = 1 << self.n_qubits
         state = np.zeros(dim, dtype=np.complex128)
         state[0] = 1.0
         for q in range(self.n_qubits):
-            angle = float(self._circuit_params[q, 0] * feature_vec[q % len(feature_vec)])
+            angle = float(self._circuit_params[q, 0] * feat[q % feat.size])
             state = self._apply_ry(state, angle, q)
         probs_full = np.abs(state) ** 2
-        # Reduce to candidate distribution.
         probs = np.zeros(n_candidates, dtype=np.float64)
         for i, p in enumerate(probs_full):
             probs[i % n_candidates] += p
@@ -133,7 +147,6 @@ class QuantumDistillationTeacher:
         if n == 0:
             return np.zeros(0)
         raw = self._simulate(np.asarray(state_features, dtype=np.float64), n)
-        # Blend with carbon-aware prior so distillation is sustainability-biased.
         carbon_prior = np.array(
             [1.0 / (1.0 + float(c.get("carbon_g", 1.0))) for c in pareto_candidates],
             dtype=np.float64,
@@ -158,39 +171,68 @@ class CausalTransition:
 
 class CausalCounterfactualEstimator:
     """
-    Maintains a linear structural causal model over (state, action, reward)
-    and estimates counterfactual rewards for actions not taken.
+    Linear SCM with joint (s, a) -> (r, s') prediction.
+
+      - predict_reward(s, a): E[r | do(a), s]
+      - predict_next(s, a)  : E[s' | do(a), s]
+
+    Uses a single shared design matrix and a stacked target. Solves the linear
+    systems only when the model is dirty, so per-step prediction is O(d^2).
     """
 
     def __init__(self, state_dim: int, n_actions: int, ridge: float = 1e-3):
         self.state_dim = state_dim
         self.n_actions = n_actions
         self.ridge = ridge
-        self._A = np.eye(state_dim + n_actions + 1) * ridge
-        self._b = np.zeros(state_dim + n_actions + 1)
+        d = state_dim + n_actions + 1
+        self._A = np.eye(d) * ridge
+        self._b_reward = np.zeros(d)
+        self._b_next = np.zeros((d, state_dim))
         self._n = 0
+        self._theta_reward: Optional[np.ndarray] = None
+        self._theta_next: Optional[np.ndarray] = None
+        self._dirty = True
 
     def _features(self, s: np.ndarray, a: int) -> np.ndarray:
+        s = np.asarray(s, dtype=np.float64).ravel()[: self.state_dim]
+        if s.size < self.state_dim:
+            s = np.pad(s, (0, self.state_dim - s.size))
         one_hot = np.zeros(self.n_actions)
         one_hot[a % self.n_actions] = 1.0
-        return np.concatenate([np.asarray(s, dtype=np.float64), one_hot, [1.0]])
+        return np.concatenate([s, one_hot, [1.0]])
 
     def update(self, t: CausalTransition) -> None:
         x = self._features(t.state, t.action)
         self._A += np.outer(x, x)
-        self._b += t.reward * x
+        self._b_reward += t.reward * x
+        ns = np.asarray(t.next_state, dtype=np.float64).ravel()[: self.state_dim]
+        if ns.size < self.state_dim:
+            ns = np.pad(ns, (0, self.state_dim - ns.size))
+        self._b_next += np.outer(x, ns)
         self._n += 1
+        self._dirty = True
 
-    def _theta(self) -> np.ndarray:
-        return np.linalg.solve(self._A, self._b)
+    def _solve(self) -> None:
+        if not self._dirty:
+            return
+        self._theta_reward = np.linalg.solve(self._A, self._b_reward)
+        self._theta_next = np.linalg.solve(self._A, self._b_next)
+        self._dirty = False
 
-    def predict(self, s: np.ndarray, a: int) -> float:
+    def predict_reward(self, s: np.ndarray, a: int) -> float:
         if self._n < 2:
             return 0.0
-        return float(self._features(s, a) @ self._theta())
+        self._solve()
+        return float(self._features(s, a) @ self._theta_reward)
+
+    def predict_next(self, s: np.ndarray, a: int) -> np.ndarray:
+        if self._n < 2:
+            return np.asarray(s, dtype=np.float64)
+        self._solve()
+        return self._features(s, a) @ self._theta_next
 
     def counterfactuals(self, s: np.ndarray, all_actions: Sequence[int]) -> Dict[int, float]:
-        return {a: self.predict(s, a) for a in all_actions}
+        return {a: self.predict_reward(s, a) for a in all_actions}
 
     def best_counterfactual(self, s: np.ndarray, all_actions: Sequence[int]) -> Tuple[int, float]:
         cf = self.counterfactuals(s, all_actions)
@@ -199,10 +241,58 @@ class CausalCounterfactualEstimator:
         best_a = max(cf, key=cf.get)
         return best_a, cf[best_a]
 
+    def get_state(self) -> Dict[str, Any]:
+        return {"n_observations": self._n, "dirty": self._dirty}
+
 
 # ===========================================================================
 # Enhancement 3 — Federated Green Learning Across Deployments
 # ===========================================================================
+class SimpleRDPAccountant:
+    """
+    Minimal RDP accountant for the federated aggregation path.
+
+    Uses the standard bound for the subsampled Gaussian mechanism:
+        eps_RDP(alpha) = alpha * q^2 / (2 * sigma^2)
+    and converts to (eps, delta) via the standard formula.
+    """
+
+    def __init__(self, target_delta: float = 1e-5, max_epsilon: float = 10.0):
+        self.target_delta = target_delta
+        self.max_epsilon = max_epsilon
+        self.steps = 0
+        self.orders = [1 + x / 10.0 for x in range(1, 100)]
+        self.rdp = np.zeros(len(self.orders))
+
+    def step(self, sigma: float, q: float = 1.0) -> None:
+        if sigma <= 0:
+            return
+        self.steps += 1
+        for i, o in enumerate(self.orders):
+            self.rdp[i] += (o * q * q) / (2 * sigma * sigma)
+
+    def epsilon(self) -> float:
+        if self.steps == 0:
+            return 0.0
+        eps = [
+            self.rdp[i] + math.log(1.0 / self.target_delta) / (self.orders[i] - 1)
+            for i in range(len(self.orders))
+            if self.orders[i] > 1
+        ]
+        return float(min(eps)) if eps else float("inf")
+
+    def budget_exceeded(self) -> bool:
+        return self.epsilon() > self.max_epsilon
+
+    def get_state(self) -> Dict[str, Any]:
+        return {
+            "steps": self.steps,
+            "epsilon": self.epsilon(),
+            "delta": self.target_delta,
+            "budget_exceeded": self.budget_exceeded(),
+        }
+
+
 @dataclass
 class FederatedUpdate:
     node_id: str
@@ -214,20 +304,61 @@ class FederatedUpdate:
 
 class FederatedAggregator:
     """
-    Carbon-weighted FedAvg aggregator. Deployments with lower carbon intensity
-    and more samples contribute more to the global model.
+    Carbon-weighted FedAvg with:
+
+      - shape validation (rejects mismatched updates)
+      - per-client Gaussian noise before aggregation (proper DP)
+      - RDP budget tracking
+      - staleness filtering
     """
 
-    def __init__(self, dp_sigma: float = 1e-3, max_staleness_s: float = 3600.0):
+    def __init__(self, dp_sigma: float = 1e-3, max_staleness_s: float = 3600.0,
+                 target_delta: float = 1e-5, max_epsilon: float = 10.0):
         self.dp_sigma = dp_sigma
         self.max_staleness_s = max_staleness_s
         self._updates: Dict[str, FederatedUpdate] = {}
         self._global: Optional[np.ndarray] = None
         self._lock = threading.Lock()
+        self.accountant = SimpleRDPAccountant(
+            target_delta=target_delta, max_epsilon=max_epsilon
+        )
+        self.rejected: List[Dict[str, Any]] = []
 
-    def submit(self, update: FederatedUpdate) -> None:
+    def submit(self, update: FederatedUpdate) -> bool:
+        if update.weights is None or update.weights.size == 0:
+            return False
         with self._lock:
+            if self._global is not None and update.weights.shape != self._global.shape:
+                self.rejected.append({
+                    "node_id": update.node_id,
+                    "expected": self._global.shape,
+                    "got": update.weights.shape,
+                    "t": time.time(),
+                })
+                logger.warning(
+                    f"Rejected federated update from {update.node_id}: shape mismatch"
+                )
+                return False
+            if self.accountant.budget_exceeded():
+                logger.warning(
+                    f"DP budget exceeded (eps={self.accountant.epsilon():.3f}); "
+                    f"skipping federated update"
+                )
+                return False
+            if self.dp_sigma > 0:
+                noisy = update.weights + np.random.normal(
+                    0.0, self.dp_sigma, size=update.weights.shape
+                )
+                self.accountant.step(self.dp_sigma, q=1.0)
+                update = FederatedUpdate(
+                    node_id=update.node_id,
+                    weights=noisy,
+                    n_samples=update.n_samples,
+                    carbon_intensity=update.carbon_intensity,
+                    timestamp=update.timestamp,
+                )
             self._updates[update.node_id] = update
+            return True
 
     def _is_stale(self, u: FederatedUpdate, now: float) -> bool:
         return (now - u.timestamp) > self.max_staleness_s
@@ -247,14 +378,14 @@ class FederatedAggregator:
             )
             weights /= max(weights.sum(), 1e-12)
             stacked = np.stack([u.weights for u in fresh], axis=0)
-            agg = np.tensordot(weights, stacked, axes=([0], [0]))
-            if self.dp_sigma > 0:
-                agg = agg + np.random.normal(0.0, self.dp_sigma, size=agg.shape)
-            self._global = agg
-            return agg
+            self._global = np.tensordot(weights, stacked, axes=([0], [0]))
+            return self._global
 
     def global_weights(self) -> Optional[np.ndarray]:
         return self._global
+
+    def get_dp_state(self) -> Dict[str, Any]:
+        return {**self.accountant.get_state(), "rejected_updates": len(self.rejected)}
 
 
 # ===========================================================================
@@ -280,21 +411,30 @@ class AgentBid:
 
 class EmergentRoleRegistry:
     """
-    Tracks recent contribution of each agent/role to successful outcomes,
-    and lets roles emerge based on performance. Specialization is dynamic.
+    Tracks per-role success rates and lets roles emerge based on which role
+    actually contributed the winning bid — not on which role is currently
+    dominant. Epsilon-greedy role selection encourages exploration.
     """
 
-    def __init__(self, decay: float = 0.95):
+    def __init__(self, decay: float = 0.995, exploration: float = 0.1):
         self.decay = decay
+        self.exploration = exploration
         self._scores: Dict[AgentRole, float] = {r: 1.0 for r in AgentRole}
         self._counts: Dict[AgentRole, int] = {r: 0 for r in AgentRole}
+        self._successes: Dict[AgentRole, int] = {r: 0 for r in AgentRole}
 
-    def record(self, role: AgentRole, success: bool, reward: float) -> None:
+    def record(self, winning_role: AgentRole, success: bool, reward: float) -> None:
         for r in self._scores:
             self._scores[r] *= self.decay
-        signal = reward if success else -abs(reward) * 0.5
-        self._scores[role] += signal
-        self._counts[role] += 1
+        signal = abs(reward) if success else -abs(reward) * 0.5
+        self._scores[winning_role] += signal
+        self._counts[winning_role] += 1
+        if success:
+            self._successes[winning_role] += 1
+
+    def success_rate(self, role: AgentRole) -> float:
+        c = self._counts[role]
+        return (self._successes[role] / c) if c > 0 else 0.5
 
     def weights(self) -> Dict[AgentRole, float]:
         total = sum(max(v, 1e-6) for v in self._scores.values())
@@ -303,13 +443,30 @@ class EmergentRoleRegistry:
     def dominant_role(self) -> AgentRole:
         return max(self._scores, key=self._scores.get)
 
+    def sample_role(self, rng: Optional[random.Random] = None) -> AgentRole:
+        rng = rng or random
+        if rng.random() < self.exploration:
+            return rng.choice(list(AgentRole))
+        return self.dominant_role()
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "scores": {r.value: round(v, 4) for r, v in self._scores.items()},
+            "counts": {r.value: c for r, c in self._counts.items()},
+            "success_rates": {r.value: round(self.success_rate(r), 4) for r in AgentRole},
+            "dominant": self.dominant_role().value,
+        }
+
 
 class MultiAgentCoordinator:
     """
-    Combines bids from specialized agents via carbon-weighted voting.
+    Carbon-weighted voting with per-role success-rate weighting and
+    proper tie-breaking.
     """
 
-    def __init__(self, registry: EmergentRoleRegistry, role_bias: Optional[Dict[AgentRole, float]] = None):
+    def __init__(self, registry: EmergentRoleRegistry,
+                 role_bias: Optional[Dict[AgentRole, float]] = None,
+                 rng: Optional[random.Random] = None):
         self.registry = registry
         self.role_bias = role_bias or {
             AgentRole.EXPLORER: 0.6,
@@ -318,22 +475,40 @@ class MultiAgentCoordinator:
             AgentRole.CARBON_BROKER: 1.1,
             AgentRole.VERIFIER: 1.0,
         }
+        self.rng = rng or random.Random(0)
+        self._last_vote: Optional[Dict[str, Any]] = None
 
     def vote(self, bids: Sequence[AgentBid], n_candidates: int) -> int:
         if not bids or n_candidates <= 0:
             return 0
         role_w = self.registry.weights()
         scores = np.zeros(n_candidates)
+        contributions: Dict[int, List[Tuple[AgentRole, float]]] = defaultdict(list)
         for b in bids:
             idx = b.proposed_action % n_candidates
+            role_success = self.registry.success_rate(b.role)
             weight = (
                 role_w.get(b.role, 0.1)
                 * self.role_bias.get(b.role, 1.0)
                 * max(b.confidence, 0.0)
                 * (1.0 + b.carbon_score)
+                * (0.5 + role_success)
             )
             scores[idx] += weight
-        return int(np.argmax(scores))
+            contributions[idx].append((b.role, weight))
+        top = float(scores.max())
+        tied = [i for i, s in enumerate(scores) if abs(s - top) < 1e-9]
+        winner = self.rng.choice(tied) if len(tied) > 1 else tied[0]
+        winning_roles = [r for r, _ in contributions.get(winner, [])]
+        self._last_vote = {
+            "winner": int(winner),
+            "scores": scores.tolist(),
+            "winning_roles": [r.value for r in winning_roles],
+        }
+        return int(winner)
+
+    def last_vote(self) -> Optional[Dict[str, Any]]:
+        return self._last_vote
 
 
 # ===========================================================================
@@ -351,18 +526,25 @@ class STLFormula:
     predicate: Callable[[Dict[str, Any]], bool]
     operator: STLOperator
     horizon: int = 10
+    # For UNTIL: the "until" predicate. If None, uses predicate as the eventual goal.
+    until_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None
 
 
 class TemporalLogicMonitor:
     """
-    Runtime monitor over a rolling window of the last `horizon` executions.
-    Supports G (always), F (eventually), and U (until).
+    Runtime monitor over rolling windows.
+
+    Semantics:
+      G[0,h) φ   : φ holds at every step in the window
+      F[0,h) φ   : φ holds at some step in the window
+      φ U[0,h) ψ : φ holds at every step until ψ holds, and ψ becomes true within h
     """
 
     def __init__(self, horizon: int = 10):
         self.horizon = horizon
-        self._history: deque = deque(maxlen=horizon * 4)
+        self._history: deque = deque(maxlen=max(horizon * 4, horizon))
         self.formulas: List[STLFormula] = []
+        self._evaluations: List[Dict[str, Any]] = []
 
     def add_formula(self, f: STLFormula) -> None:
         self.formulas.append(f)
@@ -380,51 +562,94 @@ class TemporalLogicMonitor:
             if not window:
                 results[f.name] = True
                 continue
-            sat = [f.predicate(r) for r in window]
             if f.operator == STLOperator.ALWAYS:
-                results[f.name] = all(sat)
+                ok = all(f.predicate(r) for r in window)
             elif f.operator == STLOperator.EVENTUALLY:
-                results[f.name] = any(sat)
+                ok = any(f.predicate(r) for r in window)
             elif f.operator == STLOperator.UNTIL:
-                # first occurrence of predicate must eventually become true
-                results[f.name] = any(sat)
+                until_pred = f.until_predicate or f.predicate
+                idx_until = next(
+                    (i for i, r in enumerate(window) if until_pred(r)), None
+                )
+                if idx_until is None:
+                    ok = False
+                else:
+                    ok = all(f.predicate(window[i]) for i in range(idx_until))
             else:
-                results[f.name] = True
+                ok = True
+            results[f.name] = ok
+            self._evaluations.append(
+                {"formula": f.name, "ok": ok, "t": time.time()}
+            )
         return results
+
+    def recent_evaluations(self, k: int = 32) -> List[Dict[str, Any]]:
+        return self._evaluations[-k:]
 
 
 class SafetyShield:
     """
-    Blocks actions that violate formal constraints. Falls back to a known-safe
-    action from the Pareto set (lowest carbon + latency, or index 0).
+    Screens a *candidate* against formal constraints. Two layers:
+
+      1. Immediate constraint check on the candidate's predicted metrics.
+      2. History-based invariant check (via the temporal monitor).
+
+    If either fails, falls back to the lowest-carbon feasible candidate.
     """
 
-    def __init__(self, monitor: TemporalLogicMonitor):
+    def __init__(
+        self,
+        monitor: TemporalLogicMonitor,
+        immediate_constraints: Optional[List[Callable[[Dict[str, Any]], bool]]] = None,
+    ):
         self.monitor = monitor
+        self.immediate_constraints = immediate_constraints or []
         self.violations: List[Dict[str, Any]] = []
+
+    def _candidate_ok(self, candidate: Dict[str, Any]) -> Tuple[bool, List[str]]:
+        bad = [
+            f"constraint_{i}"
+            for i, c in enumerate(self.immediate_constraints)
+            if not c(candidate)
+        ]
+        return (len(bad) == 0), bad
 
     def screen(
         self,
         selected_idx: int,
         pareto_candidates: Sequence[Dict[str, Any]],
     ) -> Tuple[int, bool, Dict[str, bool]]:
-        verdict = self.monitor.verify()
-        violated = [k for k, ok in verdict.items() if not ok]
-        if not violated:
-            return selected_idx, True, verdict
+        if not pareto_candidates:
+            return selected_idx, True, {}
 
-        # Fall back to the lowest-carbon feasible candidate.
-        safe_idx = min(
-            range(len(pareto_candidates)),
-            key=lambda i: (
-                pareto_candidates[i].get("carbon_g", float("inf")),
-                pareto_candidates[i].get("latency_ms", float("inf")),
-            ),
-        )
-        self.violations.append(
-            {"time": time.time(), "violated": violated, "replaced_with": safe_idx}
-        )
-        return safe_idx, False, verdict
+        history_verdict = self.monitor.verify()
+        violated_hist = [k for k, ok in history_verdict.items() if not ok]
+
+        cand_ok, cand_violations = (True, [])
+        if 0 <= selected_idx < len(pareto_candidates):
+            cand_ok, cand_violations = self._candidate_ok(
+                pareto_candidates[selected_idx]
+            )
+
+        if cand_ok and not violated_hist:
+            return selected_idx, True, history_verdict
+
+        def fallback_key(i: int) -> Tuple[float, float]:
+            c = pareto_candidates[i]
+            return (
+                float(c.get("carbon_g", float("inf"))),
+                float(c.get("latency_ms", float("inf"))),
+            )
+
+        safe_idx = min(range(len(pareto_candidates)), key=fallback_key)
+        self.violations.append({
+            "time": time.time(),
+            "history_violations": violated_hist,
+            "candidate_violations": cand_violations,
+            "selected_idx": selected_idx,
+            "replaced_with": safe_idx,
+        })
+        return safe_idx, False, history_verdict
 
 
 # ===========================================================================
@@ -465,7 +690,9 @@ class DecisionExplainer:
             [[float(c.get(f, 0.0)) for f in self.feature_names] for c in pareto],
             dtype=np.float64,
         )
-        chosen_vec = np.array([float(chosen.get(f, 0.0)) for f in self.feature_names])
+        chosen_vec = np.array(
+            [float(chosen.get(f, 0.0)) for f in self.feature_names]
+        )
         mean = arr.mean(axis=0)
         std = arr.std(axis=0) + 1e-9
         z = (chosen_vec - mean) / std
@@ -489,14 +716,12 @@ class DecisionExplainer:
         for idx, score in ranked[:3]:
             if idx < 0 or idx >= len(pareto):
                 continue
-            cf_list.append(
-                {
-                    "alternative_idx": idx,
-                    "expected_reward": float(score),
-                    "carbon_g": float(pareto[idx].get("carbon_g", float("nan"))),
-                    "latency_ms": float(pareto[idx].get("latency_ms", float("nan"))),
-                }
-            )
+            cf_list.append({
+                "alternative_idx": idx,
+                "expected_reward": float(score),
+                "carbon_g": float(pareto[idx].get("carbon_g", float("nan"))),
+                "latency_ms": float(pareto[idx].get("latency_ms", float("nan"))),
+            })
         conf = float(teacher_probs[chosen_idx]) if (
             teacher_probs is not None and 0 <= chosen_idx < len(teacher_probs)
         ) else 0.5
@@ -542,8 +767,13 @@ _PRECISION_COST = {
 
 class PrecisionController:
     """
-    Chooses precision level as a function of carbon intensity, latency target,
-    and quality floor. Bounded by hardware capability.
+    Chooses precision level as a monotonic function of:
+
+      - carbon intensity stress
+      - carbon price stress
+      - latency headroom (low headroom -> prefer conservative precision)
+
+    Bounded by quality floor and hardware support.
     """
 
     def __init__(
@@ -556,31 +786,36 @@ class PrecisionController:
         self.quality_floor = quality_floor
         self.carbon_aware = carbon_aware
 
+    def _feasible_levels(self) -> List[PrecisionLevel]:
+        # Ordered from least aggressive to most aggressive by energy
+        levels = [p for p in PrecisionLevel if p in self.supported]
+        levels.sort(key=lambda p: _PRECISION_COST[p]["energy"], reverse=True)
+        return [p for p in levels if _PRECISION_COST[p]["quality"] >= self.quality_floor]
+
     def select(
         self,
         carbon_intensity: float,
         latency_headroom_ratio: float,
         carbon_price: float = 0.0,
     ) -> PrecisionLevel:
-        # Base: prefer aggressive precision under carbon stress or high price.
+        feasible = self._feasible_levels()
+        if not feasible:
+            return PrecisionLevel.FP32
+
         stress = min(1.0, max(0.0, carbon_intensity / 600.0)) if self.carbon_aware else 0.0
         price_stress = min(1.0, max(0.0, carbon_price / 0.2))
         headroom = min(1.0, max(0.0, latency_headroom_ratio))
-        # Combined aggressiveness in [0,1].
         agg = 0.5 * stress + 0.3 * price_stress + 0.2 * (1.0 - headroom)
-        # Climb from low to high aggressiveness, but keep quality floor.
-        ordered = [p for p in PrecisionLevel if p in self.supported]
-        ordered.sort(key=lambda p: _PRECISION_COST[p]["energy"])
-        chosen = ordered[0]
-        for p in ordered:
-            if _PRECISION_COST[p]["quality"] >= self.quality_floor and agg >= 0.25 * ordered.index(p):
-                chosen = p
-        return chosen
+
+        idx = int(round(agg * (len(feasible) - 1)))
+        idx = max(0, min(len(feasible) - 1, idx))
+        return feasible[idx]
 
 
 class HardwareAwarePolicyAdapter:
     """
-    Applies a chosen precision level and adjusts executor hints.
+    Applies precision to the policy and returns the mutated policy + level.
+    If the policy is frozen, rebuilds it from its dict with the precision field.
     """
 
     def __init__(self, controller: PrecisionController):
@@ -594,9 +829,13 @@ class HardwareAwarePolicyAdapter:
         carbon_price: float,
     ) -> Tuple[FlexGenPolicy, PrecisionLevel]:
         level = self.controller.select(carbon_intensity, latency_headroom_ratio, carbon_price)
-        if hasattr(policy, "precision"):
+        try:
+            policy.precision = level.value  # type: ignore[attr-defined]
+        except Exception:
             try:
-                policy.precision = level.value  # type: ignore[attr-defined]
+                d = policy.to_dict()
+                d["precision"] = level.value
+                policy = FlexGenPolicy(**d)
             except Exception:
                 pass
         return policy, level
@@ -607,20 +846,82 @@ class HardwareAwarePolicyAdapter:
 # ===========================================================================
 class CarbonMarketClient:
     """
-    Lightweight in-process carbon price model. In production this would query
-    an external market API. Price is a function of grid intensity and time.
+    Carbon price model with optional real API hook.
+
+    Price = base + sensitivity * intensity * time_of_day_factor
+    time_of_day_factor peaks at 18:00 (evening peak), bottoms at 06:00.
     """
 
-    def __init__(self, base_price: float = 0.05, sensitivity: float = 0.0005):
+    def __init__(
+        self,
+        base_price: float = 0.05,
+        sensitivity: float = 0.0005,
+        session: Optional[Any] = None,  # aiohttp.ClientSession or compatible
+        api_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ):
         self.base_price = base_price
         self.sensitivity = sensitivity
+        self._session = session
+        self._api_url = api_url
+        self._api_key = api_key
+        self._cache: Dict[Tuple[int, int], float] = {}
 
-    def price(self, carbon_intensity: float, hour_of_day: Optional[int] = None) -> float:
-        tod_factor = 1.0
-        if hour_of_day is not None:
-            # Assume peak hours have higher carbon prices.
-            tod_factor = 1.0 + 0.3 * math.sin((hour_of_day / 24.0) * 2 * math.pi)
-        return self.base_price + self.sensitivity * carbon_intensity * tod_factor
+    def _tod_factor(self, hour_of_day: Optional[int]) -> float:
+        if hour_of_day is None:
+            return 1.0
+        # Peak at 18:00, trough at 06:00
+        return 1.0 + 0.3 * math.sin((hour_of_day - 6) / 24.0 * 2 * math.pi)
+
+    def _cache_key(self, carbon_intensity: float, hour_of_day: Optional[int]) -> Tuple[int, int]:
+        return (int(carbon_intensity), -1 if hour_of_day is None else int(hour_of_day))
+
+    async def price_async(
+        self, carbon_intensity: float, hour_of_day: Optional[int] = None
+    ) -> float:
+        cache_key = self._cache_key(carbon_intensity, hour_of_day)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        value: Optional[float] = None
+        if self._api_url and self._session is not None:
+            try:
+                headers = (
+                    {"Authorization": f"Bearer {self._api_key}"}
+                    if self._api_key else {}
+                )
+                async with self._session.get(
+                    self._api_url,
+                    headers=headers,
+                    params={"intensity": carbon_intensity},
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        value = float(data.get("price_usd_per_kg", 0.0))
+            except Exception as e:
+                logger.warning(f"Carbon market API failed: {e}")
+
+        if value is None:
+            value = (
+                self.base_price
+                + self.sensitivity * carbon_intensity * self._tod_factor(hour_of_day)
+            )
+        self._cache[cache_key] = value
+        return value
+
+    def price(
+        self, carbon_intensity: float, hour_of_day: Optional[int] = None
+    ) -> float:
+        """Synchronous fallback used when the caller cannot await."""
+        cache_key = self._cache_key(carbon_intensity, hour_of_day)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        value = (
+            self.base_price
+            + self.sensitivity * carbon_intensity * self._tod_factor(hour_of_day)
+        )
+        self._cache[cache_key] = value
+        return value
 
 
 @dataclass
@@ -628,43 +929,64 @@ class RECRecord:
     kwh: float
     issued_at: float
     source: str = "solar"
+    expires_at: Optional[float] = None
 
 
 class RECInventory:
     """
     Tracks Renewable Energy Credits and their carbon offset potential.
+    FIFO consumption with expiry pruning.
     """
 
-    def __init__(self, grid_kg_co2_per_kwh: float = 0.4):
+    def __init__(self, grid_kg_co2_per_kwh: float = 0.4, default_ttl_days: float = 365.0):
         self.grid_factor = grid_kg_co2_per_kwh
+        self.default_ttl_days = default_ttl_days
         self._records: List[RECRecord] = []
 
-    def add(self, kwh: float, source: str = "solar") -> None:
-        self._records.append(RECRecord(kwh=kwh, issued_at=time.time(), source=source))
+    def _prune(self) -> None:
+        now = time.time()
+        self._records = [
+            r for r in self._records
+            if r.expires_at is None or r.expires_at > now
+        ]
+
+    def add(
+        self,
+        kwh: float,
+        source: str = "solar",
+        expires_at: Optional[float] = None,
+    ) -> None:
+        if expires_at is None:
+            expires_at = time.time() + self.default_ttl_days * 86400.0
+        self._records.append(
+            RECRecord(kwh=kwh, issued_at=time.time(), source=source, expires_at=expires_at)
+        )
 
     def total_kwh(self) -> float:
+        self._prune()
         return sum(r.kwh for r in self._records)
 
-    def offset_kg(self, kwh_used: float) -> float:
-        available = min(kwh_used, self.total_kwh())
-        return available * self.grid_factor
-
     def consume(self, kwh: float) -> float:
-        """Consume RECs and return the offset carbon in kg."""
-        remaining = kwh
+        """Consume RECs FIFO and return the offset in kg CO2."""
+        self._prune()
+        remaining = float(kwh)
         offset = 0.0
-        new_records: List[RECRecord] = []
         for r in self._records:
             if remaining <= 0:
-                new_records.append(r)
-                continue
+                break
             take = min(r.kwh, remaining)
+            r.kwh -= take
             remaining -= take
             offset += take * self.grid_factor
-            if r.kwh - take > 1e-9:
-                new_records.append(RECRecord(kwh=r.kwh - take, issued_at=r.issued_at, source=r.source))
-        self._records = new_records
+        self._records = [r for r in self._records if r.kwh > 1e-9]
         return offset
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "total_kwh": self.total_kwh(),
+            "n_records": len(self._records),
+            "sources": sorted({r.source for r in self._records}),
+        }
 
 
 # ===========================================================================
@@ -690,7 +1012,10 @@ class CircuitBreaker:
 
     @property
     def state(self) -> CircuitState:
-        if self._state == CircuitState.OPEN and time.time() - self._opened_at >= self.recovery_time_s:
+        if (
+            self._state == CircuitState.OPEN
+            and time.time() - self._opened_at >= self.recovery_time_s
+        ):
             self._state = CircuitState.HALF_OPEN
         return self._state
 
@@ -735,13 +1060,17 @@ class ChaosEngineer:
 
     def maybe_latency(self, metrics: Dict[str, Any]) -> None:
         if self.latency_injection_ms > 0 and self.rng.random() < 0.3:
-            metrics["latency_ms"] = metrics.get("latency_ms", 0.0) + self.latency_injection_ms
+            metrics["latency_ms"] = (
+                metrics.get("latency_ms", 0.0) + self.latency_injection_ms
+            )
             self.events.append({"type": "latency_injection", "t": time.time()})
 
     def maybe_carbon_spike(self, carbon_intensity: float) -> float:
         if self.rng.random() < self.carbon_spike_prob:
             spike = carbon_intensity * 1.5
-            self.events.append({"type": "carbon_spike", "t": time.time(), "value": spike})
+            self.events.append(
+                {"type": "carbon_spike", "t": time.time(), "value": spike}
+            )
             return spike
         return carbon_intensity
 
@@ -811,7 +1140,9 @@ class HumanInTheLoopGate:
 
     async def request_approval(self, req: HITLRequest) -> bool:
         if self.approver is None:
-            self.audit.append({"request_id": req.request_id, "approved": True, "reason": "no_approver"})
+            self.audit.append(
+                {"request_id": req.request_id, "approved": True, "reason": "no_approver"}
+            )
             return True
         loop = asyncio.get_running_loop()
         try:
@@ -820,7 +1151,9 @@ class HumanInTheLoopGate:
             )
         except asyncio.TimeoutError:
             approved = self.auto_approve_on_timeout
-        self.audit.append({"request_id": req.request_id, "approved": approved, "reason": req.reason})
+        self.audit.append(
+            {"request_id": req.request_id, "approved": approved, "reason": req.reason}
+        )
         return bool(approved)
 
 
@@ -834,7 +1167,9 @@ class ActiveLearningSampler:
         self.capacity = capacity
         self._buffer: List[Dict[str, Any]] = []
 
-    def maybe_store(self, record: Dict[str, Any], uncertainty: float, threshold: float = 0.5) -> bool:
+    def maybe_store(
+        self, record: Dict[str, Any], uncertainty: float, threshold: float = 0.5
+    ) -> bool:
         if uncertainty < threshold:
             return False
         if len(self._buffer) >= self.capacity:
@@ -847,6 +1182,9 @@ class ActiveLearningSampler:
             return []
         k = min(k, len(self._buffer))
         return random.sample(self._buffer, k)
+
+    def size(self) -> int:
+        return len(self._buffer)
 
 
 # ===========================================================================
@@ -886,6 +1224,14 @@ class FlexGenController:
         quality_floor: float = 0.95,
         hitl_approver: Optional[Callable[[HITLRequest], bool]] = None,
         carbon_market_base_price: float = 0.05,
+        # --- v3 additions ---
+        seed: int = 0,
+        max_parallel_candidates: int = 4,
+        carbon_market_api_url: Optional[str] = None,
+        carbon_market_api_key: Optional[str] = None,
+        dp_sigma: float = 1e-3,
+        dp_target_delta: float = 1e-5,
+        dp_max_epsilon: float = 10.0,
     ):
         # Core
         self.node = node
@@ -893,9 +1239,13 @@ class FlexGenController:
         self.carbon_intensity = carbon_intensity
         self.message_queue = message_queue
         self.use_real_executor = use_real_executor
-        self.executor = executor if executor else MockFlexGenExecutor(carbon_intensity_g_per_kwh=carbon_intensity)
+        self.executor = executor if executor else MockFlexGenExecutor(
+            carbon_intensity_g_per_kwh=carbon_intensity
+        )
         self.use_cost_model_prefilter = use_cost_model_prefilter
-        self.cost_model = cost_model or FlexGenCostModel(carbon_intensity_g_per_kwh=carbon_intensity)
+        self.cost_model = cost_model or FlexGenCostModel(
+            carbon_intensity_g_per_kwh=carbon_intensity
+        )
         self.use_bio_search = use_bio_search
         self.bio_search_config = bio_search_config or {}
         self.modp_planner = modp_planner
@@ -903,7 +1253,14 @@ class FlexGenController:
         self.gpu_profiler = gpu_profiler
 
         if hasattr(self.executor, "carbon_intensity"):
-            self.executor.carbon_intensity = node.metadata.get("region_carbon_intensity", carbon_intensity)
+            self.executor.carbon_intensity = node.metadata.get(
+                "region_carbon_intensity", carbon_intensity
+            )
+
+        # Master seed for determinism
+        self._master_seed = int(seed)
+        self._rng = random.Random(self._master_seed)
+        np.random.seed(self._master_seed % (2 ** 32))
 
         self.selector = DistillationFlexGenSelector(
             n_candidates=20, persistence_path=selector_persistence_path
@@ -916,20 +1273,43 @@ class FlexGenController:
             ]
         )
 
+        self.max_parallel_candidates = max(1, int(max_parallel_candidates))
+
         # ---------------- Enhancement modules ----------------
-        self.quantum_teacher = QuantumDistillationTeacher() if enable_quantum_teacher else None
-        self.causal_estimator = CausalCounterfactualEstimator(state_dim, n_actions) if enable_causal_rl else None
-        self.federated = FederatedAggregator() if enable_federated else None
+        self.quantum_teacher = (
+            QuantumDistillationTeacher(seed=self._master_seed)
+            if enable_quantum_teacher else None
+        )
+        self.causal_estimator = (
+            CausalCounterfactualEstimator(state_dim, n_actions)
+            if enable_causal_rl else None
+        )
+        self.federated = (
+            FederatedAggregator(
+                dp_sigma=dp_sigma,
+                target_delta=dp_target_delta,
+                max_epsilon=dp_max_epsilon,
+            )
+            if enable_federated else None
+        )
 
         self.role_registry = EmergentRoleRegistry() if enable_multi_agent else None
-        self.multi_agent = MultiAgentCoordinator(self.role_registry) if enable_multi_agent and self.role_registry else None
+        self.multi_agent = (
+            MultiAgentCoordinator(
+                self.role_registry, rng=random.Random(self._master_seed)
+            )
+            if enable_multi_agent and self.role_registry else None
+        )
 
-        self.temporal_monitor = TemporalLogicMonitor(horizon=10) if enable_temporal_logic else None
+        self.temporal_monitor = (
+            TemporalLogicMonitor(horizon=10) if enable_temporal_logic else None
+        )
         if self.temporal_monitor:
             self.temporal_monitor.add_formula(
                 STLFormula(
                     name="latency_ok",
-                    predicate=lambda r: r.get("latency_ms", 0.0) <= self.workload.latency_target * 1.5,
+                    predicate=lambda r: r.get("latency_ms", 0.0)
+                    <= self.workload.latency_target * 1.5,
                     operator=STLOperator.ALWAYS,
                     horizon=10,
                 )
@@ -942,17 +1322,49 @@ class FlexGenController:
                     horizon=5,
                 )
             )
-        self.safety_shield = SafetyShield(self.temporal_monitor) if self.temporal_monitor else None
+            self.temporal_monitor.add_formula(
+                STLFormula(
+                    name="carbon_bounded_until_success",
+                    predicate=lambda r: r.get("carbon_g", 0.0) <= 10.0,
+                    operator=STLOperator.UNTIL,
+                    horizon=8,
+                    until_predicate=lambda r: r.get("success", False),
+                )
+            )
+        self.safety_shield = (
+            SafetyShield(
+                self.temporal_monitor,
+                immediate_constraints=[
+                    lambda c: c.get("latency_ms", 0.0)
+                    <= self.workload.latency_target * 2.0,
+                    lambda c: c.get("carbon_g", 0.0) <= 50.0,
+                ],
+            )
+            if self.temporal_monitor else None
+        )
 
         self.explainer = DecisionExplainer() if enable_xai else None
-        self.precision_controller = PrecisionController(quality_floor=quality_floor) if enable_precision_switching else None
-        self.precision_adapter = HardwareAwarePolicyAdapter(self.precision_controller) if self.precision_controller else None
+        self.precision_controller = (
+            PrecisionController(quality_floor=quality_floor)
+            if enable_precision_switching else None
+        )
+        self.precision_adapter = (
+            HardwareAwarePolicyAdapter(self.precision_controller)
+            if self.precision_controller else None
+        )
 
-        self.carbon_market = CarbonMarketClient(base_price=carbon_market_base_price) if enable_carbon_markets else None
+        self.carbon_market = (
+            CarbonMarketClient(
+                base_price=carbon_market_base_price,
+                api_url=carbon_market_api_url,
+                api_key=carbon_market_api_key,
+            )
+            if enable_carbon_markets else None
+        )
         self.rec_inventory = RECInventory() if enable_carbon_markets else None
 
         self.circuit_breaker = CircuitBreaker() if enable_resilience else None
-        self.chaos = ChaosEngineer() if enable_resilience else None
+        self.chaos = ChaosEngineer(seed=self._master_seed) if enable_resilience else None
 
         self.uncertainty = UncertaintyEstimator() if enable_hitl else None
         self.hitl = HumanInTheLoopGate(approver=hitl_approver) if enable_hitl else None
@@ -964,6 +1376,7 @@ class FlexGenController:
         self.last_teacher_probs: Optional[np.ndarray] = None
         self.last_candidates: Optional[List[Dict[str, Any]]] = None
         self.last_explanation: Optional[Explanation] = None
+        self.last_winning_role: Optional[AgentRole] = None
 
     # ------------------------------------------------------------------
     # Utility
@@ -1014,12 +1427,11 @@ class FlexGenController:
                 est = self.cost_model.estimate(policy, self.node, self.workload)
                 if est.peak_gpu_memory_gb <= self.node.metadata.get("gpu_memory_gb", 16):
                     estimates.append((policy, est))
-            # Normalize before summing (fixes unit-mismatch bug in original).
             if estimates:
                 lat = np.array([e.total_latency_ms for _, e in estimates])
                 ene = np.array([e.total_energy_joules for _, e in estimates])
-                lat_n = (lat - lat.min()) / (lat.ptp() + 1e-9)
-                ene_n = (ene - ene.min()) / (ene.ptp() + 1e-9)
+                lat_n = (lat - lat.min()) / (lat.max() - lat.min() + 1e-9)
+                ene_n = (ene - ene.min()) / (ene.max() - ene.min() + 1e-9)
                 scores = 0.5 * lat_n + 0.5 * ene_n
                 order = np.argsort(scores)
                 candidates = [estimates[i][0] for i in order[:10]]
@@ -1029,7 +1441,6 @@ class FlexGenController:
     # Execution
     # ------------------------------------------------------------------
     async def _execute_policy(self, policy: FlexGenPolicy) -> Dict[str, Any]:
-        # Circuit breaker check.
         if self.circuit_breaker and not self.circuit_breaker.allow():
             logger.warning("Circuit breaker OPEN — returning failure metrics.")
             return {
@@ -1041,7 +1452,6 @@ class FlexGenController:
                 "error": "circuit_open",
             }
 
-        # Chaos injection.
         if self.chaos and self.chaos.maybe_fault():
             if self.circuit_breaker:
                 self.circuit_breaker.record(False)
@@ -1055,17 +1465,26 @@ class FlexGenController:
             }
 
         try:
-            if self.use_real_executor and callable(self.executor) and not isinstance(self.executor, MockFlexGenExecutor):
+            if (
+                self.use_real_executor
+                and callable(self.executor)
+                and not isinstance(self.executor, MockFlexGenExecutor)
+            ):
                 gpu_before = self.gpu_profiler.get_gpu_metrics() if self.gpu_profiler else None
                 result = self.executor(policy, self.node, self.workload)
                 metrics = await result if asyncio.iscoroutine(result) else result
                 if self.gpu_profiler:
                     gpu_after = self.gpu_profiler.get_gpu_metrics()
                     if "energy_joules" not in metrics and gpu_before and gpu_after:
-                        avg_power = (gpu_before.get("gpu_power_watts", 65) + gpu_after.get("gpu_power_watts", 65)) / 2
+                        avg_power = (
+                            gpu_before.get("gpu_power_watts", 65)
+                            + gpu_after.get("gpu_power_watts", 65)
+                        ) / 2
                         latency_s = metrics.get("latency_ms", 0) / 1000.0
                         metrics["energy_joules"] = avg_power * latency_s
-                        metrics["carbon_g"] = (metrics["energy_joules"] / 3.6e6) * self._get_node_carbon_intensity()
+                        metrics["carbon_g"] = (
+                            metrics["energy_joules"] / 3.6e6
+                        ) * self._get_node_carbon_intensity()
             else:
                 metrics = self.executor.execute(policy, self.node, self.workload)
 
@@ -1096,60 +1515,67 @@ class FlexGenController:
         step_start = time.time()
         carbon_intensity = self._get_node_carbon_intensity()
 
-        # 0. MODP temporal decision — now recorded, not short-circuited away.
+        # 0. MODP temporal decision
         modp_info: Dict[str, Any] = {}
         if self.modp_planner:
             modp_action, delay, target_node = await self.modp_planner.plan(
-                self.workload, self.node, None, queue_length=0, current_carbon=carbon_intensity
+                self.workload, self.node, None, queue_length=0,
+                current_carbon=carbon_intensity,
             )
             modp_info = {"action": modp_action, "delay": delay, "target_node": target_node}
             if modp_action == "defer":
                 logger.info(f"MODP suggests deferring for {delay} hours.")
                 await self._publish_feedback(
-                    selected_policy=None,
-                    chosen_idx=-1,
-                    pareto=[],
-                    teacher_probs=None,
-                    explanation=None,
-                    reward=0.0,
-                    metrics={"latency_ms": 0.0, "energy_joules": 0.0, "carbon_g": 0.0, "success": True},
+                    selected_policy=None, chosen_idx=-1, pareto=[],
+                    teacher_probs=None, explanation=None, reward=0.0,
+                    metrics={"latency_ms": 0.0, "energy_joules": 0.0,
+                             "carbon_g": 0.0, "success": True},
                     drift_detected=False,
                     extra={"modp": modp_info, "reason": "modp_deferral"},
+                    carbon_intensity=carbon_intensity,
                 )
                 return {"action": "defer", "delay_hours": delay, "reason": "modp_deferral"}
-            elif modp_action == "move_node" and target_node:
+            if modp_action == "move_node" and target_node:
                 logger.info(f"MODP suggests moving to node {target_node} (single-node mode).")
 
         # 1. Candidates
         candidates = await self._generate_candidates()
 
-        # 2. Carbon market / REC price signal
+        # 2. Carbon price (per-step)
         carbon_price = 0.0
-        rec_offset_kg = 0.0
         if self.carbon_market:
-            carbon_price = self.carbon_market.price(carbon_intensity)
+            carbon_price = self.carbon_market.price(
+                carbon_intensity, hour_of_day=time.localtime().tm_hour
+            )
 
         # 3. Adaptive precision
         precision_level: Optional[PrecisionLevel] = None
         if self.precision_adapter:
-            # Rough headroom from latency target vs first-candidate estimate.
             headroom = 0.5
             adapted: List[FlexGenPolicy] = []
             for p in candidates:
-                p2, lvl = self.precision_adapter.adapt(p, carbon_intensity, headroom, carbon_price)
+                p2, lvl = self.precision_adapter.adapt(
+                    p, carbon_intensity, headroom, carbon_price
+                )
                 adapted.append(p2)
                 precision_level = lvl
             candidates = adapted
 
-        # 4. Evaluate candidates
-        metrics_list: List[Dict[str, Any]] = []
-        for idx, policy in enumerate(candidates):
-            metrics = await self._execute_policy(policy)
-            metrics["policy_idx"] = idx
-            metrics["policy"] = policy.to_dict()
-            if precision_level:
-                metrics["precision"] = precision_level.value
-            metrics_list.append(metrics)
+        # 4. Parallel candidate execution with bounded concurrency
+        sem = asyncio.Semaphore(self.max_parallel_candidates)
+
+        async def run_one(idx: int, policy: FlexGenPolicy) -> Dict[str, Any]:
+            async with sem:
+                m = await self._execute_policy(policy)
+                m["policy_idx"] = idx
+                m["policy"] = policy.to_dict()
+                if precision_level is not None:
+                    m["precision"] = precision_level.value
+                return m
+
+        metrics_list = await asyncio.gather(
+            *(run_one(i, p) for i, p in enumerate(candidates))
+        )
 
         # 5. Pareto filter
         feasible = [m for m in metrics_list if m.get("success", False)]
@@ -1158,7 +1584,21 @@ class FlexGenController:
             feasible = metrics_list
         pareto_candidates = self.pareto.filter(feasible) or feasible
 
-        # 6. State
+        if not pareto_candidates:
+            return {"action": "no_candidates", "reason": "pareto_empty"}
+
+        # 6. State — real values derived from recent outcomes
+        recent_rewards = (
+            list(self.uncertainty._recent_rewards) if self.uncertainty else []
+        )
+        recent_success = float(
+            np.mean([
+                1.0 if m.get("success", False) else 0.0
+                for m in pareto_candidates
+            ])
+        ) if pareto_candidates else 0.0
+        avg_reward = float(np.mean(recent_rewards)) if recent_rewards else 0.0
+
         state = FlexGenState(
             tokens=self.workload.tokens,
             latency_target=self.workload.latency_target,
@@ -1166,8 +1606,8 @@ class FlexGenController:
             cpu_memory_gb=self.node.metadata.get("cpu_memory_gb", 64.0),
             disk_bandwidth_gbps=self.node.metadata.get("disk_bandwidth_gbps", 2.0),
             carbon_intensity=carbon_intensity,
-            recent_success_rate=0.8,
-            avg_reward=0.6,
+            recent_success_rate=recent_success,
+            avg_reward=avg_reward,
             policy_idx=0,
         )
         state_features = self._state_features(state)
@@ -1177,25 +1617,33 @@ class FlexGenController:
             pareto_candidates, state, exploration=True
         )
         if self.quantum_teacher:
-            q_probs = self.quantum_teacher.teacher_probs(state_features, pareto_candidates)
-            if q_probs.size == (teacher_probs.size if teacher_probs is not None else 0):
-                # Blend: quantum teacher influences distillation target.
+            q_probs = self.quantum_teacher.teacher_probs(
+                state_features, pareto_candidates
+            )
+            if teacher_probs is not None and q_probs.size == teacher_probs.size:
                 teacher_probs = 0.5 * q_probs + 0.5 * np.asarray(teacher_probs)
 
-        # 8. Multi-agent coordination vote (nudges action_idx).
+        # 8. Multi-agent coordination vote
+        winning_role: Optional[AgentRole] = None
         if self.multi_agent and self.role_registry and pareto_candidates:
             bids: List[AgentBid] = []
             base_conf = (
                 float(teacher_probs[action_idx]) if teacher_probs is not None else 0.5
             )
             for role in AgentRole:
-                bias_idx = action_idx
                 if role == AgentRole.CARBON_BROKER:
                     bias_idx = int(np.argmin([c.get("carbon_g", 1e9) for c in pareto_candidates]))
                 elif role == AgentRole.EXPLOITER:
                     bias_idx = int(np.argmin([c.get("latency_ms", 1e9) for c in pareto_candidates]))
+                elif role == AgentRole.SAFETY_OFFICER:
+                    bias_idx = int(np.argmin([
+                        c.get("carbon_g", 1e9) + c.get("latency_ms", 1e9) / 1000.0
+                        for c in pareto_candidates
+                    ]))
                 elif role == AgentRole.EXPLORER:
-                    bias_idx = random.randrange(len(pareto_candidates))
+                    bias_idx = self._rng.randrange(len(pareto_candidates))
+                else:  # VERIFIER
+                    bias_idx = action_idx
                 bids.append(
                     AgentBid(
                         agent_id=f"{role.value}-agent",
@@ -1203,10 +1651,19 @@ class FlexGenController:
                         confidence=base_conf,
                         proposed_action=bias_idx,
                         rationale=role.value,
-                        carbon_score=1.0 / (1.0 + float(pareto_candidates[bias_idx].get("carbon_g", 1.0))),
+                        carbon_score=1.0 / (
+                            1.0 + float(pareto_candidates[bias_idx].get("carbon_g", 1.0))
+                        ),
                     )
                 )
             action_idx = self.multi_agent.vote(bids, len(pareto_candidates))
+            last_vote = self.multi_agent.last_vote() or {}
+            winning_roles = last_vote.get("winning_roles", [])
+            if winning_roles:
+                try:
+                    winning_role = AgentRole(winning_roles[0])
+                except ValueError:
+                    winning_role = None
 
         # 9. Causal counterfactuals
         counterfactuals: Dict[int, float] = {}
@@ -1215,11 +1672,13 @@ class FlexGenController:
                 state_features, list(range(len(pareto_candidates)))
             )
 
-        # 10. Safety shield (temporal logic).
+        # 10. Safety shield (candidate-aware, temporal-aware)
         safety_ok = True
         stl_verdict: Dict[str, bool] = {}
         if self.safety_shield:
-            action_idx, safety_ok, stl_verdict = self.safety_shield.screen(action_idx, pareto_candidates)
+            action_idx, safety_ok, stl_verdict = self.safety_shield.screen(
+                action_idx, pareto_candidates
+            )
 
         # 11. HITL + active learning
         uncertainty_score = 0.0
@@ -1237,29 +1696,44 @@ class FlexGenController:
                 )
                 human_approved = await self.hitl.request_approval(req)
                 if not human_approved and pareto_candidates:
-                    # Fall back to lowest-carbon candidate.
                     action_idx = int(
                         np.argmin([c.get("carbon_g", 1e9) for c in pareto_candidates])
                     )
 
-        chosen_policy_metrics = pareto_candidates[action_idx]
-        chosen_policy = FlexGenPolicy(**chosen_policy_metrics["policy"])
-        metrics = chosen_policy_metrics
+        # Bounds guard
+        action_idx = max(0, min(len(pareto_candidates) - 1, action_idx))
+
+        # Copy: avoid mutating pareto_candidates in place
+        chosen_policy_metrics = dict(pareto_candidates[action_idx])
+        policy_dict = dict(chosen_policy_metrics.get("policy", {}))
+        if precision_level is not None:
+            policy_dict["precision"] = precision_level.value
+        try:
+            chosen_policy = FlexGenPolicy(**policy_dict)
+        except Exception:
+            chosen_policy = FlexGenPolicy(**chosen_policy_metrics["policy"])
 
         # 12. REC offset
-        if self.rec_inventory and metrics.get("energy_joules", 0.0) > 0:
-            kwh = metrics["energy_joules"] / 3.6e6
+        rec_offset_kg = 0.0
+        if self.rec_inventory and chosen_policy_metrics.get("energy_joules", 0.0) > 0:
+            kwh = chosen_policy_metrics["energy_joules"] / 3.6e6
             rec_offset_kg = self.rec_inventory.consume(kwh)
-            # Net carbon after REC offset
-            metrics["carbon_g"] = max(0.0, float(metrics.get("carbon_g", 0.0)) - rec_offset_kg)
+            chosen_policy_metrics["carbon_g"] = max(
+                0.0,
+                float(chosen_policy_metrics.get("carbon_g", 0.0)) - rec_offset_kg,
+            )
 
-        # 13. Reward — carbon-market-aware.
-        base_reward = compute_reward(metrics, self.workload)
-        carbon_penalty = carbon_price * float(metrics.get("carbon_g", 0.0)) / 1000.0
+        # 13. Reward — carbon-market-aware
+        base_reward = compute_reward(chosen_policy_metrics, self.workload)
+        carbon_penalty = (
+            carbon_price * float(chosen_policy_metrics.get("carbon_g", 0.0)) / 100.0
+        )
         reward = base_reward - carbon_penalty
 
-        # 14. Update selector, causal model, federated aggregator.
-        next_state_vec = state_vec
+        # 14. Update selector, causal model, federated aggregator
+        # Use a plausible next-state: the chosen candidate's observed metrics
+        # compressed to the same feature dimension.
+        next_state_vec = self._next_state_features(state_features, chosen_policy_metrics)
         await self.selector.update(state_vec, action_idx, reward, next_state_vec, teacher_probs)
 
         if self.causal_estimator:
@@ -1269,7 +1743,8 @@ class FlexGenController:
                     action=action_idx,
                     reward=reward,
                     next_state=next_state_vec,
-                    context={"carbon_intensity": carbon_intensity, "carbon_price": carbon_price},
+                    context={"carbon_intensity": carbon_intensity,
+                             "carbon_price": carbon_price},
                 )
             )
 
@@ -1285,10 +1760,10 @@ class FlexGenController:
             )
             self.federated.aggregate()
 
-        if self.role_registry:
+        if self.role_registry and winning_role is not None:
             self.role_registry.record(
-                self.role_registry.dominant_role(),
-                success=bool(metrics.get("success", False)),
+                winning_role,
+                success=bool(chosen_policy_metrics.get("success", False)),
                 reward=reward,
             )
 
@@ -1306,16 +1781,14 @@ class FlexGenController:
                 threshold=0.4,
             )
 
-        # 15. Temporal monitor observation.
+        # 15. Temporal monitor observation
         if self.temporal_monitor:
-            self.temporal_monitor.observe(
-                {
-                    "latency_ms": metrics.get("latency_ms", 0.0),
-                    "carbon_g": metrics.get("carbon_g", 0.0),
-                    "success": metrics.get("success", False),
-                    "t": step_start,
-                }
-            )
+            self.temporal_monitor.observe({
+                "latency_ms": chosen_policy_metrics.get("latency_ms", 0.0),
+                "carbon_g": chosen_policy_metrics.get("carbon_g", 0.0),
+                "success": chosen_policy_metrics.get("success", False),
+                "t": step_start,
+            })
 
         # 16. Drift detection
         drift_detected = False
@@ -1330,7 +1803,7 @@ class FlexGenController:
         if self.explainer:
             explanation = self.explainer.explain(
                 chosen_idx=action_idx,
-                chosen=metrics,
+                chosen=chosen_policy_metrics,
                 pareto=pareto_candidates,
                 teacher_probs=teacher_probs,
                 counterfactuals=counterfactuals,
@@ -1340,7 +1813,7 @@ class FlexGenController:
             logger.info(f"XAI: {explanation.rationale}")
         self.last_explanation = explanation
 
-        # 18. Publish feedback
+        # 18. Publish feedback — pass the same carbon_intensity used in this step
         await self._publish_feedback(
             selected_policy=chosen_policy,
             chosen_idx=action_idx,
@@ -1348,7 +1821,7 @@ class FlexGenController:
             teacher_probs=teacher_probs,
             explanation=explanation,
             reward=reward,
-            metrics=metrics,
+            metrics=chosen_policy_metrics,
             drift_detected=drift_detected,
             extra={
                 "modp": modp_info,
@@ -1360,8 +1833,16 @@ class FlexGenController:
                 "human_approved": human_approved,
                 "uncertainty": uncertainty_score,
                 "counterfactuals": counterfactuals,
-                "federated_round_size": len(getattr(self.federated, "_updates", {}) or {}) if self.federated else 0,
+                "federated_round_size": (
+                    len(getattr(self.federated, "_updates", {}) or {})
+                    if self.federated else 0
+                ),
+                "winning_role": winning_role.value if winning_role else None,
+                "federated_dp": (
+                    self.federated.get_dp_state() if self.federated else None
+                ),
             },
+            carbon_intensity=carbon_intensity,
         )
 
         # Cache
@@ -1369,10 +1850,11 @@ class FlexGenController:
         self.last_action_idx = action_idx
         self.last_teacher_probs = teacher_probs
         self.last_candidates = pareto_candidates
+        self.last_winning_role = winning_role
 
         return {
             "chosen_policy": chosen_policy.to_dict(),
-            "metrics": metrics,
+            "metrics": chosen_policy_metrics,
             "reward": reward,
             "pareto_count": len(pareto_candidates),
             "drift_detected": drift_detected,
@@ -1385,7 +1867,34 @@ class FlexGenController:
             "uncertainty": uncertainty_score,
             "explanation": explanation.to_dict() if explanation else None,
             "counterfactuals": counterfactuals,
+            "federated_dp": self.federated.get_dp_state() if self.federated else None,
+            "winning_role": winning_role.value if winning_role else None,
         }
+
+    # ------------------------------------------------------------------
+    # Next-state features
+    # ------------------------------------------------------------------
+    def _next_state_features(
+        self, prev_state_vec: np.ndarray, metrics: Dict[str, Any]
+    ) -> np.ndarray:
+        """
+        Derive a plausible next-state vector from the observed metrics.
+        Keeps the same dimension as the state feature vector used by the
+        selector and the causal model. This is the v3 replacement for
+        `next_state_vec = state_vec`.
+        """
+        s = np.asarray(prev_state_vec, dtype=np.float64).copy()
+        if s.size >= 8:
+            s[6] = 1.0 if metrics.get("success", False) else 0.0  # recent_success_rate
+            # avg_reward slot: exponential smoothing toward observed reward proxy
+            reward_proxy = (
+                0.4 * float(metrics.get("success", 0.0))
+                + 0.3 * (1.0 - min(1.0, float(metrics.get("latency_ms", 0.0))
+                                   / max(self.workload.latency_target, 1.0)))
+                + 0.3 * (1.0 - min(1.0, float(metrics.get("carbon_g", 0.0)) / 10.0))
+            )
+            s[7] = 0.7 * s[7] + 0.3 * reward_proxy
+        return s
 
     # ------------------------------------------------------------------
     # Feedback publisher
@@ -1401,12 +1910,15 @@ class FlexGenController:
         metrics: Dict[str, Any],
         drift_detected: bool,
         extra: Optional[Dict[str, Any]] = None,
+        carbon_intensity: Optional[float] = None,
     ) -> None:
         if not self.message_queue:
             return
+        if carbon_intensity is None:
+            carbon_intensity = self._get_node_carbon_intensity()
         ctx: Dict[str, Any] = {
             "node_id": self.node.id,
-            "carbon_intensity": self._get_node_carbon_intensity(),
+            "carbon_intensity": carbon_intensity,
             "pareto_size": len(pareto),
             "executor_type": "real" if self.use_real_executor else "mock",
             "drift_detected": drift_detected,
@@ -1414,7 +1926,9 @@ class FlexGenController:
         }
         if extra:
             ctx.update({k: v for k, v in extra.items() if k != "counterfactuals"})
-            ctx["counterfactual_keys"] = list((extra.get("counterfactuals") or {}).keys())
+            ctx["counterfactual_keys"] = list(
+                (extra.get("counterfactuals") or {}).keys()
+            )
         if explanation:
             ctx["xai_rationale"] = explanation.rationale
             ctx["xai_confidence"] = explanation.confidence
@@ -1465,6 +1979,9 @@ class FlexGenController:
     def export_federated_weights(self) -> Optional[np.ndarray]:
         return self.federated.global_weights() if self.federated else None
 
+    def federated_dp_state(self) -> Optional[Dict[str, Any]]:
+        return self.federated.get_dp_state() if self.federated else None
+
     def recent_explanations(self, k: int = 8) -> List[Dict[str, Any]]:
         if not self.explainer or not self.last_explanation:
             return []
@@ -1472,3 +1989,12 @@ class FlexGenController:
 
     def active_learning_batch(self, k: int = 8) -> List[Dict[str, Any]]:
         return self.active_learner.sample(k) if self.active_learner else []
+
+    def temporal_evaluations(self, k: int = 32) -> List[Dict[str, Any]]:
+        return self.temporal_monitor.recent_evaluations(k) if self.temporal_monitor else []
+
+    def role_snapshot(self) -> Optional[Dict[str, Any]]:
+        return self.role_registry.snapshot() if self.role_registry else None
+
+    def rec_snapshot(self) -> Optional[Dict[str, Any]]:
+        return self.rec_inventory.snapshot() if self.rec_inventory else None
