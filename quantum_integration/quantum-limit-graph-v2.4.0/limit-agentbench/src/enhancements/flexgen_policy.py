@@ -1,6 +1,6 @@
 """
 FlexGen-style Policy and Mock Executor for Green Agent GPU Orchestration.
-Enhanced v2 — substrate for all ten Green Agent enhancements:
+Enhanced v3 — substrate for all ten Green Agent enhancements:
 
   1. Quantum-Distillation Integration      -> versioned feature schema, teacher-ready vectors
   2. Causal RL for Policy Adaptation       -> state/outcome feature separations, counterfactual hooks
@@ -13,8 +13,25 @@ Enhanced v2 — substrate for all ten Green Agent enhancements:
   9. Resilience / Chaos Testing            -> fault, latency, carbon-spike injection
  10. HITL / Active Learning                -> uncertainty on every metric, decision records
 
-Everything lives in this file. No new modules required.
-Backward compatible: all original signatures still work.
+CHANGELOG v2 -> v3
+- Removed dead model_size_gb computation (was computed twice).
+- Unified bits accounting: effective_weight_bits drives model_size_gb; effective_kv_bits drives kv_cache.
+- activation_gb is now derived from layers * seq * hidden (was a magic constant).
+- Quality is no longer double-penalized: precision_explicit short-circuits legacy bit penalties.
+- _failed_result is JSON-safe: uses FAILED_SENTINEL (1e12) and -1.0 sentinels, never inf/nan.
+- _failed_result resolves a valid precision level even on failure (was returning "unknown").
+- _contrib caps SNR at SNR_CAP to avoid Infinity in JSON.
+- ChaosInjector.maybe_carbon_spike returns (value, spiked); caller records the event once.
+- generate_grid_policies pruning accounts for KV cache and activation memory.
+- PRECISION_ORDER + PRECISION_INDEX for stable vector encoding.
+- to_vector(enforce_version=True) rejects precision levels outside PRECISION_ORDER.
+- MockFlexGenExecutor._role_efficiency honors ExecutionContext.role_tag.
+- Mixed precision now blends 75/25 (weight vs KV share) instead of 50/50.
+- Carbon price penalty and latency-variance penalty added to compute_reward.
+- Disk IOPS check added to CPU -> disk fallback.
+- Throughput is split into prefill_tokens_per_s and decode_tokens_per_s.
+- effective_speedup emitted for post-hoc calibration.
+- Backward compatible: all original signatures still work.
 """
 
 from __future__ import annotations
@@ -36,7 +53,7 @@ from ..schemas.workload_descriptor import WorkloadDescriptor
 # ===========================================================================
 # Feature / vector schema versioning (Enhancements 1, 2, 3)
 # ===========================================================================
-POLICY_VECTOR_VERSION = "flexgen_policy_vec_v2"
+POLICY_VECTOR_VERSION = "flexgen_policy_vec_v3"
 POLICY_VECTOR_FIELDS: Tuple[str, ...] = (
     # normalized scalars
     "gpu_batch_size_norm",
@@ -62,10 +79,16 @@ POLICY_VECTOR_FIELDS: Tuple[str, ...] = (
     "precision_level_norm",
     "mixed_precision_flag",
 )
+FEATURE_VECTOR_DIM = len(POLICY_VECTOR_FIELDS)
+
+# Finite sentinels so JSON serialization never encounters inf/nan.
+FAILED_SENTINEL = 1e12
+SNR_CAP = 1e9
 
 
 # ===========================================================================
-# Precision levels (Enhancement 7)
+# Precision levels (Enhancement 7) — CANONICAL definition.
+# The controller module MUST import these instead of redefining its own.
 # ===========================================================================
 class PrecisionLevel(str, Enum):
     FP32 = "fp32"
@@ -76,12 +99,24 @@ class PrecisionLevel(str, Enum):
     INT4 = "int4"
 
 
+# Explicit ordering for deterministic vector encoding.
+PRECISION_ORDER: Tuple[PrecisionLevel, ...] = (
+    PrecisionLevel.FP32,
+    PrecisionLevel.BF16,
+    PrecisionLevel.FP16,
+    PrecisionLevel.FP8,
+    PrecisionLevel.INT8,
+    PrecisionLevel.INT4,
+)
+PRECISION_INDEX: Dict[PrecisionLevel, int] = {p: i for i, p in enumerate(PRECISION_ORDER)}
+
+
 # Per-level hardware-aware cost model.
 # speed    : multiplicative throughput vs FP32
 # energy   : multiplicative energy vs FP32
 # quality  : relative model quality
 # memory   : multiplicative memory footprint vs FP32
-# bits     : nominal bit-width used for weight/KV accounting
+# bits     : nominal bit-width used for weight / KV accounting
 PRECISION_COST: Dict[PrecisionLevel, Dict[str, float]] = {
     PrecisionLevel.FP32: {"speed": 1.0, "energy": 1.00, "quality": 1.000, "memory": 1.00, "bits": 32.0},
     PrecisionLevel.BF16: {"speed": 1.7, "energy": 0.72, "quality": 0.997, "memory": 0.50, "bits": 16.0},
@@ -151,20 +186,34 @@ class FlexGenPolicy:
         return cls(**data)
 
     # -- vector --------------------------------------------------------
-    def to_vector(self, precision_level: Optional[PrecisionLevel] = None) -> List[float]:
+    def to_vector(
+        self,
+        precision_level: Optional[PrecisionLevel] = None,
+        enforce_version: bool = True,
+    ) -> List[float]:
         """
         Return a normalized numeric vector (schema-versioned).
         Schema: POLICY_VECTOR_FIELDS, version POLICY_VECTOR_VERSION.
+
+        If `enforce_version` is True, a provided precision_level must belong
+        to PRECISION_ORDER. This prevents silently re-encoding persisted
+        vectors from an older schema.
         """
         lvl = precision_level
         if lvl is None and self.precision_level is not None:
             lvl = PrecisionLevel(self.precision_level)
 
+        if enforce_version and lvl is not None and lvl not in PRECISION_ORDER:
+            raise ValueError(
+                f"precision_level {lvl} not in canonical PRECISION_ORDER "
+                f"({[p.value for p in PRECISION_ORDER]})"
+            )
+
         if lvl is not None:
             bits = PRECISION_COST[lvl]["bits"]
             w_bits_norm = bits / 32.0
             kv_bits_norm = bits / 32.0
-            lvl_norm = list(PrecisionLevel).index(lvl) / max(len(PrecisionLevel) - 1, 1)
+            lvl_norm = PRECISION_INDEX[lvl] / max(len(PRECISION_ORDER) - 1, 1)
         else:
             w_bits_norm = self.weight_bits / 32.0
             kv_bits_norm = self.kv_cache_bits / 32.0
@@ -194,7 +243,8 @@ class FlexGenPolicy:
         return {
             "version": POLICY_VECTOR_VERSION,
             "fields": list(POLICY_VECTOR_FIELDS),
-            "dim": len(POLICY_VECTOR_FIELDS),
+            "dim": FEATURE_VECTOR_DIM,
+            "precision_order": [p.value for p in PRECISION_ORDER],
         }
 
     def policy_hash(self) -> str:
@@ -246,11 +296,14 @@ class ChaosInjector:
             return self.config.latency_inject_ms
         return 0.0
 
-    def maybe_carbon_spike(self, carbon_intensity: float) -> float:
+    def maybe_carbon_spike(self, carbon_intensity: float) -> Tuple[float, bool]:
+        """
+        v3: returns (new_intensity, spiked_flag) so the caller records the
+        event exactly once, avoiding duplicate entries in the log.
+        """
         if self.rng.random() < self.config.carbon_spike_prob:
-            self.events.append({"type": "carbon_spike", "t": time.time()})
-            return carbon_intensity * self.config.carbon_spike_factor
-        return carbon_intensity
+            return carbon_intensity * self.config.carbon_spike_factor, True
+        return carbon_intensity, False
 
 
 # ===========================================================================
@@ -277,13 +330,15 @@ class MockFlexGenExecutor:
     Simulates execution of a FlexGen policy on a given node and workload.
 
     Produces:
-      - point estimates: latency, throughput, energy, carbon, quality, memory
+      - point estimates: latency, throughput (prefill + decode), energy,
+        carbon, quality, memory
       - uncertainty: latency_std_ms, carbon_std_g, energy_std_j (Enhancement 10)
       - market signals: carbon_price_cost, rec_offset_kg, net_carbon_g (Enhancement 8)
       - provenance: execution_id, timestamp, node_id, workload_id (Enhancement 5)
       - explainability: attribution surface (Enhancement 6)
       - runtime precision actually used (Enhancement 7)
       - chaos events applied (Enhancement 9)
+      - role-aware efficiency modifier (Enhancement 4)
     """
 
     def __init__(
@@ -324,28 +379,69 @@ class MockFlexGenExecutor:
             return context.precision_override, bool(policy.mixed_precision)
         if policy.precision_level is not None:
             return PrecisionLevel(policy.precision_level), bool(policy.mixed_precision)
-        # Legacy mapping from bits.
         if policy.weight_bits >= 16:
             return PrecisionLevel.FP16, bool(policy.mixed_precision)
         if policy.weight_bits == 8:
             return PrecisionLevel.INT8, bool(policy.mixed_precision)
         return PrecisionLevel.INT4, bool(policy.mixed_precision)
 
+    def _effective_bits(
+        self,
+        policy: FlexGenPolicy,
+        level: PrecisionLevel,
+        mixed: bool,
+        precision_explicit: bool,
+    ) -> Tuple[float, float]:
+        """
+        Returns (weight_bits, kv_bits) for memory accounting.
+
+        Rules (v3):
+          - Explicit precision, non-mixed      : both use the level's bits.
+          - Explicit precision, mixed          : weights use level bits,
+                                                 KV keeps explicit kv_cache_bits.
+          - Precision inferred from weight_bits: weights use effective bits,
+                                                 KV keeps explicit kv_cache_bits.
+        """
+        level_bits = PRECISION_COST[level]["bits"]
+        if precision_explicit:
+            if mixed:
+                return level_bits, float(policy.kv_cache_bits)
+            return level_bits, level_bits
+        return level_bits, float(policy.kv_cache_bits)
+
     def _quantization_speedup(
         self, level: PrecisionLevel, mixed: bool
     ) -> Tuple[float, float]:
         """
         Return (speed_multiplier, quality_multiplier) for a given precision.
-        Mixed precision applies a conservative blend of FP16 + target level.
+        Mixed precision blends 75 % target + 25 % FP16 to reflect that only
+        weight-side compute is quantized while KV stays higher precision.
         """
         base = PRECISION_COST[level]
         speed = base["speed"]
         quality = base["quality"]
         if mixed:
             ref = PRECISION_COST[PrecisionLevel.FP16]
-            speed = 0.5 * speed + 0.5 * ref["speed"]
-            quality = 0.5 * quality + 0.5 * ref["quality"]
+            speed = 0.75 * speed + 0.25 * ref["speed"]
+            quality = 0.75 * quality + 0.25 * ref["quality"]
         return speed, quality
+
+    def _role_efficiency(self, context: Optional[ExecutionContext]) -> float:
+        """
+        Small deterministic efficiency modifier per role tag (v3).
+        Role tags come from the multi-agent coordinator (Enhancement 4).
+        """
+        if not context or not context.role_tag:
+            return 1.0
+        tag = context.role_tag.lower()
+        table = {
+            "safety_officer": 0.95,
+            "carbon_broker": 0.98,
+            "verifier": 1.00,
+            "exploiter": 1.02,
+            "explorer": 1.05,
+        }
+        return table.get(tag, 1.0)
 
     # -- main ----------------------------------------------------------
     def execute(
@@ -358,8 +454,7 @@ class MockFlexGenExecutor:
         exec_id = str(uuid.uuid4())
         t_start = time.time()
 
-        # -- Chaos hooks (Enhancement 9) -----------------------------
-        chaos_events: List[Dict[str, Any]] = []
+        # -- Chaos hook: hard fault (Enhancement 9) ------------------
         if self.chaos and self.chaos.maybe_fault():
             return self._failed_result(
                 policy, exec_id, t_start,
@@ -373,6 +468,7 @@ class MockFlexGenExecutor:
         gpu_flops_tflops = float(node.metadata.get("gpu_flops_tflops", 30.0))
         gpu_cpu_bw_gbps = float(node.metadata.get("gpu_cpu_bandwidth_gbps", 12.0))
         disk_bw_gbps = float(node.metadata.get("disk_bandwidth_gbps", 2.0))
+        disk_iops = float(node.metadata.get("disk_iops", 5000.0))
         gpu_max_power_w = float(node.metadata.get("gpu_max_power_w", 250.0))
         cpu_max_power_w = float(node.metadata.get("cpu_max_power_w", 100.0))
         gpu_idle_power_w = float(node.metadata.get("gpu_idle_power_w", 20.0))
@@ -384,21 +480,29 @@ class MockFlexGenExecutor:
         hidden_dim = int(model_params.get("hidden_dim", 4096))
         params_billions = float(model_params.get("params_billions", 7))
         seq_len_prompt = int(workload.tokens)
-        max_new_tokens = int(workload.metadata.get("max_new_tokens", 32))
+        max_new_tokens = int(
+            model_params.get("max_new_tokens",
+                             workload.metadata.get("max_new_tokens", 32))
+        )
 
         # -- Precision resolution (Enhancement 7) -------------------
+        precision_explicit = (
+            (context is not None and context.precision_override is not None)
+            or policy.precision_level is not None
+        )
         precision_level, mixed = self._resolve_precision(policy, context)
         speed_mult, quality_mult = self._quantization_speedup(precision_level, mixed)
-        bits_effective = PRECISION_COST[precision_level]["bits"]
-        memory_mult = PRECISION_COST[precision_level]["memory"]
+        speed_mult *= self._role_efficiency(context)
+
+        eff_weight_bits, eff_kv_bits = self._effective_bits(
+            policy, precision_level, mixed, precision_explicit
+        )
 
         # -- Memory model -------------------------------------------
-        bytes_per_weight = max(bits_effective, policy.weight_bits) / 8.0
-        model_size_gb = params_billions * bytes_per_weight * memory_mult / max(memory_mult, 1e-9)
-        # Simpler: model_size scales with effective bits.
-        model_size_gb = params_billions * (bits_effective / 8.0)
+        # v3: single, consistent bits accounting.
+        model_size_gb = params_billions * (eff_weight_bits / 8.0)
 
-        bytes_per_kv = max(bits_effective, policy.kv_cache_bits) / 8.0
+        bytes_per_kv = eff_kv_bits / 8.0
         kv_prompt_gb = (
             policy.gpu_batch_size * seq_len_prompt * 2 * hidden_dim * num_layers * bytes_per_kv
         ) / 1e9
@@ -407,7 +511,11 @@ class MockFlexGenExecutor:
         ) / 1e9
         kv_cache_gb = kv_prompt_gb + kv_decode_gb
 
-        activation_gb = policy.gpu_batch_size * hidden_dim * 1e-4
+        # v3: activation memory derived from layers * seq * hidden.
+        # 2 bytes per activation element, 4x workspace factor.
+        activation_gb = (
+            policy.gpu_batch_size * seq_len_prompt * hidden_dim * num_layers * 2 * 4
+        ) / 1e9
 
         weight_on_gpu = policy.weight_device == "gpu"
         kv_on_gpu = policy.kv_cache_device == "gpu"
@@ -428,7 +536,7 @@ class MockFlexGenExecutor:
             + (kv_cache_gb if policy.kv_cache_device == "disk" else 0)
         )
 
-        # -- Feasibility with fallback (fixes #8) -------------------
+        # -- Feasibility with fallback (Enhancement 7) --------------
         fallback_applied = False
         effective_weight_device = policy.weight_device
         effective_kv_device = policy.kv_cache_device
@@ -436,14 +544,12 @@ class MockFlexGenExecutor:
         gpu_ok = peak_gpu_mem_gb <= gpu_memory_gb
         cpu_ok = peak_cpu_mem_gb <= cpu_memory_gb
         if not (gpu_ok and cpu_ok):
-            # Try CPU->disk fallback for weights, then for KV.
             if policy.weight_device == "cpu" and not cpu_ok:
                 effective_weight_device = "disk"
                 fallback_applied = True
             if policy.kv_cache_device == "cpu" and not cpu_ok:
                 effective_kv_device = "disk"
                 fallback_applied = True
-            # Recompute memory under fallback.
             peak_gpu_mem_gb = (
                 (model_size_gb if effective_weight_device == "gpu" else 0)
                 + (kv_cache_gb if effective_kv_device == "gpu" else 0)
@@ -460,6 +566,14 @@ class MockFlexGenExecutor:
             )
             gpu_ok = peak_gpu_mem_gb <= gpu_memory_gb
             cpu_ok = peak_cpu_mem_gb <= cpu_memory_gb
+
+        # v3: disk IOPS sanity check when we fall back to disk.
+        if (effective_weight_device == "disk" or effective_kv_device == "disk") and disk_iops <= 0:
+            return self._failed_result(
+                policy, exec_id, t_start,
+                reason="disk_iops_unavailable",
+                chaos_events=[],
+            )
 
         success = gpu_ok and cpu_ok
 
@@ -480,35 +594,38 @@ class MockFlexGenExecutor:
         total_flops = flops_per_token * total_tokens * policy.gpu_batch_size
 
         batch_efficiency = 0.6 + 0.4 * min(1.0, policy.gpu_batch_size / 8.0)
-        # block_size now affects scheduling granularity (fixes #1).
         block_efficiency = 0.85 + 0.15 * min(1.0, policy.block_size / 32.0)
         gpu_flops = gpu_flops_tflops * 1e12 * batch_efficiency * block_efficiency
-        gpu_flops *= speed_mult  # realistic quantization speedup (fixes #3)
+        gpu_flops *= speed_mult
         compute_time_s = total_flops / gpu_flops if gpu_flops > 0 else 0.0
 
         if policy.cpu_attention:
-            # CPU attention time parameterized by CPU-side flops (fixes #4).
             cpu_flops_tflops = float(node.metadata.get("cpu_flops_tflops", 0.5))
             cpu_attn_flops = 2 * total_tokens * policy.gpu_batch_size * hidden_dim * num_layers
             cpu_attn_flops_s = cpu_flops_tflops * 1e12
             compute_time_s += cpu_attn_flops / max(cpu_attn_flops_s, 1e-9)
 
-        # -- Total time with idle-aware energy (fixes #2) -----------
+        # -- Total time with idle-aware energy ----------------------
         if policy.overlap_io_compute:
             total_time_s = max(compute_time_s, transfer_time_s)
         else:
             total_time_s = compute_time_s + transfer_time_s
 
-        # Inject chaos latency (Enhancement 9).
+        # Chaos latency injection (Enhancement 9).
         if self.chaos:
             injected = self.chaos.maybe_latency()
             if injected > 0:
                 total_time_s += injected / 1000.0
-                chaos_events.append({"type": "latency_inject", "ms": injected})
 
         latency_ms = total_time_s * 1000.0
+
+        # Throughput split (v3): prefill vs decode.
+        prefill_tokens = seq_len_prompt * policy.gpu_batch_size
+        decode_tokens = max_new_tokens * policy.gpu_batch_size
+        prefill_tps = prefill_tokens / total_time_s if total_time_s > 0 else 0.0
+        decode_tps = decode_tokens / total_time_s if total_time_s > 0 else 0.0
         throughput_tokens_per_s = (
-            (total_tokens * policy.gpu_batch_size) / total_time_s if total_time_s > 0 else 0.0
+            (prefill_tokens + decode_tokens) / total_time_s if total_time_s > 0 else 0.0
         )
 
         # -- Energy: active + idle during overlap -------------------
@@ -533,11 +650,13 @@ class MockFlexGenExecutor:
         base_intensity = self.carbon_intensity
         if context and context.carbon_intensity_g_per_kwh is not None:
             base_intensity = context.carbon_intensity_g_per_kwh
+
+        chaos_events: List[Dict[str, Any]] = []
         if self.chaos:
-            spiked = self.chaos.maybe_carbon_spike(base_intensity)
-            if spiked != base_intensity:
+            spiked, was_spiked = self.chaos.maybe_carbon_spike(base_intensity)
+            if was_spiked:
                 chaos_events.append({"type": "carbon_spike", "value": spiked})
-            base_intensity = spiked
+                base_intensity = spiked
 
         energy_kwh = energy_j / 3.6e6
         gross_carbon_g = energy_kwh * base_intensity
@@ -555,17 +674,20 @@ class MockFlexGenExecutor:
         if context and context.carbon_price_per_kg > 0:
             carbon_price_cost = (net_carbon_g / 1000.0) * context.carbon_price_per_kg
 
-        # -- Quality: baseline * precision quality (Enhancement 7) --
-        quality = 1.0
-        if policy.weight_bits <= 4:
-            quality *= 0.85
-        elif policy.weight_bits <= 8:
-            quality *= 0.95
-        if policy.kv_cache_bits <= 4:
-            quality *= 0.9
-        elif policy.kv_cache_bits <= 8:
-            quality *= 0.97
-        quality *= quality_mult
+        # -- Quality: single source of penalty (v3) -----------------
+        if precision_explicit:
+            # Precision level fully determines quality; do not double-penalize.
+            quality = quality_mult
+        else:
+            quality = 1.0
+            if policy.weight_bits <= 4:
+                quality *= 0.85
+            elif policy.weight_bits <= 8:
+                quality *= 0.95
+            if policy.kv_cache_bits <= 4:
+                quality *= 0.90
+            elif policy.kv_cache_bits <= 8:
+                quality *= 0.97
         quality = max(0.0, min(1.0, quality))
 
         # -- Uncertainty (Enhancements 6, 10) -----------------------
@@ -617,6 +739,8 @@ class MockFlexGenExecutor:
             "disk_io_gb": disk_io_gb,
             "latency_ms": latency_ms,
             "throughput_tokens_per_s": throughput_tokens_per_s,
+            "prefill_tokens_per_s": prefill_tps,
+            "decode_tokens_per_s": decode_tps,
             "energy_joules": energy_j,
             "carbon_g": net_carbon_g,
             "gross_carbon_g": gross_carbon_g,
@@ -633,7 +757,9 @@ class MockFlexGenExecutor:
             # precision
             "precision_level": precision_level.value,
             "mixed_precision": mixed,
-            "effective_bits": bits_effective,
+            "effective_bits": eff_weight_bits,
+            "effective_kv_bits": eff_kv_bits,
+            "effective_speedup": speed_mult,
             # resilience / chaos
             "fallback_applied": fallback_applied,
             "chaos_events": chaos_events,
@@ -648,11 +774,12 @@ class MockFlexGenExecutor:
     @staticmethod
     def _contrib(value: float, std: float) -> Dict[str, float]:
         """Small per-feature contribution record for XAI consumers."""
-        return {
-            "value": float(value),
-            "std": float(std),
-            "snr": float(value / std) if std > 1e-12 else float("inf"),
-        }
+        if std > 1e-12:
+            snr = value / std
+            snr = max(-SNR_CAP, min(SNR_CAP, snr))
+        else:
+            snr = SNR_CAP if value != 0 else 0.0
+        return {"value": float(value), "std": float(std), "snr": float(snr)}
 
     def _failed_result(
         self,
@@ -662,29 +789,48 @@ class MockFlexGenExecutor:
         reason: str,
         chaos_events: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        """
+        v3: JSON-safe failure record. Uses FAILED_SENTINEL (1e12) instead of
+        inf and -1.0 instead of nan so downstream serialization never chokes.
+        """
+        # Resolve a valid precision string even on failure.
+        try:
+            if policy.precision_level is not None:
+                resolved = PrecisionLevel(policy.precision_level).value
+            elif policy.weight_bits >= 16:
+                resolved = PrecisionLevel.FP16.value
+            elif policy.weight_bits == 8:
+                resolved = PrecisionLevel.INT8.value
+            else:
+                resolved = PrecisionLevel.INT4.value
+        except Exception:
+            resolved = PrecisionLevel.FP32.value
+
         return {
             "success": False,
-            "gpu_memory_used_gb": float("nan"),
-            "cpu_memory_used_gb": float("nan"),
+            "gpu_memory_used_gb": -1.0,
+            "cpu_memory_used_gb": -1.0,
             "disk_io_gb": 0.0,
-            "latency_ms": float("inf"),
+            "latency_ms": FAILED_SENTINEL,
             "throughput_tokens_per_s": 0.0,
-            "energy_joules": float("inf"),
-            "carbon_g": float("inf"),
-            "gross_carbon_g": float("inf"),
+            "prefill_tokens_per_s": 0.0,
+            "decode_tokens_per_s": 0.0,
+            "energy_joules": FAILED_SENTINEL,
+            "carbon_g": FAILED_SENTINEL,
+            "gross_carbon_g": FAILED_SENTINEL,
             "quality_score": 0.0,
-            "latency_std_ms": float("inf"),
-            "energy_std_j": float("inf"),
-            "carbon_std_g": float("inf"),
+            "latency_std_ms": 0.0,
+            "energy_std_j": 0.0,
+            "carbon_std_g": 0.0,
             "quality_std": 0.0,
             "carbon_price_cost": 0.0,
             "rec_offset_kg": 0.0,
             "rec_kwh_used": 0.0,
-            "precision_level": (
-                policy.precision_level or "unknown"
-            ),
+            "precision_level": resolved,
             "mixed_precision": bool(policy.mixed_precision),
-            "effective_bits": policy.weight_bits,
+            "effective_bits": float(policy.weight_bits),
+            "effective_kv_bits": float(policy.kv_cache_bits),
+            "effective_speedup": 1.0,
             "fallback_applied": False,
             "chaos_events": chaos_events or [],
             "provenance": {
@@ -733,7 +879,8 @@ def generate_grid_policies(
 ) -> List[FlexGenPolicy]:
     """
     Deterministic structured grid. Node/workload, when provided, prune
-    infeasible combinations up front (Enhancement 7 hardware awareness).
+    infeasible combinations up front (v3: KV cache and activation are
+    also included in the feasibility check).
     """
     policies: List[FlexGenPolicy] = []
     for batch in [1, 2, 4, 8]:
@@ -759,12 +906,38 @@ def generate_grid_policies(
         gpu_mem = float(node.metadata.get("gpu_memory_gb", 16.0))
         cpu_mem = float(node.metadata.get("cpu_memory_gb", 64.0))
         params_b = float(workload.metadata.get("model_params", {}).get("params_billions", 7))
+        layers = int(workload.metadata.get("model_params", {}).get("num_layers", 32))
+        hidden = int(workload.metadata.get("model_params", {}).get("hidden_dim", 4096))
+        seq = int(workload.tokens)
+        max_new = int(workload.metadata.get("max_new_tokens", 32))
+
         feasible: List[FlexGenPolicy] = []
         for p in policies:
             approx_model_gb = params_b * (p.weight_bits / 8.0)
-            if p.weight_device == "gpu" and approx_model_gb > gpu_mem:
+            approx_kv_gb = (
+                p.gpu_batch_size * (seq + max_new) * 2 * hidden * layers * (p.kv_cache_bits / 8.0)
+            ) / 1e9
+            approx_act_gb = (
+                p.gpu_batch_size * seq * hidden * layers * 2 * 4
+            ) / 1e9
+
+            w_gpu = p.weight_device == "gpu"
+            kv_gpu = p.kv_cache_device == "gpu"
+            act_gpu = p.activation_device == "gpu"
+
+            gpu_mem_req = (
+                (approx_model_gb if w_gpu else 0)
+                + (approx_kv_gb if kv_gpu else 0)
+                + (approx_act_gb if act_gpu else 0)
+            )
+            cpu_mem_req = (
+                (approx_model_gb if p.weight_device == "cpu" else 0)
+                + (approx_kv_gb if p.kv_cache_device == "cpu" else 0)
+                + (approx_act_gb if not act_gpu else 0)
+            )
+            if gpu_mem_req > gpu_mem:
                 continue
-            if p.weight_device == "cpu" and approx_model_gb > cpu_mem:
+            if cpu_mem_req > cpu_mem:
                 continue
             feasible.append(p)
         policies = feasible
@@ -776,9 +949,8 @@ def generate_heuristic_policies(
     workload: Optional[WorkloadDescriptor] = None,
 ) -> List[FlexGenPolicy]:
     """
-    Node/workload-aware heuristics (fixes #13).
-    Emits low-latency, low-memory, high-throughput, and balanced candidates
-    tuned to the actual memory budget.
+    Node/workload-aware heuristics. Emits low-latency, low-memory,
+    high-throughput, and balanced candidates tuned to the actual memory budget.
     """
     gpu_mem = float(node.metadata.get("gpu_memory_gb", 16.0)) if node else 16.0
     cpu_mem = float(node.metadata.get("cpu_memory_gb", 64.0)) if node else 64.0
@@ -790,7 +962,7 @@ def generate_heuristic_policies(
 
     policies: List[FlexGenPolicy] = []
 
-    # Low-latency: prefer GPU if it fits, else CPU with FP8.
+    # Low-latency: prefer GPU if it fits, else CPU with FP16.
     if model_fp16_gb <= gpu_mem * 0.8:
         policies.append(
             FlexGenPolicy(
@@ -802,7 +974,7 @@ def generate_heuristic_policies(
             )
         )
 
-    # Low-memory: CPU weights, CPU KV, FP8.
+    # Low-memory: CPU weights, CPU KV, INT8.
     if model_fp16_gb * 0.25 <= cpu_mem * 0.8:
         policies.append(
             FlexGenPolicy(
@@ -840,7 +1012,7 @@ def generate_heuristic_policies(
 
 
 # ===========================================================================
-# Reward (workload-relative, fixes #9)
+# Reward (workload-relative, carbon-price-aware)
 # ===========================================================================
 def compute_reward(
     metrics: Dict[str, Any],
@@ -848,19 +1020,22 @@ def compute_reward(
     baseline: Optional[Dict[str, float]] = None,
 ) -> float:
     """
-    Workload-relative reward.
-    `baseline` may carry energy/carbon reference values (e.g. from a known-good
-    policy). If missing, references are derived from the workload spec so the
-    energy and carbon scores do not collapse to zero on large models.
+    Workload-relative reward with:
+
+      - latency score (relative to workload target)
+      - energy score (relative to baseline or estimated budget)
+      - carbon score (relative to baseline or estimated budget)
+      - success bonus
+      - quality term
+      - v3: carbon price cost penalty (capped)
+      - v3: latency-variance penalty (capped)
     """
     latency_target = max(float(workload.latency_target), 1.0)
     latency_score = max(0.0, 1.0 - float(metrics.get("latency_ms", 0.0)) / latency_target)
 
-    # Workload-relative references.
     if baseline and baseline.get("energy_joules", 0) > 0:
         ref_energy = baseline["energy_joules"]
     else:
-        # Estimate from token count and a nominal 5 J/token budget.
         ref_energy = max(50.0, workload.tokens * 5.0)
     if baseline and baseline.get("carbon_g", 0) > 0:
         ref_carbon = baseline["carbon_g"]
@@ -880,6 +1055,17 @@ def compute_reward(
         + 0.15 * carbon_score
         + 0.10 * success_bonus
     )
+
+    # v3: carbon price penalty. Small but non-negligible.
+    cpc = float(metrics.get("carbon_price_cost", 0.0))
+    if cpc > 0:
+        reward -= min(0.10, cpc)
+
+    # v3: latency-variance penalty. High-variance policies are less trustworthy.
+    latency_std = float(metrics.get("latency_std_ms", 0.0))
+    if latency_std > 0 and latency_target > 0:
+        reward -= min(0.05, 0.5 * latency_std / latency_target)
+
     return max(0.0, min(1.0, reward))
 
 
@@ -896,7 +1082,7 @@ def policy_schema() -> Dict[str, Any]:
     return {
         "version": POLICY_VECTOR_VERSION,
         "fields": list(POLICY_VECTOR_FIELDS),
-        "dim": len(POLICY_VECTOR_FIELDS),
-        "precision_levels": [p.value for p in PrecisionLevel],
+        "dim": FEATURE_VECTOR_DIM,
+        "precision_order": [p.value for p in PRECISION_ORDER],
         "precision_cost": {k.value: v for k, v in PRECISION_COST.items()},
     }
