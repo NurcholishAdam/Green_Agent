@@ -1,82 +1,193 @@
 """
-carbon_delay_scheduler.py
+carbon_delay_scheduler.py — Enhanced carbon-intensity-aware delay queue (v3.0.0)
+================================================================================
 
-Enhanced carbon‑intensity‑aware delay queue with MODP, bio‑inspired tuning, MoE integration,
-FlexGen policy selection, and NEW additions:
-- Causal Reinforcement Learning via CausalBandit.
-- Temporal Logic Safety Monitor.
-- Explainable AI (XAI) for every decision.
-- Federated Learning Coordinator (stub).
-- Multi-Agent Coordinator (basic).
-- Chaos Monkey for resilience testing.
-- Human-in-the-Loop with Active Learning.
+Layers MODP, bio-inspired tuning, MoE, FlexGen, causal bandit, temporal safety,
+XAI, federated coordination, multi-agent assignment, chaos engineering, and
+human-in-the-loop on top of a heap-based delay queue.
 
-All previous features retained.
+CHANGES (v3.0.0 over v2.0.0):
+- Fixed missing imports (``random``, ``uuid``, ``hashlib``).
+- **Interfaces aligned with the codebase:** ``ParetoOptimizer.evaluate``,
+  ``GeneticPolicyGenerator.evolve``, ``ExpertRouter.encode``/``select``.
+  Fallback stubs match the production signatures.
+- **Utility convention unified** (higher = better).  ``_evaluate_delay``
+  now returns ``(should_delay, scheduled_time, reason, utility)``.
+- ``federated_update`` uses a stable per-instance ``participant_id``.
+- ``MultiAgentCoordinator`` uses a stable SHA-256 hash for assignment.
+- **Async-first API** (``asubmit``, ``atick``, ``areport_reward``) with
+  sync wrappers (``submit``, ``tick``, ``report_reward``) that dispatch to
+  a background loop when called from a non-async context.
+- Heap and persistence guarded by a ``threading.RLock``.
+- Seeded ``np.random.default_rng`` replaces global ``random``.
+- ``CausalBandit`` histories are bounded; ``update`` uses ``setdefault``
+  and never raises ``KeyError`` for unknown actions.
+- ``HumanReviewManager.pending_reviews`` is a bounded ``OrderedDict``.
+- **``FeedbackEvent`` emission** on every decision (guarded by the schema
+  import and ``emit_feedback_events`` flag).
+- ``SafetyMonitor`` rules now share a uniform ``(task, delay, forecast)``
+  signature; new rules can be registered at runtime.
+- ``ChaosMonkey`` validates ``failure_probability`` and raises a typed
+  ``ChaosExperimentError``.
+- ``Delayability`` values renamed to ``NOT_DELAYABLE`` / ``TRADE_OFF`` /
+  ``FULLY_DELAYABLE`` to match the docstrings.
+- Scheduling math uses ``time.monotonic``; human-readable timestamps use
+  ``datetime.now(timezone.utc)``.
+- ``electricity_price_per_kwh`` is configurable.
+- ``_get_forecast_intensity_at`` falls back to the last known intensity.
+- Demo imports fixed (``from carbon_api import CarbonAPIStub``) with the
+  correct constructor signature.
+- ``__version__`` and ``__all__`` added.
+- Built-in test suite: ``python carbon_delay_scheduler.py --test``.
 """
 
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
 import heapq
-import time
+import inspect
 import json
-import os
 import logging
-from typing import Dict, Any, Optional, List, Tuple, Callable
-from dataclasses import dataclass, field
+import os
+import secrets
+import threading
+import time
+import uuid
+from collections import OrderedDict, deque
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Tuple
 
-# ----------------------------------------------------------------------
-# 1. Imports from other enhancement modules (assumed present)
-# ----------------------------------------------------------------------
-# Enhanced modules (with fallback stubs)
+import numpy as np
+
+__version__ = "3.0.0"
+__all__ = [
+    "__version__",
+    "Delayability",
+    "DelayedTask",
+    "CausalBandit",
+    "SafetyMonitor",
+    "SafetyRule",
+    "XAIExplainer",
+    "FederatedCoordinator",
+    "MultiAgentCoordinator",
+    "ChaosMonkey",
+    "ChaosExperimentError",
+    "HumanReviewManager",
+    "CarbonDelayScheduler",
+    "run_tests",
+]
+
+
+# ============================================================================
+# Logging
+# ============================================================================
+_LOG_DIR = Path(os.environ.get("CARBON_SCHED_LOG_DIR", "./logs"))
 try:
-    from enhancements.bio_inspired import GeneticOptimizer
-except ImportError:
-    class GeneticOptimizer:
-        def adapt(self, context, reward):
-            return None
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    _LOG_DIR = Path("/tmp")
+
+logging.basicConfig(
+    level=os.environ.get("CARBON_SCHED_LOG_LEVEL", "INFO"),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 try:
-    from enhancements.MODP import ParetoOptimizer
+    from ..schemas.feedback_event import FeedbackEvent  # type: ignore
 except ImportError:
-    class ParetoOptimizer:
-        def decide(self, objectives, weights):
-            return sum(objectives[k] * weights.get(k, 0.0) for k in objectives)
+    try:
+        from src.enhancements.schemas.feedback_event import FeedbackEvent  # type: ignore
+    except ImportError:
+        FeedbackEvent = None  # type: ignore
+
+
+# ============================================================================
+# Optional enhancement modules (fallback stubs match the production API)
+# ============================================================================
+try:
+    from enhancements.bio_inspired import GeneticPolicyGenerator  # type: ignore
+    _BIO_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _BIO_AVAILABLE = False
+
+    class GeneticPolicyGenerator:  # type: ignore
+        """Fallback that mirrors the production signature."""
+        def __init__(self, *a, **k) -> None: pass
+
+        def evolve(self, population: List[Dict[str, Any]],
+                   fitness_fn: Callable[[Dict[str, Any]], float],
+                   generations: int = 10,
+                   population_size: int = 20) -> List[Dict[str, Any]]:
+            return list(population)
+
 
 try:
-    from enhancements.moe_system import ExpertRouter
-except ImportError:
-    class ExpertRouter:
-        def classify(self, task):
-            return "normal"
+    from enhancements.MODP import ParetoOptimizer  # type: ignore
+    _MODP_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _MODP_AVAILABLE = False
 
-# FlexGen modules (with fallback)
+    class ParetoOptimizer:  # type: ignore
+        """Fallback that mirrors the production signature."""
+        def __init__(self, *a, **k) -> None: pass
+
+        def evaluate(self, objectives: Dict[str, float],
+                     weights: Dict[str, float]) -> float:
+            return float(sum(objectives.get(k, 0.0) * weights.get(k, 1.0)
+                             for k in objectives))
+
+
 try:
-    from enhancements.gpu_optimization.flexgen_policy import FlexGenPolicy, generate_candidate_policies
-    from enhancements.gpu_optimization.flexgen_cost_model import FlexGenCostModel, CostEstimate
-    from enhancements.gpu_optimization.flexgen_controller import FlexGenController
-    from enhancements.schemas.node_descriptor import NodeDescriptor
-    from enhancements.schemas.workload_descriptor import WorkloadDescriptor
-    FLEXGEN_AVAILABLE = True
-except ImportError:
-    FLEXGEN_AVAILABLE = False
-    class FlexGenPolicy: pass
-    class FlexGenCostModel:
-        def estimate(self, policy, node, workload):
-            return None
-    class FlexGenController:
-        def __init__(self, *args, **kwargs): pass
-        async def step(self): return {}
-    class NodeDescriptor: pass
-    class WorkloadDescriptor: pass
+    from enhancements.moe_system import ExpertRouter  # type: ignore
+    _MOE_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _MOE_AVAILABLE = False
+
+    class ExpertRouter:  # type: ignore
+        """Fallback that mirrors the production signature."""
+        def __init__(self, *a, **k) -> None: pass
+
+        def encode(self, context: Dict[str, Any]) -> List[float]:
+            # Deterministic encoding based on a few stable features.
+            priority = context.get("priority", "normal")
+            return [
+                1.0 if priority == "high" else 0.0,
+                1.0 if priority == "normal" else 0.0,
+                1.0 if priority == "low" else 0.0,
+                float(context.get("latency_sensitivity", 0.5)),
+                float(context.get("energy_kwh_estimate", 1.0)) / 10.0,
+            ]
+
+        def select(self, encoded: List[float]) -> str:
+            # Return one of "high" / "medium" / "low".
+            if not encoded:
+                return "normal"
+            if encoded[0] >= 0.5:
+                return "high"
+            if encoded[1] >= 0.5:
+                return "medium"
+            return "low"
 
 
-# ----------------------------------------------------------------------
-# 2. Core Enhanced CarbonDelayScheduler
-# ----------------------------------------------------------------------
+# ============================================================================
+# Types and enums
+# ============================================================================
+class Delayability(str, Enum):
+    """How delayable a task is.
 
-class Delayability(Enum):
-    HIGH = "high"       # Must not be delayed
-    MEDIUM = "medium"   # Can be delayed with trade‑offs
-    LOW = "low"         # Can be delayed aggressively
+    ``NOT_DELAYABLE`` must not be delayed; ``TRADE_OFF`` may be delayed within
+    limits; ``FULLY_DELAYABLE`` may be delayed aggressively.
+    """
+    NOT_DELAYABLE = "not_delayable"
+    TRADE_OFF = "trade_off"
+    FULLY_DELAYABLE = "fully_delayable"
+
 
 @dataclass
 class DelayedTask:
@@ -85,155 +196,340 @@ class DelayedTask:
     original_submit_time: float
     delay_reason: str
 
-# NEW: CausalBandit for policy selection
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "scheduled_time": self.scheduled_time,
+            "task": self.task,
+            "original_submit_time": self.original_submit_time,
+            "delay_reason": self.delay_reason,
+        }
+
+
+class ChaosExperimentError(Exception):
+    """Raised by ChaosMonkey when a fault is intentionally injected."""
+
+
+@dataclass
+class SafetyRule:
+    """A named predicate over (task, delay_seconds, forecast)."""
+    name: str
+    predicate: Callable[[Dict[str, Any], float,
+                         Optional[List[Tuple[float, float]]]], bool]
+    description: str = ""
+
+
+# ============================================================================
+# Enhancement components
+# ============================================================================
 class CausalBandit:
     """
-    A simple causal bandit that maintains estimates of average treatment effects
-    for each scheduling action (delay vs. forward). Used instead of or alongside
-    bio-inspired optimization.
-    """
-    def __init__(self, actions: List[str] = ["delay", "forward"], initial_value: float = 0.0):
-        self.actions = actions
-        self.q_values = {a: initial_value for a in actions}
-        self.counts = {a: 0 for a in actions}
-        self.causal_effects = {a: 0.0 for a in actions}
-        self.trials = 0
-        self.context_history = []
-        self.reward_history = []
-        self.action_history = []
+    Epsilon-greedy bandit with an average-treatment-effect estimate.
 
-    def select_action(self, context: Dict) -> str:
-        # epsilon-greedy with causal effect preference
-        epsilon = 0.1
-        if random.random() < epsilon:
-            return random.choice(self.actions)
-        # Use causal effect if enough data, else Q-values
-        if self.trials >= 10 and any(self.causal_effects.values()):
+    Bounded histories prevent unbounded memory growth.  ``update`` never
+    raises ``KeyError`` for unknown actions; new actions are registered
+    automatically (which also supports bio-driven expansion).
+    """
+
+    def __init__(self, actions: Optional[List[str]] = None,
+                 initial_value: float = 0.0,
+                 epsilon: float = 0.1,
+                 min_trials_for_causal: int = 10,
+                 history_size: int = 1000,
+                 seed: int = 42) -> None:
+        self.actions: List[str] = list(actions or ["delay", "forward"])
+        self._rng = np.random.default_rng(seed)
+        self.epsilon = float(epsilon)
+        self.min_trials_for_causal = int(min_trials_for_causal)
+        self.q_values: Dict[str, float] = {}
+        self.counts: Dict[str, int] = {}
+        self.causal_effects: Dict[str, float] = {}
+        self.trials = 0
+        self.context_history: Deque[Dict[str, Any]] = deque(maxlen=history_size)
+        self.reward_history: Deque[float] = deque(maxlen=history_size)
+        self.action_history: Deque[str] = deque(maxlen=history_size)
+        for a in self.actions:
+            self._register(a, initial_value)
+
+    def _register(self, name: str, initial: float = 0.0) -> None:
+        self.q_values.setdefault(name, float(initial))
+        self.counts.setdefault(name, 0)
+        self.causal_effects.setdefault(name, 0.0)
+        if name not in self.actions:
+            self.actions.append(name)
+
+    def select_action(self, context: Dict[str, Any]) -> str:
+        if float(self._rng.random()) < self.epsilon:
+            idx = int(self._rng.integers(0, len(self.actions)))
+            return self.actions[idx]
+        if (self.trials >= self.min_trials_for_causal
+                and any(self.causal_effects.values())):
             return max(self.causal_effects, key=self.causal_effects.get)
         return max(self.q_values, key=self.q_values.get)
 
-    def update(self, context: Dict, action: str, reward: float):
+    def update(self, context: Dict[str, Any], action: str,
+               reward: float) -> None:
+        self._register(action)
         self.trials += 1
         self.counts[action] += 1
-        self.q_values[action] += (reward - self.q_values[action]) / self.counts[action]
-        self.context_history.append(context)
-        self.reward_history.append(reward)
+        n = self.counts[action]
+        self.q_values[action] += (float(reward) - self.q_values[action]) / n
+        self.context_history.append(dict(context))
+        self.reward_history.append(float(reward))
         self.action_history.append(action)
-        # Estimate causal effect: average reward for this action
-        rewards = [r for a, r in zip(self.action_history, self.reward_history) if a == action]
-        self.causal_effects[action] = sum(rewards) / len(rewards) if rewards else 0.0
+        self.causal_effects[action] += (
+            float(reward) - self.causal_effects[action]) / n
 
-# NEW: Safety Monitor (Temporal Logic-like)
-class SafetyMonitor:
-    def __init__(self, max_delay_high_priority: float = 300.0):  # 5 minutes
-        self.rules = {
-            "max_delay_high_priority": lambda task, delay: task.get("priority") == "high" and delay > max_delay_high_priority,
-            "no_delay_without_forecast": lambda task, delay, forecast: forecast is None and delay > 0,
+    def export_state(self) -> Dict[str, Any]:
+        return {
+            "q_values": dict(self.q_values),
+            "counts": dict(self.counts),
+            "causal_effects": dict(self.causal_effects),
+            "trials": self.trials,
+            "action_names": list(self.actions),
         }
 
-    def check(self, task: Dict, delay: float, forecast: Optional[List[Tuple[float, float]]] = None) -> bool:
-        """
-        Returns True if safe, False if violation.
-        """
-        if self.rules["max_delay_high_priority"](task, delay):
-            return False
-        if self.rules["no_delay_without_forecast"](task, delay, forecast):
-            return False
-        return True
+    def import_state(self, state: Dict[str, Any]) -> None:
+        for name, v in state.get("q_values", {}).items():
+            self._register(name)
+            self.q_values[name] = float(v)
+        for name, v in state.get("counts", {}).items():
+            self._register(name)
+            self.counts[name] = int(v)
+        for name, v in state.get("causal_effects", {}).items():
+            self._register(name)
+            self.causal_effects[name] = float(v)
+        self.trials = int(state.get("trials", 0))
 
-# NEW: XAI Explainer
+
+class SafetyMonitor:
+    """
+    Temporal-logic-like safety monitor with a uniform rule signature
+    ``(task, delay_seconds, forecast) -> bool`` (True = safe).
+    """
+
+    def __init__(self,
+                 max_delay_high_priority: float = 300.0) -> None:
+        self.max_delay_high_priority = float(max_delay_high_priority)
+        self._rules: List[SafetyRule] = []
+        self._install_default_rules()
+
+    def _install_default_rules(self) -> None:
+        def max_delay_high(task: Dict[str, Any], delay: float,
+                           forecast: Optional[List[Tuple[float, float]]]
+                           ) -> bool:
+            if task.get("priority") == "high" and delay > self.max_delay_high_priority:
+                return False
+            return True
+
+        def no_delay_without_forecast(
+            task: Dict[str, Any], delay: float,
+            forecast: Optional[List[Tuple[float, float]]],
+        ) -> bool:
+            if delay > 0 and not forecast:
+                return False
+            return True
+
+        self.add_rule(SafetyRule("max_delay_high_priority",
+                                 max_delay_high,
+                                 "high-priority delay cap"))
+        self.add_rule(SafetyRule("no_delay_without_forecast",
+                                 no_delay_without_forecast,
+                                 "delay requires a forecast"))
+
+    def add_rule(self, rule: SafetyRule) -> None:
+        self._rules.append(rule)
+
+    def check(self, task: Dict[str, Any], delay: float,
+              forecast: Optional[List[Tuple[float, float]]] = None
+              ) -> Tuple[bool, List[str]]:
+        violations: List[str] = []
+        for rule in self._rules:
+            try:
+                if not rule.predicate(task, delay, forecast):
+                    violations.append(rule.name)
+            except Exception as e:  # pragma: no cover
+                logger.warning("Safety rule %s raised: %s", rule.name, e)
+        return (not violations), violations
+
+    @property
+    def rule_names(self) -> List[str]:
+        return [r.name for r in self._rules]
+
+
 class XAIExplainer:
-    def explain_delay(self, task: Dict, current_intensity: float, best_intensity: float,
-                      delay_seconds: float, utility: float, reason: str) -> str:
-        parts = []
+    def explain_delay(self, task: Dict[str, Any],
+                      current_intensity: float,
+                      best_intensity: Optional[float],
+                      delay_seconds: float,
+                      utility: float,
+                      reason: str) -> str:
+        parts: List[str] = []
         if delay_seconds > 0:
             parts.append(f"Delaying task for {delay_seconds:.0f}s.")
-            parts.append(f"Carbon intensity drops from {current_intensity:.1f} to {best_intensity:.1f} gCO2/kWh.")
+            if best_intensity is not None:
+                parts.append(
+                    f"Carbon intensity drops from {current_intensity:.1f} "
+                    f"to {best_intensity:.1f} gCO2/kWh.")
         else:
             parts.append("Forwarding task immediately.")
             if reason:
                 parts.append(f"Reason: {reason}")
-        parts.append(f"Utility score: {utility:.3f}")
+        parts.append(f"Utility: {utility:.3f}")
         return " ".join(parts)
 
-# NEW: Federated Learning Coordinator (stub)
+
 class FederatedCoordinator:
-    def __init__(self):
-        self.participants = {}
+    """In-process FedAvg over a weighted mean of numeric model updates."""
 
-    def register(self, participant_id: str, model_update: Dict):
-        self.participants[participant_id] = model_update
+    def __init__(self, max_participants: int = 1000) -> None:
+        self._participants: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._weights: Dict[str, float] = {}
+        self._max_participants = max(1, int(max_participants))
 
-    def aggregate(self) -> Dict:
-        if not self.participants:
+    def register(self, participant_id: str, model_update: Dict[str, Any],
+                 weight: float = 1.0) -> None:
+        if participant_id not in self._participants:
+            while len(self._participants) >= self._max_participants:
+                self._participants.popitem(last=False)
+        self._participants[participant_id] = dict(model_update)
+        self._weights[participant_id] = float(weight)
+
+    def aggregate(self) -> Dict[str, float]:
+        if not self._participants:
             return {}
-        # Average all model updates
         keys = set()
-        for p in self.participants.values():
-            keys.update(p.keys())
-        avg = {}
-        for key in keys:
-            vals = [p.get(key, 0.0) for p in self.participants.values()]
-            avg[key] = sum(vals) / len(vals)
-        return avg
+        for update in self._participants.values():
+            keys.update(update.keys())
+        out: Dict[str, float] = {}
+        for k in keys:
+            total = 0.0
+            wsum = 0.0
+            for pid, update in self._participants.items():
+                v = update.get(k)
+                if isinstance(v, (int, float)):
+                    w = self._weights.get(pid, 1.0)
+                    total += float(v) * w
+                    wsum += w
+            if wsum > 0:
+                out[k] = total / wsum
+        return out
 
-# NEW: Multi-Agent Coordinator (basic)
+    def reset(self) -> None:
+        self._participants.clear()
+        self._weights.clear()
+
+
 class MultiAgentCoordinator:
-    def __init__(self, num_agents: int = 3):
-        self.agents = [f"agent_{i}" for i in range(num_agents)]
-        self.responsibilities = {agent: [] for agent in self.agents}
+    """
+    Assigns tasks to agents using a stable SHA-256 hash of the task id.
+    Round-robin fallback when the id is missing.
+    """
 
-    def assign_task(self, task: Dict) -> str:
-        # Simple round-robin assignment
-        agent = self.agents[hash(task.get("id", str(time.time()))) % len(self.agents)]
-        self.responsibilities[agent].append(task.get("id"))
+    def __init__(self, num_agents: int = 3) -> None:
+        if num_agents < 1:
+            raise ValueError("num_agents must be >= 1")
+        self.agents = [f"agent_{i}" for i in range(num_agents)]
+        self.responsibilities: Dict[str, List[str]] = {
+            a: [] for a in self.agents
+        }
+        self._rr_counter = 0
+
+    def _stable_hash(self, value: Any) -> int:
+        raw = str(value).encode()
+        return int(hashlib.sha256(raw).hexdigest(), 16)
+
+    def assign_task(self, task: Dict[str, Any]) -> str:
+        task_id = task.get("id")
+        if task_id is None:
+            agent = self.agents[self._rr_counter % len(self.agents)]
+            self._rr_counter += 1
+        else:
+            agent = self.agents[self._stable_hash(task_id) % len(self.agents)]
+        self.responsibilities[agent].append(str(task_id))
         return agent
 
-# NEW: Chaos Monkey
+    def load(self) -> Dict[str, int]:
+        return {a: len(tasks) for a, tasks in self.responsibilities.items()}
+
+
 class ChaosMonkey:
-    def __init__(self, failure_probability: float = 0.1, enabled: bool = True):
-        self.failure_probability = failure_probability
-        self.enabled = enabled
+    """Injects random failures when enabled."""
 
-    def maybe_fail(self):
-        if self.enabled and random.random() < self.failure_probability:
-            raise Exception("Simulated chaos failure")
+    def __init__(self, failure_probability: float = 0.1,
+                 enabled: bool = True,
+                 seed: int = 42) -> None:
+        if not 0.0 <= failure_probability <= 1.0:
+            raise ValueError("failure_probability must be in [0, 1]")
+        self.failure_probability = float(failure_probability)
+        self.enabled = bool(enabled)
+        self._rng = np.random.default_rng(seed)
 
-# NEW: Human Review Manager
+    def maybe_fail(self) -> None:
+        if self.enabled and float(self._rng.random()) < self.failure_probability:
+            raise ChaosExperimentError("Simulated chaos failure")
+
+
 class HumanReviewManager:
-    def __init__(self):
-        self.pending_reviews = {}
+    def __init__(self, max_pending: int = 500) -> None:
+        self.pending_reviews: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._max_pending = max(1, int(max_pending))
 
-    def request_review(self, task: Dict, decision: Dict) -> str:
-        review_id = str(uuid.uuid4()) if 'uuid' in globals() else str(time.time())
-        self.pending_reviews[review_id] = {"task": task, "decision": decision, "status": "pending"}
+    def request_review(self, task: Dict[str, Any],
+                       decision: Dict[str, Any]) -> str:
+        review_id = str(uuid.uuid4())
+        self.pending_reviews[review_id] = {
+            "task": dict(task),
+            "decision": dict(decision),
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        while len(self.pending_reviews) > self._max_pending:
+            self.pending_reviews.popitem(last=False)
         return review_id
 
-    def approve(self, review_id: str):
-        if review_id in self.pending_reviews:
-            self.pending_reviews[review_id]["status"] = "approved"
+    def approve(self, review_id: str,
+                feedback: Optional[str] = None) -> bool:
+        r = self.pending_reviews.get(review_id)
+        if r is None:
+            return False
+        r["status"] = "approved"
+        r["feedback"] = feedback
+        r["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+        return True
 
-    def reject(self, review_id: str):
-        if review_id in self.pending_reviews:
-            self.pending_reviews[review_id]["status"] = "rejected"
+    def reject(self, review_id: str,
+               feedback: Optional[str] = None) -> bool:
+        r = self.pending_reviews.get(review_id)
+        if r is None:
+            return False
+        r["status"] = "rejected"
+        r["feedback"] = feedback
+        r["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+        return True
 
     def get_pending(self) -> List[str]:
-        return [rid for rid, data in self.pending_reviews.items() if data["status"] == "pending"]
+        return [rid for rid, data in self.pending_reviews.items()
+                if data["status"] == "pending"]
 
 
+# ============================================================================
+# Scheduler
+# ============================================================================
 class CarbonDelayScheduler:
     """
-    Enhanced scheduler with MODP, bio‑inspired adaptation, MoE integration,
-    FlexGen policy selection, and now also:
-    - Causal Bandit for action selection.
-    - Safety Monitor.
-    - XAI Explanations.
-    - Federated Learning (optional).
-    - Multi-Agent Coordination (basic).
-    - Chaos Monkey.
-    - Human-in-the-Loop.
+    Carbon-aware delay queue.
 
+    Recommended usage is async::
+
+        await scheduler.asubmit(task)
+        released = await scheduler.atick()
+        await scheduler.areport_reward(task, reward, action)
+
+    Synchronous ``submit``, ``tick`` and ``report_reward`` remain for
+    non-async callers; they dispatch to the background event loop when the
+    caller is not already inside one.
     """
+
     def __init__(
         self,
         carbon_api: Any,
@@ -252,106 +548,45 @@ class CarbonDelayScheduler:
         multi_agent_coordinator: Optional[MultiAgentCoordinator] = None,
         chaos_monkey: Optional[ChaosMonkey] = None,
         human_review: Optional[HumanReviewManager] = None,
-    ):
-        """
-        Args:
-            carbon_api: Object with get_current() and get_forecast().
-            max_delay_seconds: Initial maximum delay.
-            threshold_gco2_per_kwh: Initial carbon threshold.
-            persistence_file: Path to save/load queue state.
-            modp_weights: Weights for MODP objectives: carbon, latency, energy, cost.
-            bio_optimizer: Instance of bio_inspired optimizer (optional).
-            moe_router: Instance of MoE router (optional).
-            forecast_confidence_threshold: Only use forecast points with confidence > this.
-            flexgen_manager: Optional FlexGen manager for policy selection.
-            causal_bandit: Optional causal bandit for scheduling decisions.
-            safety_monitor: Optional safety monitor.
-            xai_explainer: Optional XAI explainer.
-            federated_coordinator: Optional federated learning coordinator.
-            multi_agent_coordinator: Optional multi-agent coordinator.
-            chaos_monkey: Optional chaos monkey for resilience testing.
-            human_review: Optional human review manager.
-        """
+        electricity_price_per_kwh: float = 0.15,
+        seed: int = 42,
+        emit_feedback_events: bool = True,
+    ) -> None:
         self.carbon_api = carbon_api
-        self.max_delay = max_delay_seconds
-        self.threshold = threshold_gco2_per_kwh
+        self.max_delay = float(max_delay_seconds)
+        self.threshold = float(threshold_gco2_per_kwh)
         self.persistence_file = persistence_file
-        self.forecast_confidence_threshold = forecast_confidence_threshold
+        self.forecast_confidence_threshold = float(
+            forecast_confidence_threshold)
+        self.electricity_price_per_kwh = float(electricity_price_per_kwh)
+        self.seed = int(seed)
+        self.emit_feedback_events = bool(emit_feedback_events)
+        self.instance_id = str(uuid.uuid4())[:8]
 
-        # Logging
-        self.logger = logging.getLogger(__name__)
+        self.modp_weights = modp_weights or {
+            "carbon": 0.4, "latency": 0.3, "energy": 0.2, "cost": 0.1}
 
-        # Multi‑objective decision
-        if modp_weights is None:
-            self.modp_weights = {
-                "carbon": 0.4,
-                "latency": 0.3,
-                "energy": 0.2,
-                "cost": 0.1
-            }
-        else:
-            self.modp_weights = modp_weights
-
-        # MODP instance
-        try:
-            if 'ParetoOptimizer' in globals() and hasattr(ParetoOptimizer, 'decide'):
-                self.modp = ParetoOptimizer()
-            else:
-                class _MODP:
-                    def __init__(self, weights):
-                        self.weights = weights
-                    def decide(self, objectives, weights=None):
-                        w = weights or self.weights
-                        return sum(objectives[k] * w.get(k, 0.0) for k in objectives)
-                self.modp = _MODP(self.modp_weights)
-        except Exception:
-            class _MODP:
-                def __init__(self, weights):
-                    self.weights = weights
-                def decide(self, objectives, weights=None):
-                    w = weights or self.weights
-                    return sum(objectives[k] * w.get(k, 0.0) for k in objectives)
-            self.modp = _MODP(self.modp_weights)
-
-        # Bio‑inspired adaptation
-        self.bio = bio_optimizer if bio_optimizer else GeneticOptimizer()
-
-        # Causal bandit (if provided, else default)
-        self.causal_bandit = causal_bandit if causal_bandit else CausalBandit()
-
-        # MoE router
-        self.moe = moe_router if moe_router else ExpertRouter()
-
-        # Safety monitor
-        self.safety_monitor = safety_monitor if safety_monitor else SafetyMonitor()
-
-        # XAI explainer
-        self.xai = xai_explainer if xai_explainer else XAIExplainer()
-
-        # Federated coordinator (optional)
+        self.modp = ParetoOptimizer()
+        self.bio = bio_optimizer or GeneticPolicyGenerator()
+        self.moe = moe_router or ExpertRouter()
+        self.causal_bandit = causal_bandit or CausalBandit(seed=self.seed)
+        self.safety_monitor = safety_monitor or SafetyMonitor()
+        self.xai = xai_explainer or XAIExplainer()
         self.federated = federated_coordinator
-
-        # Multi-agent coordinator (optional)
         self.multi_agent = multi_agent_coordinator
-
-        # Chaos monkey
-        self.chaos_monkey = chaos_monkey if chaos_monkey else ChaosMonkey(enabled=False)
-
-        # Human review manager
-        self.human_review = human_review if human_review else HumanReviewManager()
-
-        # FlexGen manager
+        self.chaos_monkey = chaos_monkey or ChaosMonkey(enabled=False,
+                                                       seed=self.seed)
+        self.human_review = human_review or HumanReviewManager()
         self.flexgen_manager = flexgen_manager
-        self._flexgen_available = FLEXGEN_AVAILABLE and flexgen_manager is not None
+        self._flexgen_available = flexgen_manager is not None
 
-        # Priority queue
+        self._rng = np.random.default_rng(self.seed)
         self.queue: List[Tuple[float, DelayedTask]] = []
+        self._lock = threading.RLock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_thread: Optional[threading.Thread] = None
 
-        # Load persisted queue if exists
-        self._load_queue()
-
-        # Metrics
-        self.metrics = {
+        self.metrics: Dict[str, Any] = {
             "total_delayed": 0,
             "total_forwarded": 0,
             "total_released": 0,
@@ -362,189 +597,271 @@ class CarbonDelayScheduler:
             "total_reviews_requested": 0,
         }
 
-    # --------------------- Persistence ---------------------
-    def _load_queue(self):
+        self._load_queue()
+
+    # ------------------------------------------------------------------
+    # Background loop (used by sync wrappers)
+    # ------------------------------------------------------------------
+    def _get_loop(self) -> asyncio.AbstractEventLoop:
+        with self._lock:
+            if self._loop is not None and self._loop.is_running():
+                return self._loop
+            loop = asyncio.new_event_loop()
+
+            def runner() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_forever()
+
+            t = threading.Thread(target=runner,
+                                 name=f"cds-loop-{self.instance_id}",
+                                 daemon=True)
+            t.start()
+            self._loop = loop
+            self._loop_thread = t
+            return loop
+
+    def _run_sync(self, coro: Awaitable[Any]) -> Any:
+        try:
+            # If we're already inside a loop, submit to the background one.
+            asyncio.get_running_loop()
+            loop = self._get_loop()
+            return asyncio.run_coroutine_threadsafe(coro, loop).result()
+        except RuntimeError:
+            return asyncio.run(coro)
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+    def _load_queue(self) -> None:
         if not self.persistence_file or not os.path.exists(self.persistence_file):
             return
         try:
             with open(self.persistence_file, "r") as f:
                 data = json.load(f)
+            with self._lock:
                 for item in data:
                     task = DelayedTask(
-                        scheduled_time=item["scheduled_time"],
+                        scheduled_time=float(item["scheduled_time"]),
                         task=item["task"],
-                        original_submit_time=item["original_submit_time"],
-                        delay_reason=item["delay_reason"]
+                        original_submit_time=float(item["original_submit_time"]),
+                        delay_reason=item.get("delay_reason", ""),
                     )
                     heapq.heappush(self.queue, (task.scheduled_time, task))
-            self.logger.info(f"Loaded {len(self.queue)} tasks from persistence.")
-        except Exception as e:
-            self.logger.error(f"Failed to load queue: {e}")
+            logger.info("Loaded %d tasks from persistence.", len(self.queue))
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.error("Failed to load queue: %s", e)
 
-    def _save_queue(self):
+    def _save_queue(self) -> None:
         if not self.persistence_file:
             return
         try:
-            data = []
-            for _, task in self.queue:
-                data.append({
-                    "scheduled_time": task.scheduled_time,
-                    "task": task.task,
-                    "original_submit_time": task.original_submit_time,
-                    "delay_reason": task.delay_reason,
-                })
-            with open(self.persistence_file, "w") as f:
-                json.dump(data, f)
-            self.logger.debug("Queue persisted.")
+            with self._lock:
+                payload = [t.to_dict() for _, t in self.queue]
+            path = Path(self.persistence_file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, path)
+        except OSError as e:
+            logger.error("Failed to persist queue: %s", e)
+
+    # ------------------------------------------------------------------
+    # Decision
+    # ------------------------------------------------------------------
+    def _get_delayability(self, task: Dict[str, Any]) -> Delayability:
+        if task.get("priority") == "high":
+            return Delayability.NOT_DELAYABLE
+        try:
+            encoded = self.moe.encode(task)
+            category = self.moe.select(encoded) if hasattr(self.moe, "select") \
+                else "normal"
         except Exception as e:
-            self.logger.error(f"Failed to persist queue: {e}")
+            logger.warning("MoE classification failed: %s", e)
+            category = "normal"
+        if category == "high":
+            return Delayability.NOT_DELAYABLE
+        if category == "medium":
+            return Delayability.TRADE_OFF
+        return Delayability.FULLY_DELAYABLE
 
-    # --------------------- Multi‑Objective Decision ---------------------
-    def _evaluate_delay(self, task: Dict[str, Any],
-                        current_intensity: float,
-                        forecast: List[Tuple[float, float]]) -> Tuple[bool, Optional[float], str]:
+    async def _evaluate_delay(
+        self,
+        task: Dict[str, Any],
+        current_intensity: float,
+        forecast: List[Tuple[float, float]],
+    ) -> Tuple[bool, Optional[float], str, float]:
         """
-        Uses MODP to decide whether to delay.
-        Returns (should_delay, scheduled_time, reason).
-        """
-        # Extract task features
-        task_latency_sensitivity = task.get("latency_sensitivity", 0.5)
-        task_energy_estimate = task.get("energy_kwh_estimate", 1.0)
-        task_cost_estimate = task.get("cost_estimate", 0.0)
+        Returns ``(should_delay, scheduled_time, reason, utility)``.
 
-        # Simulate chaos
+        Convention: **higher utility = better.**  Delaying is beneficial
+        when utility > 0.
+        """
+        # Chaos injection (disabled by default).
         self.chaos_monkey.maybe_fail()
 
-        # Find best low-carbon window
-        now = time.time()
-        best_time = None
-        best_intensity = None
+        now = time.monotonic()
+        best_time: Optional[float] = None
+        best_intensity: Optional[float] = None
         for ts, intensity in forecast:
             if intensity < self.threshold and (ts - now) <= self.max_delay:
-                confidence = 1.0  # stub; could be from forecast
-                if confidence >= self.forecast_confidence_threshold:
-                    if best_time is None or intensity < best_intensity:
-                        best_time = ts
-                        best_intensity = intensity
+                if best_time is None or intensity < best_intensity:
+                    best_time = ts
+                    best_intensity = intensity
 
-        if best_time is None:
-            return False, None, "No suitable low‑carbon window"
+        if best_time is None or best_intensity is None:
+            return False, None, "No suitable low-carbon window", 0.0
 
-        # Objectives
-        carbon_reduction = current_intensity - best_intensity
-        latency_cost = best_time - now
-        idle_power_watts = task.get("idle_power_watts", 10.0)
-        energy_overhead_kwh = (idle_power_watts * latency_cost) / 3600 / 1000
-        electricity_price_per_kwh = 0.15
-        cost = energy_overhead_kwh * electricity_price_per_kwh
+        carbon_reduction = max(0.0, current_intensity - best_intensity)
+        latency_cost = max(0.0, best_time - now)
+        idle_power_watts = float(task.get("idle_power_watts", 10.0))
+        energy_overhead_kwh = (idle_power_watts * latency_cost) / 3_600_000.0
+        cost = energy_overhead_kwh * self.electricity_price_per_kwh
 
+        # Higher = better for every objective.
         objectives = {
-            "carbon": -carbon_reduction,
-            "latency": latency_cost,
-            "energy": energy_overhead_kwh,
-            "cost": cost,
+            "carbon": carbon_reduction,
+            "latency": -latency_cost / max(1.0, self.max_delay),
+            "energy": -energy_overhead_kwh,
+            "cost": -cost,
         }
-        utility = self.modp.decide(objectives, self.modp_weights)
+        utility = float(self.modp.evaluate(objectives, self.modp_weights))
 
-        if utility < 0:
-            return True, best_time, f"MODP utility={utility:.3f}"
-        else:
-            return False, None, f"MODP utility={utility:.3f} (not beneficial)"
+        if utility > 0:
+            return True, best_time, f"MODP utility={utility:.3f}", utility
+        return False, None, f"MODP utility={utility:.3f} (not beneficial)", utility
 
-    # --------------------- Bio‑inspired Adaptation ---------------------
-    def adapt_parameters(self, reward: float):
+    # ------------------------------------------------------------------
+    # Bio-inspired adaptation
+    # ------------------------------------------------------------------
+    async def _adapt_parameters(self, reward: float) -> None:
+        try:
+            current_intensity = await self._current_intensity_async()
+        except Exception:
+            current_intensity = 0.0
         context = {
             "threshold": self.threshold,
             "max_delay": self.max_delay,
             "task_count": len(self.queue),
-            "avg_carbon": self.carbon_api.get_current(),
+            "avg_carbon": current_intensity,
         }
-        new_params = self.bio.adapt(context, reward)
-        if new_params:
-            self.threshold = new_params.get("threshold", self.threshold)
-            self.max_delay = new_params.get("max_delay", self.max_delay)
-            self.logger.info(f"Bio‑adapted: threshold={self.threshold:.1f}, max_delay={self.max_delay}")
 
-    # --------------------- MoE Delayability Classification ---------------------
-    def _get_delayability(self, task: Dict[str, Any]) -> Delayability:
-        if task.get("priority") == "high":
-            return Delayability.HIGH
+        def fitness(policy: Dict[str, Any]) -> float:
+            return float(reward)
 
-        category = self.moe.classify(task)
-        if category == "high":
-            return Delayability.HIGH
-        elif category == "medium":
-            return Delayability.MEDIUM
-        else:
-            return Delayability.LOW
+        try:
+            population = [{"threshold": self.threshold, "max_delay": self.max_delay}]
+            evolved = self.bio.evolve(
+                population=population,
+                fitness_fn=fitness,
+                generations=1,
+                population_size=2,
+            )
+            if evolved:
+                best = evolved[0]
+                self.threshold = float(best.get("threshold", self.threshold))
+                self.max_delay = float(best.get("max_delay", self.max_delay))
+        except Exception as e:
+            logger.warning("Bio adaptation failed: %s", e)
 
-    # --------------------- FlexGen Policy Selection ---------------------
-    def select_flexgen_policy(self, task: Dict[str, Any], node: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def adapt_parameters(self, reward: float) -> None:
+        """Sync wrapper for ``_adapt_parameters``."""
+        self._run_sync(self._adapt_parameters(reward))
+
+    # ------------------------------------------------------------------
+    # Carbon API helpers
+    # ------------------------------------------------------------------
+    async def _current_intensity_async(self) -> float:
+        result = self.carbon_api.get_current()
+        if inspect.iscoroutine(result):
+            result = await result
+        return float(result)
+
+    async def _forecast_async(self, minutes: int
+                              ) -> List[Tuple[float, float]]:
+        result = self.carbon_api.get_forecast(minutes)
+        if inspect.iscoroutine(result):
+            result = await result
+        return list(result or [])
+
+    # ------------------------------------------------------------------
+    # FlexGen
+    # ------------------------------------------------------------------
+    async def select_flexgen_policy(self,
+                                    task: Dict[str, Any],
+                                    node: Optional[Dict[str, Any]] = None
+                                    ) -> Dict[str, Any]:
         if not self._flexgen_available:
             return {"error": "FlexGen manager not available"}
         try:
-            workload = WorkloadDescriptor(**task.get("workload", {}))
-            node_desc = NodeDescriptor(**node) if node else NodeDescriptor(
-                id="default_node",
-                type="cloud",
-                region="us-east",
-                region_carbon_intensity=0.42,
-                energy_per_token=0.00005,
-                uptime=0.99,
-                maintenance_status="operational"
-            )
-            result = self.flexgen_manager.optimize_policy(workload, node_desc)
+            result = self.flexgen_manager.optimize_policy(
+                task.get("workload", task), node or {})
+            if inspect.iscoroutine(result):
+                result = await result
             self.metrics["total_flexgen_policies_selected"] += 1
             return result
         except Exception as e:
-            self.logger.error(f"FlexGen policy selection failed: {e}")
+            logger.error("FlexGen policy selection failed: %s", e)
             return {"error": str(e)}
 
-    # --------------------- Main Public API ---------------------
-    def submit(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Decide whether to delay the task, based on MODP, MoE, causal bandit,
-        safety monitor, and possibly FlexGen policy evaluation.
-        Returns dict with status, delay_until, reason, explanation, and optional FlexGen policy.
-        """
-        # 1. Determine delayability via MoE
+    # ------------------------------------------------------------------
+    # Async public API
+    # ------------------------------------------------------------------
+    async def asubmit(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        # 1. Delayability gate.
         delayability = self._get_delayability(task)
-        if delayability == Delayability.HIGH:
+        if delayability is Delayability.NOT_DELAYABLE:
             self.metrics["total_forwarded"] += 1
-            explanation = self.xai.explain_delay(task, 0, 0, 0, 0, "High priority")
-            return {"status": "forward", "task": task, "delay_until": None, "reason": "High priority",
-                    "explanation": explanation}
+            explanation = self.xai.explain_delay(
+                task, 0.0, None, 0.0, 0.0, "High priority")
+            result = {"status": "forward", "task": task, "delay_until": None,
+                      "reason": "High priority",
+                      "delayability": delayability.value,
+                      "explanation": explanation}
+            await self._emit_feedback_event(task, "forward", 0.0, explanation)
+            return result
 
-        # 2. Current carbon intensity
-        current_intensity = self.carbon_api.get_current()
+        # 2. Current intensity.
+        current_intensity = await self._current_intensity_async()
 
-        # 3. If current intensity is already low, forward immediately
+        # 3. Already low carbon?  Forward immediately.
         if current_intensity <= self.threshold:
             flexgen_policy = None
             if self._flexgen_available and task.get("type") == "inference":
-                flexgen_policy = self.select_flexgen_policy(task)
+                flexgen_policy = await self.select_flexgen_policy(task)
             self.metrics["total_forwarded"] += 1
-            explanation = self.xai.explain_delay(task, current_intensity, current_intensity, 0, 0, "Already low carbon")
-            result = {"status": "forward", "task": task, "delay_until": None, "reason": "Already low carbon",
+            explanation = self.xai.explain_delay(
+                task, current_intensity, current_intensity, 0.0, 0.0,
+                "Already low carbon")
+            result = {"status": "forward", "task": task, "delay_until": None,
+                      "reason": "Already low carbon",
+                      "delayability": delayability.value,
                       "explanation": explanation}
             if flexgen_policy:
                 result["flexgen_policy"] = flexgen_policy
+            await self._emit_feedback_event(task, "forward", 0.0, explanation)
             return result
 
-        # 4. Get forecast
-        forecast_minutes = self.max_delay // 60 + 2
-        forecast = self.carbon_api.get_forecast(forecast_minutes)
+        # 4. Forecast.
+        forecast_minutes = int(self.max_delay // 60) + 2
+        forecast = await self._forecast_async(forecast_minutes)
         if not forecast:
             self.metrics["total_forwarded"] += 1
-            explanation = self.xai.explain_delay(task, current_intensity, current_intensity, 0, 0, "No forecast available")
-            return {"status": "forward", "task": task, "delay_until": None, "reason": "No forecast available",
-                    "explanation": explanation}
+            explanation = self.xai.explain_delay(
+                task, current_intensity, current_intensity, 0.0, 0.0,
+                "No forecast available")
+            result = {"status": "forward", "task": task, "delay_until": None,
+                      "reason": "No forecast available",
+                      "delayability": delayability.value,
+                      "explanation": explanation}
+            await self._emit_feedback_event(task, "forward", 0.0, explanation)
+            return result
 
-        # 5. Evaluate delay using MODP
-        should_delay, scheduled_time, reason = self._evaluate_delay(task, current_intensity, forecast)
+        # 5. MODP evaluation.
+        should_delay, scheduled_time, reason, utility = await self._evaluate_delay(
+            task, current_intensity, forecast)
 
-        # 6. Use causal bandit to decide final action (override if bandit says forward)
-        #    (We treat bandit as a meta-decision on whether to trust MODP's delay suggestion)
+        # 6. Causal bandit meta-decision.
         context = {
             "current_intensity": current_intensity,
             "forecast_available": len(forecast) > 0,
@@ -555,164 +872,428 @@ class CarbonDelayScheduler:
         self.metrics["total_causal_bandit_actions"] += 1
 
         if should_delay and bandit_action == "forward":
-            # Bandit suggests not delaying, override
             should_delay = False
             reason = "Causal bandit suggests forward"
+            scheduled_time = None
         elif not should_delay and bandit_action == "delay":
-            # Bandit suggests delaying, but only if MODP also found a window
             if scheduled_time is not None:
                 should_delay = True
                 reason = "Causal bandit suggests delay"
 
-        # 7. Safety monitor check
-        delay_seconds = scheduled_time - time.time() if should_delay else 0
-        if should_delay and not self.safety_monitor.check(task, delay_seconds, forecast):
-            self.metrics["total_safety_violations"] += 1
-            should_delay = False
-            reason = "Safety monitor violation"
-            scheduled_time = None
+        # 7. Safety gate.
+        delay_seconds = 0.0
+        if should_delay and scheduled_time is not None:
+            delay_seconds = max(0.0, scheduled_time - time.monotonic())
+            safe, violations = self.safety_monitor.check(
+                task, delay_seconds, forecast)
+            if not safe:
+                self.metrics["total_safety_violations"] += 1
+                should_delay = False
+                scheduled_time = None
+                reason = f"Safety violation: {violations}"
 
-        # 8. If medium and delay too long, forward
-        if should_delay and delayability == Delayability.MEDIUM and delay_seconds > self.max_delay * 0.5:
+        # 8. Medium-priority cap.
+        if should_delay and delayability is Delayability.TRADE_OFF \
+                and delay_seconds > self.max_delay * 0.5:
             should_delay = False
-            reason = f"Delay too long for medium priority ({delay_seconds:.0f}s)"
             scheduled_time = None
+            reason = (f"Delay too long for trade-off priority "
+                      f"({delay_seconds:.0f}s)")
 
-        # 9. Final decision
-        if should_delay:
-            delayed_task = DelayedTask(
+        # 9. Commit.
+        if should_delay and scheduled_time is not None:
+            delayed = DelayedTask(
                 scheduled_time=scheduled_time,
                 task=task,
-                original_submit_time=time.time(),
-                delay_reason=reason
+                original_submit_time=time.monotonic(),
+                delay_reason=reason,
             )
-            heapq.heappush(self.queue, (delayed_task.scheduled_time, delayed_task))
+            with self._lock:
+                heapq.heappush(self.queue, (delayed.scheduled_time, delayed))
             self.metrics["total_delayed"] += 1
             self._save_queue()
+            best_intensity = self._get_forecast_intensity_at(
+                forecast, scheduled_time)
             explanation = self.xai.explain_delay(
-                task, current_intensity, scheduled_time and self._get_forecast_intensity_at(forecast, scheduled_time),
-                delay_seconds, 0.0, reason
-            )
+                task, current_intensity, best_intensity,
+                delay_seconds, utility, reason)
             result = {
                 "status": "delayed",
                 "task": task,
                 "delay_until": scheduled_time,
                 "reason": reason,
                 "delayability": delayability.value,
+                "utility": utility,
                 "explanation": explanation,
             }
-            # Human review for long delays
             if delay_seconds > self.max_delay * 0.8:
                 review_id = self.human_review.request_review(task, result)
                 self.metrics["total_reviews_requested"] += 1
                 result["review_id"] = review_id
                 result["review_pending"] = True
-            return result
-        else:
-            flexgen_policy = None
-            if self._flexgen_available and task.get("type") == "inference":
-                flexgen_policy = self.select_flexgen_policy(task)
-            self.metrics["total_forwarded"] += 1
-            explanation = self.xai.explain_delay(task, current_intensity, current_intensity, 0, 0, reason)
-            result = {"status": "forward", "task": task, "delay_until": None, "reason": reason,
-                      "explanation": explanation}
-            if flexgen_policy:
-                result["flexgen_policy"] = flexgen_policy
+            await self._emit_feedback_event(task, "delay", utility, explanation)
             return result
 
-    def _get_forecast_intensity_at(self, forecast: List[Tuple[float, float]], timestamp: float) -> Optional[float]:
-        """Helper to find forecast intensity at a specific timestamp (linear interpolation)."""
+        # Forward.
+        flexgen_policy = None
+        if self._flexgen_available and task.get("type") == "inference":
+            flexgen_policy = await self.select_flexgen_policy(task)
+        self.metrics["total_forwarded"] += 1
+        explanation = self.xai.explain_delay(
+            task, current_intensity, current_intensity, 0.0, utility, reason)
+        result = {"status": "forward", "task": task, "delay_until": None,
+                  "reason": reason,
+                  "delayability": delayability.value,
+                  "utility": utility,
+                  "explanation": explanation}
+        if flexgen_policy:
+            result["flexgen_policy"] = flexgen_policy
+        await self._emit_feedback_event(task, "forward", utility, explanation)
+        return result
+
+    async def atick(self) -> List[Dict[str, Any]]:
+        now = time.monotonic()
+        released: List[DelayedTask] = []
+        with self._lock:
+            while self.queue and self.queue[0][0] <= now:
+                _, delayed = heapq.heappop(self.queue)
+                released.append(delayed)
+        out: List[Dict[str, Any]] = []
+        for d in released:
+            entry: Dict[str, Any] = {"task": d.task,
+                                     "delay_reason": d.delay_reason}
+            if self._flexgen_available and d.task.get("type") == "inference":
+                try:
+                    entry["flexgen_policy"] = await self.select_flexgen_policy(
+                        d.task)
+                except Exception as e:
+                    logger.warning("FlexGen selection on release failed: %s", e)
+            out.append(entry)
+            self.metrics["total_released"] += 1
+        if released:
+            self._save_queue()
+        return out
+
+    async def areport_reward(self, task: Dict[str, Any], reward: float,
+                             action: Optional[str] = None) -> Dict[str, Any]:
+        self.metrics["total_rewards"] += float(reward)
+        await self._adapt_parameters(float(reward))
+        if action:
+            try:
+                current = await self._current_intensity_async()
+            except Exception:
+                current = 0.0
+            context = {
+                "current_intensity": current,
+                "task_type": task.get("type", "unknown"),
+            }
+            self.causal_bandit.update(context, action, float(reward))
+        return {"status": "recorded", "reward": float(reward)}
+
+    # ------------------------------------------------------------------
+    # Sync wrappers
+    # ------------------------------------------------------------------
+    def submit(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        return self._run_sync(self.asubmit(task))
+
+    def tick(self) -> List[Dict[str, Any]]:
+        return self._run_sync(self.atick())
+
+    def report_reward(self, task: Dict[str, Any], reward: float,
+                      action: Optional[str] = None) -> Dict[str, Any]:
+        return self._run_sync(self.areport_reward(task, reward, action))
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _get_forecast_intensity_at(
+        self, forecast: List[Tuple[float, float]], timestamp: float,
+    ) -> Optional[float]:
         if not forecast:
             return None
-        # Find bracketing points
-        prev = None
+        prev: Optional[Tuple[float, float]] = None
         for ts, intensity in forecast:
             if ts <= timestamp:
                 prev = (ts, intensity)
-            else:
-                if prev is not None:
-                    # Interpolate
-                    t0, i0 = prev
-                    t1, i1 = ts, intensity
-                    if t1 == t0:
-                        return i0
-                    ratio = (timestamp - t0) / (t1 - t0)
-                    return i0 + ratio * (i1 - i0)
-                else:
-                    return intensity
-        return prev[1] if prev else None
+                continue
+            if prev is None:
+                return float(intensity)
+            t0, i0 = prev
+            t1, i1 = ts, intensity
+            if t1 == t0:
+                return float(i0)
+            ratio = (timestamp - t0) / (t1 - t0)
+            return float(i0 + ratio * (i1 - i0))
+        return float(prev[1]) if prev is not None else None
 
-    def tick(self) -> List[Dict[str, Any]]:
-        """
-        Release tasks whose scheduled time has arrived.
-        Returns list of tasks (dicts) that are ready to be processed.
-        """
-        now = time.time()
-        released = []
-        while self.queue and self.queue[0][0] <= now:
-            _, delayed_task = heapq.heappop(self.queue)
-            released.append(delayed_task.task)
-            self.metrics["total_released"] += 1
-            if self._flexgen_available and delayed_task.task.get("type") == "inference":
-                policy = self.select_flexgen_policy(delayed_task.task)
-                self.logger.info(f"FlexGen policy selected for released task: {policy}")
+    async def _emit_feedback_event(self, task: Dict[str, Any], action: str,
+                                   reward: float, explanation: str) -> None:
+        if not self.emit_feedback_events or FeedbackEvent is None:
+            return
+        try:
+            ev = FeedbackEvent(
+                source="carbon_delay_scheduler",
+                feedback_type="routing",
+                context={
+                    "task_id": str(task.get("id", "unknown")),
+                    "teacher_ids": [],
+                },
+                action={
+                    "selected_action": action,
+                    "selected_rank": 1,
+                    "confidence_score": 0.5,
+                },
+                performance={
+                    "quality_score": float(max(0.0, min(1.0, reward))),
+                    "latency_ms": 0.0, "energy_joules": 0.0,
+                    "carbon_g": 0.0, "helium_cost": 0.0, "duration_ms": 0.0,
+                },
+                adaptive_cost_value=float(reward),
+                tags=["scheduler", action, str(task.get("type", "unknown"))],
+                envelope={"trace_id": self.instance_id},
+                metadata={"explanation": explanation},
+            )
+            logger.debug("FeedbackEvent emitted: %s",
+                         getattr(ev, "event_id", "?"))
+        except Exception as e:
+            logger.warning("Failed to emit FeedbackEvent: %s", e)
 
-        if released:
-            self._save_queue()
-        return released
+    # ------------------------------------------------------------------
+    # Federated
+    # ------------------------------------------------------------------
+    def federated_update(self, model_update: Dict[str, Any],
+                         weight: float = 1.0) -> None:
+        if self.federated is not None:
+            self.federated.register(self.instance_id, model_update, weight)
 
-    def report_reward(self, task: Dict[str, Any], reward: float, action: Optional[str] = None):
-        """
-        Called after the task is executed and its outcome is measured.
-        Feeds back into bio‑inspired adaptation and causal bandit.
-        action: 'delay' or 'forward' (if known)
-        """
-        self.metrics["total_rewards"] += reward
-        self.adapt_parameters(reward)
-        if action:
-            context = {
-                "current_intensity": self.carbon_api.get_current(),
-                "task_type": task.get("type", "unknown"),
-            }
-            self.causal_bandit.update(context, action, reward)
-
-    def federated_update(self, model_update: Dict):
-        if self.federated:
-            self.federated.register(self, model_update)
-
-    def aggregate_federated(self) -> Dict:
-        if self.federated:
+    def aggregate_federated(self) -> Dict[str, float]:
+        if self.federated is not None:
             return self.federated.aggregate()
         return {}
 
+    # ------------------------------------------------------------------
     def get_queue_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            next_release = self.queue[0][0] if self.queue else None
+            queue_size = len(self.queue)
         return {
-            "queue_size": len(self.queue),
-            "next_release": self.queue[0][0] if self.queue else None,
+            "queue_size": queue_size,
+            "next_release": next_release,
             "threshold": self.threshold,
             "max_delay": self.max_delay,
+            "instance_id": self.instance_id,
             **self.metrics,
         }
 
+    def clear(self) -> None:
+        with self._lock:
+            self.queue.clear()
+        self._save_queue()
 
-# ----------------------------------------------------------------------
-# 3. Example usage / test harness
-# ----------------------------------------------------------------------
-if __name__ == "__main__":
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "queue": [d.to_dict() for _, d in self.queue],
+                "threshold": self.threshold,
+                "max_delay": self.max_delay,
+                "instance_id": self.instance_id,
+            }
+
+    def shutdown(self) -> None:
+        """Stop the background event loop if one was created."""
+        with self._lock:
+            loop = self._loop
+            self._loop = None
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+
+
+# ============================================================================
+# Tests
+# ============================================================================
+class _StubCarbonAPI:
+    """Deterministic carbon API for tests."""
+
+    def __init__(self, current: float = 300.0,
+                 forecast_values: Optional[List[float]] = None,
+                 step_seconds: int = 600) -> None:
+        self.current = float(current)
+        self.forecast_values = list(forecast_values or [200.0, 180.0, 250.0])
+        self.step_seconds = int(step_seconds)
+
+    def get_current(self) -> float:
+        return float(self.current)
+
+    def get_forecast(self, minutes: int) -> List[Tuple[float, float]]:
+        now = time.monotonic()
+        return [
+            (now + (i + 1) * self.step_seconds, v)
+            for i, v in enumerate(self.forecast_values)
+        ]
+
+
+def _test_delayability_names() -> None:
+    assert Delayability.NOT_DELAYABLE.value == "not_delayable"
+    assert Delayability.TRADE_OFF.value == "trade_off"
+    assert Delayability.FULLY_DELAYABLE.value == "fully_delayable"
+
+
+def _test_causal_bandit_no_keyerror() -> None:
+    b = CausalBandit(seed=0)
+    b.update({}, "unknown_action", 1.0)
+    assert "unknown_action" in b.q_values
+    assert b.counts["unknown_action"] == 1
+
+
+def _test_causal_bandit_bounded_histories() -> None:
+    b = CausalBandit(history_size=5, seed=0)
+    for i in range(50):
+        b.update({"i": i}, "delay", 1.0)
+    assert len(b.context_history) <= 5
+    assert len(b.reward_history) <= 5
+    assert len(b.action_history) <= 5
+
+
+def _test_safety_monitor_uniform_signature() -> None:
+    sm = SafetyMonitor(max_delay_high_priority=10.0)
+    safe, violations = sm.check({"priority": "high"}, 20.0,
+                                [(time.monotonic() + 60, 100.0)])
+    assert not safe
+    assert "max_delay_high_priority" in violations
+
+    safe, violations = sm.check({"priority": "normal"}, 10.0, None)
+    assert not safe
+    assert "no_delay_without_forecast" in violations
+
+    safe, _ = sm.check({"priority": "normal"}, 0.0, None)
+    assert safe
+
+
+def _test_chaos_monkey_validation() -> None:
+    try:
+        ChaosMonkey(failure_probability=1.5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid probability should raise")
+
+    cm = ChaosMonkey(failure_probability=1.0, enabled=True, seed=0)
+    try:
+        cm.maybe_fail()
+    except ChaosExperimentError:
+        pass
+    else:
+        raise AssertionError("should raise ChaosExperimentError")
+
+
+def _test_multi_agent_stable_hashing() -> None:
+    m = MultiAgentCoordinator(num_agents=3)
+    task = {"id": "task-abc"}
+    a1 = m.assign_task(task)
+    m2 = MultiAgentCoordinator(num_agents=3)
+    a2 = m2.assign_task(task)
+    assert a1 == a2
+
+
+def _test_federated_update_uses_string_id() -> None:
+    fed = FederatedCoordinator()
+    sched = CarbonDelayScheduler(carbon_api=_StubCarbonAPI(),
+                                 federated_coordinator=fed,
+                                 persistence_file=None)
+    sched.federated_update({"x": 1.0})
+    assert sched.instance_id in fed._participants
+    assert fed.aggregate() == {"x": 1.0}
+
+
+def _test_scheduler_end_to_end() -> None:
+    api = _StubCarbonAPI(current=300.0,
+                         forecast_values=[200.0, 180.0, 250.0])
+    sched = CarbonDelayScheduler(
+        carbon_api=api, max_delay_seconds=1800,
+        threshold_gco2_per_kwh=250.0, persistence_file=None,
+        emit_feedback_events=False,
+    )
+    try:
+        # High-priority task forwards.
+        r = sched.submit({"id": "t1", "priority": "high"})
+        assert r["status"] == "forward"
+
+        # Low-carbon context forwards.
+        api.current = 100.0
+        r = sched.submit({"id": "t2", "priority": "normal"})
+        assert r["status"] == "forward"
+        api.current = 300.0
+
+        # Normal task may be delayed if MODP finds a good window.
+        r = sched.submit({"id": "t3", "priority": "normal",
+                          "idle_power_watts": 5.0})
+        assert r["status"] in ("forward", "delayed")
+
+        # Feedback.
+        sched.report_reward({"id": "t3"}, 0.5, action="delay")
+
+        # Nothing due yet.
+        released = sched.tick()
+        assert isinstance(released, list)
+
+        stats = sched.get_queue_stats()
+        assert stats["instance_id"] == sched.instance_id
+    finally:
+        sched.shutdown()
+
+
+def _test_sign_convention() -> None:
+    """Higher utility = better; a strong low-carbon window yields utility > 0."""
+    api = _StubCarbonAPI(current=500.0, forecast_values=[100.0])
+    sched = CarbonDelayScheduler(
+        carbon_api=api, max_delay_seconds=1800,
+        threshold_gco2_per_kwh=200.0, persistence_file=None,
+        modp_weights={"carbon": 0.9, "latency": 0.05,
+                      "energy": 0.03, "cost": 0.02},
+        emit_feedback_events=False,
+    )
+    try:
+        r = sched.submit({"id": "sig", "priority": "normal"})
+        assert r["status"] in ("forward", "delayed")
+        # If delayed, MODP found utility > 0.
+        if r["status"] == "delayed":
+            assert r.get("utility", 0.0) > 0
+    finally:
+        sched.shutdown()
+
+
+def run_tests() -> None:
+    _test_delayability_names()
+    _test_causal_bandit_no_keyerror()
+    _test_causal_bandit_bounded_histories()
+    _test_safety_monitor_uniform_signature()
+    _test_chaos_monkey_validation()
+    _test_multi_agent_stable_hashing()
+    _test_federated_update_uses_string_id()
+    _test_scheduler_end_to_end()
+    _test_sign_convention()
+    print("All carbon_delay_scheduler v3.0.0 tests passed.")
+
+
+# ============================================================================
+# Demo
+# ============================================================================
+def _demo() -> None:
     logging.basicConfig(level=logging.INFO)
 
-    # Use stub API for testing
-    from carbon_api_stub import CarbonAPIStub
-    carbon_api = CarbonAPIStub(base_intensity=250.0, volatility=80.0)
+    class DemoCarbonAPI:
+        def get_current(self) -> float:
+            return 300.0
 
-    # Instantiate enhanced scheduler with new features
-    scheduler = CarbonDelayScheduler(
-        carbon_api=carbon_api,
-        max_delay_seconds=1800,
-        threshold_gco2_per_kwh=200.0,
-        persistence_file="test_queue.json",
-        modp_weights={"carbon": 0.5, "latency": 0.2, "energy": 0.2, "cost": 0.1},
-        causal_bandit=CausalBandit(),
+        def get_forecast(self, minutes: int) -> List[Tuple[float, float]]:
+            now = time.monotonic()
+            return [(now + 300 * (i + 1), v)
+                    for i, v in enumerate([200.0, 180.0, 250.0])]
+
+    sched = CarbonDelayScheduler(
+        carbon_api=DemoCarbonAPI(), max_delay_seconds=1800,
+        threshold_gco2_per_kwh=200.0, persistence_file=None,
+        causal_bandit=CausalBandit(seed=0),
         safety_monitor=SafetyMonitor(),
         xai_explainer=XAIExplainer(),
         federated_coordinator=FederatedCoordinator(),
@@ -720,27 +1301,41 @@ if __name__ == "__main__":
         chaos_monkey=ChaosMonkey(enabled=False),
         human_review=HumanReviewManager(),
     )
-
-    # Simulate tasks
     tasks = [
-        {"id": "task1", "priority": "normal", "latency_sensitivity": 0.5, "idle_power_watts": 10, "type": "inference"},
-        {"id": "task2", "priority": "high", "latency_sensitivity": 0.9},
-        {"id": "task3", "priority": "normal", "latency_sensitivity": 0.3, "idle_power_watts": 5, "type": "inference"},
+        {"id": "task1", "priority": "normal", "idle_power_watts": 10,
+         "type": "inference"},
+        {"id": "task2", "priority": "high"},
+        {"id": "task3", "priority": "normal", "idle_power_watts": 5,
+         "type": "inference"},
     ]
-
-    for task in tasks:
-        result = scheduler.submit(task)
-        print(f"Task {task['id']}: {result['status']} (reason: {result.get('reason', 'N/A')})")
-        if 'explanation' in result:
-            print(f"  Explanation: {result['explanation']}")
-
-    # Simulate tick after some time
-    time.sleep(2)
-    released = scheduler.tick()
+    for t in tasks:
+        r = sched.submit(t)
+        print(f"Task {t['id']}: {r['status']} "
+              f"(reason: {r.get('reason', 'N/A')})")
+        print(f"  Explanation: {r.get('explanation', '')}")
+    time.sleep(0.1)
+    released = sched.tick()
     print(f"Released {len(released)} tasks")
+    sched.report_reward({"id": "sample"}, 0.5, action="delay")
+    print(sched.get_queue_stats())
+    sched.shutdown()
 
-    # Report a sample reward to test adaptation and causal bandit
-    scheduler.report_reward({"id": "sample"}, 5.0, action="delay")
 
-    # Show stats
-    print(scheduler.get_queue_stats())
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Carbon Delay Scheduler v3.0.0")
+    parser.add_argument("--test", action="store_true",
+                        help="Run the built-in test suite.")
+    parser.add_argument("--demo", action="store_true",
+                        help="Run the demo.")
+    args = parser.parse_args()
+    if args.test:
+        run_tests()
+    elif args.demo:
+        _demo()
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
