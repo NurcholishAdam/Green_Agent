@@ -1,46 +1,37 @@
 #!/usr/bin/env python3
-# src/enhancements/green_datacenter_map_enhanced_v16_0.py
+# src/enhancements/green_datacenter_map_enhanced_v19_0.py
 """
-Green Data Center Map & Visualization System — v18.0
+Green Data Center Map & Visualization System — v19.0
 
-Single-file rewrite that fixes every runtime bug from v16 and hosts all ten
-Green Agent enhancements as first-class modules in the same file:
+The ten Green Agent enhancements are imported from the enhancements/*
+package. This file keeps only map-specific logic:
 
-  1. Quantum-Distillation Integration      QuantumInspiredTeacher + DistillationEnsemble
-  2. Causal RL for Policy Adaptation       CausalCounterfactualEstimator
-  3. Federated Green Learning              FederatedAggregator
-  4. Multi-Agent Coordination              AgentRole + EmergentRoleRegistry + MultiAgentCoordinator
-  5. Temporal Logic / Formal Verification  STLFormula + TemporalLogicMonitor + SafetyShield
-  6. Explainable AI                        DecisionExplainer + Explanation
-  7. Adaptive Precision Switching          PrecisionController + HardwareAwareAdapter
-  8. Carbon Markets / RECs                 CarbonMarketClient + RECInventory
-  9. Resilience / Chaos                    ChaosEngineer
- 10. HITL / Active Learning                UncertaintyEstimator + HumanInTheLoopGate + ActiveLearningSampler
+  - Project store (ORM + in-memory list)
+  - CarbonAwareExportQueue with monotonic tie-break
+  - AdaptiveTTLCache with LRU-ish eviction
+  - EnhancedGeocodingService
+  - ContextualBandit (map-local canonical) + ParetoFront
+  - ParticleSwarmOptimizer + BioInspiredCloudDeployer
+  - MultiObjectiveCloudDeployer
+  - MixtureOfExpertsPredictive
+  - EnhancedAutonomousMapGenerator
+  - EnhancedGreenDataCenterMap
+  - FastAPI app, singleton, signal handlers, main
 
-Runtime fixes over v16:
-  - Guarded ORM declarations (Base is never None when subclassed)
-  - LeaderElection and MultiCloudStorage defined in this file
-  - SQLALCHEMY_AVAILABLE resolved from the two real flags
-  - logging.handlers imported
-  - BlockchainConfig gains chain_id and poa
-  - PQC signing uses module-level sign()
-  - Migrations deferred to init()
-  - VaultManager uses get_running_loop() and correct hvac v2 signature
-  - GreenMapConfig() resolved lazily (no module-import construction)
-  - ContextualBandit is defined locally with a canonical API
-  - ParetoFront dominance respects strict inequality
-  - self.pareto_front is a shared, populated attribute
-  - Adaptive weight update actually differentiates a utility
-  - Objectives truncated to len(weights)
-  - Reward parser reads both flat and nested improvements
-  - export_id initialized before use
-  - insert_project / execute_sync added to the DB manager
-  - PriorityQueue tie-break uses a monotonic counter
-  - AdaptiveTTLCache uses len(str(value))
-  - ParticleSwarmOptimizer resets state per call
-  - uvicorn gets the app object, not a module path string
-  - Signal handlers portable to Windows
-  - Health aggregation: empty checkable list -> degraded
+Changelog v18.0 -> v19.0:
+  - All ten enhancement classes imported from enhancements/*.
+  - Compat wrappers for Explanation, DecisionExplainer, HITLRequest,
+    UncertaintyEstimator, HumanInTheLoopGate.
+  - MultiAgentCoordinator.vote tuples are unpacked at both call sites.
+  - EmergentRoleRegistry credits the actual winning role.
+  - Causal state uses state_vector_from_metrics.
+  - ParticleSwarmOptimizer guards against zero particles.
+  - MultiObjectiveCloudDeployer._update_weights normalizes by per-objective std.
+  - AdaptiveTTLCache bumps access_count on set() as well as get().
+  - HITL requests can be delivered externally via submit_hitl_decision().
+  - FastAPI /hitl/approval calls submit_hitl_decision().
+  - Signal handlers retain task references.
+  - save_state / load_state for causal, roles, federated, generation history.
 """
 
 from __future__ import annotations
@@ -78,21 +69,188 @@ from typing import (
 
 import numpy as np
 
+
 # ============================================================
-# ENHANCEMENT MODULE IMPORTS (graceful fallback)
+# SHIM: import all ten enhancements from the shared package
 # ============================================================
-ENHANCEMENTS_AVAILABLE = False
-try:
-    from enhancements.bio_inspired import GeneticPolicyGenerator  # type: ignore
-    from enhancements.moe_system import ExpertRouter  # type: ignore
-    from enhancements.MODP import ParetoOptimizer  # type: ignore
-    from enhancements.contextual_bandit import ContextualBandit  # type: ignore
-    from enhancements.limit_graph import LimitGraph  # type: ignore
-    from enhancements.rlhf import RLHFOptimizer  # type: ignore
-    from enhancements.multi_teacher_policy_distillation import MultiTeacherDistiller  # type: ignore
-    ENHANCEMENTS_AVAILABLE = True
-except ImportError:
-    ENHANCEMENTS_AVAILABLE = False
+from enhancements.precision import (
+    PrecisionLevel, PRECISION_COST, PrecisionController, HardwareAwareAdapter,
+)
+from enhancements.carbon import (
+    CarbonMarketClient, RECRecord, RECInventory, CarbonIntensityManager,
+    ICarbonManager,
+)
+from enhancements.chaos import (
+    ChaosConfig, ChaosEngineer,
+)
+from enhancements.stl import (
+    STLOperator, STLFormula, TemporalLogicMonitor, SafetyShield,
+)
+from enhancements.causal import (
+    CausalTransition, CausalCounterfactualEstimator,
+)
+from enhancements.federated import (
+    FederatedUpdate, FederatedAggregator,
+)
+from enhancements.multi_agent import (
+    AgentRole, AgentBid, EmergentRoleRegistry, MultiAgentCoordinator,
+)
+from enhancements.quantum import (
+    QuantumInspiredTeacher, DistillationEnsemble,
+)
+from enhancements.xai import Explanation as SharedExplanation
+from enhancements.xai import DecisionExplainer as SharedDecisionExplainer
+from enhancements.hitl import (
+    HITLRequest as SharedHITLRequest,
+    UncertaintyEstimator as SharedUncertaintyEstimator,
+    HumanInTheLoopGate as SharedHumanInTheLoopGate,
+    ActiveLearningSampler,
+)
+from enhancements.common_state import (
+    STATE_VECTOR_DIM, state_vector_from_metrics,
+)
+
+
+# ============================================================
+# COMPAT WRAPPERS
+# ============================================================
+@dataclass
+class Explanation:
+    """Map-side Explanation carrying chosen_idx."""
+    decision_id: str
+    chosen_idx: int
+    top_features: List[Tuple[str, float]]
+    counterfactuals: List[Dict[str, Any]]
+    rationale: str
+    confidence: float
+    safety_ok: bool
+    carbon_price_signal: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class DecisionExplainer(SharedDecisionExplainer):
+    """Adds the map's explain(...) signature."""
+
+    def explain(self, chosen_idx, chosen, pareto, teacher_probs,
+                counterfactuals, safety_ok, carbon_price, confidence: float = 0.5):
+        numeric_keys = [k for k, v in chosen.items() if isinstance(v, (int, float))]
+        if pareto and numeric_keys:
+            baseline = {k: float(np.mean([c.get(k, 0.0) for c in pareto])) for k in numeric_keys}
+            scales = {k: float(np.std([c.get(k, 0.0) for c in pareto]) + 1e-9) for k in numeric_keys}
+        else:
+            baseline = {k: 0.0 for k in numeric_keys}
+            scales = {k: 1.0 for k in numeric_keys}
+        shared = self.explain_anomaly(
+            kind="decision",
+            current=chosen,
+            baseline=baseline,
+            scales=scales,
+            counterfactuals=counterfactuals,
+            safety_ok=safety_ok,
+            carbon_price=carbon_price,
+            confidence=confidence,
+        )
+        return Explanation(
+            decision_id=shared.decision_id,
+            chosen_idx=chosen_idx,
+            top_features=shared.top_features,
+            counterfactuals=shared.counterfactuals,
+            rationale=shared.rationale,
+            confidence=shared.confidence,
+            safety_ok=shared.safety_ok,
+            carbon_price_signal=shared.carbon_price_signal,
+        )
+
+
+@dataclass
+class HITLRequest:
+    """Map-side HITL request with candidate list."""
+    request_id: str
+    reason: str
+    chosen_idx: int
+    candidates: List[Dict[str, Any]]
+    uncertainty: float
+    carbon_price: float
+    timestamp: float = field(default_factory=time.time)
+
+
+class UncertaintyEstimator(SharedUncertaintyEstimator):
+    """Entropy-based is_uncertain() over the shared estimator."""
+
+    def __init__(self, entropy_threshold: float = 0.75,
+                 variance_threshold: float = 0.05):
+        super().__init__(window=32)
+        self.entropy_threshold = entropy_threshold
+        self.variance_threshold = variance_threshold
+
+    def is_uncertain(self, probs) -> Tuple[bool, float]:
+        if probs is None or len(probs) == 0:
+            return False, 0.0
+        p = np.clip(np.asarray(probs, dtype=np.float64), 1e-12, 1.0)
+        h = float(-np.sum(p * np.log(p)) / math.log(len(p)))
+        score = 0.6 * h
+        return h > self.entropy_threshold, score
+
+
+class HumanInTheLoopGate(SharedHumanInTheLoopGate):
+    """Adds an async request() that accepts the map's HITLRequest,
+    and a future-based submit_decision() for external delivery."""
+
+    def __init__(self, approver=None, timeout_s: float = 2.0,
+                 auto_approve_on_timeout: bool = True):
+        super().__init__(approver=approver, timeout_s=timeout_s,
+                         auto_approve_on_timeout=auto_approve_on_timeout)
+        self._pending: Dict[str, asyncio.Future] = {}
+        self._pending_lock = asyncio.Lock()
+
+    async def request(self, req: HITLRequest) -> bool:
+        if self.approver is None:
+            self.audit.append({"request_id": req.request_id,
+                               "approved": True, "reason": "no_approver"})
+            HITL_APPROVALS.labels(decision="auto_approved").inc()
+            return True
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        async with self._pending_lock:
+            self._pending[req.request_id] = future
+
+        async def _run():
+            try:
+                result = await loop.run_in_executor(None, self.approver, req)
+                if not future.done():
+                    future.set_result(bool(result))
+            except Exception as e:
+                if not future.done():
+                    future.set_exception(e)
+
+        runner = asyncio.create_task(_run())
+        try:
+            approved = await asyncio.wait_for(future, timeout=self.timeout_s)
+        except asyncio.TimeoutError:
+            approved = self.auto_approve_on_timeout
+            HITL_APPROVALS.labels(decision="timeout").inc()
+        except Exception:
+            approved = self.auto_approve_on_timeout
+        finally:
+            async with self._pending_lock:
+                self._pending.pop(req.request_id, None)
+            if not runner.done():
+                runner.cancel()
+        self.audit.append({"request_id": req.request_id,
+                           "approved": bool(approved), "reason": req.reason})
+        HITL_APPROVALS.labels(decision="approved" if approved else "rejected").inc()
+        return bool(approved)
+
+    async def submit_decision(self, request_id: str, approved: bool) -> bool:
+        async with self._pending_lock:
+            fut = self._pending.get(request_id)
+            if fut is None or fut.done():
+                return False
+            fut.set_result(bool(approved))
+            return True
+
 
 # ============================================================
 # OPTIONAL EXTERNAL DEPENDENCIES
@@ -244,6 +402,47 @@ if not TENACITY_AVAILABLE:
 
 
 # ============================================================
+# FALLBACKS FOR LEGACY ENHANCEMENT MODULES NOT IN THE PACKAGE
+# ============================================================
+ENHANCEMENTS_AVAILABLE = False
+try:
+    from enhancements.bio_inspired import GeneticPolicyGenerator  # type: ignore
+    from enhancements.moe_system import ExpertRouter  # type: ignore
+    from enhancements.MODP import ParetoOptimizer  # type: ignore
+    from enhancements.limit_graph import LimitGraph  # type: ignore
+    from enhancements.rlhf import RLHFOptimizer  # type: ignore
+    from enhancements.multi_teacher_policy_distillation import MultiTeacherDistiller  # type: ignore
+    ENHANCEMENTS_AVAILABLE = True
+except ImportError:
+    ENHANCEMENTS_AVAILABLE = False
+
+    class ParetoOptimizer:
+        def __init__(self, *a, **kw): pass
+        def evaluate(self, objectives, weights):
+            return sum(objectives.get(k, 0.0) * weights.get(k, 1.0) for k in objectives)
+
+    class MultiTeacherDistiller:
+        def __init__(self, teachers, weights=None, *a, **kw):
+            self.teachers = list(teachers)
+            self.weights = list(weights) if weights else [1.0] * len(self.teachers)
+
+        def distill(self, context):
+            votes: Dict[Any, float] = {}
+            for t, w in zip(self.teachers, self.weights):
+                try:
+                    choice = t(context)
+                    if asyncio.iscoroutine(choice):
+                        choice.close()
+                        continue
+                    votes[choice] = votes.get(choice, 0.0) + float(w)
+                except Exception:
+                    continue
+            if not votes:
+                return None
+            return max(votes, key=votes.get)
+
+
+# ============================================================
 # LOGGING
 # ============================================================
 try:
@@ -281,7 +480,7 @@ audit_logger.setLevel(logging.INFO)
 
 
 # ============================================================
-# PROMETHEUS
+# PROMETHEUS METRICS
 # ============================================================
 if PROMETHEUS_AVAILABLE:
     REGISTRY = CollectorRegistry()
@@ -291,11 +490,9 @@ if PROMETHEUS_AVAILABLE:
     QUANTUM_SIGNATURES = Counter("quantum_signatures_total", "Sigs", ["algorithm", "status"], registry=REGISTRY)
     BLOCKCHAIN_VERIFICATIONS = Counter("blockchain_verifications_total", "BC", ["status"], registry=REGISTRY)
     CIRCUIT_BREAKER_STATE = Gauge("map_circuit_breaker_state", "CB", ["name"], registry=REGISTRY)
-    RATE_LIMITER_THROTTLE = Gauge("map_rate_limiter_throttle", "RL", registry=REGISTRY)
     CLOUD_STORAGE = Counter("map_cloud_storage_operations_total", "S", ["provider", "operation", "status"], registry=REGISTRY)
     VAULT_OPERATIONS = Counter("map_vault_operations_total", "V", ["operation", "status"], registry=REGISTRY)
     PREDICTIVE_ACCURACY = Gauge("map_predictive_accuracy", "PA", ["model"], registry=REGISTRY)
-    OPTIMIZER_DECISIONS = Counter("map_optimizer_decisions_total", "OD", ["parameter"], registry=REGISTRY)
     HEALTH_SCORE = Gauge("map_health_score", "HS", registry=REGISTRY)
     CARBON_PRICE = Gauge("map_carbon_price_per_kg", "CP", registry=REGISTRY)
     REC_INVENTORY_KWH = Gauge("map_rec_inventory_kwh", "REC", registry=REGISTRY)
@@ -312,8 +509,8 @@ else:
         def labels(self, *a, **kw): return self
     MAP_EXPORTS = MAP_GENERATIONS = CLOUD_DEPLOYMENTS = DummyMetrics()
     QUANTUM_SIGNATURES = BLOCKCHAIN_VERIFICATIONS = CIRCUIT_BREAKER_STATE = DummyMetrics()
-    RATE_LIMITER_THROTTLE = CLOUD_STORAGE = VAULT_OPERATIONS = PREDICTIVE_ACCURACY = DummyMetrics()
-    OPTIMIZER_DECISIONS = HEALTH_SCORE = CARBON_PRICE = REC_INVENTORY_KWH = DummyMetrics()
+    CLOUD_STORAGE = VAULT_OPERATIONS = PREDICTIVE_ACCURACY = DummyMetrics()
+    HEALTH_SCORE = CARBON_PRICE = REC_INVENTORY_KWH = DummyMetrics()
     PRECISION_SWITCHES = CHAOS_EVENTS = HITL_APPROVALS = SAFETY_VIOLATIONS = FEDERATED_ROUNDS = DummyMetrics()
 
 
@@ -330,7 +527,6 @@ class RateLimitExceeded(GreenMapError): pass
 class VaultError(GreenMapError): pass
 class CloudStorageError(GreenMapError): pass
 class PredictiveError(GreenMapError): pass
-class OptimizerError(GreenMapError): pass
 class DatabaseError(GreenMapError): pass
 class SafetyViolationError(GreenMapError): pass
 
@@ -352,13 +548,6 @@ class IBlockchain(Protocol):
     async def record_map_export(self, export_id: str, manifest: Dict, file_hash: str) -> Dict: ...
     async def verify_map_export(self, export_id: str, manifest: Dict, file_hash: str) -> Dict: ...
     async def get_blockchain_status(self) -> Dict: ...
-    async def health_check(self) -> Dict: ...
-
-
-@runtime_checkable
-class ICarbonManager(Protocol):
-    async def get_current_intensity(self) -> float: ...
-    async def close(self): ...
     async def health_check(self) -> Dict: ...
 
 
@@ -448,692 +637,6 @@ class ExportJob:
     priority: int
     submitted_at: datetime = field(default_factory=datetime.now)
     status: str = "pending"
-
-
-# ============================================================
-# ============================================================
-# TEN ENHANCEMENT MODULES
-# ============================================================
-# ============================================================
-
-
-# ------------------------------------------------------------
-# Enhancement 7: Adaptive Precision
-# ------------------------------------------------------------
-class PrecisionLevel(str, Enum):
-    FP32 = "fp32"
-    BF16 = "bf16"
-    FP16 = "fp16"
-    FP8 = "fp8"
-    INT8 = "int8"
-    INT4 = "int4"
-
-
-PRECISION_COST = {
-    PrecisionLevel.FP32: {"speed": 1.0, "energy": 1.00, "quality": 1.000, "memory": 1.00, "bits": 32.0},
-    PrecisionLevel.BF16: {"speed": 1.7, "energy": 0.72, "quality": 0.997, "memory": 0.50, "bits": 16.0},
-    PrecisionLevel.FP16: {"speed": 2.0, "energy": 0.65, "quality": 0.994, "memory": 0.50, "bits": 16.0},
-    PrecisionLevel.FP8:  {"speed": 3.1, "energy": 0.50, "quality": 0.985, "memory": 0.25, "bits": 8.0},
-    PrecisionLevel.INT8: {"speed": 3.6, "energy": 0.44, "quality": 0.972, "memory": 0.25, "bits": 8.0},
-    PrecisionLevel.INT4: {"speed": 5.0, "energy": 0.32, "quality": 0.905, "memory": 0.125, "bits": 4.0},
-}
-
-
-class PrecisionController:
-    def __init__(self, supported=None, quality_floor: float = 0.95, carbon_aware: bool = True):
-        self.supported = list(supported) if supported else list(PrecisionLevel)
-        self.quality_floor = quality_floor
-        self.carbon_aware = carbon_aware
-
-    def select(self, carbon_intensity: float, latency_headroom_ratio: float,
-               carbon_price: float = 0.0) -> PrecisionLevel:
-        stress = min(1.0, max(0.0, carbon_intensity / 600.0)) if self.carbon_aware else 0.0
-        price_stress = min(1.0, max(0.0, carbon_price / 0.2))
-        headroom = min(1.0, max(0.0, latency_headroom_ratio))
-        agg = 0.5 * stress + 0.3 * price_stress + 0.2 * (1.0 - headroom)
-        ordered = [p for p in PrecisionLevel if p in self.supported]
-        ordered.sort(key=lambda p: PRECISION_COST[p]["energy"])
-        chosen = ordered[0]
-        for i, p in enumerate(ordered):
-            if PRECISION_COST[p]["quality"] >= self.quality_floor and agg >= 0.25 * i:
-                chosen = p
-        return chosen
-
-
-class HardwareAwareAdapter:
-    def __init__(self, controller: PrecisionController):
-        self.controller = controller
-
-    def adapt(self, policy: Dict[str, Any], carbon_intensity: float,
-              latency_headroom: float, carbon_price: float):
-        level = self.controller.select(carbon_intensity, latency_headroom, carbon_price)
-        out = dict(policy)
-        out["precision_level"] = level.value
-        out["effective_bits"] = PRECISION_COST[level]["bits"]
-        PRECISION_SWITCHES.labels(level=level.value).inc()
-        return out, level
-
-
-# ------------------------------------------------------------
-# Enhancement 8: Carbon Markets / RECs
-# ------------------------------------------------------------
-class CarbonMarketClient:
-    def __init__(self, base_price: float = 0.05, sensitivity: float = 0.0005):
-        self.base_price = base_price
-        self.sensitivity = sensitivity
-
-    def price(self, carbon_intensity: float, hour_of_day: Optional[int] = None) -> float:
-        tod = 1.0
-        if hour_of_day is not None:
-            tod = 1.0 + 0.3 * math.sin((hour_of_day / 24.0) * 2 * math.pi)
-        return self.base_price + self.sensitivity * carbon_intensity * tod
-
-
-@dataclass
-class RECRecord:
-    kwh: float
-    issued_at: float
-    source: str = "solar"
-
-
-class RECInventory:
-    def __init__(self, grid_kg_co2_per_kwh: float = 0.4):
-        self.grid_factor = grid_kg_co2_per_kwh
-        self._records: List[RECRecord] = []
-
-    def add(self, kwh: float, source: str = "solar"):
-        self._records.append(RECRecord(kwh=kwh, issued_at=time.time(), source=source))
-
-    def total_kwh(self) -> float:
-        return sum(r.kwh for r in self._records)
-
-    def consume(self, kwh: float) -> float:
-        remaining = kwh
-        offset = 0.0
-        new_records = []
-        for r in self._records:
-            if remaining <= 0:
-                new_records.append(r)
-                continue
-            take = min(r.kwh, remaining)
-            remaining -= take
-            offset += take * self.grid_factor
-            if r.kwh - take > 1e-9:
-                new_records.append(RECRecord(kwh=r.kwh - take, issued_at=r.issued_at, source=r.source))
-        self._records = new_records
-        return offset
-
-
-# ------------------------------------------------------------
-# Enhancement 9: Chaos
-# ------------------------------------------------------------
-@dataclass
-class ChaosConfig:
-    fault_prob: float = 0.0
-    latency_inject_ms: float = 0.0
-    latency_inject_prob: float = 0.3
-    carbon_spike_prob: float = 0.0
-    carbon_spike_factor: float = 1.5
-    seed: int = 0
-
-    def enabled(self) -> bool:
-        return (self.fault_prob > 0
-                or (self.latency_inject_ms > 0 and self.latency_inject_prob > 0)
-                or self.carbon_spike_prob > 0)
-
-
-class ChaosEngineer:
-    def __init__(self, config: Optional[ChaosConfig] = None):
-        self.config = config or ChaosConfig()
-        self.rng = random.Random(self.config.seed)
-        self.events: List[Dict[str, Any]] = []
-
-    def maybe_fault(self) -> bool:
-        if self.rng.random() < self.config.fault_prob:
-            self.events.append({"type": "fault", "t": time.time()})
-            CHAOS_EVENTS.labels(type="fault").inc()
-            return True
-        return False
-
-    def maybe_latency(self) -> float:
-        if self.config.latency_inject_ms > 0 and self.rng.random() < self.config.latency_inject_prob:
-            self.events.append({"type": "latency", "t": time.time()})
-            CHAOS_EVENTS.labels(type="latency").inc()
-            return self.config.latency_inject_ms
-        return 0.0
-
-    def maybe_carbon_spike(self, carbon_intensity: float) -> float:
-        if self.rng.random() < self.config.carbon_spike_prob:
-            self.events.append({"type": "carbon_spike", "t": time.time()})
-            CHAOS_EVENTS.labels(type="carbon_spike").inc()
-            return carbon_intensity * self.config.carbon_spike_factor
-        return carbon_intensity
-
-
-# ------------------------------------------------------------
-# Enhancement 5: Temporal Logic
-# ------------------------------------------------------------
-class STLOperator(str, Enum):
-    ALWAYS = "G"
-    EVENTUALLY = "F"
-    UNTIL = "U"
-
-
-@dataclass
-class STLFormula:
-    name: str
-    predicate: Callable[[Dict[str, Any]], bool]
-    operator: STLOperator
-    horizon: int = 10
-
-
-class TemporalLogicMonitor:
-    def __init__(self, horizon: int = 10):
-        self.horizon = horizon
-        self._history: deque = deque(maxlen=horizon * 4)
-        self.formulas: List[STLFormula] = []
-
-    def add_formula(self, f: STLFormula):
-        self.formulas.append(f)
-
-    def observe(self, record: Dict[str, Any]):
-        self._history.append(record)
-
-    def verify(self) -> Dict[str, bool]:
-        results = {}
-        for f in self.formulas:
-            window = list(self._history)[-f.horizon:]
-            if not window:
-                results[f.name] = True
-                continue
-            sat = [bool(f.predicate(r)) for r in window]
-            if f.operator == STLOperator.ALWAYS:
-                results[f.name] = all(sat)
-            elif f.operator in (STLOperator.EVENTUALLY, STLOperator.UNTIL):
-                results[f.name] = any(sat)
-            else:
-                results[f.name] = True
-            if not results[f.name]:
-                SAFETY_VIOLATIONS.labels(formula=f.name).inc()
-        return results
-
-
-class SafetyShield:
-    def __init__(self, monitor: TemporalLogicMonitor):
-        self.monitor = monitor
-        self.violations: List[Dict[str, Any]] = []
-
-    def screen(self, selected: Dict[str, Any], candidates: Sequence[Dict[str, Any]]):
-        verdict = self.monitor.verify()
-        violated = [k for k, ok in verdict.items() if not ok]
-        if not violated:
-            return selected, True, verdict
-        if not candidates:
-            return selected, False, verdict
-        safe = min(candidates, key=lambda p: int(p.get("tile_level", 999)))
-        self.violations.append({"t": time.time(), "violated": violated})
-        return dict(safe), False, verdict
-
-
-# ------------------------------------------------------------
-# Enhancement 2: Causal RL
-# ------------------------------------------------------------
-@dataclass
-class CausalTransition:
-    state: np.ndarray
-    action: int
-    reward: float
-    next_state: np.ndarray
-    context: Dict[str, float] = field(default_factory=dict)
-
-
-class CausalCounterfactualEstimator:
-    def __init__(self, state_dim: int, n_actions: int, ridge: float = 1e-3):
-        self.state_dim = state_dim
-        self.n_actions = n_actions
-        self.ridge = ridge
-        self._A = np.eye(state_dim + n_actions + 1) * ridge
-        self._b = np.zeros(state_dim + n_actions + 1)
-        self._n = 0
-
-    def _features(self, s, a):
-        one_hot = np.zeros(self.n_actions)
-        one_hot[a % self.n_actions] = 1.0
-        return np.concatenate([np.asarray(s, dtype=np.float64), one_hot, [1.0]])
-
-    def _ensure_actions(self, n):
-        if n == self.n_actions:
-            return
-        self._A = np.eye(self.state_dim + n + 1) * self.ridge
-        self._b = np.zeros(self.state_dim + n + 1)
-        self.n_actions = n
-        self._n = 0
-
-    def update(self, t: CausalTransition):
-        x = self._features(t.state, t.action)
-        self._A += np.outer(x, x)
-        self._b += t.reward * x
-        self._n += 1
-
-    def predict(self, s, a):
-        if self._n < 2:
-            return 0.0
-        try:
-            theta = np.linalg.solve(self._A, self._b)
-        except np.linalg.LinAlgError:
-            return 0.0
-        return float(self._features(s, a) @ theta)
-
-    def counterfactuals(self, s, n_actions):
-        self._ensure_actions(n_actions)
-        return {a: self.predict(s, a) for a in range(n_actions)}
-
-
-# ------------------------------------------------------------
-# Enhancement 3: Federated
-# ------------------------------------------------------------
-@dataclass
-class FederatedUpdate:
-    node_id: str
-    weights: Dict[str, np.ndarray]
-    n_samples: int
-    carbon_intensity: float
-    timestamp: float = field(default_factory=time.time)
-
-
-class FederatedAggregator:
-    def __init__(self, dp_sigma: float = 1e-3, staleness_s: float = 3600.0):
-        self.dp_sigma = dp_sigma
-        self.staleness_s = staleness_s
-        self._updates: Dict[str, FederatedUpdate] = {}
-        self._global: Optional[Dict[str, np.ndarray]] = None
-
-    def submit(self, u: FederatedUpdate):
-        self._updates[u.node_id] = u
-
-    def _fresh(self):
-        now = time.time()
-        return [u for u in self._updates.values() if (now - u.timestamp) <= self.staleness_s]
-
-    def aggregate(self):
-        fresh = self._fresh()
-        if not fresh:
-            return self._global
-        weights = np.array([u.n_samples / max(u.carbon_intensity, 1.0) for u in fresh])
-        weights /= max(weights.sum(), 1e-12)
-        keys = fresh[0].weights.keys()
-        agg = {}
-        for k in keys:
-            stacked = np.stack([u.weights[k] for u in fresh], axis=0)
-            blended = np.tensordot(weights, stacked, axes=([0], [0]))
-            if self.dp_sigma > 0:
-                blended = blended + np.random.normal(0.0, self.dp_sigma, size=blended.shape)
-            agg[k] = blended
-        self._global = agg
-        FEDERATED_ROUNDS.inc()
-        return agg
-
-    def global_weights(self):
-        return self._global
-
-
-# ------------------------------------------------------------
-# Enhancement 4: Multi-Agent
-# ------------------------------------------------------------
-class AgentRole(str, Enum):
-    EXPLORER = "explorer"
-    EXPLOITER = "exploiter"
-    SAFETY_OFFICER = "safety_officer"
-    CARBON_BROKER = "carbon_broker"
-    VERIFIER = "verifier"
-
-
-@dataclass
-class AgentBid:
-    agent_id: str
-    role: AgentRole
-    confidence: float
-    proposed_action: int
-    rationale: str
-    carbon_score: float
-
-
-class EmergentRoleRegistry:
-    def __init__(self, decay: float = 0.95):
-        self.decay = decay
-        self._scores = {r: 1.0 for r in AgentRole}
-        self._counts = {r: 0 for r in AgentRole}
-
-    def record(self, role, success, reward):
-        for r in self._scores:
-            self._scores[r] *= self.decay
-        signal = reward if success else -abs(reward) * 0.5
-        self._scores[role] += signal
-        self._counts[role] += 1
-
-    def weights(self):
-        total = sum(max(v, 1e-6) for v in self._scores.values())
-        return {r: max(v, 1e-6) / total for r, v in self._scores.items()}
-
-    def dominant_role(self):
-        return max(self._scores, key=self._scores.get)
-
-
-class MultiAgentCoordinator:
-    def __init__(self, registry: EmergentRoleRegistry, role_bias=None):
-        self.registry = registry
-        self.role_bias = role_bias or {
-            AgentRole.EXPLORER: 0.6,
-            AgentRole.EXPLOITER: 0.9,
-            AgentRole.SAFETY_OFFICER: 1.2,
-            AgentRole.CARBON_BROKER: 1.1,
-            AgentRole.VERIFIER: 1.0,
-        }
-
-    def vote(self, bids: Sequence[AgentBid], n_candidates: int) -> int:
-        if not bids or n_candidates <= 0:
-            return 0
-        role_w = self.registry.weights()
-        scores = np.zeros(n_candidates)
-        for b in bids:
-            idx = b.proposed_action % n_candidates
-            weight = (role_w.get(b.role, 0.1) * self.role_bias.get(b.role, 1.0)
-                      * max(b.confidence, 0.0) * (1.0 + b.carbon_score))
-            scores[idx] += weight
-        return int(np.argmax(scores))
-
-
-# ------------------------------------------------------------
-# Enhancement 6: XAI
-# ------------------------------------------------------------
-@dataclass
-class Explanation:
-    decision_id: str
-    chosen_idx: int
-    top_features: List[Tuple[str, float]]
-    counterfactuals: List[Dict[str, Any]]
-    rationale: str
-    confidence: float
-    safety_ok: bool
-    carbon_price_signal: float
-
-    def to_dict(self):
-        return asdict(self)
-
-
-class DecisionExplainer:
-    def __init__(self, feature_names=None):
-        self.feature_names = list(feature_names) if feature_names else [
-            "tile_level", "cluster_radius", "estimated_size_mb",
-            "estimated_carbon_savings", "project_count",
-        ]
-
-    def _attributions(self, chosen, pareto):
-        if not pareto:
-            return []
-        arr = np.array([[float(c.get(f, 0.0)) for f in self.feature_names] for c in pareto])
-        chosen_vec = np.array([float(chosen.get(f, 0.0)) for f in self.feature_names])
-        mean = arr.mean(axis=0)
-        std = arr.std(axis=0) + 1e-9
-        z = (chosen_vec - mean) / std
-        attrs = list(zip(self.feature_names, z.tolist()))
-        attrs.sort(key=lambda kv: abs(kv[1]), reverse=True)
-        return attrs
-
-    def explain(self, chosen_idx, chosen, pareto, teacher_probs, counterfactuals,
-                safety_ok, carbon_price, confidence: float = 0.5):
-        attrs = self._attributions(chosen, pareto)
-        cf_list = []
-        for idx, score in sorted(counterfactuals.items(), key=lambda kv: kv[1], reverse=True)[:3]:
-            if 0 <= idx < len(pareto):
-                cf_list.append({"alternative_idx": idx, "expected_reward": float(score)})
-        top_feat = ", ".join(f"{n}={v:+.2f}" for n, v in attrs[:3])
-        rationale = (
-            f"Chose #{chosen_idx} (confidence={confidence:.2f}). "
-            f"Top deviations: {top_feat}. Carbon price={carbon_price:.4f}. "
-            f"Safety={'ok' if safety_ok else 'OVERRIDE'}. Counterfactuals: {len(cf_list)}."
-        )
-        return Explanation(
-            decision_id=f"dec-{uuid.uuid4().hex[:8]}",
-            chosen_idx=chosen_idx,
-            top_features=attrs[:5],
-            counterfactuals=cf_list,
-            rationale=rationale,
-            confidence=confidence,
-            safety_ok=safety_ok,
-            carbon_price_signal=carbon_price,
-        )
-
-
-# ------------------------------------------------------------
-# Enhancement 1: Quantum-Distillation
-# ------------------------------------------------------------
-class QuantumInspiredTeacher:
-    def __init__(self, n_qubits: int = 5, seed: int = 0):
-        self.n_qubits = n_qubits
-        self.rng = np.random.default_rng(seed)
-        self._params = self.rng.normal(size=(n_qubits, 2)) * 0.5
-
-    def _ry(self, state, theta, q):
-        c, s = math.cos(theta / 2), math.sin(theta / 2)
-        n = len(state)
-        new = state.copy()
-        step = 1 << q
-        for i in range(n):
-            if i & step == 0:
-                a, b = state[i], state[i | step]
-                new[i] = c * a - s * b
-                new[i | step] = s * a + c * b
-        return new
-
-    def _simulate(self, features: np.ndarray, n_candidates: int) -> np.ndarray:
-        dim = 1 << self.n_qubits
-        state = np.zeros(dim, dtype=np.complex128)
-        state[0] = 1.0
-        for q in range(self.n_qubits):
-            angle = float(self._params[q, 0] * features[q % len(features)] + self._params[q, 1])
-            state = self._ry(state, angle, q)
-        probs_full = np.abs(state) ** 2
-        probs = np.zeros(n_candidates, dtype=np.float64)
-        for i, p in enumerate(probs_full):
-            probs[i % n_candidates] += p
-        return probs / max(probs.sum(), 1e-12)
-
-    def teacher_probs(self, features: np.ndarray, n: int) -> np.ndarray:
-        if n <= 0:
-            return np.zeros(0)
-        return self._simulate(np.asarray(features, dtype=np.float64), n)
-
-
-class DistillationEnsemble:
-    def __init__(self, quantum: QuantumInspiredTeacher, alpha: float = 0.5):
-        self.quantum = quantum
-        self.alpha = alpha
-
-    def blend(self, features, other, n):
-        q = self.quantum.teacher_probs(features, n)
-        if other is None or len(other) != n:
-            return q
-        return self.alpha * q + (1.0 - self.alpha) * np.asarray(other)
-
-
-# ------------------------------------------------------------
-# Enhancement 10: HITL / Active Learning
-# ------------------------------------------------------------
-@dataclass
-class HITLRequest:
-    request_id: str
-    reason: str
-    chosen_idx: int
-    candidates: List[Dict[str, Any]]
-    uncertainty: float
-    carbon_price: float
-
-
-class UncertaintyEstimator:
-    def __init__(self, entropy_threshold: float = 0.75, variance_threshold: float = 0.05):
-        self.entropy_threshold = entropy_threshold
-        self.variance_threshold = variance_threshold
-        self._rewards: deque = deque(maxlen=32)
-
-    def observe(self, reward: float):
-        self._rewards.append(float(reward))
-
-    def entropy(self, probs) -> float:
-        if probs is None or len(probs) == 0:
-            return 1.0
-        p = np.clip(np.asarray(probs, dtype=np.float64), 1e-12, 1.0)
-        return float(-np.sum(p * np.log(p)) / math.log(len(p)))
-
-    def variance(self) -> float:
-        if len(self._rewards) < 3:
-            return 0.0
-        return float(np.var(np.asarray(self._rewards)))
-
-    def is_uncertain(self, probs):
-        h = self.entropy(probs)
-        v = self.variance()
-        score = 0.6 * h + 0.4 * min(1.0, v / max(self.variance_threshold, 1e-9))
-        return (h > self.entropy_threshold or v > self.variance_threshold), score
-
-
-class HumanInTheLoopGate:
-    def __init__(self, approver=None, timeout_s: float = 2.0, auto_approve_on_timeout: bool = True):
-        self.approver = approver
-        self.timeout_s = timeout_s
-        self.auto_approve_on_timeout = auto_approve_on_timeout
-        self.audit: List[Dict[str, Any]] = []
-
-    async def request(self, req: HITLRequest) -> bool:
-        if self.approver is None:
-            self.audit.append({"request_id": req.request_id, "approved": True, "reason": "no_approver"})
-            HITL_APPROVALS.labels(decision="auto_approved").inc()
-            return True
-        loop = asyncio.get_running_loop()
-        try:
-            approved = await asyncio.wait_for(
-                loop.run_in_executor(None, self.approver, req),
-                timeout=self.timeout_s,
-            )
-        except asyncio.TimeoutError:
-            approved = self.auto_approve_on_timeout
-        self.audit.append({"request_id": req.request_id, "approved": bool(approved), "reason": req.reason})
-        HITL_APPROVALS.labels(decision="approved" if approved else "rejected").inc()
-        return bool(approved)
-
-
-class ActiveLearningSampler:
-    def __init__(self, capacity: int = 256):
-        self.capacity = capacity
-        self._buffer: List[Dict[str, Any]] = []
-
-    def maybe_store(self, record, uncertainty, threshold=0.5):
-        if uncertainty < threshold:
-            return False
-        if len(self._buffer) >= self.capacity:
-            self._buffer.pop(0)
-        self._buffer.append({**record, "uncertainty": uncertainty, "t": time.time()})
-        return True
-
-    def sample(self, k=8):
-        if not self._buffer:
-            return []
-        k = min(k, len(self._buffer))
-        return random.sample(self._buffer, k)
-
-    def __len__(self):
-        return len(self._buffer)
-
-
-# ============================================================
-# Local canonical ContextualBandit
-# ============================================================
-class ContextualBandit:
-    """
-    Canonical contextual bandit with one API:
-      - select_action(context) -> action index
-      - update(action, context, reward)
-      - seed_safe_policy(context, policy)
-    """
-
-    def __init__(self, num_actions=4, feature_dim=4, epsilon=0.1,
-                 action_space=None, **kwargs):
-        if action_space is not None:
-            self.actions = list(action_space)
-            self.num_actions = len(self.actions)
-        else:
-            self.num_actions = int(num_actions)
-            self.actions = list(range(self.num_actions))
-        self.feature_dim = int(feature_dim)
-        self.epsilon = float(epsilon)
-        self.theta = np.zeros((self.feature_dim, self.num_actions))
-        self.counts = np.zeros(self.num_actions, dtype=int)
-
-    def _feat(self, context):
-        if isinstance(context, np.ndarray):
-            v = context.astype(np.float64).reshape(-1)
-        elif isinstance(context, dict):
-            v = np.array([float(context.get(k, 0.0)) for k in
-                          ("carbon", "hour", "demand", "modules")], dtype=np.float64)
-        else:
-            v = np.asarray(context, dtype=np.float64).reshape(-1)
-        if v.size < self.feature_dim:
-            v = np.pad(v, (0, self.feature_dim - v.size))
-        return v[:self.feature_dim]
-
-    def select_action(self, context, *args, **kwargs):
-        if random.random() < self.epsilon:
-            return random.randrange(self.num_actions)
-        x = self._feat(context)
-        q = x @ self.theta
-        return int(np.argmax(q))
-
-    def update(self, action_idx, context, reward):
-        x = self._feat(context)
-        a = int(action_idx) % self.num_actions
-        self.theta[:, a] += 0.01 * (float(reward) - float(x @ self.theta[:, a])) * x
-        self.counts[a] += 1
-
-    def seed_safe_policy(self, context, policy, reward: float = 1.0):
-        # Simple no-op since we operate on int action indices
-        pass
-
-
-# ============================================================
-# Local ParetoFront with correct dominance
-# ============================================================
-class ParetoFront:
-    def __init__(self):
-        self.solutions: List[Tuple[List[float], Any]] = []
-
-    def add(self, objectives: List[float], decision: Any) -> bool:
-        dominated = False
-        for obj, _ in self.solutions:
-            if (all(obj[i] <= objectives[i] for i in range(len(objectives)))
-                    and any(obj[i] < objectives[i] for i in range(len(objectives)))):
-                dominated = True
-                break
-        if not dominated:
-            self.solutions = [
-                (obj, dec) for obj, dec in self.solutions
-                if not (all(objectives[i] <= obj[i] for i in range(len(objectives)))
-                        and any(objectives[i] < obj[i] for i in range(len(objectives))))
-            ]
-            self.solutions.append((objectives, decision))
-        return dominated
-
-    def get_pareto_front(self):
-        return self.solutions
-
-    def get_best_by_weight(self, weights):
-        best = None
-        best_score = -float("inf")
-        for obj, dec in self.solutions:
-            score = sum(w * o for w, o in zip(weights, obj))
-            if score > best_score:
-                best_score = score
-                best = dec
-        return best
 
 
 # ============================================================
@@ -1264,10 +767,11 @@ class TaskManager:
         self.tasks: Dict[str, asyncio.Task] = {}
         self.shutdown_event = asyncio.Event()
         self._lock = asyncio.Lock()
-        self._task_coroutines: Dict[str, Tuple[Callable, tuple, dict]] = {}
-        self.metrics = {"total_tasks": 0, "completed": 0, "failed": 0}
+        self._task_coroutines: Dict[str, Tuple[Callable, tuple, dict, bool]] = {}
+        self.metrics = {"total_tasks": 0, "completed": 0, "failed": 0, "restarts": 0}
 
-    def start_task(self, name: str, coro_func, *args, **kwargs):
+    def start_task(self, name: str, coro_func, *args,
+                   restart_on_exit: bool = False, **kwargs):
         shutdown_event = self.shutdown_event
 
         async def wrapper():
@@ -1275,23 +779,27 @@ class TaskManager:
             while not shutdown_event.is_set():
                 try:
                     await coro_func(*args, **kwargs)
-                    break
+                    if not restart_on_exit:
+                        break
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
                     logger.error(f"Task {name} crashed: {e}")
+                    self.metrics["restarts"] += 1
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 300)
         task = asyncio.create_task(wrapper(), name=name)
         self.tasks[name] = task
+        self.metrics["total_tasks"] += 1
         return task
 
-    def register_task(self, name, coro_func, *args, **kwargs):
-        self._task_coroutines[name] = (coro_func, args, kwargs)
+    def register_task(self, name, coro_func, *args,
+                      restart_on_exit: bool = True, **kwargs):
+        self._task_coroutines[name] = (coro_func, args, kwargs, restart_on_exit)
 
     def start_registered_tasks(self):
-        for name, (coro, args, kwargs) in list(self._task_coroutines.items()):
-            self.start_task(name, coro, *args, **kwargs)
+        for name, (coro, args, kwargs, restart) in list(self._task_coroutines.items()):
+            self.start_task(name, coro, *args, restart_on_exit=restart, **kwargs)
         self._task_coroutines.clear()
 
     async def stop_all(self):
@@ -1312,7 +820,7 @@ class TaskManager:
 if PYDANTIC_AVAILABLE:
     class GeneralConfig(BaseModel):
         instance_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
-        version: str = Field("18.0")
+        version: str = Field("19.0")
         log_level: str = Field("INFO")
         output_dir: str = Field("./maps")
         backup_interval: int = Field(86400, ge=60)
@@ -1333,7 +841,7 @@ if PYDANTIC_AVAILABLE:
     class QuantumConfig(BaseModel):
         enabled: bool = True
         algorithm: str = Field("dilithium")
-        master_key: str = Field("", description="Hex string for key encryption")
+        master_key: str = Field("")
 
         @field_validator("master_key")
         @classmethod
@@ -1409,9 +917,6 @@ if PYDANTIC_AVAILABLE:
         enabled: bool = True
         horizon_hours: int = Field(24, ge=1)
         model_storage_path: str = Field("./prophet_models")
-        evolve_hyperparams: bool = True
-        hyperparam_population_size: int = Field(10, ge=1)
-        hyperparam_generations: int = Field(5, ge=1)
 
     class OptimizerConfig(BaseModel):
         enabled: bool = True
@@ -1419,17 +924,9 @@ if PYDANTIC_AVAILABLE:
         modp_weights: Dict[str, float] = Field(
             default_factory=lambda: {"performance": 0.4, "carbon": 0.3, "cost": 0.3}
         )
-        bandit_min_trials: int = Field(5, ge=1)
-        bandit_confidence_threshold: float = Field(0.6, ge=0, le=1)
-        bio_generations: int = Field(10, ge=1)
         bio_population_size: int = Field(20, ge=2)
-        limit_graph_enabled: bool = True
-        limit_graph_max_nodes: int = 100
-        rlhf_enabled: bool = True
-        rlhf_buffer_size: int = 1000
+        bio_generations: int = Field(10, ge=1)
         distillation_enabled: bool = True
-        distillation_update_interval: int = 600
-        # Ten enhancements
         causal_enabled: bool = True
         federated_enabled: bool = True
         multi_agent_enabled: bool = True
@@ -1517,7 +1014,7 @@ else:
     @dataclass
     class GeneralConfig:
         instance_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-        version: str = "18.0"
+        version: str = "19.0"
         log_level: str = "INFO"
         output_dir: str = "./maps"
         backup_interval: int = 86400
@@ -1605,9 +1102,6 @@ else:
         enabled: bool = True
         horizon_hours: int = 24
         model_storage_path: str = "./prophet_models"
-        evolve_hyperparams: bool = True
-        hyperparam_population_size: int = 10
-        hyperparam_generations: int = 5
 
     @dataclass
     class OptimizerConfig:
@@ -1616,16 +1110,9 @@ else:
         modp_weights: Dict[str, float] = field(
             default_factory=lambda: {"performance": 0.4, "carbon": 0.3, "cost": 0.3}
         )
-        bandit_min_trials: int = 5
-        bandit_confidence_threshold: float = 0.6
-        bio_generations: int = 10
         bio_population_size: int = 20
-        limit_graph_enabled: bool = True
-        limit_graph_max_nodes: int = 100
-        rlhf_enabled: bool = True
-        rlhf_buffer_size: int = 1000
+        bio_generations: int = 10
         distillation_enabled: bool = True
-        distillation_update_interval: int = 600
         causal_enabled: bool = True
         federated_enabled: bool = True
         multi_agent_enabled: bool = True
@@ -1717,7 +1204,7 @@ else:
 
 
 # ============================================================
-# ORM (guarded)
+# ORM MODELS
 # ============================================================
 if SQLALCHEMY_AVAILABLE:
     Base = declarative_base()
@@ -1820,10 +1307,10 @@ class VaultManager(IVault):
 
 
 # ============================================================
-# DATABASE MANAGER (with insert_project, execute_sync)
+# DATABASE MANAGER
 # ============================================================
 class EnhancedDatabaseManager(IDatabaseManager):
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 1
 
     def __init__(self, config: GreenMapConfig):
         self.config = config
@@ -1860,13 +1347,17 @@ class EnhancedDatabaseManager(IDatabaseManager):
                     applied_at TEXT NOT NULL
                 )
             """))
-            result = await conn.execute(text("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"))
+            result = await conn.execute(text(
+                "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
+            ))
             row = result.fetchone()
             current_ver = row[0] if row else 0
             if current_ver < 1:
                 if Base is not None:
                     await conn.run_sync(Base.metadata.create_all)
-                await conn.execute(text("INSERT INTO schema_version (version, applied_at) VALUES (1, datetime('now'))"))
+                await conn.execute(text(
+                    "INSERT INTO schema_version (version, applied_at) VALUES (1, datetime('now'))"
+                ))
         self._migrations_applied = True
 
     async def init(self):
@@ -1880,7 +1371,6 @@ class EnhancedDatabaseManager(IDatabaseManager):
             return await func(session)
 
     async def execute_sync(self, func):
-        """Run a sync SQLAlchemy callable against a session (thread-pooled)."""
         if not self.async_engine:
             return []
         loop = asyncio.get_running_loop()
@@ -1937,57 +1427,147 @@ class EnhancedDatabaseManager(IDatabaseManager):
 
 
 # ============================================================
-# CARBON MANAGER (market + REC aware)
+# POST-QUANTUM CRYPTO
 # ============================================================
-class CarbonIntensityManager(ICarbonManager):
-    def __init__(self, config: GreenMapConfig):
+class PostQuantumCrypto(IQuantumSecurity):
+    def __init__(self, config: GreenMapConfig, vault: VaultManager):
         self.config = config
-        self.market = CarbonMarketClient(
-            base_price=config.carbon.base_price_per_kg,
-            sensitivity=config.carbon.price_sensitivity,
-        )
-        self.recs = RECInventory()
-        if config.carbon.rec_default_kwh > 0:
-            self.recs.add(config.carbon.rec_default_kwh)
+        self.vault = vault
+        self.key_cache: Dict[str, Tuple[bytes, bytes]] = {}
+        self._lock = asyncio.Lock()
 
-    async def get_current_intensity(self) -> float:
-        return 400.0
+    async def generate_keypair(self, algorithm: str = None) -> Dict:
+        algorithm = algorithm or self.config.quantum.algorithm
+        async with self._lock:
+            if not PQC_AVAILABLE:
+                key_id = uuid.uuid4().hex[:8]
+                self.key_cache[key_id] = (b"", b"")
+                return {"key_id": key_id, "algorithm": "none", "public_key": b""}
+            try:
+                if algorithm == "dilithium":
+                    pub, priv = await asyncio.to_thread(dilithium.generate_keypair)
+                elif algorithm == "falcon":
+                    pub, priv = await asyncio.to_thread(falcon.generate_keypair)
+                else:
+                    pub, priv = await asyncio.to_thread(sphincs.generate_keypair)
+            except Exception as e:
+                raise QuantumError(f"Keypair failed: {e}") from e
+            key_id = uuid.uuid4().hex[:8]
+            self.key_cache[key_id] = (pub, priv)
+            return {"key_id": key_id, "algorithm": algorithm, "public_key": pub}
 
-    async def get_current_price(self, hour_of_day=None) -> float:
-        intensity = await self.get_current_intensity()
-        price = self.market.price(intensity, hour_of_day)
-        CARBON_PRICE.set(price)
-        REC_INVENTORY_KWH.set(self.recs.total_kwh())
-        return price
+    async def sign_map_export(self, export_data: Dict, key_id: str) -> Dict:
+        if not PQC_AVAILABLE or key_id not in self.key_cache:
+            return {"algorithm": "none", "signature": "", "key_id": key_id}
+        pub, priv = self.key_cache[key_id]
+        data = json.dumps(export_data, sort_keys=True, default=str).encode()
+        try:
+            algorithm = self.config.quantum.algorithm
+            if algorithm == "dilithium":
+                sig = await asyncio.to_thread(dilithium.sign, priv, data)
+            elif algorithm == "falcon":
+                sig = await asyncio.to_thread(falcon.sign, priv, data)
+            else:
+                sig = await asyncio.to_thread(sphincs.sign, priv, data)
+            QUANTUM_SIGNATURES.labels(algorithm=algorithm, status="success").inc()
+            return {"algorithm": algorithm, "signature": base64.b64encode(sig).decode(),
+                    "key_id": key_id}
+        except Exception as e:
+            QUANTUM_SIGNATURES.labels(algorithm=self.config.quantum.algorithm, status="failed").inc()
+            raise QuantumError(f"Signature failed: {e}") from e
 
-    async def close(self):
-        pass
+    async def verify_map_export(self, export_data: Dict, signature_data: Dict) -> bool:
+        algorithm = signature_data.get("algorithm")
+        if algorithm == "none" or not PQC_AVAILABLE:
+            return True
+        key_id = signature_data.get("key_id")
+        if key_id not in self.key_cache:
+            return False
+        pub, _ = self.key_cache[key_id]
+        data = json.dumps(export_data, sort_keys=True, default=str).encode()
+        try:
+            sig = base64.b64decode(signature_data.get("signature", ""))
+        except Exception:
+            return False
+        try:
+            if algorithm == "dilithium":
+                return bool(await asyncio.to_thread(dilithium.verify, pub, data, sig))
+            if algorithm == "falcon":
+                return bool(await asyncio.to_thread(falcon.verify, pub, data, sig))
+            return bool(await asyncio.to_thread(sphincs.verify, pub, data, sig))
+        except Exception:
+            return False
+
+    def get_quantum_status(self):
+        return {"pqc_available": PQC_AVAILABLE,
+                "algorithms": ["dilithium", "falcon", "sphincs"] if PQC_AVAILABLE else []}
 
     async def health_check(self):
-        return {"status": "ok", "rec_kwh": self.recs.total_kwh()}
+        return {"status": "ok" if PQC_AVAILABLE else "degraded"}
 
 
 # ============================================================
 # BLOCKCHAIN
 # ============================================================
+MINIMAL_MAP_REGISTRY_ABI = [
+    {
+        "inputs": [
+            {"internalType": "string", "name": "exportId", "type": "string"},
+            {"internalType": "string", "name": "fileHash", "type": "string"},
+        ],
+        "name": "recordExport",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+
+
 class BlockchainMapVerification(IBlockchain):
     def __init__(self, config: GreenMapConfig):
         self.config = config
         self.web3 = None
+        self.contract = None
+        self.account = None
         bc = config.blockchain
         if WEB3_AVAILABLE and bc.enabled:
             try:
                 self.web3 = Web3(Web3.HTTPProvider(bc.rpc_url))
                 if bc.poa:
                     self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+                if bc.contract_address and self.web3.is_connected():
+                    self.contract = self.web3.eth.contract(
+                        address=Web3.to_checksum_address(bc.contract_address),
+                        abi=MINIMAL_MAP_REGISTRY_ABI,
+                    )
+                if bc.private_key:
+                    from web3 import Account
+                    self.account = Account.from_key(bc.private_key)
             except Exception as e:
                 logger.warning(f"Web3 init failed: {e}")
 
     async def record_map_export(self, export_id: str, manifest: Dict, file_hash: str) -> Dict:
-        if self.web3 and self.web3.is_connected():
-            BLOCKCHAIN_VERIFICATIONS.labels(status="recorded").inc()
-            return {"tx_hash": "0x" + uuid.uuid4().hex, "status": "simulated"}
-        return {"tx_hash": None, "status": "not_connected"}
+        if self.contract and self.account and self.web3 and self.web3.is_connected():
+            loop = asyncio.get_running_loop()
+
+            def _send():
+                nonce = self.web3.eth.get_transaction_count(self.account.address)
+                tx = self.contract.functions.recordExport(export_id, file_hash).build_transaction({
+                    "from": self.account.address, "nonce": nonce,
+                    "gas": 200000, "gasPrice": self.web3.eth.gas_price,
+                })
+                signed = self.web3.eth.account.sign_transaction(tx, self.account.key)
+                return self.web3.eth.send_raw_transaction(signed.rawTransaction)
+
+            try:
+                tx_hash = await loop.run_in_executor(None, _send)
+                BLOCKCHAIN_VERIFICATIONS.labels(status="recorded").inc()
+                return {"tx_hash": tx_hash.hex(), "status": "success"}
+            except Exception as e:
+                BLOCKCHAIN_VERIFICATIONS.labels(status="failed").inc()
+                return {"tx_hash": None, "status": "failed", "error": str(e)}
+        BLOCKCHAIN_VERIFICATIONS.labels(status="simulated").inc()
+        return {"tx_hash": None, "status": "simulated"}
 
     async def verify_map_export(self, export_id: str, manifest: Dict, file_hash: str) -> Dict:
         BLOCKCHAIN_VERIFICATIONS.labels(status="verified").inc()
@@ -1997,7 +1577,8 @@ class BlockchainMapVerification(IBlockchain):
         if self.web3:
             try:
                 return {"connected": self.web3.is_connected(),
-                        "network": self.config.blockchain.chain_id}
+                        "network": self.config.blockchain.chain_id,
+                        "contract": bool(self.contract)}
             except Exception:
                 pass
         return {"connected": False}
@@ -2005,64 +1586,6 @@ class BlockchainMapVerification(IBlockchain):
     async def health_check(self):
         s = await self.get_blockchain_status()
         return {"status": "ok" if s["connected"] else "degraded", **s}
-
-
-# ============================================================
-# POST-QUANTUM CRYPTO (fixed)
-# ============================================================
-class PostQuantumCrypto(IQuantumSecurity):
-    def __init__(self, config: GreenMapConfig, vault: VaultManager):
-        self.config = config
-        self.vault = vault
-        self.key_cache: Dict[str, Tuple[bytes, bytes]] = {}
-
-    async def generate_keypair(self, algorithm: str = None) -> Dict:
-        algorithm = algorithm or self.config.quantum.algorithm
-        if not PQC_AVAILABLE:
-            key_id = uuid.uuid4().hex[:8]
-            self.key_cache[key_id] = (b"", b"")
-            return {"key_id": key_id, "public_key": b""}
-        try:
-            if algorithm == "dilithium":
-                pub, priv = dilithium.generate_keypair()
-            elif algorithm == "falcon":
-                pub, priv = falcon.generate_keypair()
-            else:
-                pub, priv = sphincs.generate_keypair()
-        except Exception as e:
-            raise QuantumError(f"Keypair failed: {e}") from e
-        key_id = uuid.uuid4().hex[:8]
-        self.key_cache[key_id] = (pub, priv)
-        return {"key_id": key_id, "public_key": pub}
-
-    async def sign_map_export(self, export_data: Dict, key_id: str) -> Dict:
-        if not PQC_AVAILABLE or key_id not in self.key_cache:
-            return {"algorithm": "none", "signature": ""}
-        pub, priv = self.key_cache[key_id]
-        data = json.dumps(export_data, sort_keys=True, default=str).encode()
-        try:
-            algorithm = self.config.quantum.algorithm
-            if algorithm == "dilithium":
-                signature = dilithium.sign(priv, data)
-            elif algorithm == "falcon":
-                signature = falcon.sign(priv, data)
-            else:
-                signature = sphincs.sign(priv, data)
-            QUANTUM_SIGNATURES.labels(algorithm=algorithm, status="success").inc()
-            return {"algorithm": algorithm, "signature": base64.b64encode(signature).decode()}
-        except Exception as e:
-            QUANTUM_SIGNATURES.labels(algorithm=self.config.quantum.algorithm, status="failed").inc()
-            raise QuantumError(f"Signature failed: {e}") from e
-
-    async def verify_map_export(self, export_data: Dict, signature_data: Dict) -> bool:
-        return True
-
-    def get_quantum_status(self):
-        return {"pqc_available": PQC_AVAILABLE,
-                "algorithms": ["dilithium", "falcon", "sphincs"] if PQC_AVAILABLE else []}
-
-    async def health_check(self):
-        return {"status": "ok" if PQC_AVAILABLE else "degraded"}
 
 
 # ============================================================
@@ -2101,10 +1624,47 @@ class MultiCloudStorage(ICloudStorage):
 
 
 # ============================================================
+# PARETO FRONT
+# ============================================================
+class ParetoFront:
+    def __init__(self):
+        self.solutions: List[Tuple[List[float], Any]] = []
+
+    def add(self, objectives: List[float], decision: Any) -> bool:
+        dominated = False
+        for obj, _ in self.solutions:
+            if (all(obj[i] <= objectives[i] for i in range(len(objectives)))
+                    and any(obj[i] < objectives[i] for i in range(len(objectives)))):
+                dominated = True
+                break
+        if not dominated:
+            self.solutions = [
+                (obj, dec) for obj, dec in self.solutions
+                if not (all(objectives[i] <= obj[i] for i in range(len(objectives)))
+                        and any(objectives[i] < obj[i] for i in range(len(objectives))))
+            ]
+            self.solutions.append((objectives, decision))
+        return dominated
+
+    def get_pareto_front(self):
+        return self.solutions
+
+    def get_best_by_weight(self, weights):
+        best, best_score = None, -float("inf")
+        for obj, dec in self.solutions:
+            score = sum(w * o for w, o in zip(weights, obj))
+            if score > best_score:
+                best_score = score
+                best = dec
+        return best
+
+
+# ============================================================
 # MULTI-OBJECTIVE CLOUD DEPLOYER
 # ============================================================
 class MultiObjectiveCloudDeployer(ICloudDeployer):
-    def __init__(self, config: GreenMapConfig, db_manager: IDatabaseManager, carbon_manager: ICarbonManager):
+    def __init__(self, config: GreenMapConfig, db_manager: IDatabaseManager,
+                 carbon_manager: ICarbonManager):
         self.config = config
         self.db_manager = db_manager
         self.carbon_manager = carbon_manager
@@ -2132,10 +1692,17 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
         self.deployment_history: deque = deque(maxlen=100)
 
         # Enhancements
-        self.quantum_teacher = QuantumInspiredTeacher(seed=1) if config.optimizer.distillation_enabled else None
-        self.distill_ensemble = DistillationEnsemble(self.quantum_teacher, alpha=0.5) if self.quantum_teacher else None
+        self.quantum_teacher = (
+            QuantumInspiredTeacher(seed=1) if config.optimizer.distillation_enabled else None
+        )
+        self.distill_ensemble = (
+            DistillationEnsemble(self.quantum_teacher, alpha=0.5)
+            if self.quantum_teacher else None
+        )
         self.roles = EmergentRoleRegistry() if config.optimizer.multi_agent_enabled else None
-        self.coordinator = MultiAgentCoordinator(self.roles) if self.roles else None
+        self.coordinator = (
+            MultiAgentCoordinator(self.roles, rng=random.Random(0)) if self.roles else None
+        )
         self.temporal = None
         self.shield = None
         if config.optimizer.temporal_logic_enabled:
@@ -2148,8 +1715,14 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
             self.shield = SafetyShield(self.temporal)
         self.explainer = DecisionExplainer() if config.optimizer.xai_enabled else None
         self.last_explanation: Optional[Explanation] = None
-        self.precision_controller = PrecisionController() if config.optimizer.precision_switching_enabled else None
-        self.precision_adapter = HardwareAwareAdapter(self.precision_controller) if self.precision_controller else None
+        self.precision_controller = (
+            PrecisionController(quality_floor=0.95)
+            if config.optimizer.precision_switching_enabled else None
+        )
+        self.precision_adapter = (
+            HardwareAwareAdapter(self.precision_controller)
+            if self.precision_controller else None
+        )
         self.current_precision: Optional[PrecisionLevel] = None
         self.recs = RECInventory() if config.optimizer.carbon_market_enabled else None
         self.chaos = ChaosEngineer(ChaosConfig(
@@ -2158,10 +1731,12 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
             carbon_spike_prob=config.optimizer.chaos_carbon_spike_prob,
         )) if config.optimizer.chaos_enabled else None
         self.uncertainty = UncertaintyEstimator() if config.optimizer.hitl_enabled else None
-        self.hitl = HumanInTheLoopGate(timeout_s=config.optimizer.hitl_timeout_s) if config.optimizer.hitl_enabled else None
+        self.hitl = (
+            HumanInTheLoopGate(timeout_s=config.optimizer.hitl_timeout_s)
+            if config.optimizer.hitl_enabled else None
+        )
         self.active_learner = ActiveLearningSampler() if config.optimizer.hitl_enabled else None
 
-        # Legacy distiller teacher ensemble
         if ENHANCEMENTS_AVAILABLE:
             self.distiller = MultiTeacherDistiller([
                 self._modp_teacher, self._rule_teacher, self._static_teacher,
@@ -2210,8 +1785,7 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
             latency = await self._measure_latency(name)
             cost = p["cost_per_gb"] * map_data.get("size_mb", 1) / 1024
             carbon = p["carbon_score"] * carbon_intensity / 400.0
-            availability = p["availability"]
-            objectives = [cost, carbon, latency, 1 - availability]
+            objectives = [cost, carbon, latency / 100.0, 1 - p["availability"]]
             results[name] = {"objectives": objectives,
                              "decision": (name, p["regions"][0])}
         return results
@@ -2250,46 +1824,69 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
                     provider_name = best[0]
                 source = "modp"
 
-            # Multi-agent vote
-            bids = []
-            for role in AgentRole:
-                idx = list(self.providers.keys()).index(provider_name)
-                if role == AgentRole.CARBON_BROKER:
-                    idx = min(range(len(self.providers)),
-                              key=lambda i: list(self.providers.values())[i]["carbon_score"])
-                elif role == AgentRole.EXPLOITER:
-                    idx = min(range(len(self.providers)),
-                              key=lambda i: list(self.providers.values())[i]["latency_score"])
-                bids.append(AgentBid(
-                    agent_id=role.value, role=role, confidence=0.7,
-                    proposed_action=idx, rationale=role.value, carbon_score=1.0,
-                ))
-            voted = self.coordinator.vote(bids, len(self.providers))
-            provider_name = list(self.providers.keys())[voted]
+            # Multi-agent vote: unpack the tuple, credit winning role
+            winning_role: Optional[AgentRole] = None
+            if self.coordinator and self.roles:
+                bids = []
+                for role in AgentRole:
+                    idx = list(self.providers.keys()).index(provider_name)
+                    if role == AgentRole.CARBON_BROKER:
+                        idx = min(range(len(self.providers)),
+                                  key=lambda i: list(self.providers.values())[i]["carbon_score"])
+                    elif role == AgentRole.EXPLOITER:
+                        idx = min(range(len(self.providers)),
+                                  key=lambda i: list(self.providers.values())[i]["latency_score"])
+                    bids.append(AgentBid(
+                        agent_id=role.value, role=role, confidence=0.7,
+                        proposed_action=idx, rationale=role.value,
+                        carbon_score=1.0,
+                    ))
+                voted, winning_role = self.coordinator.vote(bids, len(self.providers))
+                provider_name = list(self.providers.keys())[voted]
 
             # Temporal shield
-            synth_candidates = [{"tile_level": 10, "latency_ms": v["latency_score"] * 100}
-                                for v in self.providers.values()]
-            safe_idx, safety_ok, stl_verdict = self.shield.screen(voted, synth_candidates) if self.shield else (voted, True, {})
-            provider_name = list(self.providers.keys())[safe_idx]
+            safety_ok = True
+            stl_verdict: Dict[str, bool] = {}
+            if self.shield and self.temporal:
+                self.temporal.observe({"latency_ms": self.providers[provider_name]["latency_score"] * 100})
+                candidate_list = [
+                    {"carbon_g": v["carbon_score"] * 100,
+                     "latency_ms": v["latency_score"] * 100,
+                     "tile_level": 10}
+                    for v in self.providers.values()
+                ]
+                try:
+                    idx = list(self.providers.keys()).index(provider_name)
+                except ValueError:
+                    idx = 0
+                safe_idx, safety_ok, stl_verdict = self.shield.screen(idx, candidate_list)
+                provider_name = list(self.providers.keys())[safe_idx]
 
             # Precision
             carbon_intensity = await self.carbon_manager.get_current_intensity()
-            carbon_price = await self.carbon_manager.get_current_price() if hasattr(self.carbon_manager, "get_current_price") else 0.0
+            try:
+                carbon_price = await self.carbon_manager.get_current_price()
+            except Exception:
+                carbon_price = 0.0
             precision_level = None
             if self.precision_adapter:
-                _, precision_level = self.precision_adapter.adapt({}, carbon_intensity, 0.5, carbon_price)
+                _, precision_level = self.precision_adapter.adapt(
+                    {}, carbon_intensity, 0.5, carbon_price
+                )
                 self.current_precision = precision_level
 
             # HITL
             probs = np.ones(len(self.providers)) / len(self.providers)
-            is_unc, unc = self.uncertainty.is_uncertain(probs) if self.uncertainty else (False, 0.0)
+            is_unc, unc = (
+                self.uncertainty.is_uncertain(probs)
+                if self.uncertainty else (False, 0.0)
+            )
             human_approved = True
             if (is_unc or not safety_ok) and self.hitl:
                 req = HITLRequest(
                     request_id=uuid.uuid4().hex[:8],
                     reason="high_uncertainty" if is_unc else "safety_violation",
-                    chosen_idx=safe_idx,
+                    chosen_idx=list(self.providers.keys()).index(provider_name),
                     candidates=[{"provider": p} for p in self.providers],
                     uncertainty=unc,
                     carbon_price=carbon_price,
@@ -2307,25 +1904,33 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
             actual_cost = self.providers[provider_name]["cost_per_gb"] * map_data.get("size_mb", 1) / 1024
             actual_carbon = self.providers[provider_name]["carbon_score"] * carbon_intensity / 400.0
             actual_latency = await self._measure_latency(provider_name)
-            outcome = [actual_cost, actual_carbon, actual_latency, 0.0][:len(self.weights)]
+            outcome = [actual_cost, actual_carbon, actual_latency / 100.0, 0.0][:n]
             self.recent_outcomes.append((list(self.weights), outcome))
             if self.adaptive_weights and len(self.recent_outcomes) >= 10:
                 self._update_weights()
 
+            # Role credit
+            if self.roles:
+                self.roles.record(
+                    winning_role or AgentRole.EXPLOITER,
+                    success=safety_ok and human_approved,
+                    reward=1.0 if safety_ok else 0.0,
+                )
+
             # XAI
             if self.explainer:
                 chosen_dict = {
-                    "tile_level": 10,
-                    "cluster_radius": 75,
+                    "tile_level": 10, "cluster_radius": 75,
                     "estimated_size_mb": map_data.get("size_mb", 1),
-                    "estimated_carbon_savings": 0.0,
-                    "project_count": 0,
+                    "estimated_carbon_savings": 0.0, "project_count": 0,
                 }
                 pareto_list = [chosen_dict for _ in self.providers]
                 explanation = self.explainer.explain(
-                    chosen_idx=safe_idx, chosen=chosen_dict, pareto=pareto_list,
+                    chosen_idx=list(self.providers.keys()).index(provider_name),
+                    chosen=chosen_dict, pareto=pareto_list,
                     teacher_probs=probs, counterfactuals={},
-                    safety_ok=safety_ok and human_approved, carbon_price=carbon_price,
+                    safety_ok=safety_ok and human_approved,
+                    carbon_price=carbon_price,
                 )
                 self.last_explanation = explanation
 
@@ -2342,6 +1947,7 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
                 "stl_verdict": stl_verdict,
                 "human_approved": human_approved,
                 "uncertainty": unc,
+                "winning_role": winning_role.value if winning_role else None,
                 "explanation": self.last_explanation.to_dict() if self.last_explanation else None,
                 "timestamp": datetime.now().isoformat(),
             }
@@ -2350,14 +1956,13 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
             if self.db_manager:
                 try:
                     async def insert(session):
-                        await session.execute(
-                            text("INSERT INTO cloud_deployments (provider, region, map_path, cdn_url, score, timestamp) "
-                                 "VALUES (:p, :r, :mp, :url, :s, :t)"),
-                            {"p": provider_name, "r": region,
-                             "mp": map_data.get("path", ""),
-                             "url": f"https://{provider_name}.example.com",
-                             "s": 0.0, "t": datetime.now()},
-                        )
+                        session.add(CloudDeploymentDB(
+                            provider=provider_name, region=region,
+                            map_path=map_data.get("path", ""),
+                            cdn_url=f"https://{provider_name}.example.com",
+                            score=0.0, timestamp=datetime.now(),
+                        ))
+                        await session.commit()
                     await self.db_manager.execute_async(insert)
                 except Exception:
                     pass
@@ -2370,7 +1975,9 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
             return
         outcomes = np.array([o for _, o in self.recent_outcomes])
         mean_outcome = outcomes.mean(axis=0)
-        delta = mean_outcome - mean_outcome.mean()
+        # v19: normalize by per-objective std so raw scale does not dominate
+        scale = np.std(outcomes, axis=0) + 1e-9
+        delta = (mean_outcome - mean_outcome.mean()) / scale
         w = np.array(self.weights) - self.learning_rate * delta
         w = np.clip(w, 0.05, None)
         w /= w.sum()
@@ -2384,7 +1991,6 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
             "weights": self.weights,
             "deployment_history": list(self.deployment_history)[-5:],
             "distillation_active": self.distiller is not None,
-            "limit_graph_active": False,
             "multi_agent_active": self.coordinator is not None,
             "temporal_logic_active": self.temporal is not None,
             "xai_active": self.explainer is not None,
@@ -2393,6 +1999,7 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
             "chaos_active": self.chaos is not None,
             "hitl_active": self.hitl is not None,
             "current_precision": self.current_precision.value if self.current_precision else None,
+            "role_snapshot": self.roles.snapshot() if self.roles else {},
             "last_explanation": self.last_explanation.to_dict() if self.last_explanation else None,
         }
 
@@ -2401,11 +2008,12 @@ class MultiObjectiveCloudDeployer(ICloudDeployer):
 
 
 # ============================================================
-# BIO-INSPIRED DEPLOYER (fixed PSO reset)
+# PSO + BIO-INSPIRED DEPLOYER
 # ============================================================
 class ParticleSwarmOptimizer:
     def __init__(self, num_particles=20, max_iter=50, w=0.7, c1=1.5, c2=1.5):
-        self.num_particles = num_particles
+        # v19: ensure num_particles is at least 1
+        self.num_particles = max(1, int(num_particles))
         self.max_iter = max_iter
         self.w = w
         self.c1 = c1
@@ -2420,7 +2028,6 @@ class ParticleSwarmOptimizer:
         return -(0.5 * cost + 0.3 * carbon) + 0.2 * p["availability"]
 
     async def optimise(self, providers, map_data, carbon_intensity):
-        # Reset state per call
         keys = list(providers.keys())
         n = len(keys)
         particles = []
@@ -2435,6 +2042,9 @@ class ParticleSwarmOptimizer:
             if fit > global_best_val:
                 global_best_val = fit
                 global_best_pos = pos.copy()
+        # v19: guard against None (only possible if num_particles == 0)
+        if global_best_pos is None:
+            return keys[0]
         for _ in range(self.max_iter):
             for p in particles:
                 r1, r2 = self.rng.random(), self.rng.random()
@@ -2473,12 +2083,13 @@ class BioInspiredCloudDeployer(ICloudDeployer):
         if self.db_manager:
             try:
                 async def insert(session):
-                    await session.execute(
-                        text("INSERT INTO cloud_deployments (provider, region, map_path, cdn_url, score, timestamp) "
-                             "VALUES (:p, :r, :mp, :url, :s, :t)"),
-                        {"p": best, "r": region, "mp": map_data.get("path", ""),
-                         "url": f"https://{best}.example.com", "s": 0.0, "t": datetime.now()},
-                    )
+                    session.add(CloudDeploymentDB(
+                        provider=best, region=region,
+                        map_path=map_data.get("path", ""),
+                        cdn_url=f"https://{best}.example.com",
+                        score=0.0, timestamp=datetime.now(),
+                    ))
+                    await session.commit()
                 await self.db_manager.execute_async(insert)
             except Exception:
                 pass
@@ -2509,7 +2120,6 @@ class MixtureOfExpertsPredictive(IPredictive):
         self._lock = asyncio.Lock()
         self.experts: List[Tuple[str, Callable]] = []
         self._init_experts()
-        self.gating_weights = np.ones(len(self.experts)) / len(self.experts)
 
     def _init_experts(self):
         if self.prophet_available:
@@ -2564,20 +2174,22 @@ class MixtureOfExpertsPredictive(IPredictive):
         for name, fn in self.experts:
             try:
                 res = await fn(history, horizon)
+                conf = res.get("confidence", 0.0)
+                if conf <= 0.0:
+                    continue  # v19: skip failing experts entirely
                 forecasts.append(np.asarray(res["forecast"]))
-                weights.append(res.get("confidence", 0.5))
+                weights.append(conf)
             except Exception as e:
                 logger.warning(f"Expert {name} failed: {e}")
-                forecasts.append(np.zeros(horizon))
-                weights.append(0.0)
-        total = sum(weights) or 1.0
-        weights_n = np.array(weights) / total
+        if not forecasts:
+            return {"forecast": [0.0] * horizon, "expert_weights": [], "confidence": 0.0}
+        weights_n = np.array(weights) / sum(weights)
         final = np.zeros(horizon)
         for w, f in zip(weights_n, forecasts):
             final += w * f
         return {"forecast": final.tolist(),
                 "expert_weights": weights_n.tolist(),
-                "confidence": 0.8}
+                "confidence": float(weights_n.max())}
 
     async def update_history(self, project_count: int, carbon_intensity: float):
         async with self._lock:
@@ -2586,12 +2198,14 @@ class MixtureOfExpertsPredictive(IPredictive):
 
     async def forecast_project_count(self, horizon_hours=None):
         return await self._get_forecast(
-            self.history_project_count, horizon_hours or self.config.predictive.horizon_hours
+            self.history_project_count,
+            horizon_hours or self.config.predictive.horizon_hours,
         )
 
     async def forecast_carbon(self, horizon_hours=None):
         return await self._get_forecast(
-            self.history_carbon, horizon_hours or self.config.predictive.horizon_hours
+            self.history_carbon,
+            horizon_hours or self.config.predictive.horizon_hours,
         )
 
     async def health_check(self):
@@ -2615,7 +2229,8 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
         }
         self.strategy_keys = list(self.strategies.keys())
         self.bandit = ContextualBandit(
-            num_actions=len(self.strategy_keys), feature_dim=4,
+            num_actions=len(self.strategy_keys),
+            feature_dim=4,
             epsilon=config.optimizer.epsilon,
         )
         self.generation_history: deque = deque(maxlen=100)
@@ -2624,13 +2239,18 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
         # Enhancements
         self.quantum_teacher = QuantumInspiredTeacher(seed=2)
         self.distill_ensemble = DistillationEnsemble(self.quantum_teacher, alpha=0.5)
-        self.causal = CausalCounterfactualEstimator(
-            state_dim=8, n_actions=len(self.strategy_keys)
-        ) if config.optimizer.causal_enabled else None
+        self.causal = (
+            CausalCounterfactualEstimator(
+                state_dim=STATE_VECTOR_DIM,
+                n_actions=len(self.strategy_keys),
+            ) if config.optimizer.causal_enabled else None
+        )
         self.last_counterfactuals: Dict[int, float] = {}
         self.federated = FederatedAggregator() if config.optimizer.federated_enabled else None
         self.roles = EmergentRoleRegistry() if config.optimizer.multi_agent_enabled else None
-        self.coordinator = MultiAgentCoordinator(self.roles) if self.roles else None
+        self.coordinator = (
+            MultiAgentCoordinator(self.roles, rng=random.Random(0)) if self.roles else None
+        )
         self.temporal = None
         self.shield = None
         if config.optimizer.temporal_logic_enabled:
@@ -2643,8 +2263,14 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
             self.shield = SafetyShield(self.temporal)
         self.explainer = DecisionExplainer() if config.optimizer.xai_enabled else None
         self.last_explanation: Optional[Explanation] = None
-        self.precision_controller = PrecisionController() if config.optimizer.precision_switching_enabled else None
-        self.precision_adapter = HardwareAwareAdapter(self.precision_controller) if self.precision_controller else None
+        self.precision_controller = (
+            PrecisionController(quality_floor=0.95)
+            if config.optimizer.precision_switching_enabled else None
+        )
+        self.precision_adapter = (
+            HardwareAwareAdapter(self.precision_controller)
+            if self.precision_controller else None
+        )
         self.current_precision: Optional[PrecisionLevel] = None
         self.recs = RECInventory() if config.optimizer.carbon_market_enabled else None
         self.chaos = ChaosEngineer(ChaosConfig(
@@ -2653,7 +2279,10 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
             carbon_spike_prob=config.optimizer.chaos_carbon_spike_prob,
         )) if config.optimizer.chaos_enabled else None
         self.uncertainty = UncertaintyEstimator() if config.optimizer.hitl_enabled else None
-        self.hitl = HumanInTheLoopGate(timeout_s=config.optimizer.hitl_timeout_s) if config.optimizer.hitl_enabled else None
+        self.hitl = (
+            HumanInTheLoopGate(timeout_s=config.optimizer.hitl_timeout_s)
+            if config.optimizer.hitl_enabled else None
+        )
         self.active_learner = ActiveLearningSampler() if config.optimizer.hitl_enabled else None
 
     async def _extract_features(self, data: Dict) -> np.ndarray:
@@ -2665,22 +2294,30 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
         complexity = len(set(data.get("types", []))) / 10.0
         return np.array([project_count, carbon / 1000.0, hour, complexity])
 
-    def _build_state_vec(self, features: np.ndarray) -> np.ndarray:
-        v = np.asarray(features, dtype=np.float64).reshape(-1)
-        if v.size < 8:
-            v = np.pad(v, (0, 8 - v.size))
-        return v[:8]
+    def _build_state_vec(self, data: Dict, features: np.ndarray) -> np.ndarray:
+        """v19: use the canonical state_vector_from_metrics."""
+        hw = {}
+        metrics = {
+            "gpu_utilization_pct": float(hw.get("gpu_utilization_pct", 0.0)),
+            "gpu_power_watts": float(hw.get("gpu_power_watts", 0.0)),
+            "gpu_temp_c": float(hw.get("gpu_temp_c", 0.0)),
+            "cpu_utilization_pct": float(hw.get("cpu_utilization_pct", 0.0)),
+            "carbon_intensity_g_per_kwh": float(features[1]) * 1000.0,
+            "carbon_price_per_kg": 0.05,
+            "rec_kwh_available": self.recs.total_kwh() if self.recs else 0.0,
+            "uncertainty_score": 0.0,
+        }
+        return state_vector_from_metrics(metrics)
 
     async def generate_map_autonomously(self, data: Dict, strategy: str = None) -> Dict:
         features = await self._extract_features(data)
 
-        # Determine strategy
+        # Strategy selection
         if strategy is not None and strategy in self.strategy_keys:
             selected = strategy
             action = self.strategy_keys.index(selected)
             source = "explicit"
         else:
-            # Distillation ensemble: blend quantum teacher with bandit preference
             bandit_action = self.bandit.select_action(features)
             bandit_onehot = np.zeros(len(self.strategy_keys))
             bandit_onehot[bandit_action] = 1.0
@@ -2689,7 +2326,8 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
             selected = self.strategy_keys[action]
             source = "distilled"
 
-        # Multi-agent vote
+        # Multi-agent vote: unpack tuple, credit winning role
+        winning_role: Optional[AgentRole] = None
         if self.coordinator and self.roles:
             bids = []
             for role in AgentRole:
@@ -2704,7 +2342,7 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
                     agent_id=role.value, role=role, confidence=0.7,
                     proposed_action=idx, rationale=role.value, carbon_score=1.0,
                 ))
-            action = self.coordinator.vote(bids, len(self.strategy_keys))
+            action, winning_role = self.coordinator.vote(bids, len(self.strategy_keys))
             selected = self.strategy_keys[action]
 
         # Execute strategy
@@ -2723,17 +2361,23 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
                 {"tile_level": 10, "cluster_radius": 75, "estimated_size_mb": 1.0}
                 for _ in range(len(self.strategy_keys) - 1)
             ]
-            result, safety_ok, stl_verdict = self.shield.screen(result, candidates)
+            # Shared SafetyShield.screen signature: (idx, candidates)
+            result, safety_ok, stl_verdict = self.shield.screen(action, candidates)
+            if isinstance(result, int):  # shield returned an index
+                result = candidates[result]
 
         # Precision switch
         precision_level = None
         if self.precision_adapter:
             carbon = await self.carbon_manager.get_current_intensity()
-            price = await self.carbon_manager.get_current_price() if hasattr(self.carbon_manager, "get_current_price") else 0.0
+            try:
+                price = await self.carbon_manager.get_current_price()
+            except Exception:
+                price = 0.0
             result, precision_level = self.precision_adapter.adapt(result, carbon, 0.5, price)
             self.current_precision = precision_level
 
-        # Reward: read flat AND nested improvement keys
+        # Reward
         reward = 0.0
         if selected in ("performance", "hybrid") and result.get("estimated_size_mb"):
             reward += 1.0 / (result["estimated_size_mb"] + 0.1)
@@ -2747,24 +2391,30 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
                     reward += 0.2 * float(v)
         reward = max(0.0, min(1.0, reward))
 
-        # Carbon price penalty and REC offset
         carbon_price = 0.0
-        if hasattr(self.carbon_manager, "get_current_price"):
+        try:
             carbon_price = await self.carbon_manager.get_current_price()
+        except Exception:
+            carbon_price = 0.0
         reward -= carbon_price * 0.05
         reward = max(0.0, reward)
+
         if self.recs and self.recs.total_kwh() > 0:
             offset = self.recs.consume(min(0.001, self.recs.total_kwh()))
             reward += offset * 0.1
 
         # Learners
         self.bandit.update(action, features, reward)
+
         if self.causal:
-            state_vec = self._build_state_vec(features)
+            state_vec = self._build_state_vec(data, features)
             self.causal.update(CausalTransition(
                 state=state_vec, action=action, reward=reward, next_state=state_vec,
             ))
-            self.last_counterfactuals = self.causal.counterfactuals(state_vec, len(self.strategy_keys))
+            self.last_counterfactuals = self.causal.counterfactuals(
+                state_vec, len(self.strategy_keys)
+            )
+
         if self.federated:
             self.federated.submit(FederatedUpdate(
                 node_id="map_generator",
@@ -2773,16 +2423,23 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
                 carbon_intensity=await self.carbon_manager.get_current_intensity(),
             ))
             self.federated.aggregate()
+
         if self.roles:
-            self.roles.record(AgentRole.CARBON_BROKER if "carbon" in selected else AgentRole.EXPLOITER,
-                              success=reward > 0.5, reward=reward)
+            self.roles.record(
+                winning_role or AgentRole.EXPLOITER,
+                success=reward > 0.5,
+                reward=reward,
+            )
+
         if self.uncertainty:
             self.uncertainty.observe(reward)
-        # HITL check
+
+        # HITL
         probs = np.ones(len(self.strategy_keys)) / len(self.strategy_keys)
+        human_approved = True
+        unc = 0.0
         if self.uncertainty and self.hitl:
             is_unc, unc = self.uncertainty.is_uncertain(probs)
-            human_approved = True
             if is_unc or not safety_ok:
                 req = HITLRequest(
                     request_id=uuid.uuid4().hex[:8],
@@ -2801,8 +2458,6 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
                     {"strategy": selected, "reward": reward},
                     uncertainty=unc, threshold=0.4,
                 )
-        else:
-            human_approved = True
 
         # XAI
         if self.explainer:
@@ -2814,25 +2469,26 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
             )
             self.last_explanation = explanation
 
-        # Record history
         async with self._lock:
             self.generation_history.append({
                 "strategy": selected, "result": result,
                 "timestamp": datetime.now().isoformat(), "source": source,
                 "reward": reward,
             })
+
         if self.db_manager:
             try:
                 async def insert(session):
-                    await session.execute(
-                        text("INSERT INTO generation_history (strategy, result, timestamp) "
-                             "VALUES (:s, :r, :t)"),
-                        {"s": selected, "r": json.dumps(result, default=str),
-                         "t": datetime.now()},
-                    )
+                    session.add(GenerationHistoryDB(
+                        strategy=selected,
+                        result=json.dumps(result, default=str),
+                        timestamp=datetime.now(),
+                    ))
+                    await session.commit()
                 await self.db_manager.execute_async(insert)
             except Exception:
                 pass
+
         MAP_GENERATIONS.labels(strategy=selected, status="success").inc()
 
         return {
@@ -2844,6 +2500,8 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
             "safety_ok": safety_ok,
             "stl_verdict": stl_verdict,
             "human_approved": human_approved,
+            "uncertainty": unc,
+            "winning_role": winning_role.value if winning_role else None,
             "counterfactuals": self.last_counterfactuals,
             "explanation": self.last_explanation.to_dict() if self.last_explanation else None,
         }
@@ -2878,10 +2536,11 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
             "total_generations": len(self.generation_history),
             "strategies": self.strategy_keys,
             "recent_generations": list(self.generation_history)[-5:],
-            "strategy_usage": {s: sum(1 for h in self.generation_history if h["strategy"] == s)
+            "strategy_usage": {s: sum(1 for h in self.generation_history
+                                      if h["strategy"] == s)
                                for s in self.strategy_keys},
             "epsilon": getattr(self.bandit, "epsilon", None),
-            "distillation_active": True,
+            "distillation_active": self.distill_ensemble is not None,
             "causal_active": self.causal is not None,
             "federated_active": self.federated is not None,
             "multi_agent_active": self.coordinator is not None,
@@ -2893,7 +2552,8 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
             "hitl_active": self.hitl is not None,
             "current_precision": self.current_precision.value if self.current_precision else None,
             "last_explanation": self.last_explanation.to_dict() if self.last_explanation else None,
-            "last_counterfactuals": {int(k): float(v) for k, v in self.last_counterfactuals.items()},
+            "last_counterfactuals": {int(k): float(v)
+                                     for k, v in self.last_counterfactuals.items()},
         }
 
     async def health_check(self):
@@ -2901,10 +2561,11 @@ class EnhancedAutonomousMapGenerator(IAutonomousGenerator):
 
 
 # ============================================================
-# CARBON-AWARE EXPORT QUEUE (with monotonic tie-break)
+# CARBON-AWARE EXPORT QUEUE
 # ============================================================
 class CarbonAwareExportQueue(IExportQueue):
-    def __init__(self, config: GreenMapConfig, carbon_manager: ICarbonManager, max_concurrent: int = 3):
+    def __init__(self, config: GreenMapConfig, carbon_manager: ICarbonManager,
+                 max_concurrent: int = 3):
         self.config = config
         self.carbon_manager = carbon_manager
         self.max_concurrent = max_concurrent
@@ -2918,7 +2579,6 @@ class CarbonAwareExportQueue(IExportQueue):
         self._counter = itertools.count()
 
     async def submit(self, job: ExportJob):
-        # Use monotonic counter as tiebreaker so ExportJob is never compared
         await self.queue.put((job.priority, next(self._counter), job))
         self.metrics["submitted"] += 1
 
@@ -2942,7 +2602,6 @@ class CarbonAwareExportQueue(IExportQueue):
                     self.metrics["delayed"] += 1
                 async with self.semaphore:
                     try:
-                        # Write the export file
                         try:
                             job.output_path.write_text(json.dumps({
                                 "job_id": job.job_id,
@@ -2979,7 +2638,7 @@ class CarbonAwareExportQueue(IExportQueue):
 
 
 # ============================================================
-# ADAPTIVE TTL CACHE (uses len(str(value)))
+# ADAPTIVE TTL CACHE (v19: bump access_count on set)
 # ============================================================
 class AdaptiveTTLCache:
     def __init__(self, config: GreenMapConfig):
@@ -3015,8 +2674,12 @@ class AdaptiveTTLCache:
             if self.current_size_bytes > self.max_size_mb * 1024 * 1024:
                 self._evict()
             size = self._size_of(key, value)
-            self._cache[key] = (value, datetime.now(), 1)
-            self.current_size_bytes += size
+            # v19: preserve access_count on overwrite, otherwise start at 1
+            prev = self._cache.get(key)
+            prev_count = prev[2] if prev else 0
+            self._cache[key] = (value, datetime.now(), prev_count + 1)
+            if prev is None:
+                self.current_size_bytes += size
 
     def _evict(self):
         if not self._cache:
@@ -3029,6 +2692,21 @@ class AdaptiveTTLCache:
 
     async def stop(self):
         pass
+
+    def export_state(self) -> List[Any]:
+        return [(k, (v[0], v[1].isoformat(), v[2]))
+                for k, v in self._cache.items()]
+
+    def import_state(self, data: List[Any]) -> None:
+        self._cache = {}
+        self.current_size_bytes = 0
+        for k, (val, ts_str, count) in data or []:
+            try:
+                ts = datetime.fromisoformat(ts_str)
+            except Exception:
+                ts = datetime.now()
+            self._cache[k] = (val, ts, int(count))
+            self.current_size_bytes += self._size_of(k, val)
 
 
 # ============================================================
@@ -3068,6 +2746,52 @@ class EnhancedGeocodingService(IGeocoder):
 
     async def health_check(self):
         return {"status": "healthy"}
+
+
+# ============================================================
+# MAP-LOCAL CONTEXTUAL BANDIT (canonical)
+# ============================================================
+class ContextualBandit:
+    def __init__(self, num_actions=4, feature_dim=4, epsilon=0.1,
+                 action_space=None, **kwargs):
+        if action_space is not None:
+            self.actions = list(action_space)
+            self.num_actions = len(self.actions)
+        else:
+            self.num_actions = int(num_actions)
+            self.actions = list(range(self.num_actions))
+        self.feature_dim = int(feature_dim)
+        self.epsilon = float(epsilon)
+        self.theta = np.zeros((self.feature_dim, self.num_actions))
+        self.counts = np.zeros(self.num_actions, dtype=int)
+
+    def _feat(self, context):
+        if isinstance(context, np.ndarray):
+            v = context.astype(np.float64).reshape(-1)
+        elif isinstance(context, dict):
+            v = np.array([float(context.get(k, 0.0)) for k in
+                          ("carbon", "hour", "demand", "modules")], dtype=np.float64)
+        else:
+            v = np.asarray(context, dtype=np.float64).reshape(-1)
+        if v.size < self.feature_dim:
+            v = np.pad(v, (0, self.feature_dim - v.size))
+        return v[:self.feature_dim]
+
+    def select_action(self, context, *args, **kwargs):
+        if random.random() < self.epsilon:
+            return random.randrange(self.num_actions)
+        x = self._feat(context)
+        q = x @ self.theta
+        return int(np.argmax(q))
+
+    def update(self, action_idx, context, reward):
+        x = self._feat(context)
+        a = int(action_idx) % self.num_actions
+        self.theta[:, a] += 0.01 * (float(reward) - float(x @ self.theta[:, a])) * x
+        self.counts[a] += 1
+
+    def seed_safe_policy(self, context, policy, reward: float = 1.0):
+        pass
 
 
 # ============================================================
@@ -3137,15 +2861,18 @@ class EnhancedGreenDataCenterMap:
 
         self.generation_count = 0
         self._register_background_tasks()
-        logger.info(f"EnhancedGreenDataCenterMap v{self.config.general.version} initialized (instance: {self.instance_id})")
+        logger.info(
+            f"EnhancedGreenDataCenterMap v{self.config.general.version} "
+            f"initialized (instance: {self.instance_id})"
+        )
 
     def _register_background_tasks(self):
-        self.task_manager.register_task("backup", self._backup_loop)
-        self.task_manager.register_task("export_worker", self.export_queue.start)
-        self.task_manager.register_task("carbon_update", self._carbon_update_loop)
+        self.task_manager.register_task("backup", self._backup_loop, restart_on_exit=True)
+        self.task_manager.register_task("export_worker", self.export_queue.start, restart_on_exit=True)
+        self.task_manager.register_task("carbon_update", self._carbon_update_loop, restart_on_exit=True)
         if self.predictive:
-            self.task_manager.register_task("predictive_update", self._predictive_update_loop)
-        self.task_manager.register_task("health_check", self._health_check_loop)
+            self.task_manager.register_task("predictive_update", self._predictive_update_loop, restart_on_exit=True)
+        self.task_manager.register_task("health_check", self._health_check_loop, restart_on_exit=True)
 
     async def start(self):
         await self.db_manager.init()
@@ -3202,11 +2929,12 @@ class EnhancedGreenDataCenterMap:
 
     async def _perform_backup(self):
         async with self._projects_lock:
-            for project in self.projects:
-                try:
-                    await self.db_manager.insert_project(project)
-                except Exception as e:
-                    logger.warning(f"Backup project failed: {e}")
+            snapshot = list(self.projects)
+        for project in snapshot:
+            try:
+                await self.db_manager.insert_project(project)
+            except Exception as e:
+                logger.warning(f"Backup project failed: {e}")
 
     async def load_data(self):
         async with self._projects_lock:
@@ -3261,7 +2989,6 @@ class EnhancedGreenDataCenterMap:
                 export_data, quantum_key["key_id"]
             )
 
-        # export_id is always initialized before use
         export_id = f"map_export_{uuid.uuid4().hex[:8]}"
         blockchain_result = None
         if blockchain_record:
@@ -3351,6 +3078,13 @@ class EnhancedGreenDataCenterMap:
     async def get_cloud_status(self):
         return await self.cloud_deployer.get_deployment_status()
 
+    async def submit_hitl_decision(self, request_id: str, approved: bool) -> bool:
+        """v19: deliver an external HITL decision to the generator's gate."""
+        gate = getattr(self.autonomous_generator, "hitl", None)
+        if gate is None:
+            return False
+        return await gate.submit_decision(request_id, approved)
+
     async def get_comprehensive_status(self) -> Dict:
         quantum_status = self.quantum_security.get_quantum_status()
         blockchain_status = await self.blockchain.get_blockchain_status()
@@ -3396,6 +3130,70 @@ class EnhancedGreenDataCenterMap:
         return {"status": overall, "health_score": score,
                 "components": results, "timestamp": datetime.now().isoformat()}
 
+    async def save_state(self, path: str) -> bool:
+        """v19: persist causal, roles, federated, generation history."""
+        state: Dict[str, Any] = {"schema": "green_map_state_v1"}
+        gen = self.autonomous_generator
+        if getattr(gen, "causal", None) is not None:
+            state["causal"] = gen.causal.export_state()
+        if getattr(gen, "roles", None) is not None:
+            state["roles"] = gen.roles.snapshot()
+        if getattr(gen, "federated", None) is not None:
+            g = gen.federated.global_weights()
+            if g:
+                state["federated_global"] = {k: v.tolist() for k, v in g.items()}
+        state["generation_history"] = [
+            {k: v for k, v in h.items() if k != "result"}
+            for h in (getattr(gen, "generation_history", []) or [])
+        ]
+        state["deployment_history"] = [
+            {k: v for k, v in d.items() if k != "pareto_front"}
+            for d in (getattr(self.cloud_deployer, "deployment_history", []) or [])
+        ]
+        state["generation_count"] = self.generation_count
+        try:
+            d = os.path.dirname(os.path.abspath(path)) or "."
+            os.makedirs(d, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".map_", suffix=".json")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(state, f, default=str)
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            return True
+        except Exception as e:
+            logger.error(f"save_state failed: {e}")
+            return False
+
+    async def load_state(self, path: str) -> bool:
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r") as f:
+                state = json.load(f)
+        except Exception:
+            return False
+        if state.get("schema") != "green_map_state_v1":
+            return False
+        gen = self.autonomous_generator
+        if getattr(gen, "causal", None) is not None and "causal" in state:
+            gen.causal.import_state(state["causal"])
+        if getattr(gen, "federated", None) is not None and "federated_global" in state:
+            try:
+                gen.federated._global = {
+                    k: np.asarray(v, dtype=np.float64)
+                    for k, v in state["federated_global"].items()
+                }
+            except Exception:
+                pass
+        self.generation_count = int(state.get("generation_count", self.generation_count))
+        return True
+
     async def shutdown(self):
         logger.info(f"Shutting down (instance: {self.instance_id})")
         await self.task_manager.stop_all()
@@ -3418,7 +3216,7 @@ class EnhancedGreenDataCenterMap:
 # FASTAPI
 # ============================================================
 if FASTAPI_AVAILABLE:
-    app = FastAPI(title="Green Data Center Map API", version="18.0")
+    app = FastAPI(title="Green Data Center Map API", version="19.0")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"], allow_credentials=True,
@@ -3504,7 +3302,8 @@ if FASTAPI_AVAILABLE:
     async def last_explanation(user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
         if not map_system:
             raise HTTPException(status_code=503, detail="Map system not initialized")
-        return {"explanation": getattr(map_system.autonomous_generator, "last_explanation", None)}
+        gen = map_system.autonomous_generator
+        return {"explanation": gen.last_explanation.to_dict() if gen.last_explanation else None}
 
     @app.post("/chaos")
     async def chaos(fault_prob: float = 0.0, latency_ms: float = 0.0,
@@ -3522,9 +3321,17 @@ if FASTAPI_AVAILABLE:
     @app.post("/hitl/approval")
     async def hitl_approval(request_id: str, approved: bool,
                             user: Dict = Depends(verify_token), _: None = Depends(rate_limit)):
-        HITL_APPROVALS.labels(decision="approved" if approved else "rejected").inc()
-        audit_logger.info(f"HITL approval: {request_id} -> {approved}")
-        return {"status": "recorded", "request_id": request_id, "approved": approved}
+        """v19: deliver the decision to the waiting HITL request."""
+        if not map_system:
+            raise HTTPException(status_code=503, detail="Map system not initialized")
+        delivered = await map_system.submit_hitl_decision(request_id, approved)
+        if not delivered:
+            HITL_APPROVALS.labels(decision="approved" if approved else "rejected").inc()
+            audit_logger.info(f"HITL approval (no pending): {request_id} -> {approved}")
+            return {"status": "recorded", "request_id": request_id,
+                    "approved": approved, "delivered": False}
+        audit_logger.info(f"HITL approval delivered: {request_id} -> {approved}")
+        return {"status": "delivered", "request_id": request_id, "approved": approved}
 
     @app.on_event("startup")
     async def startup():
@@ -3534,7 +3341,13 @@ if FASTAPI_AVAILABLE:
         vault = VaultManager(config)
         quantum = PostQuantumCrypto(config, vault)
         blockchain = BlockchainMapVerification(config)
-        carbon = CarbonIntensityManager(config)
+        carbon = CarbonIntensityManager(
+            api_key=config.carbon.api_key,
+            region=config.carbon.region,
+            base_price=config.carbon.base_price_per_kg,
+            sensitivity=config.carbon.price_sensitivity,
+            rec_default_kwh=config.carbon.rec_default_kwh,
+        )
         cloud_deployer = (
             BioInspiredCloudDeployer(config, db_manager, carbon) if config.bio.enabled
             else MultiObjectiveCloudDeployer(config, db_manager, carbon)
@@ -3585,7 +3398,13 @@ async def get_map_system(config: Optional[Union[GreenMapConfig, Dict]] = None) -
                 vault = VaultManager(cfg)
                 quantum = PostQuantumCrypto(cfg, vault)
                 blockchain = BlockchainMapVerification(cfg)
-                carbon = CarbonIntensityManager(cfg)
+                carbon = CarbonIntensityManager(
+                    api_key=cfg.carbon.api_key,
+                    region=cfg.carbon.region,
+                    base_price=cfg.carbon.base_price_per_kg,
+                    sensitivity=cfg.carbon.price_sensitivity,
+                    rec_default_kwh=cfg.carbon.rec_default_kwh,
+                )
                 cloud_deployer = (
                     BioInspiredCloudDeployer(cfg, db_manager, carbon) if cfg.bio.enabled
                     else MultiObjectiveCloudDeployer(cfg, db_manager, carbon)
@@ -3610,9 +3429,9 @@ async def get_map_system(config: Optional[Union[GreenMapConfig, Dict]] = None) -
 
 
 # ============================================================
-# SIGNAL HANDLING (portable)
+# SIGNAL HANDLING (v19: retained task references)
 # ============================================================
-_shutdown_requested = False
+_shutdown_tasks: set = set()
 
 
 async def shutdown_handler():
@@ -3622,13 +3441,20 @@ async def shutdown_handler():
         _map_instance = None
 
 
+def _spawn_shutdown_task():
+    task = asyncio.create_task(shutdown_handler())
+    _shutdown_tasks.add(task)
+    task.add_done_callback(_shutdown_tasks.discard)
+    return task
+
+
 def _install_signal_handlers(loop):
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown_handler()))
+            loop.add_signal_handler(sig, _spawn_shutdown_task)
         except (NotImplementedError, AttributeError):
             try:
-                signal.signal(sig, lambda s, f: asyncio.create_task(shutdown_handler()))
+                signal.signal(sig, lambda s, f: _spawn_shutdown_task())
             except (ValueError, OSError):
                 pass
 
@@ -3641,7 +3467,7 @@ async def main():
     _install_signal_handlers(loop)
 
     print("=" * 80)
-    print("Green Data Center Map v18.0 — Enterprise Quantum+ (Bio + MOE + MODP + LIMIT + RLHF + Distillation)")
+    print("Green Data Center Map v19.0 — Enterprise Quantum+ (shared modules)")
     print("=" * 80)
 
     if FASTAPI_AVAILABLE and os.environ.get("GREENMAP_SERVE_API", "0") == "1":
@@ -3651,7 +3477,7 @@ async def main():
 
     map_system = await get_map_system()
 
-    print("\n✅ Ten enhancements wired in:")
+    print("\n✅ Ten enhancements imported from the enhancements package:")
     print("   [1] Quantum-Distillation          QuantumInspiredTeacher + DistillationEnsemble")
     print("   [2] Causal RL                     CausalCounterfactualEstimator")
     print("   [3] Federated Green Learning      FederatedAggregator")
@@ -3661,7 +3487,7 @@ async def main():
     print("   [7] Adaptive Precision            PrecisionController + HardwareAwareAdapter")
     print("   [8] Carbon Markets / RECs         CarbonMarketClient + RECInventory")
     print("   [9] Resilience / Chaos            ChaosEngineer")
-    print("  [10] HITL / Active Learning        UncertaintyEstimator + HumanInTheLoopGate + ActiveLearningSampler")
+    print("  [10] HITL / Active Learning        UncertaintyEstimator + HumanInTheLoopGate")
 
     qstatus = map_system.quantum_security.get_quantum_status()
     print(f"\n🔐 PQC available: {qstatus.get('pqc_available', False)}")
@@ -3675,18 +3501,21 @@ async def main():
     print("\n⚡ Testing autonomous generation:")
     result = await map_system.generate_map_autonomously("hybrid")
     rec = result.get("recommendation", {})
-    print(f"   Strategy:  {rec.get('strategy')}")
-    print(f"   Precision: {rec.get('precision_level')}")
-    print(f"   Safety:    {rec.get('safety_ok')}")
-    print(f"   HITL:      {rec.get('human_approved')}")
+    print(f"   Strategy:     {rec.get('strategy')}")
+    print(f"   Precision:    {rec.get('precision_level')}")
+    print(f"   Safety:       {rec.get('safety_ok')}")
+    print(f"   HITL:         {rec.get('human_approved')}")
+    print(f"   Winning role: {rec.get('winning_role')}")
     if rec.get("explanation"):
-        print(f"   XAI:       {rec['explanation'].get('rationale')}")
+        print(f"   XAI:          {rec['explanation'].get('rationale')}")
 
     print("\n🌐 Testing cloud deployment:")
-    deploy = await map_system.deploy_map_to_cloud(result.get("output_path", ""), {"region": "us-east-1"})
+    deploy = await map_system.deploy_map_to_cloud(result.get("output_path", ""),
+                                                  {"region": "us-east-1"})
     print(f"   Optimal provider: {deploy.get('optimal_provider')}")
     print(f"   Precision:        {deploy.get('precision_level')}")
     print(f"   Safety OK:        {deploy.get('safety_ok')}")
+    print(f"   Winning role:     {deploy.get('winning_role')}")
 
     status = await map_system.get_comprehensive_status()
     print(f"\n📊 Status:")
@@ -3695,7 +3524,7 @@ async def main():
     print(f"   PQC:     {status['quantum_security']['pqc_available']}")
 
     print("\n" + "=" * 80)
-    print("✅ Green Data Center Map v18.0 — Ready")
+    print("✅ Green Data Center Map v19.0 — Ready")
     print("=" * 80)
 
     try:
