@@ -1,19 +1,23 @@
 """
-multi_agent.py — Multi-agent coordination (Enhancement 4, patched + advanced).
+multi_agent.py — Multi-agent coordination (Enhancement 4, full).
 
 Core:
   * Correct winning-role attribution (weighted per-role totals for the winner).
-  * Clamped ``confidence`` / ``carbon_score`` (both [0, 1]).
+  * Clamped ``confidence`` / ``carbon_score`` (both in [0, 1]).
   * EMA-based success tracking (non-stationary friendly).
   * Per-agent role tracking via ``agent_id``.
   * Safety-officer veto and distinct-role quorum.
   * Structured ``VoteResult`` with full explainability.
   * Config dataclasses, serialization, and vote hooks.
 
-Advanced coordination (opt-in):
+Advanced coordination:
   * Negotiation rounds with confidence-weighted defection.
   * Coalition formation by action.
   * Byzantine-robust voting via agent reputation + trimmed weights.
+
+Façade:
+  * ``MultiAgentTeam`` chains negotiation → coalitions → vote in one call.
+  * ``run_episode`` closes the loop with outcome feedback.
 """
 
 from __future__ import annotations
@@ -86,6 +90,33 @@ class VotingConfig:
     safety_veto_threshold: float = 0.75
 
 
+@dataclass
+class NegotiationConfig:
+    max_rounds: int = 3
+    convergence_threshold: float = 0.9
+    defection_probability: float = 0.5
+    low_confidence_threshold: float = 0.5
+
+
+@dataclass
+class ByzantineConfig:
+    enabled: bool = False
+    trim_quantile: float = 0.1
+    min_reputation: float = 0.2
+    reputation_decay: float = 0.98
+    reputation_bonus: float = 0.05
+    reputation_penalty: float = 0.10
+
+
+@dataclass
+class TeamConfig:
+    voting: VotingConfig = field(default_factory=VotingConfig)
+    negotiation: NegotiationConfig = field(default_factory=NegotiationConfig)
+    byzantine: ByzantineConfig = field(default_factory=ByzantineConfig)
+    enable_negotiation: bool = True
+    enable_coalitions: bool = True
+
+
 # --------------------------------------------------------------------------- #
 # Role statistics
 # --------------------------------------------------------------------------- #
@@ -96,6 +127,12 @@ class RoleStats:
     successes: float = 0.0
     success_ema: float = 0.5
     last_reward: float = 0.0
+
+
+@dataclass
+class AgentReputation:
+    score: float = 0.5
+    observations: int = 0
 
 
 # --------------------------------------------------------------------------- #
@@ -219,7 +256,7 @@ class EmergentRoleRegistry:
 
 
 # --------------------------------------------------------------------------- #
-# Vote result
+# Result types
 # --------------------------------------------------------------------------- #
 @dataclass
 class VoteResult:
@@ -245,17 +282,6 @@ class VoteResult:
             "quorum_met": self.quorum_met,
             "n_distinct_roles": self.n_distinct_roles,
         }
-
-
-# --------------------------------------------------------------------------- #
-# Advanced coordination — config & result types
-# --------------------------------------------------------------------------- #
-@dataclass
-class NegotiationConfig:
-    max_rounds: int = 3
-    convergence_threshold: float = 0.9   # leader's share of total weight
-    defection_probability: float = 0.5   # prob a low-confidence agent defects
-    low_confidence_threshold: float = 0.5
 
 
 @dataclass
@@ -311,20 +337,38 @@ class Coalition:
 
 
 @dataclass
-class ByzantineConfig:
-    # Disabled by default to preserve legacy behaviour.
-    enabled: bool = False
-    trim_quantile: float = 0.1
-    min_reputation: float = 0.2
-    reputation_decay: float = 0.98
-    reputation_bonus: float = 0.05
-    reputation_penalty: float = 0.10
+class TeamResult:
+    """Full record of one team decision."""
 
+    winner: int
+    winning_role: Optional[AgentRole]
+    final_vote: VoteResult
+    negotiation: Optional[NegotiationResult]
+    coalitions: List[Coalition]
+    converged: bool
+    rounds_used: int
+    final_bids: List[AgentBid]
 
-@dataclass
-class AgentReputation:
-    score: float = 0.5
-    observations: int = 0
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "winner": self.winner,
+            "winning_role": self.winning_role.value if self.winning_role else None,
+            "final_vote": self.final_vote.to_dict(),
+            "negotiation": self.negotiation.to_dict() if self.negotiation else None,
+            "coalitions": [c.to_dict() for c in self.coalitions],
+            "converged": self.converged,
+            "rounds_used": self.rounds_used,
+            "final_bids": [
+                {
+                    "agent_id": b.agent_id,
+                    "role": b.role.value,
+                    "confidence": b.confidence,
+                    "proposed_action": b.proposed_action,
+                    "carbon_score": b.carbon_score,
+                }
+                for b in self.final_bids
+            ],
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -537,7 +581,7 @@ class MultiAgentCoordinator:
         converged = False
 
         if not current or n_candidates <= 0:
-            _, _ = self.vote(current, n_candidates)
+            self.vote(current, n_candidates)
             return NegotiationResult(
                 final_vote=self._last_vote,
                 rounds=rounds,
@@ -665,3 +709,214 @@ class MultiAgentCoordinator:
         for aid, rep_data in data.get("reputations", {}).items():
             coord._reputations[aid] = AgentReputation(**rep_data)
         return coord
+
+
+# --------------------------------------------------------------------------- #
+# Team façade
+# --------------------------------------------------------------------------- #
+class MultiAgentTeam:
+    """
+    Façade that chains: negotiation → coalitions → vote, in a single call.
+
+    Typical usage::
+
+        team = MultiAgentTeam(seed=0)
+        result = team.decide(bids, n_candidates=4)
+        # ... execute result.winner ...
+        team.observe_outcome(result.winner, result.final_bids,
+                             n_candidates=4, reward=1.0, success=True)
+
+    Or with a closed-loop helper::
+
+        team.run_episode(bids, 4, outcome_fn=lambda w, r: (True, 1.0))
+    """
+
+    def __init__(
+        self,
+        config: Optional[TeamConfig] = None,
+        seed: Optional[int] = None,
+        rng: Optional[random.Random] = None,
+    ) -> None:
+        self.config = config or TeamConfig()
+        base_seed = 0 if seed is None else seed
+        self.registry = EmergentRoleRegistry(
+            config=RegistryConfig(),
+            rng=random.Random(base_seed),
+        )
+        self.coordinator = MultiAgentCoordinator(
+            self.registry,
+            self.config.voting,
+            rng=rng or random.Random(base_seed),
+        )
+        self.coordinator.byzantine_config = self.config.byzantine
+        self._last_result: Optional[TeamResult] = None
+
+    # ---- main entry ----------------------------------------------------- #
+    def decide(
+        self,
+        bids: Sequence[AgentBid],
+        n_candidates: int,
+        *,
+        negotiate: Optional[bool] = None,
+        form_coalitions: Optional[bool] = None,
+    ) -> TeamResult:
+        """Run the full pipeline once. Overrides let callers skip stages."""
+        do_negotiate = (
+            self.config.enable_negotiation if negotiate is None else negotiate
+        )
+        do_coalitions = (
+            self.config.enable_coalitions if form_coalitions is None else form_coalitions
+        )
+
+        # ---- guard: empty / degenerate inputs -------------------------- #
+        if not bids or n_candidates <= 0:
+            self.coordinator.vote(bids, n_candidates)
+            empty_vote = self.coordinator.last_vote()
+            result = TeamResult(
+                winner=empty_vote.winner,
+                winning_role=None,
+                final_vote=empty_vote,
+                negotiation=None,
+                coalitions=[],
+                converged=False,
+                rounds_used=0,
+                final_bids=list(bids),
+            )
+            self._last_result = result
+            return result
+
+        # ---- stage 1: negotiation -------------------------------------- #
+        negotiation: Optional[NegotiationResult] = None
+        if do_negotiate:
+            negotiation = self.coordinator.negotiate(
+                bids, n_candidates, config=self.config.negotiation
+            )
+            final_bids: List[AgentBid] = list(negotiation.final_bids)
+            final_vote: VoteResult = negotiation.final_vote
+            converged: bool = negotiation.converged
+            rounds_used: int = len(negotiation.rounds)
+        else:
+            final_bids = list(bids)
+            self.coordinator.vote(final_bids, n_candidates)
+            final_vote = self.coordinator.last_vote()
+            converged = True  # trivially "converged" when negotiation is skipped
+            rounds_used = 0
+
+        # ---- stage 2: coalitions --------------------------------------- #
+        coalitions: List[Coalition] = []
+        if do_coalitions:
+            coalitions = self.coordinator.form_coalitions(final_bids, n_candidates)
+
+        # ---- assemble -------------------------------------------------- #
+        result = TeamResult(
+            winner=final_vote.winner,
+            winning_role=final_vote.winning_role,
+            final_vote=final_vote,
+            negotiation=negotiation,
+            coalitions=coalitions,
+            converged=converged,
+            rounds_used=rounds_used,
+            final_bids=final_bids,
+        )
+        self._last_result = result
+        return result
+
+    # ---- outcome feedback ---------------------------------------------- #
+    def observe_outcome(
+        self,
+        winner: int,
+        bids: Sequence[AgentBid],
+        n_candidates: int,
+        reward: float,
+        success: bool,
+    ) -> None:
+        """Feed the realised outcome back into reputation + role stats."""
+        if n_candidates <= 0:
+            return
+
+        for b in bids:
+            agreed = (b.proposed_action % n_candidates) == winner
+            self.coordinator.record_outcome(b.agent_id, agreed, reward)
+
+        if self._last_result is not None and self._last_result.winning_role is not None:
+            self.registry.record(self._last_result.winning_role, success, reward)
+
+    def run_episode(
+        self,
+        bids: Sequence[AgentBid],
+        n_candidates: int,
+        outcome_fn: Callable[[int, Optional[AgentRole]], Tuple[bool, float]],
+    ) -> TeamResult:
+        """
+        One full loop: decide → call ``outcome_fn(winner, winning_role)``
+        → observe_outcome. ``outcome_fn`` must return ``(success, reward)``.
+        """
+        result = self.decide(bids, n_candidates)
+        success, reward = outcome_fn(result.winner, result.winning_role)
+        self.observe_outcome(
+            result.winner, result.final_bids, n_candidates, reward, success
+        )
+        return result
+
+    # ---- accessors ------------------------------------------------------ #
+    def last_result(self) -> Optional[TeamResult]:
+        return self._last_result
+
+    def last_result_dict(self) -> Optional[Dict[str, Any]]:
+        return self._last_result.to_dict() if self._last_result else None
+
+    # ---- persistence ---------------------------------------------------- #
+    def to_dict(self) -> Dict[str, Any]:
+        coord = self.coordinator.to_dict()
+        return {
+            "config": {
+                "voting": coord["config"],
+                "negotiation": asdict(self.config.negotiation),
+                "byzantine": asdict(self.config.byzantine),
+                "enable_negotiation": self.config.enable_negotiation,
+                "enable_coalitions": self.config.enable_coalitions,
+            },
+            "coordinator": coord,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+        seed: Optional[int] = None,
+        rng: Optional[random.Random] = None,
+    ) -> "MultiAgentTeam":
+        cfg_data = data.get("config", {})
+        voting_raw = dict(cfg_data.get("voting", {}))
+        role_bias_raw = voting_raw.pop("role_bias", None)
+        voting = VotingConfig(**voting_raw)
+        if role_bias_raw:
+            voting.role_bias = {
+                AgentRole(k): float(v) for k, v in role_bias_raw.items()
+            }
+        negotiation = NegotiationConfig(**cfg_data.get("negotiation", {}))
+        byzantine = ByzantineConfig(**cfg_data.get("byzantine", {}))
+        cfg = TeamConfig(
+            voting=voting,
+            negotiation=negotiation,
+            byzantine=byzantine,
+            enable_negotiation=cfg_data.get("enable_negotiation", True),
+            enable_coalitions=cfg_data.get("enable_coalitions", True),
+        )
+
+        team = cls(cfg, seed=seed, rng=rng)
+
+        coord_data = data.get("coordinator", {})
+        team.registry = EmergentRoleRegistry.from_dict(
+            coord_data.get("registry", {}),
+            rng=rng or random.Random(seed or 0),
+        )
+        team.coordinator = MultiAgentCoordinator(
+            team.registry,
+            voting,
+            rng=rng or random.Random(seed or 0),
+        )
+        team.coordinator.byzantine_config = byzantine
+        for aid, rep_data in coord_data.get("reputations", {}).items():
+            team.coordinator._reputations[aid] = AgentReputation(**rep_data)
+        return team
