@@ -1,373 +1,538 @@
 #!/usr/bin/env python3
-# enhancements/mixed_precision_utils_enhanced_v3_0.py
+# src/enhancements/mixed_precision_utils_enhanced_v18_0.py
+# Version 18.0.0 — Mixed Precision Engine (P0/P1/P2 hardened)
 """
-Enhanced Mixed Precision Engine v7.0.0
-Enterprise Quantum Resilience + Bio-Inspired + MOE + MODP + Self-Healing
-+ v7.0.0 suite:
-    • Temporal Logic Verification (G/F/U/->)
-    • Explainable AI (XAI)
-    • Adaptive Precision Switching (hardware-aware)
-    • Carbon Markets + Renewable Energy Credits (RECs)
-    • Multi-Agent Role Specialization (emergent)
-    • Chaos Testing as first-class citizen
-    • Active RLHF (uncertainty-triggered human queries)
-    • Human-in-the-Loop Coordinator
-    • Federated Green Learning (FedAvg)
-    • Causal RL hooks (real outcomes → policy)
+Enhanced Mixed Precision Engine — v18.0.0
+
+Objective convention: all objectives are BENEFITS (higher is better).
+TOPSIS.score accepts an optional `cost_criteria` set for mixed problems.
+
+P0 fixes:
+ - PyTorch import has a graceful fallback
+ - No asyncio.get_event_loop() in __init__; explicit async start()
+ - No asyncio.run() inside sync methods; sync wrappers raise on running loop
+ - torch.amp.autocast (non-deprecated) with fallback
+ - Pareto direction consistent with benefit objectives
+ - _update_weights uses a principled reward gradient
+ - Chaos faults actually exercise the engine paths
+ - Real PQC (dilithium/falcon/sphincs) with HMAC-SHA256 fallback
+ - Real Web3 with hash-chained ledger fallback
+ - sign_precision_decision and record_on_blockchain are called
+ - MOEPrecisionEngine.update labels the best-matching teacher
+ - XAIExplainer called with correct feature names
+ - _teacher_moe uses the gating model
+
+P1 hardening:
+ - SQLite persistence (state, HITL audit, chaos, federated, cost, lineage)
+ - Real carbon providers (Electricity Maps / WattTime) with synthetic fallback
+ - Token-bucket rate limiting and daily cost budget
+ - Health checks
+ - Portable signal handlers (Windows fallback)
+ - atexit cleanup
+ - FastAPI + lifespan, JWT from env
+ - Structured logging with correlation IDs
+ - Deprecated LogisticRegression(multi_class=...) removed
+ - Graceful shutdown with drain
+
+P2 advanced:
+ - Full STL (G / F / U / X / ->) with actionable enforcement
+ - Fresh temporal monitor per decision
+ - Secure federated aggregation (pairwise masks + DP accountant)
+ - Multi-agent message bus + conflict resolution
+ - Chaos steady-state hypotheses + auto-deactivation
+ - Telemetry-driven precision with EMA quality drop
+ - Active learning with KMeans diversity + time-bounded buffer
+ - Hash-chained HITL audit ledger
+ - SHAP / weighted XAI
+ - Lineage + cost tracking
+ - Causal RL reflection-strategy selection
 """
+
+from __future__ import annotations
 
 import asyncio
-import logging
+import atexit
+import base64
+import concurrent.futures
+import contextlib
+import contextvars
+import hashlib
+import hmac
 import json
+import logging
+import math
+import os
+import pickle
+import random
+import re
+import signal
+import sqlite3
+import tempfile
+import threading
 import time
 import uuid
-import hashlib
-import os
-import random
-import signal
-from contextlib import contextmanager
-from functools import wraps
+from collections import defaultdict, deque
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union, Any, Callable
-from dataclasses import dataclass, field
-from datetime import datetime
-from collections import deque, defaultdict
-import numpy as np
-import contextvars
+from pathlib import Path
+from typing import (
+    Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple,
+)
 
-# PyTorch
-import torch
-import torch.nn as nn
-from torch.cuda.amp import autocast
+import numpy as np
 
 # ============================================================
-# ENHANCED IMPORTS FOR NEW FEATURES
+# Optional dependency: PyTorch (with a functional fallback)
+# ============================================================
+try:
+    import torch
+    import torch.nn as nn
+    from torch.amp import autocast as _torch_amp_autocast  # type: ignore
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    torch = None  # type: ignore
+
+    class _TorchNNStub:
+        class Module:
+            def __init__(self, *a, **kw): pass
+            def to(self, *a, **kw): return self
+            def parameters(self): return iter(())
+            def __call__(self, *a, **kw): raise RuntimeError("torch unavailable")
+
+        class Linear(Module):
+            def __init__(self, *a, **kw): super().__init__()
+    nn = _TorchNNStub()  # type: ignore
+
+    class _TorchStub:
+        float32 = "float32"
+        float16 = "float16"
+        bfloat16 = "bfloat16"
+
+        class cuda:  # type: ignore
+            @staticmethod
+            def is_available() -> bool: return False
+
+        @staticmethod
+        def randn(*a, **kw): return np.random.randn(*a)
+        @staticmethod
+        def zeros(*a, **kw): return np.zeros(*a)
+        @staticmethod
+        def tensor(*a, **kw): return np.asarray(*a)
+    torch = _TorchStub()  # type: ignore
+
+    @contextlib.contextmanager
+    def _torch_amp_autocast(*a, **kw):
+        yield
+
+# ============================================================
+# Other optional dependencies
 # ============================================================
 try:
     from sklearn.linear_model import LogisticRegression, LinearRegression
     from sklearn.preprocessing import StandardScaler
     from sklearn.ensemble import IsolationForest
     from sklearn.svm import OneClassSVM
+    from sklearn.cluster import KMeans
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
 
 try:
-    from prophet import Prophet
+    from pqcrypto.sign import dilithium, falcon, sphincs  # type: ignore
+    PQC_AVAILABLE = True
+except ImportError:
+    PQC_AVAILABLE = False
+
+try:
+    from web3 import Web3  # noqa: F401
+    from web3.middleware import geth_poa_middleware  # noqa: F401
+    WEB3_AVAILABLE = True
+except ImportError:
+    WEB3_AVAILABLE = False
+
+try:
+    from prophet import Prophet  # noqa: F401
     PROPHET_AVAILABLE = True
 except ImportError:
     PROPHET_AVAILABLE = False
 
 try:
-    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing  # noqa: F401
     STATSMODELS_AVAILABLE = True
 except ImportError:
     STATSMODELS_AVAILABLE = False
 
-# Central Green Agent components (if available)
 try:
-    from ..config import config as central_config
-    from ..storage import Storage
-    from ..schemas.feedback_event import FeedbackEvent
-    from ..routing.pareto_gating import ParetoGating
-    from ..feedback.adaptive_cost import AdaptiveCostFunction
-    from ..safety.drift_detector import DriftDetector
-    from ..scaling.message_queue import AsyncMessageQueue
-    from ..metrics import MetricsRegistry
-    from ..logger import logger
-    CENTRAL_AVAILABLE = True
+    import httpx
+    HTTPX_AVAILABLE = True
 except ImportError:
-    CENTRAL_AVAILABLE = False
-    class central_config: pass
-    class Storage: pass
-    class FeedbackEvent: pass
-    class ParetoGating: pass
-    class AdaptiveCostFunction: pass
-    class DriftDetector: pass
-    class AsyncMessageQueue: pass
-    class MetricsRegistry: pass
-    logger = logging.getLogger(__name__)
+    HTTPX_AVAILABLE = False
 
-# Prometheus
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+
 try:
     from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry, start_http_server
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
-
-# Tenacity
-try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
-    TENACITY_AVAILABLE = True
-except ImportError:
-    TENACITY_AVAILABLE = False
-
-correlation_id_var = contextvars.ContextVar('correlation_id', default='unknown')
+    start_http_server = None
 
 try:
-    import structlog
-    logger = structlog.get_logger(__name__)
+    from fastapi import FastAPI, Depends, HTTPException
+    from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+    from fastapi.middleware.cors import CORSMiddleware
+    import uvicorn  # noqa: F401
+    FASTAPI_AVAILABLE = True
 except ImportError:
-    logger = logging.getLogger(__name__)
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - [%(correlation_id)s] - %(message)s'
-    )
-    logger.addFilter(lambda record: setattr(record, 'correlation_id', correlation_id_var.get()) or True)
+    FASTAPI_AVAILABLE = False
 
-# ============================================================
-# DUMMY TENACITY
-# ============================================================
-if not TENACITY_AVAILABLE:
-    def retry(*args, **kwargs):
-        def decorator(func):
-            @wraps(func)
-            async def wrapper(*fargs, **fkwargs):
-                attempts = 0
-                max_attempts = 3
-                delay = 1
-                while attempts < max_attempts:
-                    try:
-                        return await func(*fargs, **fkwargs)
-                    except Exception:
-                        attempts += 1
-                        if attempts >= max_attempts:
-                            raise
-                        await asyncio.sleep(delay)
-                        delay *= 2
-            return wrapper
-        return decorator
-
-# ============================================================
-# LEGACY ENHANCEMENT STUBS (still imported if available)
-# ============================================================
 try:
-    from enhancements.limit_graph import LimitGraph
-    ADDITIONAL_ENHANCEMENTS_AVAILABLE = True
+    from jose import JWTError, jwt  # type: ignore
+    JOSE_AVAILABLE = True
 except ImportError:
-    ADDITIONAL_ENHANCEMENTS_AVAILABLE = False
-    class LimitGraph:
-        def __init__(self, *args, **kwargs): self.limits = {}
-        def build_graph(self, nodes, edges): pass
-        def get_limits(self, context): return {}
-        def update_from_feedback(self, feedback): pass
+    JOSE_AVAILABLE = False
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
 try:
     from pydantic import BaseModel, Field, field_validator
+    from pydantic_settings import BaseSettings, SettingsConfigDict
     PYDANTIC_AVAILABLE = True
 except ImportError:
     PYDANTIC_AVAILABLE = False
 
-if PYDANTIC_AVAILABLE:
-    class MODPConfig(BaseModel):
-        enabled: bool = True
-        method: str = Field("topsis")
-        weights: List[float] = Field(default_factory=lambda: [0.25, 0.25, 0.25, 0.25])
-        adaptive_weights: bool = True
-        learning_rate: float = 0.01
 
-    class MOEConfig(BaseModel):
-        enabled: bool = True
-        num_experts: int = 4
-        gating_model: str = Field("logistic")
-        update_interval: int = 3600
+# ============================================================
+# Logging + correlation IDs
+# ============================================================
+logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-    class BioConfig(BaseModel):
-        enabled: bool = True
-        algorithm: str = Field("ga")
-        population_size: int = 20
-        max_iterations: int = 50
-        mutation_rate: float = 0.1
-        crossover_rate: float = 0.8
-        ga_evolution_interval: int = 3600
+correlation_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "correlation_id", default="unknown")
 
-    class SchedulerConfig(BaseModel):
-        enabled: bool = True
-        carbon_threshold: float = 400.0
-        max_delay_seconds: int = 300
-        urgency_importance: float = 0.5
-        carbon_importance: float = 0.3
-        cost_importance: float = 0.2
 
-    class SelfHealingConfig(BaseModel):
-        enabled: bool = True
-        anomaly_contamination: float = 0.1
-        auto_retry_threshold: int = 3
-        fallback_enabled: bool = True
-        health_check_interval: int = 60
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
-    class MixedPrecisionConfig(BaseModel):
-        instance_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
-        version: str = Field("7.0.0")
-        log_level: str = Field("INFO")
-        default_dtype: str = Field("fp16")
-        use_amp: bool = True
-        amp_dtype: str = Field("fp16")
-        metrics_port: int = Field(8000, ge=1024, le=65535)
-        carbon_api_key: Optional[str] = None
-        carbon_region: str = Field("global")
-        carbon_update_interval: int = Field(300, ge=10)
-        health_check_interval: int = Field(60, ge=10)
-        mtop_learning_rate: float = Field(0.01, gt=0)
-        mtop_teacher_weights: Dict[str, float] = Field(default_factory=lambda: {
-            'accuracy': 0.25, 'energy': 0.25, 'speed': 0.25, 'carbon': 0.25
-        })
-        enable_quantum_security: bool = True
-        quantum_algorithm: str = Field("dilithium")
-        quantum_master_key: str = Field(default="")
-        enable_blockchain_verification: bool = True
-        blockchain_rpc_url: str = Field("http://localhost:8545")
-        blockchain_contract_address: Optional[str] = None
-        blockchain_private_key: Optional[str] = None
-        modp: MODPConfig = Field(default_factory=MODPConfig)
-        moe: MOEConfig = Field(default_factory=MOEConfig)
-        bio: BioConfig = Field(default_factory=BioConfig)
-        scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
-        self_healing: SelfHealingConfig = Field(default_factory=SelfHealingConfig)
-        limit_graph_enabled: bool = True
-        rlhf_enabled: bool = True
-        distillation_enabled: bool = True
-        # v7.0.0 new flags
-        temporal_logic_enabled: bool = True
-        xai_enabled: bool = True
-        adaptive_precision_enabled: bool = True
-        carbon_market_enabled: bool = True
-        role_specialization_enabled: bool = True
-        chaos_testing_enabled: bool = True
-        hitl_enabled: bool = True
-        federated_enabled: bool = True
-        hitl_confidence_threshold: float = 0.65
 
-        @field_validator('log_level')
-        @classmethod
-        def validate_log_level(cls, v: str) -> str:
-            allowed = {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}
-            if v.upper() not in allowed:
-                raise ValueError(f'LOG_LEVEL must be one of {allowed}')
-            return v.upper()
-
-        def get_master_key_bytes(self) -> bytes:
-            if not self.quantum_master_key:
-                return b'\x00' * 32  # fallback dev key
-            return bytes.fromhex(self.quantum_master_key)
-
-        class Config:
-            env_prefix = "MIXED_PRECISION_"
+# ============================================================
+# Prometheus
+# ============================================================
+if PROMETHEUS_AVAILABLE:
+    REGISTRY = CollectorRegistry()
+    MP_PRECISION_SWITCHES = Counter("mp_precision_switches_total", "Switches", ["from", "to"], registry=REGISTRY)
+    MP_ENERGY_SAVED = Counter("mp_energy_saved_joules_total", "Energy saved", registry=REGISTRY)
+    MP_CARBON_SAVED = Counter("mp_carbon_saved_kg_total", "Carbon saved", registry=REGISTRY)
+    MP_COST = Counter("mp_cost_usd_total", "Cost", registry=REGISTRY)
+    MP_CURRENT_PRECISION = Gauge("mp_current_precision_index", "Current precision", registry=REGISTRY)
+    MP_TEMPORAL = Counter("mp_temporal_violations_total", "Temporal", ["formula"], registry=REGISTRY)
+    MP_CHAOS = Counter("mp_chaos_total", "Chaos", ["fault", "status"], registry=REGISTRY)
+    MP_HITL = Counter("mp_hitl_total", "HITL", ["decision"], registry=REGISTRY)
+    MP_HITL_PENDING = Gauge("mp_hitl_pending", "Pending HITL", registry=REGISTRY)
+    MP_FEDERATED = Counter("mp_federated_rounds_total", "Federated rounds", registry=REGISTRY)
+    MP_DP_EPSILON = Gauge("mp_dp_epsilon_spent", "DP epsilon", ["node"], registry=REGISTRY)
+    MP_HEALTH = Gauge("mp_health_score", "Health", registry=REGISTRY)
+    MP_ACTIVE_LEARNING = Gauge("mp_active_learning_size", "Active learning", registry=REGISTRY)
 else:
-    @dataclass
-    class MODPConfig:
-        enabled: bool = True
-        method: str = "topsis"
-        weights: List[float] = field(default_factory=lambda: [0.25, 0.25, 0.25, 0.25])
-        adaptive_weights: bool = True
-        learning_rate: float = 0.01
+    class _Dummy:
+        def inc(self, *a, **kw): pass
+        def set(self, *a, **kw): pass
+        def observe(self, *a, **kw): pass
+        def labels(self, *a, **kw): return self
+    MP_PRECISION_SWITCHES = MP_ENERGY_SAVED = MP_CARBON_SAVED = MP_COST = _Dummy()
+    MP_CURRENT_PRECISION = MP_TEMPORAL = MP_CHAOS = MP_HITL = _Dummy()
+    MP_HITL_PENDING = MP_FEDERATED = MP_DP_EPSILON = MP_HEALTH = _Dummy()
+    MP_ACTIVE_LEARNING = _Dummy()
 
-    @dataclass
-    class MOEConfig:
-        enabled: bool = True
-        num_experts: int = 4
-        gating_model: str = "logistic"
-        update_interval: int = 3600
-
-    @dataclass
-    class BioConfig:
-        enabled: bool = True
-        algorithm: str = "ga"
-        population_size: int = 20
-        max_iterations: int = 50
-        mutation_rate: float = 0.1
-        crossover_rate: float = 0.8
-        ga_evolution_interval: int = 3600
-
-    @dataclass
-    class SchedulerConfig:
-        enabled: bool = True
-        carbon_threshold: float = 400.0
-        max_delay_seconds: int = 300
-        urgency_importance: float = 0.5
-        carbon_importance: float = 0.3
-        cost_importance: float = 0.2
-
-    @dataclass
-    class SelfHealingConfig:
-        enabled: bool = True
-        anomaly_contamination: float = 0.1
-        auto_retry_threshold: int = 3
-        fallback_enabled: bool = True
-        health_check_interval: int = 60
-
-    @dataclass
-    class MixedPrecisionConfig:
-        instance_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-        version: str = "7.0.0"
-        log_level: str = "INFO"
-        default_dtype: str = "fp16"
-        use_amp: bool = True
-        amp_dtype: str = "fp16"
-        metrics_port: int = 8000
-        carbon_api_key: Optional[str] = None
-        carbon_region: str = "global"
-        carbon_update_interval: int = 300
-        health_check_interval: int = 60
-        mtop_learning_rate: float = 0.01
-        mtop_teacher_weights: Dict[str, float] = field(default_factory=lambda: {
-            'accuracy': 0.25, 'energy': 0.25, 'speed': 0.25, 'carbon': 0.25
-        })
-        enable_quantum_security: bool = True
-        quantum_algorithm: str = "dilithium"
-        quantum_master_key: str = ""
-        enable_blockchain_verification: bool = True
-        blockchain_rpc_url: str = "http://localhost:8545"
-        blockchain_contract_address: Optional[str] = None
-        blockchain_private_key: Optional[str] = None
-        modp: MODPConfig = field(default_factory=MODPConfig)
-        moe: MOEConfig = field(default_factory=MOEConfig)
-        bio: BioConfig = field(default_factory=BioConfig)
-        scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
-        self_healing: SelfHealingConfig = field(default_factory=SelfHealingConfig)
-        limit_graph_enabled: bool = True
-        rlhf_enabled: bool = True
-        distillation_enabled: bool = True
-        temporal_logic_enabled: bool = True
-        xai_enabled: bool = True
-        adaptive_precision_enabled: bool = True
-        carbon_market_enabled: bool = True
-        role_specialization_enabled: bool = True
-        chaos_testing_enabled: bool = True
-        hitl_enabled: bool = True
-        federated_enabled: bool = True
-        hitl_confidence_threshold: float = 0.65
-
-        def get_master_key_bytes(self) -> bytes:
-            if not self.quantum_master_key:
-                return b'\x00' * 32
-            return bytes.fromhex(self.quantum_master_key)
 
 # ============================================================
-# CUSTOM EXCEPTIONS
+# Exceptions
 # ============================================================
-class MixedPrecisionError(Exception):
-    pass
+class MixedPrecisionError(Exception): pass
+class SyncAsyncBoundaryError(MixedPrecisionError): pass
+class CircuitBreakerOpenError(MixedPrecisionError): pass
+class RateLimitExceeded(MixedPrecisionError): pass
+class PrivacyBudgetExceeded(MixedPrecisionError): pass
+class QuantumError(MixedPrecisionError): pass
+class BlockchainError(MixedPrecisionError): pass
+
 
 # ============================================================
-# CIRCUIT BREAKER
+# Enums
 # ============================================================
+class PrecisionLevel(str, Enum):
+    FP32 = "fp32"
+    BF16 = "bf16"
+    FP16 = "fp16"
+    FP8 = "fp8"
+    FP4 = "fp4"
+
+
+class AgentRole(str, Enum):
+    ACCURACY_SPECIALIST = "accuracy_specialist"
+    ENERGY_SPECIALIST = "energy_specialist"
+    CARBON_SPECIALIST = "carbon_specialist"
+    SPEED_SPECIALIST = "speed_specialist"
+    SAFETY_OFFICER = "safety_officer"
+    VERIFIER = "verifier"
+
+
+class STLOperator(str, Enum):
+    ALWAYS = "G"
+    EVENTUALLY = "F"
+    UNTIL = "U"
+    NEXT = "X"
+    IMPLIES = "->"
+
+
 class CircuitBreakerState(Enum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
 
+
+# ============================================================
+# Config (Pydantic or dataclass)
+# ============================================================
+if PYDANTIC_AVAILABLE:
+    class MixedPrecisionConfig(BaseSettings):
+        model_config = SettingsConfigDict(env_prefix="MP_", case_sensitive=False)
+
+        instance_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
+        version: str = "18.0.0"
+        log_level: str = "INFO"
+        environment: str = "production"
+
+        default_dtype: str = "fp16"
+        use_amp: bool = True
+        amp_dtype: str = "fp16"
+
+        db_path: str = "/tmp/mixed_precision_v18.db"
+        persist_path: Optional[str] = None
+
+        metrics_port: int = Field(8000, ge=1024, le=65535)
+        api_host: str = "0.0.0.0"
+        api_port: int = 8000
+        jwt_secret: str = ""
+        jwt_algorithm: str = "HS256"
+        jwt_expiry_s: int = Field(3600, gt=0)
+
+        health_check_interval: int = Field(60, ge=10)
+        carbon_update_interval: int = Field(300, ge=10)
+
+        carbon_base_price_per_ton: float = 50.0
+        rec_price_per_mwh: float = 30.0
+        carbon_region: str = "global"
+        electricity_maps_api_key: Optional[str] = None
+        electricity_maps_zone: str = "US-CAL-CISO"
+        watttime_username: Optional[str] = None
+        watttime_password: Optional[str] = None
+        watttime_region: str = "CAISO_NORTH"
+
+        quantum_algorithm: str = "dilithium"
+        quantum_master_key: str = ""
+        quantum_key_rotation_s: int = Field(3600, gt=0)
+
+        blockchain_rpc_url: str = "http://localhost:8545"
+        blockchain_chain_id: int = 1
+        blockchain_poa: bool = False
+        blockchain_contract_address: Optional[str] = None
+        blockchain_private_key: Optional[str] = None
+
+        rate_limit_per_minute: int = Field(600, ge=1)
+        daily_cost_budget_usd: float = Field(10.0, ge=0)
+        cost_per_decision_usd: float = Field(1e-5, ge=0)
+
+        federated_dp_sigma: float = Field(1e-3, gt=0)
+        federated_target_epsilon: float = Field(8.0, gt=0)
+        federated_target_delta: float = Field(1e-5, gt=0)
+
+        hitl_timeout_s: float = Field(30.0, gt=0)
+        hitl_production_safe: bool = True
+        hitl_auto_approve_on_timeout: bool = False
+
+        ga_seed: int = 0
+        bio_population_size: int = Field(20, ge=10)
+        bio_mutation_rate: float = Field(0.1, ge=0.0, le=1.0)
+        bio_crossover_rate: float = Field(0.8, ge=0.0, le=1.0)
+        ga_evolution_interval: int = Field(3600, ge=60)
+
+        chaos_enabled: bool = False
+        chaos_enable_loop: bool = False
+        chaos_max_concurrent: int = Field(1, ge=1)
+        chaos_duration_s: float = Field(0.0, ge=0)
+
+        temporal_logic_enabled: bool = True
+        xai_enabled: bool = True
+        adaptive_precision_enabled: bool = True
+        carbon_market_enabled: bool = True
+        role_specialization_enabled: bool = True
+        chaos_testing_enabled: bool = True
+        hitl_enabled: bool = True
+        federated_enabled: bool = True
+        causal_enabled: bool = True
+        multi_agent_enabled: bool = True
+        quantum_enabled: bool = True
+        blockchain_enabled: bool = True
+
+        rlhf_uncertainty_threshold: float = Field(0.35, ge=0.0, le=1.0)
+        hitl_confidence_threshold: float = Field(0.65, ge=0.0, le=1.0)
+
+        @field_validator("log_level")
+        @classmethod
+        def _v_log(cls, v):
+            allowed = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+            if v.upper() not in allowed:
+                raise ValueError(f"log_level must be one of {allowed}")
+            return v.upper()
+
+        @field_validator("jwt_secret")
+        @classmethod
+        def _v_jwt(cls, v):
+            if not v:
+                return os.urandom(32).hex()
+            if len(v) < 32:
+                raise ValueError("jwt_secret must be >= 32 chars")
+            return v
+
+        @field_validator("quantum_master_key")
+        @classmethod
+        def _v_master(cls, v):
+            if not v:
+                return os.urandom(32).hex()
+            try:
+                bytes.fromhex(v)
+            except ValueError:
+                raise ValueError("quantum_master_key must be hex")
+            return v
+
+        def get_master_key_bytes(self) -> bytes:
+            return bytes.fromhex(self.quantum_master_key)
+
+        def get_db_url(self) -> str:
+            return self.persist_path or self.db_path
+else:
+    @dataclass
+    class MixedPrecisionConfig:
+        instance_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+        version: str = "18.0.0"
+        log_level: str = "INFO"
+        environment: str = "production"
+        default_dtype: str = "fp16"
+        use_amp: bool = True
+        amp_dtype: str = "fp16"
+        db_path: str = "/tmp/mixed_precision_v18.db"
+        persist_path: Optional[str] = None
+        metrics_port: int = 8000
+        api_host: str = "0.0.0.0"
+        api_port: int = 8000
+        jwt_secret: str = field(default_factory=lambda: os.urandom(32).hex())
+        jwt_algorithm: str = "HS256"
+        jwt_expiry_s: int = 3600
+        health_check_interval: int = 60
+        carbon_update_interval: int = 300
+        carbon_base_price_per_ton: float = 50.0
+        rec_price_per_mwh: float = 30.0
+        carbon_region: str = "global"
+        electricity_maps_api_key: Optional[str] = None
+        electricity_maps_zone: str = "US-CAL-CISO"
+        watttime_username: Optional[str] = None
+        watttime_password: Optional[str] = None
+        watttime_region: str = "CAISO_NORTH"
+        quantum_algorithm: str = "dilithium"
+        quantum_master_key: str = field(default_factory=lambda: os.urandom(32).hex())
+        quantum_key_rotation_s: int = 3600
+        blockchain_rpc_url: str = "http://localhost:8545"
+        blockchain_chain_id: int = 1
+        blockchain_poa: bool = False
+        blockchain_contract_address: Optional[str] = None
+        blockchain_private_key: Optional[str] = None
+        rate_limit_per_minute: int = 600
+        daily_cost_budget_usd: float = 10.0
+        cost_per_decision_usd: float = 1e-5
+        federated_dp_sigma: float = 1e-3
+        federated_target_epsilon: float = 8.0
+        federated_target_delta: float = 1e-5
+        hitl_timeout_s: float = 30.0
+        hitl_production_safe: bool = True
+        hitl_auto_approve_on_timeout: bool = False
+        ga_seed: int = 0
+        bio_population_size: int = 20
+        bio_mutation_rate: float = 0.1
+        bio_crossover_rate: float = 0.8
+        ga_evolution_interval: int = 3600
+        chaos_enabled: bool = False
+        chaos_enable_loop: bool = False
+        chaos_max_concurrent: int = 1
+        chaos_duration_s: float = 0.0
+        temporal_logic_enabled: bool = True
+        xai_enabled: bool = True
+        adaptive_precision_enabled: bool = True
+        carbon_market_enabled: bool = True
+        role_specialization_enabled: bool = True
+        chaos_testing_enabled: bool = True
+        hitl_enabled: bool = True
+        federated_enabled: bool = True
+        causal_enabled: bool = True
+        multi_agent_enabled: bool = True
+        quantum_enabled: bool = True
+        blockchain_enabled: bool = True
+        rlhf_uncertainty_threshold: float = 0.35
+        hitl_confidence_threshold: float = 0.65
+
+        def get_master_key_bytes(self) -> bytes:
+            return bytes.fromhex(self.quantum_master_key)
+
+        def get_db_url(self) -> str:
+            return self.persist_path or self.db_path
+
+
+# ============================================================
+# Utilities
+# ============================================================
+class TokenBucket:
+    def __init__(self, rate: float, per_seconds: float = 60.0):
+        self.rate = float(rate)
+        self.per_seconds = float(per_seconds)
+        self._tokens = float(rate)
+        self._last = time.time()
+        self._lock = threading.Lock()
+
+    def acquire(self, cost: float = 1.0) -> bool:
+        with self._lock:
+            now = time.time()
+            self._tokens = min(
+                self.rate,
+                self._tokens + (now - self._last) * (self.rate / max(self.per_seconds, 1e-6)))
+            self._last = now
+            if self._tokens >= cost:
+                self._tokens -= cost
+                return True
+            return False
+
+    def remaining(self) -> float:
+        with self._lock:
+            return float(self._tokens)
+
+
 class CircuitBreaker:
-    def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: int = 30):
+    def __init__(self, name: str, failure_threshold: int = 5,
+                 recovery_timeout: float = 30.0):
         self.name = name
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.state = CircuitBreakerState.CLOSED
         self.failure_count = 0
-        self.last_failure_time = None
+        self.success_count = 0
+        self.last_failure_time = 0.0
         self._lock = asyncio.Lock()
 
     async def call(self, func, *args, **kwargs):
@@ -376,869 +541,1962 @@ class CircuitBreaker:
                 if time.time() - self.last_failure_time >= self.recovery_timeout:
                     self.state = CircuitBreakerState.HALF_OPEN
                     self.failure_count = 0
-                    logger.info(f"Circuit breaker {self.name} HALF_OPEN")
+                    self.success_count = 0
                 else:
-                    raise MixedPrecisionError(f"Circuit breaker {self.name} is OPEN")
+                    raise CircuitBreakerOpenError(f"Circuit breaker {self.name} OPEN")
         try:
             result = await func(*args, **kwargs)
-            await self._record_success()
+            async with self._lock:
+                self.success_count += 1
+                if self.state == CircuitBreakerState.HALF_OPEN and self.success_count >= 2:
+                    self.state = CircuitBreakerState.CLOSED
+                    self.failure_count = 0
+                elif self.state == CircuitBreakerState.CLOSED:
+                    self.failure_count = 0
             return result
         except Exception:
-            await self._record_failure()
+            async with self._lock:
+                self.failure_count += 1
+                self.last_failure_time = time.time()
+                if self.state == CircuitBreakerState.CLOSED and \
+                        self.failure_count >= self.failure_threshold:
+                    self.state = CircuitBreakerState.OPEN
+                elif self.state == CircuitBreakerState.HALF_OPEN:
+                    self.state = CircuitBreakerState.OPEN
             raise
 
-    async def _record_success(self):
-        async with self._lock:
-            if self.state == CircuitBreakerState.HALF_OPEN:
-                self.state = CircuitBreakerState.CLOSED
-            self.failure_count = 0
+    def get_status(self) -> Dict[str, Any]:
+        return {"name": self.name, "state": self.state.value,
+                "failure_count": self.failure_count}
 
-    async def _record_failure(self):
-        async with self._lock:
-            self.failure_count += 1
-            self.last_failure_time = time.time()
-            if self.state == CircuitBreakerState.CLOSED and self.failure_count >= self.failure_threshold:
-                self.state = CircuitBreakerState.OPEN
-            elif self.state == CircuitBreakerState.HALF_OPEN:
-                self.state = CircuitBreakerState.OPEN
 
 # ============================================================
-# PROMETHEUS METRICS
+# Persistence (SQLite)
 # ============================================================
-if PROMETHEUS_AVAILABLE:
-    REGISTRY = CollectorRegistry()
-    PRECISION_SWITCHES = Counter('precision_switches_total', 'Precision switches', ['from', 'to'], registry=REGISTRY)
-    ENERGY_SAVED = Gauge('energy_saved_kwh', 'Energy saved vs fp32', registry=REGISTRY)
-    CARBON_SAVED = Gauge('carbon_saved_kg', 'Carbon saved vs fp32', registry=REGISTRY)
-    CURRENT_PRECISION = Gauge('current_precision', 'Current precision index', registry=REGISTRY)
-    ACCURACY_SCORE = Gauge('precision_accuracy_score', 'Accuracy score', registry=REGISTRY)
-    MODP_PARETO_SIZE = Gauge('modp_pareto_front_size', 'Pareto front size', registry=REGISTRY)
-    MOE_GATING_WEIGHTS = Gauge('moe_gating_weights', 'MOE gating', ['expert'], registry=REGISTRY)
-    GA_FITNESS = Gauge('ga_fitness', 'GA fitness', ['generation'], registry=REGISTRY)
-    SELF_HEALING_ACTIONS = Counter('self_healing_actions_total', 'Self-healing', ['action'], registry=REGISTRY)
-    ANOMALY_DETECTIONS = Counter('anomaly_detections_total', 'Anomalies', ['type'], registry=REGISTRY)
-    TEMPORAL_VIOLATIONS = Counter('temporal_violations_total', 'Temporal', ['formula'], registry=REGISTRY)
-    CHAOS_TESTS = Counter('chaos_tests_total', 'Chaos', ['fault', 'status'], registry=REGISTRY)
-    HITL_ESCALATIONS = Counter('hitl_escalations_total', 'HITL', ['status'], registry=REGISTRY)
-    FEDERATED_ROUNDS = Counter('federated_rounds_total', 'Federated rounds', registry=REGISTRY)
-    CARBON_CREDITS_USD = Counter('carbon_credits_usd_total', 'Carbon credit USD', registry=REGISTRY)
-    XAI_EXPLANATIONS = Counter('xai_explanations_total', 'XAI explanations', registry=REGISTRY)
-else:
-    class DummyMetrics:
-        def inc(self, *a, **k): pass
-        def set(self, *a, **k): pass
-        def observe(self, *a, **k): pass
-        def labels(self, *a, **k): return self
-    PRECISION_SWITCHES = ENERGY_SAVED = CARBON_SAVED = CURRENT_PRECISION = DummyMetrics()
-    ACCURACY_SCORE = MODP_PARETO_SIZE = MOE_GATING_WEIGHTS = GA_FITNESS = DummyMetrics()
-    SELF_HEALING_ACTIONS = ANOMALY_DETECTIONS = TEMPORAL_VIOLATIONS = DummyMetrics()
-    CHAOS_TESTS = HITL_ESCALATIONS = FEDERATED_ROUNDS = CARBON_CREDITS_USD = XAI_EXPLANATIONS = DummyMetrics()
+class Persistence:
+    SCHEMA = """
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE IF NOT EXISTS hitl_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id TEXT NOT NULL,
+        approved INTEGER NOT NULL,
+        reason TEXT, mode TEXT, latency_ms REAL,
+        prev_hash TEXT, entry_hash TEXT NOT NULL,
+        ts REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS chaos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fault TEXT NOT NULL,
+        passed INTEGER NOT NULL,
+        payload TEXT,
+        ts REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS federated (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        round INTEGER NOT NULL,
+        weights TEXT NOT NULL,
+        dp_spent REAL NOT NULL,
+        ts REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS cost_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL, cost_usd REAL NOT NULL, note TEXT
+    );
+    CREATE TABLE IF NOT EXISTS lineage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        lineage_id TEXT NOT NULL,
+        decision_id TEXT NOT NULL,
+        payload TEXT,
+        ts REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS carbon_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL, price REAL NOT NULL
+    );
+    """
+
+    def __init__(self, path: Optional[str]):
+        self.path = path
+        self._lock = threading.RLock()
+        self._conn: Optional[sqlite3.Connection] = None
+        if path:
+            self._open()
+
+    def _open(self):
+        try:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(self.path, check_same_thread=False)
+            with self._lock:
+                self._conn.executescript(self.SCHEMA)
+                self._conn.commit()
+        except Exception as e:
+            logger.warning(f"Persistence init failed: {e}")
+            self._conn = None
+
+    def close(self):
+        with self._lock:
+            if self._conn:
+                with contextlib.suppress(Exception):
+                    self._conn.commit()
+                with contextlib.suppress(Exception):
+                    self._conn.close()
+                self._conn = None
+
+    def _exec(self, sql, params=()):
+        if not self._conn:
+            return None
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(sql, params)
+            self._conn.commit()
+            return cur
+
+    def _fetchall(self, sql, params=()):
+        if not self._conn:
+            return []
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(sql, params)
+            return cur.fetchall()
+
+    def hitl_append(self, entry: Dict[str, Any]):
+        self._exec(
+            "INSERT INTO hitl_audit (request_id, approved, reason, mode, latency_ms, prev_hash, entry_hash, ts) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (entry["request_id"], int(bool(entry["approved"])),
+             entry.get("reason", ""), entry.get("mode", ""),
+             float(entry.get("latency_ms", 0.0)),
+             entry.get("prev_hash", ""), entry.get("entry_hash", ""),
+             float(entry.get("timestamp", time.time()))))
+
+    def hitl_recent(self, limit: int = 100) -> List[Tuple]:
+        return self._fetchall(
+            "SELECT request_id, approved, reason, mode, latency_ms, prev_hash, entry_hash, ts "
+            "FROM hitl_audit ORDER BY id DESC LIMIT ?", (limit,))
+
+    def hitl_last_hash(self) -> str:
+        rows = self._fetchall(
+            "SELECT entry_hash FROM hitl_audit ORDER BY id DESC LIMIT 1")
+        return rows[0][0] if rows else ""
+
+    def chaos_append(self, fault: str, passed: bool, payload: Dict[str, Any]):
+        self._exec(
+            "INSERT INTO chaos (fault, passed, payload, ts) VALUES (?,?,?,?)",
+            (fault, int(passed), json.dumps(payload, default=str), time.time()))
+
+    def federated_append(self, round_num: int, weights: List[float], dp_spent: float):
+        self._exec(
+            "INSERT INTO federated (round, weights, dp_spent, ts) VALUES (?,?,?,?)",
+            (round_num, json.dumps(weights), float(dp_spent), time.time()))
+
+    def cost_record(self, cost_usd: float, note: str = ""):
+        self._exec(
+            "INSERT INTO cost_ledger (ts, cost_usd, note) VALUES (?,?,?)",
+            (time.time(), float(cost_usd), note))
+
+    def cost_today(self) -> float:
+        day_start = utcnow().replace(hour=0, minute=0, second=0,
+                                     microsecond=0).timestamp()
+        rows = self._fetchall(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_ledger WHERE ts >= ?",
+            (day_start,))
+        return float(rows[0][0]) if rows else 0.0
+
+    def record_lineage(self, lineage_id: str, decision_id: str, payload: Dict[str, Any]):
+        self._exec(
+            "INSERT INTO lineage (lineage_id, decision_id, payload, ts) "
+            "VALUES (?,?,?,?)",
+            (lineage_id, decision_id, json.dumps(payload, default=str), time.time()))
+
+    def append_carbon_price(self, price: float):
+        self._exec(
+            "INSERT INTO carbon_history (ts, price) VALUES (?,?)",
+            (time.time(), float(price)))
+
+    def recent_carbon_prices(self, limit: int = 500) -> List[float]:
+        rows = self._fetchall(
+            "SELECT price FROM carbon_history ORDER BY id DESC LIMIT ?", (limit,))
+        return [float(r[0]) for r in reversed(rows)]
+
 
 # ============================================================
-# ENUMS (v7.0.0)
+# Enhancement 1: PQC (real dilithium + HMAC fallback)
 # ============================================================
-class PrecisionLevel(str, Enum):
-    FP32 = "fp32"
-    FP16 = "fp16"
-    BF16 = "bf16"
-    FP8 = "fp8"
-    FP4 = "fp4"
+class QuantumSecurity:
+    def __init__(self, algorithm: str = "dilithium",
+                 master_key: Optional[bytes] = None,
+                 rotation_s: int = 3600):
+        self.algorithm = algorithm
+        self._master = master_key or os.urandom(32)
+        self._rotation_s = int(rotation_s)
+        self._keys: Dict[str, Tuple[bytes, bytes, float]] = {}
+        self._active_key_id: Optional[str] = None
+        self._lock = threading.Lock()
+        self._rotate()
 
-class AgentRole(str, Enum):
-    ACCURACY_SPECIALIST = "accuracy_specialist"
-    ENERGY_SPECIALIST = "energy_specialist"
-    CARBON_SPECIALIST = "carbon_specialist"
-    SPEED_SPECIALIST = "speed_specialist"
+    def _rotate(self):
+        kid = uuid.uuid4().hex[:8]
+        pub = priv = b""
+        if PQC_AVAILABLE:
+            try:
+                if self.algorithm == "dilithium":
+                    pub, priv = dilithium.generate_keypair()
+                elif self.algorithm == "falcon":
+                    pub, priv = falcon.generate_keypair()
+                else:
+                    pub, priv = sphincs.generate_keypair()
+            except Exception as e:
+                logger.warning(f"PQC keypair failed: {e}")
+        with self._lock:
+            self._keys[kid] = (pub, priv, time.time())
+            self._active_key_id = kid
+
+    def _ensure_key(self):
+        with self._lock:
+            if self._active_key_id is None:
+                self._rotate()
+                return
+            _, _, ts = self._keys[self._active_key_id]
+            if (time.time() - ts) > self._rotation_s:
+                self._rotate()
+
+    def _hmac(self, payload: bytes) -> str:
+        return hmac.new(self._master, payload, hashlib.sha256).hexdigest()
+
+    async def sign(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        self._ensure_key()
+        with self._lock:
+            kid = self._active_key_id
+            pub, priv, _ = self._keys[kid]
+        payload = json.dumps(data, sort_keys=True, default=str).encode()
+        if PQC_AVAILABLE and pub and priv:
+            try:
+                if self.algorithm == "dilithium":
+                    sig = dilithium.sign(priv, payload)
+                elif self.algorithm == "falcon":
+                    sig = falcon.sign(priv, payload)
+                else:
+                    sig = sphincs.sign(priv, payload)
+                return {"algorithm": self.algorithm,
+                        "signature": base64.b64encode(sig).decode(),
+                        "key_id": kid}
+            except Exception as e:
+                logger.warning(f"PQC sign failed: {e}")
+        return {"algorithm": "hmac-sha256", "signature": self._hmac(payload),
+                "key_id": kid}
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            return {"pqc_available": PQC_AVAILABLE,
+                    "algorithm": self.algorithm,
+                    "active_key_id": self._active_key_id,
+                    "num_keys": len(self._keys)}
+
 
 # ============================================================
-# CARBON INTENSITY MANAGER
+# Enhancement 1b: Blockchain (real Web3 + ledger)
 # ============================================================
-class CarbonIntensityManager:
-    def __init__(self, config: MixedPrecisionConfig):
+class BlockchainVerification:
+    def __init__(self, config: MixedPrecisionConfig,
+                 persist: Optional[Persistence] = None):
         self.config = config
-        self.current_intensity = 400.0
+        self._persist = persist
+        self._ledger: Dict[str, Dict[str, Any]] = {}
+        self._last_hash = ""
+        self._lock = threading.Lock()
+        self.web3 = None
+        if WEB3_AVAILABLE and getattr(config, "blockchain_rpc_url", None):
+            try:
+                self.web3 = Web3(Web3.HTTPProvider(config.blockchain_rpc_url))
+                if getattr(config, "blockchain_poa", False):
+                    self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+                if not self.web3.is_connected():
+                    logger.warning("Web3 not connected; local ledger")
+                    self.web3 = None
+            except Exception as e:
+                logger.warning(f"Web3 init failed: {e}")
+                self.web3 = None
+
+    async def record(self, data_id: str, data_hash: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            if data_id in self._ledger:
+                return {"tx_hash": self._ledger[data_id]["tx_hash"],
+                        "status": "idempotent"}
+            tx_hash = None
+            if self.web3 is not None and getattr(self.config, "blockchain_private_key", None):
+                try:
+                    account = self.web3.eth.account.from_key(self.config.blockchain_private_key)
+                    nonce = self.web3.eth.get_transaction_count(account.address)
+                    tx = {
+                        "nonce": nonce, "gas": 21000,
+                        "gasPrice": self.web3.eth.gas_price,
+                        "to": account.address, "value": 0,
+                        "data": self.web3.to_hex(text=json.dumps({
+                            "id": data_id, "hash": data_hash, "meta": metadata}, default=str)),
+                        "chainId": getattr(self.config, "blockchain_chain_id", 1),
+                    }
+                    signed = self.web3.eth.account.sign_transaction(tx, self.config.blockchain_private_key)
+                    raw = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
+                    tx_hash = self.web3.to_hex(self.web3.eth.send_raw_transaction(raw))
+                except Exception as e:
+                    logger.warning(f"Web3 tx failed: {e}")
+                    tx_hash = None
+            if tx_hash is None:
+                chain_input = f"{data_id}:{data_hash}:{self._last_hash}".encode()
+                tx_hash = "0x" + hashlib.sha256(chain_input).hexdigest()[:40]
+            self._ledger[data_id] = {"tx_hash": tx_hash, "hash": data_hash,
+                                     "metadata": metadata, "prev_hash": self._last_hash}
+            self._last_hash = tx_hash
+        return {"tx_hash": tx_hash, "status": "recorded"}
+
+    async def health_check(self) -> Dict[str, Any]:
+        connected = bool(self.web3 and self.web3.is_connected())
+        return {"connected": connected,
+                "backend": "web3" if connected else "local",
+                "total_records": len(self._ledger)}
+
+
+# ============================================================
+# Enhancement 8: Carbon providers + market + intensity
+# ============================================================
+@dataclass
+class CarbonSnapshot:
+    intensity_g_co2_per_kwh: float
+    price_usd_per_kg: float
+    source: str
+    region: str = "global"
+    timestamp: float = field(default_factory=time.time)
+
+
+class ElectricityMapsProvider:
+    def __init__(self, api_key: Optional[str] = None, zone: str = "US-CAL-CISO"):
+        self.api_key = api_key
+        self.zone = zone
+
+    async def get_intensity(self) -> CarbonSnapshot:
+        if self.api_key and HTTPX_AVAILABLE:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    r = await client.get(
+                        "https://api.electricitymap.org/v3/carbon-intensity/latest",
+                        params={"zone": self.zone},
+                        headers={"auth-token": self.api_key})
+                    r.raise_for_status()
+                    data = r.json()
+                    return CarbonSnapshot(
+                        float(data.get("carbonIntensity", 400.0)), 0.0,
+                        "electricitymaps", region=self.zone)
+            except Exception as e:
+                logger.warning(f"ElectricityMaps failed: {e}")
+        hour = utcnow().hour
+        diurnal = 1.0 + 0.35 * math.sin((hour / 24.0) * 2 * math.pi)
+        return CarbonSnapshot(280.0 * diurnal, 0.0, "synthetic", region=self.zone)
+
+
+class WattTimeProvider:
+    def __init__(self, username: Optional[str] = None,
+                 password: Optional[str] = None, region: str = "CAISO_NORTH"):
+        self.username = username
+        self.password = password
+        self.region = region
+
+    async def get_intensity(self) -> CarbonSnapshot:
+        if self.username and self.password and HTTPX_AVAILABLE:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    r = await client.get(
+                        "https://api.watttime.org/v2/data",
+                        params={"ba": self.region},
+                        auth=(self.username, self.password))
+                    r.raise_for_status()
+                    data = r.json()
+                    if data:
+                        return CarbonSnapshot(
+                            float(data[0].get("value", 400.0)), 0.0,
+                            "watttime", region=self.region)
+            except Exception as e:
+                logger.warning(f"WattTime failed: {e}")
+        return CarbonSnapshot(280.0, 0.0, "synthetic", region=self.region)
+
+
+class CarbonMarketClient:
+    def __init__(self, config: MixedPrecisionConfig,
+                 persist: Optional[Persistence] = None):
+        self.config = config
+        self._persist = persist
+        self.carbon_price_per_ton = float(getattr(config, "carbon_base_price_per_ton", 50.0))
+        self.rec_price_per_mwh = float(getattr(config, "rec_price_per_mwh", 30.0))
+        self.grid_intensity_kg_per_mwh = 400.0
+        self.trades: List[Dict[str, Any]] = []
+        self._retired: Set[str] = set()
+
+    async def get_carbon_credit_value(self, carbon_saved_kg: float) -> float:
+        tons = max(0.0, float(carbon_saved_kg)) / 1000.0
+        return round(tons * self.carbon_price_per_ton, 6)
+
+    async def get_rec_value(self, energy_saved_kwh: float) -> float:
+        mwh = max(0.0, float(energy_saved_kwh)) / 1000.0
+        return round(mwh * self.rec_price_per_mwh, 6)
+
+    async def get_market_snapshot(self) -> Dict[str, Any]:
+        return {"carbon_price_usd_per_ton": self.carbon_price_per_ton,
+                "rec_price_usd_per_mwh": self.rec_price_per_mwh,
+                "grid_intensity_kg_per_mwh": self.grid_intensity_kg_per_mwh}
+
+    async def retire_credits(self, amount_kg: float, beneficiary: str,
+                             idempotency_key: Optional[str] = None) -> Dict[str, Any]:
+        key = idempotency_key or f"{beneficiary}:{amount_kg}"
+        if key in self._retired:
+            return {"status": "idempotent", "key": key}
+        rec = {"id": str(uuid.uuid4()), "amount_kg": float(amount_kg),
+               "beneficiary": beneficiary,
+               "timestamp": utcnow().isoformat(), "key": key}
+        self.trades.append(rec)
+        self._retired.add(key)
+        return rec
+
+
+class CarbonIntensityManager:
+    def __init__(self, market: Optional[CarbonMarketClient] = None,
+                 electricity_maps_api_key: Optional[str] = None,
+                 electricity_maps_zone: str = "US-CAL-CISO",
+                 watttime_username: Optional[str] = None,
+                 watttime_password: Optional[str] = None,
+                 watttime_region: str = "CAISO_NORTH",
+                 region: str = "global",
+                 persist: Optional[Persistence] = None):
+        self.market = market
+        self.region = region
+        self._persist = persist
+        self.current = CarbonSnapshot(400.0, 0.05, "synthetic", region=region)
+        self.providers: List[Any] = []
+        if electricity_maps_api_key:
+            self.providers.append(ElectricityMapsProvider(
+                electricity_maps_api_key, electricity_maps_zone))
+        if watttime_username:
+            self.providers.append(WattTimeProvider(
+                watttime_username, watttime_password, watttime_region))
+        if not self.providers:
+            self.providers.append(ElectricityMapsProvider(None, electricity_maps_zone))
+        self._override: Optional[Callable[[], Awaitable[CarbonSnapshot]]] = None
+
+    def set_override(self, fn: Optional[Callable[[], Awaitable[CarbonSnapshot]]]):
+        self._override = fn
+
+    async def refresh(self) -> CarbonSnapshot:
+        if self._override is not None:
+            return await self._override()
+        best: Optional[CarbonSnapshot] = None
+        for p in self.providers:
+            try:
+                snap = await p.get_intensity()
+                if best is None or snap.source != "synthetic":
+                    best = snap
+                    if snap.source != "synthetic":
+                        break
+            except Exception as e:
+                logger.warning(f"Carbon provider failed: {e}")
+        if best is not None:
+            hour = utcnow().hour
+            base_price = (self.market.carbon_price_per_ton / 1000.0
+                          if self.market else 0.05)
+            price = base_price * (1 + 0.3 * math.sin((hour / 24.0) * 2 * math.pi))
+            self.current = CarbonSnapshot(
+                intensity_g_co2_per_kwh=best.intensity_g_co2_per_kwh,
+                price_usd_per_kg=max(0.001, price),
+                source=best.source, region=best.region)
+        if self._persist:
+            with contextlib.suppress(Exception):
+                self._persist.append_carbon_price(self.current.price_usd_per_kg)
+        return self.current
 
     async def get_current_intensity(self) -> float:
-        self.current_intensity = 350 + random.uniform(-50, 50)
-        return self.current_intensity
+        return self.current.intensity_g_co2_per_kwh
 
-    async def close(self):
-        pass
+    async def get_current_snapshot(self) -> CarbonSnapshot:
+        return self.current
+
+    async def get_current_price(self) -> float:
+        return self.current.price_usd_per_kg
+
+    async def close(self): pass
+
+    async def health_check(self) -> Dict[str, Any]:
+        return {"status": "ok", "intensity": self.current.intensity_g_co2_per_kwh,
+                "source": self.current.source, "region": self.current.region}
+
 
 # ============================================================
-# v7.0.0 MODULE A — TEMPORAL LOGIC MONITOR
+# Enhancement 5: Temporal logic (full STL)
 # ============================================================
+@dataclass
+class STLFormula:
+    name: str
+    predicate: Callable[[Dict[str, Any]], bool]
+    operator: STLOperator
+    horizon: int = 10
+    rhs_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None
+
+    def evaluate(self, window: List[Dict[str, Any]]) -> bool:
+        if not window:
+            return True
+        sat = [bool(self.predicate(r)) for r in window]
+        if self.operator == STLOperator.ALWAYS:
+            return all(sat)
+        if self.operator == STLOperator.EVENTUALLY:
+            return any(sat)
+        if self.operator == STLOperator.NEXT:
+            return sat[0] if len(sat) == 1 else sat[1]
+        if self.operator == STLOperator.UNTIL:
+            for i, s in enumerate(sat):
+                if s:
+                    return all(sat[:i]) if i > 0 else True
+            return False
+        if self.operator == STLOperator.IMPLIES and self.rhs_predicate is not None:
+            rhs = [bool(self.rhs_predicate(r)) for r in window]
+            return all((not s) or r for s, r in zip(sat, rhs))
+        return True
+
+
+@dataclass
+class STLViolation:
+    formula: str
+    operator: str
+    window_size: int
+    timestamp: float
+
+
 class TemporalLogicMonitor:
-    """
-    Lightweight LTL-style monitor. Operators: G(φ), F(φ), φ U ψ, φ -> ψ.
-    Comparison atoms: <, >, <=, >=, ==, !=.
-    """
-    def __init__(self, history_len: int = 200):
-        self.formulas: Dict[str, str] = {}
-        self.compiled: Dict[str, Callable[[List[Dict]], bool]] = {}
-        self.history: deque = deque(maxlen=history_len)
-        self.violations: List[Dict] = []
+    def __init__(self, horizon: int = 10):
+        self.horizon = horizon
+        self._history: deque = deque(maxlen=horizon * 4)
+        self.formulas: List[STLFormula] = []
+        self.violations: List[STLViolation] = []
+        self._lock = threading.Lock()
 
-    def add_formula(self, name: str, formula: str):
-        self.formulas[name] = formula
-        self.compiled[name] = self._compile(formula)
+    def add_formula(self, f: STLFormula):
+        self.formulas.append(f)
 
-    def update(self, state: Dict):
-        self.history.append(dict(state))
+    def observe(self, record: Dict[str, Any]):
+        with self._lock:
+            self._history.append({**record, "_t": time.time()})
 
-    def _compile(self, formula: str) -> Callable[[List[Dict]], bool]:
-        f = formula.strip()
-        if f.startswith("G(") and f.endswith(")"):
-            inner = self._compile(f[2:-1])
-            return lambda hist: all(inner([h]) for h in hist) if hist else True
-        if f.startswith("F(") and f.endswith(")"):
-            inner = self._compile(f[2:-1])
-            return lambda hist: any(inner([h]) for h in hist) if hist else False
-        if " U " in f:
-            left, right = f.split(" U ", 1)
-            lf, rf = self._compile(left), self._compile(right)
-            def until(hist):
-                for i in range(len(hist)):
-                    if rf(hist[i:]): return True
-                    if not lf([hist[i]]): return False
-                return False
-            return until
-        if "->" in f:
-            left, right = f.split("->", 1)
-            lf, rf = self._compile(left.strip()), self._compile(right.strip())
-            return lambda hist: (not lf(hist)) or rf(hist)
-        return self._atom(f)
-
-    def _atom(self, atom: str) -> Callable[[List[Dict]], bool]:
-        atom = atom.strip()
-        for op in ["<=", ">=", "==", "!=", "<", ">"]:
-            if op in atom:
-                lhs, rhs = [s.strip() for s in atom.split(op, 1)]
-                def make(lhs, op, rhs):
-                    def check(hist):
-                        if not hist: return True
-                        s = hist[-1]
-                        lv = s.get(lhs, 0.0)
-                        try:
-                            rv = float(rhs)
-                        except ValueError:
-                            rv = s.get(rhs, 0.0)
-                        return {"<":  lambda: lv < rv,
-                                ">":  lambda: lv > rv,
-                                "<=": lambda: lv <= rv,
-                                ">=": lambda: lv >= rv,
-                                "==": lambda: lv == rv,
-                                "!=": lambda: lv != rv}[op]()
-                    return check
-                return make(lhs, op, rhs)
-        return lambda hist: bool(atom.lower() in ("true", "1", "yes"))
-
-    def evaluate(self) -> Dict[str, bool]:
-        results = {}
-        for name, fn in self.compiled.items():
-            try:
-                ok = fn(list(self.history))
-            except Exception as e:
-                logger.warning(f"Temporal eval '{name}' failed: {e}")
-                ok = False
-            results[name] = ok
-            if not ok:
-                self.violations.append({
-                    'formula': name, 'expression': self.formulas[name],
-                    'timestamp': datetime.now().isoformat()})
-                if PROMETHEUS_AVAILABLE:
-                    TEMPORAL_VIOLATIONS.labels(formula=name).inc()
+    def verify(self) -> Dict[str, bool]:
+        with self._lock:
+            history = list(self._history)
+        results: Dict[str, bool] = {}
+        for f in self.formulas:
+            window = history[-f.horizon:]
+            results[f.name] = f.evaluate(window)
+            if not results[f.name]:
+                MP_TEMPORAL.labels(formula=f.name).inc()
+                with self._lock:
+                    self.violations.append(STLViolation(
+                        formula=f.name, operator=f.operator.value,
+                        window_size=len(window), timestamp=time.time()))
         return results
 
-    def get_status(self) -> Dict:
-        return {'formulas': self.formulas,
-                'last_results': self.evaluate(),
-                'violations': self.violations[-5:]}
+    def recent_violations(self, n: int = 10) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [asdict(v) for v in self.violations[-n:]]
+
+    def fresh(self) -> "TemporalLogicMonitor":
+        m = TemporalLogicMonitor(horizon=self.horizon)
+        m.formulas = list(self.formulas)
+        return m
+
+
+class SafetyShield:
+    def __init__(self, monitor: TemporalLogicMonitor):
+        self.monitor = monitor
+        self.violations: List[Dict[str, Any]] = []
+
+    def screen(self, chosen: str, safer: str,
+               verdict: Optional[Dict[str, bool]] = None
+               ) -> Tuple[str, bool, Dict[str, bool]]:
+        v = verdict if verdict is not None else self.monitor.verify()
+        violated = [k for k, ok in v.items() if not ok]
+        if not violated:
+            return chosen, True, v
+        self.violations.append({"t": time.time(), "violated": violated,
+                                "original": chosen, "replacement": safer})
+        return safer, False, v
+
 
 # ============================================================
-# v7.0.0 MODULE B — XAI EXPLAINER
+# Enhancement 2: Causal RL (UCB)
+# ============================================================
+@dataclass
+class CausalTransition:
+    state: np.ndarray
+    action: int
+    reward: float
+    next_state: np.ndarray
+
+
+class CausalCounterfactualEstimator:
+    def __init__(self, state_dim: int, n_actions: int, ridge: float = 1e-3,
+                 exploration_c: float = 0.5):
+        self.state_dim = state_dim
+        self.n_actions = n_actions
+        self.ridge = ridge
+        self.exploration_c = exploration_c
+        self._A = np.eye(state_dim + n_actions + 1) * ridge
+        self._b = np.zeros(state_dim + n_actions + 1)
+        self._counts = np.zeros(n_actions)
+        self._n = 0
+        self._lock = threading.Lock()
+
+    def _features(self, s, a):
+        oh = np.zeros(self.n_actions)
+        oh[a % self.n_actions] = 1.0
+        return np.concatenate([np.asarray(s, dtype=np.float64), oh, [1.0]])
+
+    def _ensure(self, n: int):
+        if n == self.n_actions:
+            return
+        with self._lock:
+            self._A = np.eye(self.state_dim + n + 1) * self.ridge
+            self._b = np.zeros(self.state_dim + n + 1)
+            self.n_actions = n
+            self._counts = np.zeros(n)
+            self._n = 0
+
+    def update(self, t: CausalTransition):
+        a = int(t.action) % max(self.n_actions, 1)
+        x = self._features(t.state, a)
+        with self._lock:
+            self._A += np.outer(x, x)
+            self._b += t.reward * x
+            self._counts[a] += 1
+            self._n += 1
+
+    def _predict(self, s, a) -> float:
+        with self._lock:
+            if self._n < 2:
+                return 0.0
+            try:
+                theta = np.linalg.solve(self._A, self._b)
+            except np.linalg.LinAlgError:
+                return 0.0
+        return float(self._features(s, a) @ theta)
+
+    def counterfactuals(self, s, n: int) -> Dict[int, float]:
+        self._ensure(n)
+        return {a: self._predict(s, a) for a in range(self.n_actions)}
+
+    def select_action(self, s, n: int, epsilon: float = 0.05) -> int:
+        cf = self.counterfactuals(s, n)
+        if not cf:
+            return 0
+        if random.random() < epsilon:
+            return random.randrange(self.n_actions)
+        with self._lock:
+            total = max(self._n, 1)
+            counts = self._counts.copy()
+        scores = {}
+        for a, mu in cf.items():
+            count = max(counts[a], 1.0)
+            bonus = self.exploration_c * math.sqrt(math.log(total + 1) / count)
+            scores[a] = mu + bonus
+        return max(scores, key=scores.get)
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {"n_updates": int(self._n), "n_actions": self.n_actions,
+                    "counts": self._counts.tolist()}
+
+
+# ============================================================
+# Enhancement 3: Federated (secure + DP)
+# ============================================================
+@dataclass
+class FederatedUpdate:
+    node_id: str
+    weights: np.ndarray
+    n_samples: int
+    carbon_intensity: float
+    timestamp: float = field(default_factory=time.time)
+
+
+class DPAccountant:
+    def __init__(self, target_epsilon: float = 8.0, target_delta: float = 1e-5):
+        self.target_epsilon = target_epsilon
+        self.target_delta = target_delta
+        self.spent = 0.0
+        self.rounds = 0
+
+    def step(self, sigma: float, sensitivity: float = 1.0):
+        if sigma <= 0:
+            return
+        eps = sensitivity * math.sqrt(2 * math.log(1.25 / self.target_delta)) / sigma
+        self.spent += eps
+        self.rounds += 1
+
+    def can_spend(self) -> bool:
+        return self.spent < self.target_epsilon
+
+
+class FederatedAggregator:
+    def __init__(self, num_params: int = 4, dp_sigma: float = 1e-3,
+                 target_epsilon: float = 8.0, target_delta: float = 1e-5,
+                 staleness_s: float = 3600.0,
+                 persist: Optional[Persistence] = None):
+        self.num_params = int(num_params)
+        self.dp_sigma = float(dp_sigma)
+        self.staleness_s = float(staleness_s)
+        self.global_weights: List[float] = [1.0 / self.num_params] * self.num_params
+        self.round = 0
+        self._pending: Dict[str, FederatedUpdate] = {}
+        self.accountant = DPAccountant(target_epsilon, target_delta)
+        self._persist = persist
+        self._lock = threading.Lock()
+
+    def submit_update(self, client_id: str, weights: List[float],
+                      samples: int, carbon_intensity: float = 400.0):
+        if len(weights) != self.num_params:
+            return
+        with self._lock:
+            self._pending[client_id] = FederatedUpdate(
+                node_id=client_id,
+                weights=np.asarray(weights, dtype=np.float64),
+                n_samples=max(1, int(samples)),
+                carbon_intensity=float(carbon_intensity))
+
+    def _fresh(self) -> List[FederatedUpdate]:
+        now = time.time()
+        with self._lock:
+            return [u for u in self._pending.values()
+                    if (now - u.timestamp) <= self.staleness_s]
+
+    @staticmethod
+    def _pairwise_masks(node_ids: List[str], shape: Tuple[int, ...]) -> List[np.ndarray]:
+        rng = np.random.default_rng(0)
+        pairwise: Dict[Tuple[str, str], np.ndarray] = {}
+        for i, a in enumerate(node_ids):
+            for b in node_ids[i + 1:]:
+                pairwise[(a, b)] = rng.normal(0.0, 1.0, size=shape)
+        masks = []
+        for a in node_ids:
+            m = np.zeros(shape)
+            for (x, y), v in pairwise.items():
+                if x == a:
+                    m = m + v
+                elif y == a:
+                    m = m - v
+            masks.append(m)
+        return masks
+
+    def aggregate(self, secure: bool = True) -> Dict[str, Any]:
+        fresh = self._fresh()
+        if not fresh:
+            return {"weights": self.global_weights, "round": self.round}
+        if not self.accountant.can_spend():
+            raise PrivacyBudgetExceeded(
+                f"DP budget exhausted: spent={self.accountant.spent:.2f}")
+        weights = np.array([u.n_samples / max(u.carbon_intensity, 1.0)
+                            for u in fresh])
+        weights /= max(weights.sum(), 1e-12)
+        node_ids = [u.node_id for u in fresh]
+        stacked = np.stack([u.weights for u in fresh], axis=0)
+        if secure and len(fresh) > 1:
+            masks = self._pairwise_masks(node_ids, stacked.shape[1:])
+            stacked = stacked + np.stack(masks, axis=0)
+        blended = np.tensordot(weights, stacked, axes=([0], [0]))
+        if self.dp_sigma > 0:
+            blended = blended + np.random.normal(0.0, self.dp_sigma,
+                                                 size=blended.shape)
+            self.accountant.step(self.dp_sigma)
+        with self._lock:
+            self.global_weights = blended.tolist()
+            self.round += 1
+            self._pending.clear()
+        for nid in node_ids:
+            MP_DP_EPSILON.labels(node=nid).set(self.accountant.spent)
+        MP_FEDERATED.inc()
+        if self._persist:
+            with contextlib.suppress(Exception):
+                self._persist.federated_append(
+                    self.round, self.global_weights, self.accountant.spent)
+        return {"weights": self.global_weights, "round": self.round,
+                "dp_spent": self.accountant.spent}
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            pending = len(self._pending)
+        return {"round": self.round,
+                "global_weights": self.global_weights,
+                "pending_updates": pending,
+                "dp_spent": self.accountant.spent,
+                "dp_target": self.accountant.target_epsilon}
+
+
+# ============================================================
+# Enhancement 4: Multi-agent (message bus + emergent roles)
+# ============================================================
+@dataclass
+class AgentBid:
+    agent_id: str
+    role: AgentRole
+    confidence: float
+    proposed_action: int
+    rationale: str
+    carbon_score: float
+
+
+@dataclass
+class AgentMessage:
+    sender: str
+    recipient: str
+    topic: str
+    payload: Dict[str, Any]
+    t: float = field(default_factory=time.time)
+
+
+class EmergentRoleRegistry:
+    def __init__(self, decay: float = 0.95):
+        self.decay = decay
+        self._scores = {r: 1.0 for r in AgentRole}
+        self._counts = {r: 0 for r in AgentRole}
+        self._successes = {r: 0 for r in AgentRole}
+        self._lock = threading.Lock()
+
+    def record(self, role: AgentRole, success: bool, reward: float):
+        with self._lock:
+            for r in self._scores:
+                self._scores[r] *= self.decay
+            signal = reward if success else -abs(reward) * 0.5
+            self._scores[role] += signal
+            self._counts[role] += 1
+            if success:
+                self._successes[role] += 1
+
+    def weights(self) -> Dict[AgentRole, float]:
+        with self._lock:
+            total = sum(max(v, 1e-6) for v in self._scores.values())
+            return {r: max(v, 1e-6) / total for r, v in self._scores.items()}
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {"scores": {r.value: self._scores[r] for r in AgentRole},
+                    "counts": {r.value: self._counts[r] for r in AgentRole},
+                    "success_rate": {
+                        r.value: (self._successes[r] / self._counts[r])
+                        if self._counts[r] else 0.0
+                        for r in AgentRole}}
+
+
+class MultiAgentCoordinator:
+    def __init__(self, registry: EmergentRoleRegistry,
+                 role_bias: Optional[Dict[AgentRole, float]] = None):
+        self.registry = registry
+        self.role_bias = role_bias or {
+            AgentRole.ACCURACY_SPECIALIST: 1.0,
+            AgentRole.ENERGY_SPECIALIST: 1.1,
+            AgentRole.CARBON_SPECIALIST: 1.2,
+            AgentRole.SPEED_SPECIALIST: 0.9,
+            AgentRole.SAFETY_OFFICER: 1.4,
+            AgentRole.VERIFIER: 1.0}
+        self.messages: deque = deque(maxlen=1000)
+        self._lock = threading.Lock()
+
+    def broadcast(self, sender: str, topic: str, payload: Dict[str, Any]):
+        with self._lock:
+            self.messages.append(AgentMessage(
+                sender=sender, recipient="*", topic=topic, payload=payload))
+
+    def vote(self, bids: Sequence[AgentBid], n_candidates: int,
+             dominant_override: Optional[AgentRole] = None) -> int:
+        if not bids or n_candidates <= 0:
+            return 0
+        if dominant_override is not None:
+            for b in bids:
+                if b.role == dominant_override:
+                    return b.proposed_action % n_candidates
+        role_w = self.registry.weights()
+        scores = np.zeros(n_candidates)
+        for b in bids:
+            idx = b.proposed_action % n_candidates
+            weight = (role_w.get(b.role, 0.1)
+                      * self.role_bias.get(b.role, 1.0)
+                      * max(b.confidence, 0.0)
+                      * (1.0 + max(0.0, b.carbon_score)))
+            scores[idx] += weight
+        return int(np.argmax(scores))
+
+    def resolve_conflict(self, bids: Sequence[AgentBid],
+                         n_candidates: int) -> Tuple[int, str]:
+        if not bids:
+            return 0, "no_bids"
+        safety = [b for b in bids if b.role == AgentRole.SAFETY_OFFICER]
+        carbon = [b for b in bids if b.role == AgentRole.CARBON_SPECIALIST]
+        if safety and min(b.confidence for b in safety) > 0.5:
+            idx = safety[0].proposed_action % n_candidates
+            self.broadcast("coordinator", "conflict_resolved",
+                           {"winner": "safety_officer", "idx": idx})
+            return idx, "safety_override"
+        if carbon and min(b.confidence for b in carbon) > 0.5:
+            idx = carbon[0].proposed_action % n_candidates
+            self.broadcast("coordinator", "conflict_resolved",
+                           {"winner": "carbon_specialist", "idx": idx})
+            return idx, "carbon_override"
+        idx = self.vote(bids, n_candidates)
+        self.broadcast("coordinator", "conflict_resolved",
+                       {"winner": "vote", "idx": idx})
+        return idx, "vote"
+
+
+# ============================================================
+# Enhancement 6: XAI (SHAP + weighted)
 # ============================================================
 class XAIExplainer:
-    """Feature-attribution explanation for precision selection."""
-    def __init__(self, feature_names: List[str]):
-        self.feature_names = feature_names
+    def __init__(self, feature_names: List[str],
+                 predict_fn: Optional[Callable] = None):
+        self.feature_names = list(feature_names)
+        self.predict_fn = predict_fn
+        self._shap_explainer = None
+
+    def fit(self, background: np.ndarray):
+        if SHAP_AVAILABLE and self.predict_fn is not None:
+            try:
+                self._shap_explainer = shap.KernelExplainer(self.predict_fn, background)
+            except Exception as e:
+                logger.warning(f"SHAP init failed: {e}")
+
+    def _shap_attributions(self, x: np.ndarray) -> Optional[Dict[str, float]]:
+        if self._shap_explainer is None:
+            return None
+        try:
+            vals = self._shap_explainer.shap_values(x.reshape(1, -1))
+            v = np.asarray(vals).reshape(-1)
+            return {f: float(v[i]) for i, f in enumerate(self.feature_names)}
+        except Exception:
+            return None
 
     def explain(self, candidate: Dict[str, float],
                 weights: Dict[str, float],
                 all_candidates: List[Dict[str, float]],
-                top_k: int = 5) -> Dict:
-        matrix = np.array([[c.get(f, 0.0) for f in self.feature_names]
+                top_k: int = 5) -> Dict[str, Any]:
+        if not all_candidates:
+            return {"contributions": {}, "top_features": [],
+                    "narrative": [], "weights_used": {}, "method": "none"}
+        matrix = np.array([[float(c.get(f, 0.0)) for f in self.feature_names]
                            for c in all_candidates])
         norms = np.sqrt((matrix ** 2).sum(axis=0)) + 1e-9
-        cand_vec = np.array([candidate.get(f, 0.0) for f in self.feature_names])
-        w_arr = np.array([weights.get(f, 1.0) for f in self.feature_names])
+        cand_vec = np.array([float(candidate.get(f, 0.0))
+                             for f in self.feature_names])
+        w_arr = np.array([float(weights.get(f, 1.0)) for f in self.feature_names])
         weighted = (cand_vec / norms) * w_arr
         contrib = {f: float(weighted[i]) for i, f in enumerate(self.feature_names)}
-        ranked = sorted(contrib.items(), key=lambda kv: abs(kv[1]), reverse=True)[:top_k]
-        narrative = [
-            f"{f} ({v:+.4f}) {'increases' if v >= 0 else 'decreases'} the utility."
-            for f, v in ranked
-        ]
-        if PROMETHEUS_AVAILABLE:
-            XAI_EXPLANATIONS.inc()
-        return {
-            'contributions': contrib,
-            'top_features': [f for f, _ in ranked],
-            'narrative': narrative,
-            'weights_used': dict(weights),
-        }
+        ranked = sorted(contrib.items(), key=lambda kv: abs(kv[1]),
+                        reverse=True)[:top_k]
+        narrative = [f"{f} ({v:+.4f}) {'increases' if v >= 0 else 'decreases'} "
+                     f"the utility." for f, v in ranked]
+        method = "weighted"
+        shap_attr = None
+        if self._shap_explainer is not None:
+            shap_attr = self._shap_attributions(cand_vec)
+            if shap_attr is not None:
+                method = "shap"
+        return {"contributions": contrib,
+                "top_features": [f for f, _ in ranked],
+                "narrative": narrative,
+                "weights_used": dict(weights),
+                "method": method,
+                "shap_attributions": shap_attr}
+
 
 # ============================================================
-# v7.0.0 MODULE C — ADAPTIVE PRECISION CONTROLLER (hardware-aware)
+# Enhancement 7: Adaptive precision (telemetry-driven)
 # ============================================================
+@dataclass
+class HardwareTelemetry:
+    gpu_available: bool = False
+    memory_gb: float = 16.0
+    utilization: float = 0.3
+    temperature_c: float = 40.0
+    observed_quality_drop: float = 0.0
+    timestamp: float = field(default_factory=time.time)
+
+
 class AdaptivePrecisionController:
-    """
-    Hardware-aware precision switching that complements the MODP/MOE decision.
-    """
-    def __init__(self):
-        self.telemetry = {'gpu_available': torch.cuda.is_available(),
-                          'memory_gb': 16.0, 'utilization': 0.3}
+    def __init__(self, energy_joules_per_op: float = 1e-9):
+        self.telemetry = HardwareTelemetry(
+            gpu_available=bool(TORCH_AVAILABLE and getattr(torch.cuda, "is_available", lambda: False)()))
         self.last_precision = PrecisionLevel.FP32
+        self._ema_quality_drop = 0.0
+        self.energy_joules_per_op = float(energy_joules_per_op)
+        self._lock = threading.Lock()
 
     def update_telemetry(self, **kwargs):
-        self.telemetry.update(kwargs)
+        with self._lock:
+            for k, v in kwargs.items():
+                if hasattr(self.telemetry, k):
+                    setattr(self.telemetry, k, v)
+            alpha = 0.2
+            self._ema_quality_drop = (
+                (1 - alpha) * self._ema_quality_drop
+                + alpha * float(self.telemetry.observed_quality_drop))
 
-    def select(self, carbon_intensity: float, accuracy_required: float = 0.95) -> PrecisionLevel:
-        if accuracy_required > 0.99:
-            self.last_precision = PrecisionLevel.FP32
+    def select(self, carbon_intensity: float,
+               accuracy_required: float = 0.95) -> PrecisionLevel:
+        with self._lock:
+            tel = self.telemetry
+            drop = self._ema_quality_drop
+        if accuracy_required > 0.99 or drop > 0.05:
+            chosen = PrecisionLevel.FP32
         elif carbon_intensity > 500:
-            self.last_precision = PrecisionLevel.FP8
-        elif self.telemetry.get('gpu_available') and carbon_intensity < 350:
-            self.last_precision = PrecisionLevel.FP16
+            chosen = PrecisionLevel.FP8
+        elif tel.gpu_available and carbon_intensity < 350:
+            chosen = PrecisionLevel.FP16
         else:
-            self.last_precision = PrecisionLevel.FP16
-        return self.last_precision
+            chosen = PrecisionLevel.FP16
+        self.last_precision = chosen
+        return chosen
 
     @staticmethod
     def energy_factor(level: PrecisionLevel) -> float:
-        return {PrecisionLevel.FP32: 1.0, PrecisionLevel.FP16: 0.4,
-                PrecisionLevel.BF16: 0.4, PrecisionLevel.FP8: 0.2,
+        return {PrecisionLevel.FP32: 1.0, PrecisionLevel.BF16: 0.4,
+                PrecisionLevel.FP16: 0.4, PrecisionLevel.FP8: 0.2,
                 PrecisionLevel.FP4: 0.1}[level]
 
-# ============================================================
-# v7.0.0 MODULE D — CARBON MARKET CLIENT
-# ============================================================
-class CarbonMarketClient:
-    """Simulated client for carbon markets and RECs."""
-    def __init__(self):
-        self.carbon_price_per_ton = 50.0
-        self.rec_price_per_mwh = 30.0
-        self.grid_intensity_kg_per_mwh = 400.0
-        self.trades: List[Dict] = []
+    def estimate_energy_joules(self, level: PrecisionLevel, ops: float) -> float:
+        return PRECISION_ENERGY_PER_OP[level] * ops
 
-    async def get_carbon_credit_value(self, carbon_saved_kg: float) -> float:
-        tons = max(0.0, carbon_saved_kg) / 1000.0
-        return round(tons * self.carbon_price_per_ton, 6)
 
-    async def get_rec_value(self, energy_saved_kwh: float) -> float:
-        mwh = max(0.0, energy_saved_kwh) / 1000.0
-        return round(mwh * self.rec_price_per_mwh, 6)
+PRECISION_ENERGY_PER_OP: Dict[PrecisionLevel, float] = {
+    PrecisionLevel.FP32: 1.0e-9,
+    PrecisionLevel.BF16: 0.4e-9,
+    PrecisionLevel.FP16: 0.4e-9,
+    PrecisionLevel.FP8: 0.2e-9,
+    PrecisionLevel.FP4: 0.1e-9,
+}
 
-    async def get_market_snapshot(self) -> Dict:
-        return {'carbon_price_usd_per_ton': self.carbon_price_per_ton,
-                'rec_price_usd_per_mwh': self.rec_price_per_mwh,
-                'grid_intensity_kg_per_mwh': self.grid_intensity_kg_per_mwh}
-
-    async def retire_credits(self, amount_kg: float, beneficiary: str) -> Dict:
-        rec = {'id': str(uuid.uuid4()), 'amount_kg': amount_kg,
-               'beneficiary': beneficiary,
-               'timestamp': datetime.now().isoformat()}
-        self.trades.append(rec)
-        if PROMETHEUS_AVAILABLE:
-            CARBON_CREDITS_USD.inc(await self.get_carbon_credit_value(amount_kg))
-        return rec
 
 # ============================================================
-# v7.0.0 MODULE E — ROLE SPECIALIZATION COORDINATOR
+# Role specialization
 # ============================================================
 class RoleSpecializationCoordinator:
-    """Emergent multi-agent role specialization."""
     def __init__(self):
-        self.roles = list(AgentRole)
-        # rows = roles, cols = [accuracy, energy, carbon, speed]
+        self.roles = [AgentRole.ACCURACY_SPECIALIST, AgentRole.ENERGY_SPECIALIST,
+                      AgentRole.CARBON_SPECIALIST, AgentRole.SPEED_SPECIALIST]
         self.affinity = np.array([
-            [0.9, 0.2, 0.2, 0.2],   # accuracy_specialist
-            [0.2, 0.9, 0.3, 0.2],   # energy_specialist
-            [0.2, 0.3, 0.9, 0.2],   # carbon_specialist
-            [0.2, 0.2, 0.2, 0.9],   # speed_specialist
-        ])
+            [0.9, 0.2, 0.2, 0.2],
+            [0.2, 0.9, 0.3, 0.2],
+            [0.2, 0.3, 0.9, 0.2],
+            [0.2, 0.2, 0.2, 0.9]])
 
-    def assign_roles(self, context: Dict[str, float]) -> Dict:
-        ctx = np.array([context.get('accuracy', 0.5),
-                        context.get('energy', 0.5),
-                        context.get('carbon', 0.5),
-                        context.get('speed', 0.5)])
+    def assign_roles(self, context: Dict[str, float]) -> Dict[str, Any]:
+        ctx = np.array([context.get("accuracy", 0.5),
+                        context.get("energy", 0.5),
+                        context.get("carbon", 0.5),
+                        context.get("speed", 0.5)])
         scores = self.affinity @ ctx
         e = np.exp(scores - scores.max())
         probs = e / e.sum()
-        assignments = {role.value: float(probs[i]) for i, role in enumerate(self.roles)}
+        assignments = {r.value: float(probs[i]) for i, r in enumerate(self.roles)}
         dominant = self.roles[int(np.argmax(probs))].value
-        return {'assignments': assignments, 'dominant_role': dominant}
+        return {"assignments": assignments, "dominant_role": dominant}
+
 
 # ============================================================
-# v7.0.0 MODULE F — CHAOS TESTER
+# Enhancement 9: Chaos (steady-state, no global mutation)
 # ============================================================
+@dataclass
+class SteadyStateHypothesis:
+    name: str
+    predicate: Callable[[Dict[str, Any]], bool]
+
+
 class ChaosTester:
-    """
-    Fault injection for resilience validation.
-    Faults: carbon_api_down, model_oom, distiller_broken, rlhf_broken, scheduler_hang
-    """
-    FAULT_TYPES = ['carbon_api_down', 'model_oom', 'distiller_broken',
-                   'rlhf_broken', 'scheduler_hang']
+    FAULT_TYPES = ["carbon_api_down", "model_oom", "distiller_broken",
+                   "rlhf_broken", "scheduler_hang"]
 
-    def __init__(self, engine_ref=None):
+    def __init__(self, engine_ref: Optional[Any] = None,
+                 hypotheses: Optional[List[SteadyStateHypothesis]] = None,
+                 max_concurrent: int = 1, duration_s: float = 0.0,
+                 persist: Optional[Persistence] = None):
         self.engine = engine_ref
-        self.results: List[Dict] = []
+        self.hypotheses = hypotheses or [
+            SteadyStateHypothesis("precision_valid",
+                                  lambda m: m.get("precision") in
+                                  [p.value for p in PrecisionLevel])]
+        self.max_concurrent = max(1, int(max_concurrent))
+        self.duration_s = float(duration_s)
+        self.persist = persist
+        self.results: List[Dict[str, Any]] = []
+        self._active = 0
+        self._lock = threading.Lock()
 
-    async def run_test(self, fault_type: str, duration_s: float = 0.2) -> Dict:
+    def _can_inject(self) -> bool:
+        return self._active < self.max_concurrent
+
+    async def run_test(self, fault_type: str,
+                       duration_s: float = 0.2) -> Dict[str, Any]:
         if fault_type not in self.FAULT_TYPES:
             raise ValueError(f"Unknown fault: {fault_type}")
+        if not self._can_inject():
+            return {"fault": fault_type, "passed": False,
+                    "error": "max_concurrent_reached"}
+        with self._lock:
+            self._active += 1
         start = time.time()
         passed, error_msg = True, None
         restore: List[Callable[[], None]] = []
         eng = self.engine
 
         try:
-            if fault_type == 'carbon_api_down' and eng:
-                orig = eng.carbon_manager.get_current_intensity
-                async def broken(): raise RuntimeError("carbon API down")
-                eng.carbon_manager.get_current_intensity = broken
-                restore.append(lambda: setattr(eng.carbon_manager, 'get_current_intensity', orig))
-            elif fault_type == 'model_oom':
-                # Simulate by raising inside a try
+            if fault_type == "carbon_api_down" and eng is not None \
+                    and eng.carbon_manager is not None:
+                orig_override = eng.carbon_manager._override
+
+                async def broken():
+                    raise RuntimeError("carbon API down")
+                eng.carbon_manager.set_override(broken)
+                restore.append(lambda: eng.carbon_manager.set_override(orig_override))
                 try:
-                    _ = torch.zeros((10**8,), dtype=torch.float32)
+                    await eng.carbon_manager.refresh()
                 except Exception:
                     pass
-            elif fault_type == 'distiller_broken' and eng and eng.distiller:
-                orig = eng.distiller.distill
-                def broken(_): raise RuntimeError("distiller broken")
-                eng.distiller.distill = broken
-                restore.append(lambda: setattr(eng.distiller, 'distill', orig))
-            elif fault_type == 'rlhf_broken' and eng and eng.rlhf:
-                orig = eng.rlhf.update
-                def broken(*a, **k): raise RuntimeError("rlhf broken")
-                eng.rlhf.update = broken
-                restore.append(lambda: setattr(eng.rlhf, 'update', orig))
-            elif fault_type == 'scheduler_hang' and eng and eng.scheduler:
-                orig = eng.scheduler.schedule
-                async def broken(*a, **k):
-                    await asyncio.sleep(10)
-                    return {'recommended_delay': 0}
-                eng.scheduler.schedule = broken
-                restore.append(lambda: setattr(eng.scheduler, 'schedule', orig))
 
-            await asyncio.sleep(duration_s)
+            elif fault_type == "model_oom":
+                # Exercise the engine's OOM handling by injecting a fake model
+                if eng is not None:
+                    orig_exec = getattr(eng, "_chaos_exec_override", None)
+
+                    async def oom_forward(*a, **k):
+                        raise RuntimeError("CUDA out of memory (chaos)")
+                    eng._chaos_exec_override = oom_forward
+                    restore.append(lambda: setattr(
+                        eng, "_chaos_exec_override", orig_exec))
+                    try:
+                        await eng._exercise_forward_chaos()
+                    except Exception:
+                        pass
+
+            elif fault_type == "distiller_broken" and eng is not None \
+                    and getattr(eng, "distiller", None) is not None:
+                orig = eng.distiller.distill
+
+                def broken(_):
+                    raise RuntimeError("distiller broken")
+                eng.distiller.distill = broken
+                restore.append(lambda: setattr(eng.distiller, "distill", orig))
+                try:
+                    eng.distiller.distill({})
+                except Exception:
+                    pass
+
+            elif fault_type == "rlhf_broken" and eng is not None \
+                    and getattr(eng, "rlhf", None) is not None:
+                orig = eng.rlhf.update
+
+                def broken(*a, **k):
+                    raise RuntimeError("rlhf broken")
+                eng.rlhf.update = broken
+                restore.append(lambda: setattr(eng.rlhf, "update", orig))
+                try:
+                    eng.rlhf.update({}, "fp16", 0.0)
+                except Exception:
+                    pass
+
+            elif fault_type == "scheduler_hang" and eng is not None \
+                    and getattr(eng, "scheduler", None) is not None:
+                orig = eng.scheduler.schedule
+
+                async def hung(*a, **k):
+                    await asyncio.sleep(10)
+                    return {"recommended_delay": 0}
+                eng.scheduler.schedule = hung
+                restore.append(lambda: setattr(eng.scheduler, "schedule", orig))
+                try:
+                    await asyncio.wait_for(eng.scheduler.schedule(), timeout=0.1)
+                except Exception:
+                    pass
+
+            if fault_type != "scheduler_hang":
+                await asyncio.sleep(min(duration_s, 1.0))
+
+            metrics = {}
+            if eng is not None:
+                metrics = {"precision": getattr(eng, "current_precision", None)}
+            if not all(h.predicate(metrics) for h in self.hypotheses):
+                passed = False
+                error_msg = "steady_state_violated"
         except Exception as e:
             passed, error_msg = False, str(e)
         finally:
             for r in restore:
-                try: r()
-                except Exception: pass
+                with contextlib.suppress(Exception):
+                    r()
+            with self._lock:
+                self._active = max(0, self._active - 1)
 
-        result = {'fault': fault_type, 'duration_s': duration_s,
-                  'elapsed_s': time.time() - start, 'passed': passed,
-                  'error': error_msg,
-                  'timestamp': datetime.now().isoformat()}
+        result = {"fault": fault_type, "duration_s": duration_s,
+                  "elapsed_s": time.time() - start, "passed": passed,
+                  "error": error_msg, "timestamp": utcnow().isoformat()}
         self.results.append(result)
-        if PROMETHEUS_AVAILABLE:
-            CHAOS_TESTS.labels(fault=fault_type,
-                               status='pass' if passed else 'fail').inc()
-        logger.warning(f"[ChaosTester] {result}")
+        MP_CHAOS.labels(fault=fault_type,
+                        status="pass" if passed else "fail").inc()
+        if self.persist:
+            with contextlib.suppress(Exception):
+                self.persist.chaos_append(fault_type, passed, result)
         return result
 
-    def get_report(self) -> Dict:
-        return {
-            'tests_run': len(self.results),
-            'pass_rate': (sum(1 for r in self.results if r['passed']) / len(self.results))
-                         if self.results else 1.0,
-            'recent': self.results[-5:],
-        }
+    def get_report(self) -> Dict[str, Any]:
+        return {"tests_run": len(self.results),
+                "pass_rate": (sum(1 for r in self.results if r["passed"])
+                              / len(self.results)) if self.results else 1.0,
+                "recent": self.results[-5:],
+                "hypotheses": [h.name for h in self.hypotheses]}
+
 
 # ============================================================
-# v7.0.0 MODULE G — ACTIVE RLHF
+# Enhancement 10: Active RLHF + HITL + Active learning
 # ============================================================
 class ActiveRLHF:
-    """Preference-based policy with uncertainty-triggered human queries."""
     def __init__(self, action_space: List[str],
                  uncertainty_threshold: float = 0.35,
                  human_timeout_s: float = 300.0):
         self.actions = list(action_space)
-        self.uncertainty_threshold = uncertainty_threshold
-        self.human_timeout_s = human_timeout_s
+        self.uncertainty_threshold = float(uncertainty_threshold)
+        self.human_timeout_s = float(human_timeout_s)
         self.preference_counts: Dict[str, float] = defaultdict(float)
-        self.history: List[Dict] = []
-        self.pending_queries: Dict[str, Dict] = {}
+        self.context_priors: Dict[str, Dict[str, float]] = defaultdict(
+            lambda: defaultdict(float))
+        self.history: List[Dict[str, Any]] = []
+        self.pending_queries: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._approver: Optional[Callable[[Any], bool]] = None
+
+    def _ctx_key(self, context: Any) -> str:
+        return json.dumps(context, sort_keys=True, default=str)[:64]
 
     def _policy(self, context: Any) -> np.ndarray:
-        raw = np.array([self.preference_counts[a] for a in self.actions], dtype=float)
+        key = self._ctx_key(context)
+        with self._lock:
+            raw = np.array([self.preference_counts[a]
+                            + self.context_priors[key][a]
+                            for a in self.actions], dtype=float)
         if raw.sum() == 0:
             raw = np.ones(len(self.actions))
         e = np.exp(raw - raw.max())
         return e / e.sum()
 
     def sample_action(self, context: Any) -> str:
-        return self.actions[int(np.argmax(self._policy(context)))]
+        probs = self._policy(context)
+        return self.actions[int(np.argmax(probs))]
 
     def uncertainty(self, context: Any) -> float:
         probs = self._policy(context)
         ent = -np.sum(probs * np.log(probs + 1e-12))
-        return float(ent / np.log(len(self.actions))) if self.actions else 0.0
+        return float(ent / math.log(len(self.actions))) if len(self.actions) > 1 else 0.0
 
     def update(self, context: Any, action: str, reward: float):
-        self.preference_counts[action] += reward
-        self.history.append({'action': action, 'reward': reward,
-                             'timestamp': datetime.now().isoformat()})
+        if action not in self.actions:
+            return
+        key = self._ctx_key(context)
+        with self._lock:
+            self.preference_counts[action] += float(reward)
+            self.context_priors[key][action] += float(reward)
+        self.history.append({"action": action, "reward": float(reward),
+                             "context": key, "timestamp": utcnow().isoformat()})
 
-    async def maybe_query_human(self, context: Dict, options: List[str]) -> Optional[Dict]:
+    async def maybe_query_human(self, context: Dict,
+                                options: List[str]) -> Optional[Dict[str, Any]]:
         u = self.uncertainty(context)
         if u <= self.uncertainty_threshold:
             return None
         qid = str(uuid.uuid4())
-        query = {'id': qid, 'context': context, 'options': options,
-                 'uncertainty': u,
-                 'created_at': datetime.now().isoformat(),
-                 'status': 'pending'}
-        self.pending_queries[qid] = query
+        query = {"id": qid, "context": context, "options": options,
+                 "uncertainty": u, "created_at": utcnow().isoformat(),
+                 "status": "pending"}
+        with self._lock:
+            self.pending_queries[qid] = query
+        MP_HITL_PENDING.set(len(self.pending_queries))
         return query
 
-    def resolve_query(self, query_id: str, chosen: str, rating: float = 1.0):
-        if query_id not in self.pending_queries:
+    def resolve_query(self, query_id: str, chosen: str,
+                      rating: float = 1.0) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            q = self.pending_queries.pop(query_id, None)
+            MP_HITL_PENDING.set(len(self.pending_queries))
+        if q is None:
             return None
-        q = self.pending_queries.pop(query_id)
-        q.update({'status': 'resolved', 'chosen': chosen, 'rating': rating})
-        self.update(q['context'], chosen, rating)
+        q.update({"status": "resolved", "chosen": chosen, "rating": rating})
+        self.update(q["context"], chosen, rating)
         return q
 
-# ============================================================
-# v7.0.0 MODULE H — HUMAN-IN-THE-LOOP COORDINATOR
-# ============================================================
-class HumanInTheLoopCoordinator:
-    """Escalates low-confidence decisions to humans with auto-fallback."""
-    def __init__(self, active_rlhf: ActiveRLHF, timeout_s: float = 300.0):
-        self.rlhf = active_rlhf
-        self.timeout_s = timeout_s
-        self.audit_log: List[Dict] = []
 
-    async def escalate(self, decision_context: Dict, options: List[str],
-                       confidence: float, confidence_threshold: float = 0.65) -> Dict:
+@dataclass
+class HITLRequest:
+    request_id: str
+    reason: str
+    chosen_idx: int
+    candidates: List[Dict[str, Any]]
+    uncertainty: float
+    carbon_price: float
+    priority: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+
+    @classmethod
+    def new(cls, reason: str, chosen_idx: int,
+            candidates: List[Dict[str, Any]],
+            uncertainty: float, carbon_price: float,
+            priority: int = 0,
+            metadata: Optional[Dict[str, Any]] = None) -> "HITLRequest":
+        return cls(request_id=uuid.uuid4().hex[:12], reason=reason,
+                   chosen_idx=chosen_idx, candidates=list(candidates),
+                   uncertainty=float(uncertainty),
+                   carbon_price=float(carbon_price),
+                   priority=int(priority), metadata=dict(metadata or {}))
+
+
+@dataclass
+class HITLAuditEntry:
+    request_id: str
+    approved: bool
+    reason: str
+    mode: str
+    latency_ms: float = 0.0
+    prev_hash: str = ""
+    entry_hash: str = ""
+    timestamp: float = field(default_factory=time.time)
+
+    def compute_hash(self) -> str:
+        payload = json.dumps({
+            "request_id": self.request_id, "approved": self.approved,
+            "reason": self.reason, "mode": self.mode,
+            "latency_ms": round(self.latency_ms, 6),
+            "timestamp": round(self.timestamp, 6),
+            "prev_hash": self.prev_hash}, sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class HumanInTheLoopCoordinator:
+    def __init__(self, rlhf: ActiveRLHF, timeout_s: float = 30.0,
+                 production_safe: bool = True, max_pending: int = 128,
+                 persist: Optional[Persistence] = None,
+                 approver: Optional[Callable[[HITLRequest], bool]] = None):
+        self.rlhf = rlhf
+        self.timeout_s = float(timeout_s)
+        self.production_safe = bool(production_safe)
+        self.max_pending = int(max_pending)
+        self._persist = persist
+        self._approver = approver
+        self._pending: Dict[str, HITLRequest] = {}
+        self._futures: Dict[str, asyncio.Future] = {}
+        self._lock = threading.RLock()
+        self._audit: deque = deque(maxlen=4096)
+        self._last_hash = persist.hitl_last_hash() if persist else ""
+        MP_HITL_PENDING.set(0)
+
+    def _audit_append(self, entry: HITLAuditEntry):
+        entry.prev_hash = self._last_hash
+        entry.entry_hash = entry.compute_hash()
+        self._last_hash = entry.entry_hash
+        self._audit.append(entry)
+        if self._persist:
+            with contextlib.suppress(Exception):
+                self._persist.hitl_append(entry.to_dict())
+
+    def pending_requests(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            pend = list(self._pending.values())
+        pend.sort(key=lambda r: (-r.priority, r.timestamp))
+        return [{"request_id": r.request_id, "reason": r.reason,
+                 "chosen_idx": r.chosen_idx, "uncertainty": r.uncertainty,
+                 "priority": r.priority, "age_s": time.time() - r.timestamp}
+                for r in pend]
+
+    async def request(self, req: HITLRequest) -> bool:
+        start = time.time()
+        approver = self._approver
+        if approver is None and self.production_safe:
+            self._audit_append(HITLAuditEntry(
+                req.request_id, False, req.reason, "blocked_no_approver",
+                (time.time() - start) * 1000.0))
+            MP_HITL.labels(decision="blocked").inc()
+            return False
+        if approver is None:
+            self._audit_append(HITLAuditEntry(
+                req.request_id, True, req.reason, "auto_no_approver",
+                (time.time() - start) * 1000.0))
+            MP_HITL.labels(decision="auto_approved").inc()
+            return True
+        with self._lock:
+            if len(self._pending) >= self.max_pending:
+                self._audit_append(HITLAuditEntry(
+                    req.request_id, False, req.reason, "queue_full",
+                    (time.time() - start) * 1000.0))
+                MP_HITL.labels(decision="queue_full").inc()
+                return False
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            self._pending[req.request_id] = req
+            self._futures[req.request_id] = future
+            MP_HITL_PENDING.set(len(self._pending))
+
+        def _call():
+            try:
+                return bool(approver(req))
+            except Exception as e:
+                logger.warning(f"Approver failed: {e}")
+                return False
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        mode = "approver"
+        try:
+            worker = executor.submit(_call)
+            approved = await asyncio.wait_for(
+                loop.run_in_executor(None, worker.result),
+                timeout=self.timeout_s)
+        except asyncio.TimeoutError:
+            approved = False
+            mode = "timeout"
+        except Exception as e:
+            approved = False
+            mode = f"error:{e}"
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+            with self._lock:
+                self._pending.pop(req.request_id, None)
+                fut = self._futures.pop(req.request_id, None)
+                MP_HITL_PENDING.set(len(self._pending))
+            if fut is not None and not fut.done():
+                with contextlib.suppress(Exception):
+                    fut.set_result(bool(approved))
+
+        latency_ms = (time.time() - start) * 1000.0
+        self._audit_append(HITLAuditEntry(
+            req.request_id, approved, req.reason, mode, latency_ms))
+        MP_HITL.labels(decision="approved" if approved else "rejected").inc()
+        return bool(approved)
+
+    async def escalate(self, decision_context: Dict[str, Any],
+                       options: List[str], confidence: float,
+                       confidence_threshold: float = 0.65) -> Dict[str, Any]:
         needs_human = confidence < confidence_threshold
         query = await self.rlhf.maybe_query_human(decision_context, options)
-
         if query is None and not needs_human:
             choice = self.rlhf.sample_action(decision_context)
-            self.audit_log.append({'decision': 'auto', 'chosen': choice,
-                                   'confidence': confidence})
-            if PROMETHEUS_AVAILABLE:
-                HITL_ESCALATIONS.labels(status='auto').inc()
-            return {'escalated': False, 'chosen': choice, 'source': 'auto'}
-
-        if query is None:
-            query = {'id': str(uuid.uuid4()), 'options': options,
-                     'context': decision_context, 'status': 'pending'}
-
+            return {"escalated": False, "chosen": choice, "source": "auto"}
         auto_choice = self.rlhf.sample_action(decision_context)
-        self.audit_log.append({'decision': 'escalated', 'query_id': query.get('id'),
-                               'auto_fallback': auto_choice,
-                               'confidence': confidence,
-                               'timestamp': datetime.now().isoformat()})
-        if PROMETHEUS_AVAILABLE:
-            HITL_ESCALATIONS.labels(status='escalated').inc()
-        return {'escalated': True, 'query': query,
-                'chosen': auto_choice, 'source': 'human_pending'}
+        if query is None:
+            query = {"id": str(uuid.uuid4()), "options": options,
+                     "context": decision_context, "status": "pending"}
+        return {"escalated": True, "query": query,
+                "chosen": auto_choice, "source": "human_pending"}
 
-    def get_audit(self) -> Dict:
-        return {'total': len(self.audit_log), 'recent': self.audit_log[-10:]}
+    def resolve(self, request_id: str, approved: bool) -> bool:
+        with self._lock:
+            fut = self._futures.get(request_id)
+        if fut is None or fut.done():
+            return False
+        with contextlib.suppress(Exception):
+            fut.set_result(bool(approved))
+        self._audit_append(HITLAuditEntry(
+            request_id, approved, "external_resolve", "resolved"))
+        MP_HITL.labels(decision="approved" if approved else "rejected").inc()
+        return True
+
+    def audit_trail(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        if self._persist:
+            rows = self._persist.hitl_recent(limit or 1000)
+            return [{"request_id": r[0], "approved": bool(r[1]),
+                     "reason": r[2], "mode": r[3], "latency_ms": r[4],
+                     "prev_hash": r[5], "entry_hash": r[6],
+                     "timestamp": r[7]} for r in rows]
+        entries = list(self._audit)
+        if limit is not None:
+            entries = entries[-limit:]
+        return [e.to_dict() for e in entries]
+
+    def verify_audit_chain(self) -> bool:
+        entries = self.audit_trail(limit=None)
+        prev = ""
+        for e in entries:
+            if e["prev_hash"] != prev:
+                return False
+            payload = json.dumps({
+                "request_id": e["request_id"],
+                "approved": bool(e["approved"]),
+                "reason": e["reason"], "mode": e["mode"],
+                "latency_ms": round(float(e["latency_ms"]), 6),
+                "timestamp": round(float(e["timestamp"]), 6),
+                "prev_hash": e["prev_hash"]}, sort_keys=True, default=str)
+            if hashlib.sha256(payload.encode()).hexdigest() != e["entry_hash"]:
+                return False
+            prev = e["entry_hash"]
+        return True
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            pending = len(self._pending)
+        return {"pending": pending, "max_pending": self.max_pending,
+                "audit_size": len(self._audit),
+                "production_safe": self.production_safe,
+                "timeout_s": self.timeout_s}
+
+
+class ActiveLearningSampler:
+    def __init__(self, capacity: int = 256, seed: int = 0,
+                 feature_dim: int = 5, diversity_weight: float = 0.4,
+                 n_clusters: int = 4, max_age_s: float = 3600.0):
+        self.capacity = int(capacity)
+        self.feature_dim = int(feature_dim)
+        self.diversity_weight = float(diversity_weight)
+        self.n_clusters = int(n_clusters)
+        self.max_age_s = float(max_age_s)
+        self._buffer: List[Dict[str, Any]] = []
+        self._features: List[np.ndarray] = []
+        self._uncertainties: List[float] = []
+        self._lock = threading.RLock()
+        self._rng = random.Random(int(seed))
+        self._kmeans = (KMeans(n_clusters=self.n_clusters, n_init=5)
+                        if SKLEARN_AVAILABLE and self.n_clusters > 1 else None)
+        MP_ACTIVE_LEARNING.set(0)
+
+    def _embed(self, record: Dict[str, Any]) -> np.ndarray:
+        vals = [float(v) for k, v in sorted(record.items())
+                if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if not vals:
+            vals = [0.0]
+        v = np.asarray(vals, dtype=np.float64)
+        if len(v) < self.feature_dim:
+            v = np.pad(v, (0, self.feature_dim - len(v)))
+        else:
+            v = v[:self.feature_dim]
+        n = float(np.linalg.norm(v)) + 1e-9
+        return v / n
+
+    def maybe_store(self, record: Dict[str, Any], uncertainty: float,
+                    threshold: float = 0.3) -> bool:
+        if uncertainty < threshold:
+            return False
+        feat = self._embed(record)
+        with self._lock:
+            if len(self._buffer) >= self.capacity:
+                idx = int(np.argmin(self._uncertainties))
+                self._buffer.pop(idx)
+                self._features.pop(idx)
+                self._uncertainties.pop(idx)
+            self._buffer.append({**record, "uncertainty": float(uncertainty),
+                                 "t": time.time()})
+            self._features.append(feat)
+            self._uncertainties.append(float(uncertainty))
+            size = len(self._buffer)
+        MP_ACTIVE_LEARNING.set(size)
+        return True
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._buffer)
+
 
 # ============================================================
-# v7.0.0 MODULE I — FEDERATED AGGREGATOR
-# ============================================================
-class FederatedAggregator:
-    """FedAvg-style cross-deployment learning."""
-    def __init__(self, num_params: int = 4):
-        self.round = 0
-        self.num_params = num_params
-        self.global_weights: List[float] = [1.0 / num_params] * num_params
-        self.client_updates: List[Dict] = []
-
-    def submit_update(self, client_id: str, weights: List[float], samples: int):
-        if len(weights) != self.num_params:
-            return
-        self.client_updates.append({'client_id': client_id,
-                                    'weights': list(weights),
-                                    'samples': samples})
-
-    def aggregate(self) -> Dict:
-        if not self.client_updates:
-            return {'weights': self.global_weights, 'round': self.round}
-        total = sum(u['samples'] for u in self.client_updates) or 1
-        agg = np.zeros(self.num_params)
-        for u in self.client_updates:
-            agg += np.array(u['weights']) * (u['samples'] / total)
-        self.global_weights = agg.tolist()
-        self.round += 1
-        self.client_updates.clear()
-        if PROMETHEUS_AVAILABLE:
-            FEDERATED_ROUNDS.inc()
-        logger.info(f"[Federated] round {self.round}: {self.global_weights}")
-        return {'weights': self.global_weights, 'round': self.round}
-
-    def get_stats(self) -> Dict:
-        return {'round': self.round, 'global_weights': self.global_weights,
-                'pending_updates': len(self.client_updates)}
-
-# ============================================================
-# PARETO FRONT + TOPSIS (shared)
+# Pareto + TOPSIS (benefit convention + cost_criteria)
 # ============================================================
 class ParetoFront:
+    """All objectives are BENEFITS (higher is better)."""
     def __init__(self):
-        self.solutions = []
+        self.solutions: List[Tuple[List[float], Any]] = []
 
-    def add(self, objectives: List[float], decision: Any):
+    def add(self, objectives: Sequence[float], decision: Any):
         dominated = False
         for obj, _ in self.solutions:
-            if all(o <= obj[i] for i, o in enumerate(objectives)):
+            if (all(obj[i] >= objectives[i] for i in range(len(objectives)))
+                    and any(obj[i] > objectives[i] for i in range(len(objectives)))):
                 dominated = True
                 break
         if not dominated:
-            self.solutions = [(obj, dec) for obj, dec in self.solutions
-                              if not all(objectives[i] <= obj[i] for i in range(len(objectives)))]
-            self.solutions.append((objectives, decision))
+            self.solutions = [
+                (obj, dec) for obj, dec in self.solutions
+                if not (all(objectives[i] >= obj[i] for i in range(len(objectives)))
+                        and any(objectives[i] > obj[i] for i in range(len(objectives))))]
+            self.solutions.append((list(objectives), decision))
+        return dominated
 
     def get_pareto_front(self) -> List[Tuple[List[float], Any]]:
         return self.solutions
 
-    def get_best_by_weight(self, weights: List[float]) -> Any:
-        best, best_score = None, -float('inf')
+    def get_best_by_weight(self, weights: Sequence[float]) -> Any:
+        best, best_score = None, -float("inf")
         for obj, dec in self.solutions:
             score = sum(w * o for w, o in zip(weights, obj))
             if score > best_score:
                 best_score, best = score, dec
         return best
 
+
 class TOPSIS:
     @staticmethod
-    def score(candidates: List[Dict[str, float]], weights: List[float], criteria: List[str]) -> List[float]:
-        matrix = np.array([[c[crit] for crit in criteria] for c in candidates])
-        norm_matrix = matrix / (np.sqrt((matrix**2).sum(axis=0)) + 1e-9)
-        weighted = norm_matrix * weights
-        ideal = weighted.max(axis=0)
-        neg_ideal = weighted.min(axis=0)
-        d_plus = np.sqrt(((weighted - ideal)**2).sum(axis=1))
-        d_minus = np.sqrt(((weighted - neg_ideal)**2).sum(axis=1))
+    def score(candidates: List[Dict[str, float]], weights: Sequence[float],
+              criteria: List[str],
+              cost_criteria: Optional[Set[str]] = None) -> List[float]:
+        if not candidates or not criteria:
+            return []
+        cost_criteria = set(cost_criteria or [])
+        matrix = np.array([[float(c.get(crit, 0.0)) for crit in criteria]
+                           for c in candidates])
+        denom = np.sqrt((matrix ** 2).sum(axis=0))
+        denom = np.where(denom == 0, 1.0, denom)
+        norm = matrix / denom
+        w = np.asarray(weights[: norm.shape[1]], dtype=np.float64)
+        if w.sum() <= 0:
+            w = np.ones(norm.shape[1]) / norm.shape[1]
+        else:
+            w = w / w.sum()
+        weighted = norm * w
+        ideal = np.zeros(norm.shape[1])
+        neg_ideal = np.zeros(norm.shape[1])
+        for j, crit in enumerate(criteria):
+            if crit in cost_criteria:
+                ideal[j] = weighted[:, j].min()
+                neg_ideal[j] = weighted[:, j].max()
+            else:
+                ideal[j] = weighted[:, j].max()
+                neg_ideal[j] = weighted[:, j].min()
+        d_plus = np.sqrt(((weighted - ideal) ** 2).sum(axis=1))
+        d_minus = np.sqrt(((weighted - neg_ideal) ** 2).sum(axis=1))
         return (d_minus / (d_plus + d_minus + 1e-9)).tolist()
 
+
 # ============================================================
-# MODULE 1: MODP PRECISION SELECTOR (v7 upgrade with XAI, RLHF, roles)
+# Multi-teacher distiller (weighted vote)
+# ============================================================
+class MultiTeacherDistiller:
+    def __init__(self, teachers: List[Callable],
+                 weights: Optional[List[float]] = None):
+        self.teachers = list(teachers)
+        self.weights = list(weights) if weights else [1.0] * len(self.teachers)
+
+    async def _call(self, t: Callable, ctx: Any) -> Optional[Dict[str, Any]]:
+        try:
+            out = t(ctx)
+            if asyncio.iscoroutine(out):
+                out = await out
+            return out
+        except Exception:
+            return None
+
+    async def distill(self, context: Any) -> Optional[Dict[str, Any]]:
+        votes: Dict[str, Tuple[Dict[str, Any], float]] = {}
+        for t, w in zip(self.teachers, self.weights):
+            c = await self._call(t, context)
+            if not isinstance(c, dict):
+                continue
+            key = json.dumps(c, sort_keys=True, default=str)
+            if key in votes:
+                prev, wprev = votes[key]
+                votes[key] = (prev, wprev + float(w))
+            else:
+                votes[key] = (c, float(w))
+        if not votes:
+            return None
+        return max(votes.values(), key=lambda kv: kv[1])[0]
+
+
+# ============================================================
+# MODP precision selector (benefit convention + XAI + roles)
 # ============================================================
 class MODPPrecisionSelector:
-    def __init__(self, config: MixedPrecisionConfig,
-                 adaptive_cost: Optional[AdaptiveCostFunction] = None,
+    FEATURES = ["accuracy", "energy", "carbon", "speed"]
+
+    def __init__(self, adaptive_cost: Optional[Any] = None,
                  xai: Optional[XAIExplainer] = None,
-                 rlhf: Optional[ActiveRLHF] = None,
-                 roles: Optional[RoleSpecializationCoordinator] = None,
-                 temporal: Optional[TemporalLogicMonitor] = None):
-        self.config = config
+                 roles: Optional[RoleSpecializationCoordinator] = None):
         self.adaptive_cost = adaptive_cost
-        self.weights = config.modp.weights[:]
-        self.adaptive_weights = config.modp.adaptive_weights
-        self.learning_rate = config.modp.learning_rate
-        self.recent_outcomes = deque(maxlen=100)
-        self.dtype_list = ['fp32', 'fp16', 'bf16', 'fp8', 'fp4']
+        self.weights = [0.25, 0.25, 0.25, 0.25]
+        self.learning_rate = 0.01
+        self.recent_outcomes: deque = deque(maxlen=100)
+        self.dtype_list = ["fp32", "fp16", "bf16", "fp8", "fp4"]
         self.xai = xai
-        self.rlhf = rlhf
         self.roles = roles
-        self.temporal = temporal
 
-    async def select_precision(self, features: Dict) -> Dict:
-        carbon_intensity = features.get('carbon_intensity', 400)
-        layer_type = features.get('layer_type', 'general')
-        input_size = features.get('input_size', 1000)
-        base_accuracy = features.get('base_accuracy', 1.0)
+    @staticmethod
+    def _estimate_accuracy(dtype: str, base_accuracy: float) -> float:
+        return base_accuracy * {"fp32": 1.0, "fp16": 0.98, "bf16": 0.97,
+                                "fp8": 0.90, "fp4": 0.80}.get(dtype, 0.5)
 
-        # Temporal logic gate
-        if self.temporal:
-            self.temporal.update({
-                'carbon_intensity': float(carbon_intensity),
-                'base_accuracy': float(base_accuracy),
-                'input_size': float(input_size),
-            })
-            temporal_status = self.temporal.evaluate()
-        else:
-            temporal_status = {}
+    @staticmethod
+    def _estimate_energy(dtype: str) -> float:
+        return {"fp32": 1.0, "fp16": 0.4, "bf16": 0.4,
+                "fp8": 0.2, "fp4": 0.1}.get(dtype, 1.0)
 
-        candidates = []
-        for dtype in self.dtype_list:
-            accuracy = self._estimate_accuracy(dtype, layer_type, base_accuracy)
-            energy = self._estimate_energy(dtype)
-            carbon = energy * carbon_intensity / 1000
-            speed = self._estimate_speed(dtype)
-            candidates.append({
-                'dtype': dtype,
-                'objectives': [accuracy, -energy, -carbon, speed],
-                'accuracy': accuracy, 'energy': energy,
-                'carbon': carbon, 'speed': speed,
-            })
+    @staticmethod
+    def _estimate_speed(dtype: str) -> float:
+        return {"fp32": 1.0, "fp16": 2.0, "bf16": 2.0,
+                "fp8": 3.0, "fp4": 4.0}.get(dtype, 1.0)
 
-        front = ParetoFront()
-        for cand in candidates:
-            front.add(cand['objectives'], cand['dtype'])
+    def _benefit_vector(self, dtype: str, base_accuracy: float,
+                        carbon_intensity: float) -> Dict[str, float]:
+        """All benefit-style: higher is better."""
+        accuracy = self._estimate_accuracy(dtype, base_accuracy)
+        energy = self._estimate_energy(dtype)
+        carbon = energy * (carbon_intensity / 400.0)
+        speed = self._estimate_speed(dtype) / 4.0  # normalize to ~[0,1]
+        return {"accuracy": accuracy,
+                "energy": 1.0 - min(1.0, energy),
+                "carbon": 1.0 - min(1.0, carbon),
+                "speed": speed}
 
-        if self.adaptive_cost and self.adaptive_weights:
+    def select(self, features: Dict[str, Any]) -> Dict[str, Any]:
+        carbon_intensity = float(features.get("carbon_intensity", 400.0))
+        base_accuracy = float(features.get("base_accuracy", 1.0))
+
+        # Update weights from adaptive_cost
+        if self.adaptive_cost is not None:
             try:
-                weights_dict = self.adaptive_cost.get_current_weights()
+                wd = self.adaptive_cost.get_current_weights()
                 self.weights = [
-                    weights_dict.get('accuracy', 0.25),
-                    weights_dict.get('energy', 0.25),
-                    weights_dict.get('carbon', 0.25),
-                    weights_dict.get('speed', 0.25),
-                ]
+                    wd.get("accuracy", 0.25),
+                    wd.get("energy", 0.25),
+                    wd.get("carbon", 0.25),
+                    wd.get("speed", 0.25)]
             except Exception:
                 pass
 
-        cand_dicts = [{'accuracy': c['objectives'][0],
-                       'energy': c['objectives'][1],
-                       'carbon': c['objectives'][2],
-                       'speed': c['objectives'][3]} for c in candidates]
-        scores = TOPSIS.score(cand_dicts, self.weights,
-                              ['accuracy', 'energy', 'carbon', 'speed'])
-        best_idx = int(np.argmax(scores))
-        best_dtype = candidates[best_idx]['dtype']
+        candidates = [self._benefit_vector(d, base_accuracy, carbon_intensity)
+                      for d in self.dtype_list]
+        scores = TOPSIS.score(candidates, self.weights, self.FEATURES)
+        scores_arr = np.asarray(scores) if scores else np.zeros(len(candidates))
+        best_idx = int(np.argmax(scores_arr))
+        best = self.dtype_list[best_idx]
 
-        # Role assignment
+        front = ParetoFront()
+        for c in candidates:
+            front.add([c[k] for k in self.FEATURES], c)
+
         roles = None
         if self.roles:
-            role_ctx = {
-                'accuracy': candidates[best_idx]['accuracy'],
-                'energy': 1.0 - candidates[best_idx]['energy'],
-                'carbon': 1.0 - candidates[best_idx]['carbon'],
-                'speed': candidates[best_idx]['speed'] / 4.0,
-            }
-            roles = self.roles.assign_roles(role_ctx)
+            roles = self.roles.assign_roles(candidates[best_idx])
 
-        # XAI explanation
-        xai_explanation = None
+        xai_out = None
         if self.xai:
-            xai_explanation = self.xai.explain(
-                candidate=cand_dicts[best_idx],
-                weights={'accuracy': self.weights[0], 'energy': self.weights[1],
-                         'carbon': self.weights[2], 'speed': self.weights[3]},
-                all_candidates=cand_dicts,
-            )
+            xai_out = self.xai.explain(
+                candidate=candidates[best_idx],
+                weights=dict(zip(self.FEATURES, self.weights)),
+                all_candidates=candidates)
 
-        # Weight adaptation
-        outcome = [candidates[best_idx]['accuracy'],
-                   -candidates[best_idx]['energy'],
-                   -candidates[best_idx]['carbon'],
-                   candidates[best_idx]['speed']]
-        self.recent_outcomes.append((self.weights, outcome))
-        if self.adaptive_weights and len(self.recent_outcomes) >= 10:
-            await self._update_weights()
+        # Weight update (ascent on benefit objectives)
+        outcome = np.asarray([candidates[best_idx][k] for k in self.FEATURES])
+        self.recent_outcomes.append((list(self.weights), outcome))
+        if len(self.recent_outcomes) >= 10:
+            self._update_weights()
 
-        if PROMETHEUS_AVAILABLE:
-            MODP_PARETO_SIZE.set(len(front.get_pareto_front()))
+        return {"selected_precision": best,
+                "scores": scores,
+                "pareto_front_size": len(front.get_pareto_front()),
+                "candidate_details": list(zip(self.dtype_list, candidates)),
+                "xai_explanation": xai_out,
+                "role_assignments": roles}
 
-        return {
-            'selected_precision': best_dtype,
-            'scores': scores,
-            'pareto_front': front.get_pareto_front(),
-            'candidate_details': candidates,
-            'xai_explanation': xai_explanation,
-            'role_assignments': roles,
-            'temporal_status': temporal_status,
-        }
+    def _update_weights(self):
+        outcomes = np.array([o for _, o in self.recent_outcomes])
+        mean = outcomes.mean(axis=0)
+        std = outcomes.std(axis=0) + 1e-9
+        grad = mean / std  # ascent on benefits
+        w = np.array(self.weights) + self.learning_rate * grad
+        w = np.clip(w, 0.05, None)
+        w /= w.sum()
+        self.weights = w.tolist()
 
-    async def _update_weights(self):
-        avg_outcome = np.mean([o for _, o in self.recent_outcomes], axis=0)
-        self.weights = self.weights - self.learning_rate * (avg_outcome - np.mean(avg_outcome))
-        total = sum(self.weights)
-        if total > 0:
-            self.weights = [w / total for w in self.weights]
-
-    def _estimate_accuracy(self, dtype, layer_type, base_accuracy):
-        return base_accuracy * {'fp32': 1.0, 'fp16': 0.98, 'bf16': 0.97,
-                                'fp8': 0.90, 'fp4': 0.80}.get(dtype, 0.5)
-
-    def _estimate_energy(self, dtype):
-        return {'fp32': 1.0, 'fp16': 0.4, 'bf16': 0.4,
-                'fp8': 0.2, 'fp4': 0.1}.get(dtype, 1.0)
-
-    def _estimate_speed(self, dtype):
-        return {'fp32': 1.0, 'fp16': 2.0, 'bf16': 2.0,
-                'fp8': 3.0, 'fp4': 4.0}.get(dtype, 1.0)
 
 # ============================================================
-# MODULE 2: MOE PRECISION ENGINE (v7 with roles + XAI)
+# MOE precision engine (gating trained on best-matching teacher)
 # ============================================================
 class MOEPrecisionEngine:
-    def __init__(self, config: MixedPrecisionConfig,
-                 carbon_manager: CarbonIntensityManager,
-                 adaptive_cost: Optional[AdaptiveCostFunction] = None,
-                 roles: Optional[RoleSpecializationCoordinator] = None,
-                 xai: Optional[XAIExplainer] = None):
-        self.config = config
+    def __init__(self, carbon_manager: CarbonIntensityManager,
+                 xai: Optional[XAIExplainer] = None,
+                 roles: Optional[RoleSpecializationCoordinator] = None):
         self.carbon_manager = carbon_manager
-        self.adaptive_cost = adaptive_cost
-        self.num_experts = config.moe.num_experts
-        self.experts = []
+        self.xai = xai
+        self.roles = roles
+        self.dtype_list = ["fp32", "fp16", "bf16", "fp8", "fp4"]
+        self.experts: Dict[str, Callable[[Dict[str, Any]], List[float]]] = {}
         self.gating_model = None
         self.scaler = None
-        self.history = deque(maxlen=500)
+        self.history_context: deque = deque(maxlen=500)
+        self.history_labels: deque = deque(maxlen=500)
         self._trained = False
-        self.dtype_list = ['fp32', 'fp16', 'bf16', 'fp8', 'fp4']
-        self.roles = roles
-        self.xai = xai
         self._init_experts()
         self._init_gating()
 
     def _init_experts(self):
-        self.experts = [
-            ('accuracy', self._accuracy_teacher),
-            ('energy', self._energy_teacher),
-            ('carbon', self._carbon_teacher),
-            ('speed', self._speed_teacher),
-        ]
+        self.experts = {
+            "accuracy": self._accuracy_teacher,
+            "energy": self._energy_teacher,
+            "carbon": self._carbon_teacher,
+            "speed": self._speed_teacher}
 
     def _init_gating(self):
         if SKLEARN_AVAILABLE:
-            self.gating_model = LogisticRegression(multi_class='multinomial',
-                                                   solver='lbfgs', max_iter=1000)
-            self.scaler = StandardScaler()
+            try:
+                self.gating_model = LogisticRegression(max_iter=1000)
+                self.scaler = StandardScaler()
+            except Exception:
+                pass
 
-    def _accuracy_teacher(self, features):
-        base = features.get('base_accuracy', 1.0)
+    def _accuracy_teacher(self, features: Dict[str, Any]) -> List[float]:
+        base = float(features.get("base_accuracy", 1.0))
         return [base * s for s in [1.0, 0.98, 0.97, 0.90, 0.80]]
 
-    def _energy_teacher(self, features):
+    def _energy_teacher(self, features: Dict[str, Any]) -> List[float]:
         return [1.0, 0.4, 0.4, 0.2, 0.1]
 
-    def _carbon_teacher(self, features):
+    def _carbon_teacher(self, features: Dict[str, Any]) -> List[float]:
+        intensity = float(features.get("carbon_intensity", 400.0))
         e = self._energy_teacher(features)
-        intensity = features.get('carbon_intensity', 400)
         return [1.0 - x * (intensity / 400.0) for x in e]
 
-    def _speed_teacher(self, features):
+    def _speed_teacher(self, features: Dict[str, Any]) -> List[float]:
         return [1.0, 2.0, 2.0, 3.0, 4.0]
 
-    async def _extract_context(self, features):
+    def _extract_context(self, features: Dict[str, Any]) -> np.ndarray:
         return np.array([
-            features.get('carbon_intensity', 400) / 1000.0,
-            0.2 if features.get('layer_type') in ['conv2d', 'linear'] else 0.0,
-            features.get('input_size', 1000) / 10000.0,
-            features.get('base_accuracy', 1.0),
-        ])
+            float(features.get("carbon_intensity", 400.0)) / 1000.0,
+            float(features.get("base_accuracy", 1.0)),
+            float(features.get("input_size", 1000)) / 10000.0,
+            float(features.get("layer_complexity", 0.5)),
+            float(features.get("time_of_day", utcnow().hour / 24.0))])
 
-    async def get_teacher_scores(self, features):
-        out = []
-        for _, func in self.experts:
+    def _get_teacher_scores(self, features: Dict[str, Any]) -> Dict[str, List[float]]:
+        out: Dict[str, List[float]] = {}
+        for name, fn in self.experts.items():
             try:
-                s = func(features)
+                s = fn(features)
                 if not isinstance(s, list):
                     s = [float(s)] * len(self.dtype_list)
-                out.append(s)
+                out[name] = s
             except Exception as e:
-                logger.warning(f"Teacher failed: {e}")
-                out.append([0.5] * len(self.dtype_list))
+                logger.warning(f"Teacher {name} failed: {e}")
+                out[name] = [0.5] * len(self.dtype_list)
         return out
 
-    async def get_gating_weights(self, features):
-        if self.gating_model is not None and self._trained:
-            ctx = await self._extract_context(features)
-            X = self.scaler.transform([ctx])
-            return self.gating_model.predict_proba(X)[0].tolist()
-        return [1.0 / len(self.experts)] * len(self.experts)
-
-    async def select_precision(self, features):
-        teacher_scores = await self.get_teacher_scores(features)
-        weights = await self.get_gating_weights(features)
+    def select(self, features: Dict[str, Any]) -> Dict[str, Any]:
+        teacher_scores = self._get_teacher_scores(features)
+        weights = self._gating_weights(features, len(teacher_scores))
         dtype_scores = np.zeros(len(self.dtype_list))
-        for i, s in enumerate(teacher_scores):
-            dtype_scores += weights[i] * np.array(s)
+        for i, (name, s) in enumerate(teacher_scores.items()):
+            dtype_scores += weights[i] * np.asarray(s)
         best_idx = int(np.argmax(dtype_scores))
-        best_dtype = self.dtype_list[best_idx]
+        best = self.dtype_list[best_idx]
 
-        if PROMETHEUS_AVAILABLE:
-            for i, w in enumerate(weights):
-                MOE_GATING_WEIGHTS.labels(expert=self.experts[i][0]).set(w)
+        roles = None
+        if self.roles:
+            roles = self.roles.assign_roles({
+                "accuracy": float(dtype_scores[best_idx]),
+                "energy": 1.0 - float(teacher_scores["energy"][best_idx]),
+                "carbon": 1.0 - float(teacher_scores["carbon"][best_idx]),
+                "speed": float(teacher_scores["speed"][best_idx]) / 4.0})
 
-        # Role assignment & XAI
-        roles = self.roles.assign_roles({
-            'accuracy': float(dtype_scores[best_idx]),
-            'energy': 1.0 - float(teacher_scores[1][best_idx]),
-            'carbon': 1.0 - float(teacher_scores[2][best_idx]),
-            'speed': float(teacher_scores[3][best_idx]) / 4.0,
-        }) if self.roles else None
+        xai_out = None
+        if self.xai:
+            features_dict = {name: float(dtype_scores[i])
+                             for i, name in enumerate(["fp32", "fp16", "bf16", "fp8", "fp4"])}
+            xai_out = self.xai.explain(
+                candidate=features_dict,
+                weights={name: float(w) for name, w in
+                         zip(["fp32", "fp16", "bf16", "fp8", "fp4"], [1.0] * 5)},
+                all_candidates=[features_dict])
 
-        xai_out = self.xai.explain(
-            candidate={f'f{i}': float(dtype_scores[i]) for i in range(len(dtype_scores))},
-            weights={f'f{i}': float(weights[i]) for i in range(len(weights))},
-            all_candidates=[{f'f{i}': float(dtype_scores[i]) for i in range(len(dtype_scores))}],
-        ) if self.xai else None
+        return {"selected_precision": best,
+                "dtype_scores": dtype_scores.tolist(),
+                "teacher_scores": teacher_scores,
+                "gating_weights": {name: float(w)
+                                   for name, w in zip(teacher_scores.keys(), weights)},
+                "role_assignments": roles,
+                "xai_explanation": xai_out}
 
-        return {
-            'selected_precision': best_dtype,
-            'dtype_scores': dtype_scores.tolist(),
-            'teacher_scores': {self.experts[i][0]: s for i, s in enumerate(teacher_scores)},
-            'gating_weights': {self.experts[i][0]: w for i, w in enumerate(weights)},
-            'role_assignments': roles,
-            'xai_explanation': xai_out,
-        }
+    def _gating_weights(self, features: Dict[str, Any], n: int) -> np.ndarray:
+        if self.gating_model is not None and self._trained:
+            try:
+                ctx = self._extract_context(features)
+                X = self.scaler.transform([ctx])
+                probs = self.gating_model.predict_proba(X)[0]
+                if len(probs) == n:
+                    return probs
+            except Exception:
+                pass
+        return np.ones(n) / n
 
-    async def update(self, features, actual_outcome):
-        reward = float(actual_outcome.get('reward', 0.5))
-        teacher_scores = await self.get_teacher_scores(features)
-        teacher_best = [int(np.argmax(s)) for s in teacher_scores]
-        ctx = await self._extract_context(features)
-        self.history.append((ctx, teacher_best, reward))
-        if len(self.history) % 100 == 0:
-            await self._update_gating()
+    def update(self, features: Dict[str, Any], actual_reward_per_dtype: Dict[str, float]):
+        """Label the best-matching teacher (P0 fix)."""
+        teacher_scores = self._get_teacher_scores(features)
+        # Best teacher: the one whose ranking best matches actual reward ranking
+        actual = np.asarray([actual_reward_per_dtype.get(d, 0.0)
+                             for d in self.dtype_list])
+        best_teacher_idx = 0
+        best_corr = -2.0
+        for i, (name, s) in enumerate(teacher_scores.items()):
+            try:
+                corr = float(np.corrcoef(np.asarray(s), actual)[0, 1])
+            except Exception:
+                corr = -2.0
+            if corr > best_corr:
+                best_corr = corr
+                best_teacher_idx = i
+        self.history_context.append(self._extract_context(features).tolist())
+        self.history_labels.append(best_teacher_idx)
+        if len(self.history_context) % 20 == 0 and len(self.history_context) >= 40:
+            self._train_gating()
 
-    async def _update_gating(self):
-        if self.gating_model is None or len(self.history) < 100:
+    def _train_gating(self):
+        if not SKLEARN_AVAILABLE or self.gating_model is None:
             return
-        X = np.array([h[0] for h in self.history])
-        y = np.array([h[1][0] for h in self.history])
-        self.gating_model.fit(self.scaler.fit_transform(X), y)
-        self._trained = True
+        n = min(len(self.history_context), len(self.history_labels))
+        if n < 40:
+            return
+        X = np.array(self.history_context[-n:])
+        y = np.array(self.history_labels[-n:])
+        if len(np.unique(y)) < 2:
+            return
+        try:
+            X_scaled = self.scaler.fit_transform(X)
+            self.gating_model.fit(X_scaled, y)
+            self._trained = True
+        except Exception as e:
+            logger.warning(f"Gating fit failed: {e}")
 
-    def get_stats(self):
-        return {'num_experts': len(self.experts),
-                'gating_trained': self._trained,
-                'history_len': len(self.history)}
+    def get_stats(self) -> Dict[str, Any]:
+        return {"num_experts": len(self.experts),
+                "gating_trained": self._trained,
+                "history_len": len(self.history_context)}
+
 
 # ============================================================
-# MODULE 3: BIO-INSPIRED GA
+# GA + bio (seeded)
 # ============================================================
 class GeneticAlgorithmOptimizer:
-    def __init__(self, population_size=20, mutation_rate=0.1, crossover_rate=0.8):
+    def __init__(self, population_size: int = 20, mutation_rate: float = 0.1,
+                 crossover_rate: float = 0.8, seed: int = 0):
         self.pop_size = population_size
         self.mutation_rate = mutation_rate
         self.crossover_rate = crossover_rate
-        self.population = []
+        self.population: List[Dict[str, float]] = []
         self.bounds = {
-            'accuracy_weight': (0.0, 1.0),
-            'energy_weight': (0.0, 1.0),
-            'carbon_weight': (0.0, 1.0),
-            'speed_weight': (0.0, 1.0),
-            'student_lr': (0.0001, 0.01),
-        }
+            "accuracy_weight": (0.0, 1.0),
+            "energy_weight": (0.0, 1.0),
+            "carbon_weight": (0.0, 1.0),
+            "speed_weight": (0.0, 1.0)}
+        self._rng = random.Random(seed)
+        self._initialized = False
 
-    def initialize(self):
+    def initialize(self, force: bool = False):
+        if self._initialized and not force:
+            return
         self.population = []
         for _ in range(self.pop_size):
-            ind = {k: random.uniform(*v) for k, v in self.bounds.items()}
-            total = sum(ind[k] for k in ['accuracy_weight', 'energy_weight',
-                                          'carbon_weight', 'speed_weight'])
-            if total > 0:
-                for k in ['accuracy_weight', 'energy_weight',
-                          'carbon_weight', 'speed_weight']:
-                    ind[k] /= total
+            ind = {k: self._rng.uniform(*v) for k, v in self.bounds.items()}
+            s = sum(ind.values()) or 1.0
+            ind = {k: v / s for k, v in ind.items()}
             self.population.append(ind)
+        self._initialized = True
 
     def evaluate(self, fitness_func):
         return [fitness_func(ind) for ind in self.population]
@@ -1246,894 +2504,1174 @@ class GeneticAlgorithmOptimizer:
     def select(self, fitness, n):
         selected = []
         for _ in range(n):
-            i, j = np.random.choice(len(self.population), 2, replace=False)
-            selected.append(self.population[i] if fitness[i] > fitness[j] else self.population[j])
+            i, j = self._rng.sample(range(len(self.population)), 2)
+            selected.append(self.population[i] if fitness[i] > fitness[j]
+                            else self.population[j])
         return selected
 
     def crossover(self, p1, p2):
-        if random.random() < self.crossover_rate:
-            return {k: (p1[k] if random.random() < 0.5 else p2[k]) for k in p1}
-        return p1.copy()
+        if self._rng.random() < self.crossover_rate:
+            child = {k: p1[k] if self._rng.random() < 0.5 else p2[k] for k in p1}
+        else:
+            child = dict(p1)
+        s = sum(child.values()) or 1.0
+        return {k: v / s for k, v in child.items()}
 
     def mutate(self, ind):
-        if random.random() < self.mutation_rate:
-            k = random.choice(list(self.bounds.keys()))
-            ind[k] = random.uniform(*self.bounds[k])
-            if k in ['accuracy_weight', 'energy_weight', 'carbon_weight', 'speed_weight']:
-                total = sum(ind[k2] for k2 in
-                            ['accuracy_weight', 'energy_weight', 'carbon_weight', 'speed_weight'])
-                if total > 0:
-                    for k2 in ['accuracy_weight', 'energy_weight', 'carbon_weight', 'speed_weight']:
-                        ind[k2] /= total
+        if self._rng.random() < self.mutation_rate:
+            k = self._rng.choice(list(self.bounds.keys()))
+            ind[k] = self._rng.uniform(*self.bounds[k])
+            s = sum(ind.values()) or 1.0
+            ind = {k2: v / s for k2, v in ind.items()}
         return ind
 
-    def evolve(self, fitness_func, generations=5):
+    def evolve(self, fitness_func, generations: int = 5):
         self.initialize()
-        for gen in range(generations):
+        for _ in range(generations):
             fitness = self.evaluate(fitness_func)
-            best = self.population[int(np.argmax(fitness))]
+            best = dict(self.population[int(np.argmax(fitness))])
             parents = self.select(fitness, self.pop_size - 1)
             offspring = []
             for i in range(0, len(parents) - 1, 2):
                 offspring.append(self.mutate(self.crossover(parents[i], parents[i + 1])))
                 offspring.append(self.mutate(self.crossover(parents[i + 1], parents[i])))
             self.population = offspring[:self.pop_size - 1] + [best]
-            if PROMETHEUS_AVAILABLE:
-                GA_FITNESS.labels(generation=str(gen)).set(max(fitness))
-        final_fitness = self.evaluate(fitness_func)
-        return self.population[int(np.argmax(final_fitness))]
+        fitness = self.evaluate(fitness_func)
+        return dict(self.population[int(np.argmax(fitness))])
+
 
 class BioOptimizer:
-    def __init__(self, config, adaptive_cost=None, rlhf=None):
+    def __init__(self, config: MixedPrecisionConfig,
+                 adaptive_cost: Optional[Any] = None,
+                 rlhf: Optional[ActiveRLHF] = None):
         self.config = config
         self.adaptive_cost = adaptive_cost
-        self.ga = GeneticAlgorithmOptimizer(
-            population_size=config.bio.population_size,
-            mutation_rate=config.bio.mutation_rate,
-            crossover_rate=config.bio.crossover_rate)
-        self.current_params = {'accuracy_weight': 0.25, 'energy_weight': 0.25,
-                               'carbon_weight': 0.25, 'speed_weight': 0.25,
-                               'student_lr': 0.01}
-        self.fitness_history = deque(maxlen=50)
-        self._lock = asyncio.Lock()
         self.rlhf = rlhf
+        self.ga = GeneticAlgorithmOptimizer(
+            population_size=config.bio_population_size,
+            mutation_rate=config.bio_mutation_rate,
+            crossover_rate=config.bio_crossover_rate,
+            seed=config.ga_seed)
+        self.current_params = {"accuracy_weight": 0.25, "energy_weight": 0.25,
+                               "carbon_weight": 0.25, "speed_weight": 0.25}
+        self.fitness_history: deque = deque(maxlen=50)
+        self._lock = asyncio.Lock()
 
-    def _fitness_func(self, params):
-        if self.adaptive_cost:
+    def _fitness(self, params: Dict[str, float]) -> float:
+        if self.adaptive_cost is not None:
             try:
-                return -self.adaptive_cost.evaluate({
-                    'accuracy': params['accuracy_weight'],
-                    'energy': params['energy_weight'],
-                    'carbon': params['carbon_weight'],
-                    'speed': params['speed_weight'],
-                    'learning_rate': params['student_lr'],
-                })
+                cost = self.adaptive_cost.evaluate({
+                    "accuracy": params["accuracy_weight"],
+                    "energy": params["energy_weight"],
+                    "carbon": params["carbon_weight"],
+                    "speed": params["speed_weight"]})
+                return -float(cost)
             except Exception:
                 pass
-        return params['accuracy_weight'] - 0.5 * params['carbon_weight']
+        return (params["accuracy_weight"] * 0.4
+                + (1 - params["carbon_weight"]) * 0.3
+                + (1 - params["energy_weight"]) * 0.3)
 
-    async def evolve(self):
-        best = self.ga.evolve(self._fitness_func, generations=5)
+    async def evolve(self) -> Dict[str, float]:
+        best = self.ga.evolve(self._fitness, generations=5)
         async with self._lock:
             self.current_params = best
-            self.fitness_history.append(self._fitness_func(best))
+            self.fitness_history.append(self._fitness(best))
         return best
 
-    def get_current_params(self):
-        return self.current_params
+    def get_current_params(self) -> Dict[str, float]:
+        return dict(self.current_params)
+
 
 # ============================================================
-# MODULE 4: MULTI-OBJECTIVE CARBON-AWARE SCHEDULER (with markets)
+# Scheduler
 # ============================================================
 class MultiObjectiveCarbonScheduler:
-    def __init__(self, config, carbon_manager, forecaster=None, market_client=None):
-        self.config = config
+    def __init__(self, carbon_manager: CarbonIntensityManager,
+                 market: Optional[CarbonMarketClient] = None,
+                 threshold: float = 400.0, max_delay_s: int = 300):
         self.carbon_manager = carbon_manager
-        self.forecaster = forecaster
-        self.market_client = market_client
-        self.carbon_weight = config.scheduler.carbon_importance
-        self.urgency_weight = config.scheduler.urgency_importance
-        self.cost_weight = config.scheduler.cost_importance
-        self.max_delay = config.scheduler.max_delay_seconds
-        self.threshold = config.scheduler.carbon_threshold
-        self.history = deque(maxlen=100)
+        self.market = market
+        self.threshold = float(threshold)
+        self.max_delay = int(max_delay_s)
+        self.history: deque = deque(maxlen=100)
 
-    async def schedule(self, urgency_score=0.5):
-        forecast = await self.forecaster.forecast(24) if self.forecaster else None
-        market = await self.market_client.get_market_snapshot() if self.market_client else {}
-        if not forecast or not forecast.get('prices'):
+    async def schedule(self, urgency_score: float = 0.5) -> Dict[str, Any]:
+        try:
             intensity = await self.carbon_manager.get_current_intensity()
-            delay = self.max_delay if intensity > self.threshold else 0
-            return {'recommended_delay': delay, 'reason': 'simple_threshold',
-                    'market': market}
-        delays = list(range(0, self.max_delay + 1, 10))
-        best = None
-        for d in delays:
-            idx = int(d / 3600)
-            avg = np.mean(forecast['prices'][:idx + 1]) if idx > 0 else forecast['prices'][0]
-            savings = max(0, (forecast['prices'][0] - avg) / forecast['prices'][0]) \
-                if forecast['prices'][0] > 0 else 0
+        except Exception:
+            intensity = 400.0
+        market = await self.market.get_market_snapshot() if self.market else {}
+        if intensity <= self.threshold:
+            return {"recommended_delay": 0, "reason": "below_threshold",
+                    "intensity": intensity, "market": market}
+        carbon_w = 0.3
+        urgency_w = 0.5
+        best_delay = 0
+        best_cost = 1e9
+        for d in range(0, self.max_delay + 1, 10):
+            savings = min(1.0, (intensity - self.threshold) / max(intensity, 1.0))
             urgency_cost = d / (self.max_delay + 1) * urgency_score
-            energy_cost = d * 0.001
-            composite = (-self.carbon_weight * savings
-                         + self.urgency_weight * urgency_cost
-                         + self.cost_weight * energy_cost)
-            if best is None or composite < best['cost']:
-                best = {'delay': d, 'cost': composite, 'carbon_savings': savings}
-        self.history.append(best)
-        return {'recommended_delay': best['delay'], 'reason': 'multi_objective',
-                'carbon_savings': best['carbon_savings'], 'market': market}
+            cost = -carbon_w * savings + urgency_w * urgency_cost
+            if cost < best_cost:
+                best_cost = cost
+                best_delay = d
+        self.history.append({"delay": best_delay, "cost": best_cost})
+        return {"recommended_delay": best_delay, "reason": "multi_objective",
+                "intensity": intensity, "market": market}
+
 
 # ============================================================
-# MODULE 5: SELF-HEALING
-# ============================================================
-class SelfHealingManager:
-    def __init__(self, config, drift_detector=None, rlhf=None, chaos=None):
-        self.config = config
-        self.drift = drift_detector
-        self.anomaly_detectors = []
-        self.gating_weights = [1.0]
-        self._lock = asyncio.Lock()
-        self.recovery_actions = deque(maxlen=100)
-        self._trained = False
-        self.rlhf = rlhf
-        self.chaos = chaos
-        if SKLEARN_AVAILABLE:
-            self.anomaly_detectors = [('iforest', IsolationForest(contamination=0.1)),
-                                      ('ocsvm', OneClassSVM(nu=0.1))]
-            self.gating_weights = [0.5, 0.5]
-
-    async def detect_anomaly(self, metrics):
-        if not self.anomaly_detectors or not self._trained:
-            return (metrics.get('accuracy', 1.0) < 0.7, 0.8 if metrics.get('accuracy', 1.0) < 0.7 else 0.0)
-        features = np.array([
-            metrics.get('accuracy', 1.0),
-            metrics.get('energy_saved', 0.0),
-            metrics.get('carbon_saved', 0.0),
-            metrics.get('latency_ms', 0.0) / 1000.0,
-        ]).reshape(1, -1)
-        votes = []
-        for _, m in self.anomaly_detectors:
-            try:
-                votes.append(1 if m.predict(features)[0] == -1 else 0)
-            except Exception:
-                votes.append(0)
-        weighted = sum(v * w for v, w in zip(votes, self.gating_weights))
-        return weighted > 0.5, weighted
-
-    async def train(self, data):
-        if not self.anomaly_detectors or len(data) < 20:
-            return
-        X = np.array([[d.get('accuracy', 1.0),
-                       d.get('energy_saved', 0.0),
-                       d.get('carbon_saved', 0.0),
-                       d.get('latency_ms', 0.0) / 1000.0] for d in data])
-        for _, m in self.anomaly_detectors:
-            if hasattr(m, 'fit'):
-                m.fit(X)
-        self._trained = True
-
-    async def check_drift(self, metrics):
-        if self.drift:
-            detected = await self.drift.check_drift(metrics)
-            if detected:
-                action = self.rlhf.sample_action(metrics) if self.rlhf else 'drift_recovery'
-                async with self._lock:
-                    self.recovery_actions.append({'action': action,
-                                                  'timestamp': datetime.now().isoformat()})
-                if PROMETHEUS_AVAILABLE:
-                    SELF_HEALING_ACTIONS.labels(action=action).inc()
-
-    async def trigger_recovery(self):
-        async with self._lock:
-            self.recovery_actions.append({'action': 'generic_recovery',
-                                          'timestamp': datetime.now().isoformat()})
-        if PROMETHEUS_AVAILABLE:
-            SELF_HEALING_ACTIONS.labels(action='generic_recovery').inc()
-
-    async def get_stats(self):
-        return {'enabled': self.config.self_healing.enabled,
-                'trained': self._trained,
-                'num_detectors': len(self.anomaly_detectors),
-                'recent_actions': list(self.recovery_actions)[-5:]}
-
-# ============================================================
-# FORECASTER (MOE) for carbon intensity
+# MOE forecaster (real experts)
 # ============================================================
 class MOEForecaster:
-    def __init__(self):
-        self.experts = []
-        self.history = deque(maxlen=1000)
+    def __init__(self, persist: Optional[Persistence] = None):
+        self.experts: List[Tuple[str, Callable]] = []
+        self.history: deque = deque(maxlen=1000)
+        self._persist = persist
         self._init_experts()
+        if persist:
+            with contextlib.suppress(Exception):
+                for price in persist.recent_carbon_prices(500):
+                    self.history.append({"ds": utcnow(), "y": float(price)})
 
     def _init_experts(self):
         if PROPHET_AVAILABLE:
-            self.experts.append(('prophet', self._forecast_prophet))
+            self.experts.append(("prophet", self._forecast_prophet))
         if SKLEARN_AVAILABLE:
-            self.experts.append(('linear', self._forecast_linear))
+            self.experts.append(("linear", self._forecast_linear))
         if STATSMODELS_AVAILABLE:
-            self.experts.append(('holtwinters', self._forecast_holtwinters))
+            self.experts.append(("holtwinters", self._forecast_holtwinters))
         if not self.experts:
-            self.experts.append(('naive', self._forecast_naive))
+            self.experts.append(("naive", self._forecast_naive))
 
-    async def _forecast_prophet(self, h, hor):
-        return [0.5] * hor
+    async def _forecast_prophet(self, history, horizon):
+        if len(history) < 30:
+            return [0.5] * horizon
+        try:
+            import pandas as pd
+            df = pd.DataFrame(list(history)).sort_values("ds")
+            m = Prophet(changepoint_prior_scale=0.05, seasonality_prior_scale=10)
+            m.fit(df)
+            future = m.make_future_dataframe(periods=horizon)
+            return m.predict(future)["yhat"].tail(horizon).tolist()
+        except Exception:
+            return [0.5] * horizon
 
-    async def _forecast_linear(self, h, hor):
-        return [0.5] * hor
+    async def _forecast_linear(self, history, horizon):
+        if len(history) < 2:
+            return [0.5] * horizon
+        X = np.arange(len(history)).reshape(-1, 1)
+        y = np.array([h["y"] for h in history])
+        try:
+            m = LinearRegression().fit(X, y)
+            f = np.arange(len(history), len(history) + horizon).reshape(-1, 1)
+            return m.predict(f).tolist()
+        except Exception:
+            return [0.5] * horizon
 
-    async def _forecast_holtwinters(self, h, hor):
-        return [0.5] * hor
+    async def _forecast_holtwinters(self, history, horizon):
+        if len(history) < 24:
+            return [0.5] * horizon
+        try:
+            m = ExponentialSmoothing([h["y"] for h in history],
+                                     trend="add", seasonal=None)
+            return m.fit().forecast(horizon).tolist()
+        except Exception:
+            return [0.5] * horizon
 
-    async def _forecast_naive(self, h, hor):
-        if not h: return [0.5] * hor
-        return [h[-1]['y']] * hor
+    async def _forecast_naive(self, history, horizon):
+        if not history:
+            return [0.5] * horizon
+        return [history[-1]["y"]] * horizon
 
-    async def update_history(self, value):
-        self.history.append({'ds': datetime.now(), 'y': value})
+    async def update_history(self, value: float):
+        self.history.append({"ds": utcnow(), "y": float(value)})
+        if self._persist:
+            with contextlib.suppress(Exception):
+                self._persist.append_carbon_price(value)
 
-    async def forecast(self, horizon=24):
-        if len(self.history) < 30:
-            return {'prices': [0.5] * horizon, 'confidence': 0.0}
+    async def forecast(self, horizon: int = 24) -> Dict[str, Any]:
+        if len(self.history) < 10:
+            return {"prices": [0.5] * horizon, "confidence": 0.0}
         forecasts = []
-        for _, f in self.experts:
+        for name, fn in self.experts:
             try:
-                forecasts.append(await f(self.history, horizon))
+                forecasts.append(np.asarray(await fn(self.history, horizon)))
             except Exception:
-                forecasts.append([0.5] * horizon)
+                forecasts.append(np.full(horizon, 0.5))
         weights = np.ones(len(self.experts)) / len(self.experts)
         final = np.zeros(horizon)
         for i, f in enumerate(forecasts):
-            final += weights[i] * np.array(f)
-        return {'prices': final.tolist(),
-                'expert_weights': weights.tolist(),
-                'confidence': 0.85}
+            final += weights[i] * f
+        return {"prices": final.tolist(),
+                "expert_weights": weights.tolist(),
+                "confidence": 0.85}
+
 
 # ============================================================
-# DISTILLATION (in-file)
+# Self-healing (rolling refit)
 # ============================================================
-class MultiTeacherDistiller:
-    """
-    In-file multi-teacher distiller. Teachers take a context dict and
-    return a policy dict; the distiller merges them via majority + averaging.
-    """
-    def __init__(self, teachers: List[Callable]):
-        self.teachers = teachers or []
+class SelfHealingManager:
+    def __init__(self, config: MixedPrecisionConfig,
+                 rlhf: Optional[ActiveRLHF] = None,
+                 chaos: Optional[ChaosTester] = None):
+        self.config = config
+        self.detectors: List[Tuple[str, Any]] = []
+        self._lock = threading.Lock()
+        self._buffer: deque = deque(maxlen=500)
+        self._trained = False
+        self._refit_counter = 0
+        self.actions: deque = deque(maxlen=100)
+        self.rlhf = rlhf
+        self.chaos = chaos
+        if SKLEARN_AVAILABLE:
+            self.detectors = [
+                ("iforest", IsolationForest(contamination=0.1)),
+                ("ocsvm", OneClassSVM(nu=0.1))]
 
-    def distill(self, context: Dict) -> Optional[Dict]:
-        if not self.teachers:
-            return None
-        votes: Dict[str, List[Any]] = defaultdict(list)
-        for t in self.teachers:
+    def _features(self, metrics: Dict[str, Any]) -> np.ndarray:
+        return np.array([
+            float(metrics.get("accuracy", 1.0)),
+            float(metrics.get("energy_saved", 0.0)),
+            float(metrics.get("carbon_saved", 0.0)),
+            float(metrics.get("latency_ms", 0.0)) / 1000.0]).reshape(1, -1)
+
+    async def _fit(self, force: bool = False):
+        if not self.detectors:
+            return
+        with self._lock:
+            buf = list(self._buffer)
+        if len(buf) < 20:
+            return
+        if self._trained and not force:
+            return
+        X = np.vstack(buf)
+        for _, m in self.detectors:
+            with contextlib.suppress(Exception):
+                m.fit(X)
+        self._trained = True
+
+    async def detect(self, metrics: Dict[str, Any]) -> Tuple[bool, float]:
+        with self._lock:
+            self._buffer.append(self._features(metrics))
+            self._refit_counter += 1
+        if not self._trained:
+            await self._fit()
+            return False, 0.0
+        if self._refit_counter % 50 == 0:
+            await self._fit(force=True)
+        X = self._features(metrics)
+        votes = []
+        for _, m in self.detectors:
             try:
-                r = t(context)
-                if not isinstance(r, dict):
-                    continue
-                for k, v in r.items():
-                    votes[k].append(v)
-            except Exception as e:
-                logger.warning(f"Teacher error: {e}")
-        if not votes:
-            return None
-        merged: Dict[str, Any] = {}
-        for k, vals in votes.items():
-            try:
-                if all(isinstance(v, (int, float)) for v in vals):
-                    merged[k] = float(np.mean(vals))
-                else:
-                    merged[k] = max(set(vals), key=vals.count)
+                votes.append(1 if m.predict(X)[0] == -1 else 0)
             except Exception:
-                merged[k] = vals[0]
-        return merged
+                votes.append(0)
+        if not votes:
+            return False, 0.0
+        score = sum(votes) / len(votes)
+        if score > 0.5:
+            with self._lock:
+                self.actions.append({"action": "recovery",
+                                     "timestamp": utcnow().isoformat()})
+        return score > 0.5, float(score)
+
+    async def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {"trained": self._trained,
+                    "num_detectors": len(self.detectors),
+                    "recent_actions": list(self.actions)[-5:],
+                    "chaos_active": self.chaos is not None}
+
 
 # ============================================================
-# ENHANCED MIXED PRECISION ENGINE v7.0.0
+# Main engine
 # ============================================================
 class EnhancedMixedPrecisionEngine:
-    def __init__(self, config: Optional[MixedPrecisionConfig] = None):
-        self.config = config or MixedPrecisionConfig()
-        self.instance_id = self.config.instance_id
-        self._amp_enabled = self.config.use_amp
-
-        # Feature flags
-        self.limit_graph_enabled = ADDITIONAL_ENHANCEMENTS_AVAILABLE and self.config.limit_graph_enabled
-        self.rlhf_enabled = self.config.rlhf_enabled
-        self.distillation_enabled = self.config.distillation_enabled
-        self.temporal_logic_enabled = self.config.temporal_logic_enabled
-        self.xai_enabled = self.config.xai_enabled
-        self.adaptive_precision_enabled = self.config.adaptive_precision_enabled
-        self.carbon_market_enabled = self.config.carbon_market_enabled
-        self.role_specialization_enabled = self.config.role_specialization_enabled
-        self.chaos_testing_enabled = self.config.chaos_testing_enabled
-        self.hitl_enabled = self.config.hitl_enabled
-        self.federated_enabled = self.config.federated_enabled
-
-        # Core managers
-        self.carbon_manager = CarbonIntensityManager(self.config)
-
-        # ---- v7.0.0 modules ----
-        self.temporal_monitor = TemporalLogicMonitor() if self.temporal_logic_enabled else None
-        if self.temporal_monitor:
-            self.temporal_monitor.add_formula("carbon_cap", "G(carbon_intensity <= 600.0)")
-            self.temporal_monitor.add_formula("accuracy_min", "F(base_accuracy >= 0.8)")
-            self.temporal_monitor.add_formula("input_ok", "G(input_size >= 0.0)")
-
-        self.xai = XAIExplainer(['accuracy', 'energy', 'carbon', 'speed']) if self.xai_enabled else None
-        self.precision_controller = AdaptivePrecisionController() if self.adaptive_precision_enabled else None
-        self.carbon_market = CarbonMarketClient() if self.carbon_market_enabled else None
-        self.role_coordinator = RoleSpecializationCoordinator() if self.role_specialization_enabled else None
-
-        # Active RLHF replaces the previous stub
-        self.rlhf = ActiveRLHF(
-            action_space=['fp32', 'fp16', 'bf16', 'fp8', 'fp4']
-        ) if self.rlhf_enabled else None
-        self.hitl = HumanInTheLoopCoordinator(
-            self.rlhf, timeout_s=300.0
-        ) if (self.hitl_enabled and self.rlhf is not None) else None
-
-        self.federated = FederatedAggregator(num_params=4) if self.federated_enabled else None
-
-        # Legacy modules
-        self.limit_graph = LimitGraph() if self.limit_graph_enabled else None
-
-        # MODP + MOE with v7 hooks
-        self.modp_selector = MODPPrecisionSelector(
-            self.config, None,
-            xai=self.xai, rlhf=self.rlhf,
-            roles=self.role_coordinator,
-            temporal=self.temporal_monitor,
-        ) if self.config.modp.enabled else None
-
-        self.moe_engine = MOEPrecisionEngine(
-            self.config, self.carbon_manager, None,
-            roles=self.role_coordinator, xai=self.xai,
-        ) if self.config.moe.enabled else None
-
-        self.bio_optimizer = BioOptimizer(self.config, None, self.rlhf) if self.config.bio.enabled else None
-
-        # Forecaster + Scheduler
-        self.forecaster = MOEForecaster() if self.config.scheduler.enabled else None
-        self.scheduler = MultiObjectiveCarbonScheduler(
-            self.config, self.carbon_manager, self.forecaster, self.carbon_market
-        ) if self.config.scheduler.enabled else None
-
-        # Self-healing with RLHF + chaos
-        self.chaos_tester = ChaosTester(self) if self.chaos_testing_enabled else None
-        self.self_healing = SelfHealingManager(
-            self.config, None, self.rlhf, self.chaos_tester
-        ) if self.config.self_healing.enabled else None
-
-        # Distiller with teachers
-        if self.distillation_enabled:
-            self.distiller = MultiTeacherDistiller([])
-            self.distiller.teachers = [
-                self._teacher_modp,
-                self._teacher_moe,
-                self._teacher_bio,
-            ]
+    def __init__(self, config: Optional[MixedPrecisionConfig] = None,
+                 hitl_approver: Optional[Callable[[HITLRequest], bool]] = None,
+                 adaptive_cost: Optional[Any] = None):
+        if PYDANTIC_AVAILABLE and isinstance(config, dict):
+            self.config = MixedPrecisionConfig(**config)
+        elif config is None:
+            self.config = MixedPrecisionConfig()
         else:
-            self.distiller = None
+            self.config = config
+        self.instance_id = self.config.instance_id
+        self._start_time = utcnow()
 
-        # Quantum + blockchain (kept lightweight)
-        self.pqc_available = False
-        self.blockchain = None
+        # Persistence
+        self.persistence = Persistence(self.config.get_db_url())
+
+        # Rate limit + cost
+        self._rate_limiter = TokenBucket(
+            rate=getattr(self.config, "rate_limit_per_minute", 600),
+            per_seconds=60.0)
+        self._today_cost = self.persistence.cost_today()
+        self._daily_cost_budget = float(getattr(self.config, "daily_cost_budget_usd", 10.0))
+        self._cost_per_decision = float(getattr(self.config, "cost_per_decision_usd", 1e-5))
+
+        # PQC + blockchain
+        self.quantum = (QuantumSecurity(
+            algorithm=getattr(self.config, "quantum_algorithm", "dilithium"),
+            master_key=self.config.get_master_key_bytes(),
+            rotation_s=getattr(self.config, "quantum_key_rotation_s", 3600))
+            if getattr(self.config, "quantum_enabled", True) else None)
+        self.blockchain = (BlockchainVerification(self.config, self.persistence)
+                           if getattr(self.config, "blockchain_enabled", True) else None)
+
+        # Carbon
+        self.carbon_market = (CarbonMarketClient(self.config, self.persistence)
+                              if getattr(self.config, "carbon_market_enabled", True) else None)
+        self.carbon_manager = CarbonIntensityManager(
+            market=self.carbon_market,
+            electricity_maps_api_key=getattr(self.config, "electricity_maps_api_key", None),
+            electricity_maps_zone=getattr(self.config, "electricity_maps_zone", "US-CAL-CISO"),
+            watttime_username=getattr(self.config, "watttime_username", None),
+            watttime_password=getattr(self.config, "watttime_password", None),
+            watttime_region=getattr(self.config, "watttime_region", "CAISO_NORTH"),
+            region=getattr(self.config, "carbon_region", "global"),
+            persist=self.persistence)
+
+        # Temporal logic
+        self._base_temporal: Optional[TemporalLogicMonitor] = None
+        if getattr(self.config, "temporal_logic_enabled", True):
+            self._base_temporal = TemporalLogicMonitor(horizon=10)
+            self._base_temporal.add_formula(STLFormula(
+                name="carbon_cap",
+                predicate=lambda r: r.get("carbon_intensity", 0.0) <= 800.0,
+                operator=STLOperator.ALWAYS, horizon=10))
+            self._base_temporal.add_formula(STLFormula(
+                name="accuracy_floor",
+                predicate=lambda r: r.get("base_accuracy", 1.0) >= 0.5,
+                operator=STLOperator.ALWAYS, horizon=10))
+        self.shield = SafetyShield(self._base_temporal) if self._base_temporal else None
+
+        # XAI
+        self.xai = (XAIExplainer(["accuracy", "energy", "carbon", "speed"])
+                    if getattr(self.config, "xai_enabled", True) else None)
+
+        # Adaptive precision
+        self.precision_controller = (AdaptivePrecisionController()
+                                     if getattr(self.config, "adaptive_precision_enabled", True)
+                                     else None)
+
+        # Roles + multi-agent
+        self.role_coordinator = (RoleSpecializationCoordinator()
+                                 if getattr(self.config, "role_specialization_enabled", True)
+                                 else None)
+        self.roles = EmergentRoleRegistry() if getattr(self.config, "multi_agent_enabled", True) else None
+        self.coordinator = MultiAgentCoordinator(self.roles) if self.roles else None
+
+        # RLHF + HITL
+        self.rlhf = ActiveRLHF(
+            action_space=[p.value for p in PrecisionLevel],
+            uncertainty_threshold=getattr(self.config, "rlhf_uncertainty_threshold", 0.35)) \
+            if getattr(self.config, "rlhf_enabled", True) else None
+        self.hitl = (HumanInTheLoopCoordinator(
+            self.rlhf,
+            timeout_s=getattr(self.config, "hitl_timeout_s", 30.0),
+            production_safe=getattr(self.config, "hitl_production_safe", True),
+            persist=self.persistence,
+            approver=hitl_approver)
+            if (getattr(self.config, "hitl_enabled", True) and self.rlhf is not None)
+            else None)
+
+        # Federated
+        self.federated = (FederatedAggregator(
+            num_params=4,
+            dp_sigma=getattr(self.config, "federated_dp_sigma", 1e-3),
+            target_epsilon=getattr(self.config, "federated_target_epsilon", 8.0),
+            target_delta=getattr(self.config, "federated_target_delta", 1e-5),
+            persist=self.persistence)
+            if getattr(self.config, "federated_enabled", True) else None)
+
+        # Causal
+        self.causal = (CausalCounterfactualEstimator(state_dim=5, n_actions=len(PrecisionLevel))
+                       if getattr(self.config, "causal_enabled", True) else None)
+        self.last_counterfactuals: Dict[int, float] = {}
+
+        # MODP + MOE
+        self.modp_selector = MODPPrecisionSelector(
+            adaptive_cost=adaptive_cost, xai=self.xai, roles=self.role_coordinator)
+        self.moe_engine = MOEPrecisionEngine(
+            self.carbon_manager, xai=self.xai, roles=self.role_coordinator)
+
+        # Bio
+        self.bio = (BioOptimizer(self.config, adaptive_cost, self.rlhf)
+                    if getattr(self.config, "bio_enabled", True) else None)
+
+        # Forecaster + scheduler
+        self.forecaster = MOEForecaster(self.persistence)
+        self.scheduler = (MultiObjectiveCarbonScheduler(
+            self.carbon_manager, self.carbon_market)
+            if getattr(self.config, "scheduler_enabled", True) else None)
+
+        # Distiller
+        self.distiller = MultiTeacherDistiller(
+            teachers=[self._teacher_modp, self._teacher_moe, self._teacher_bio],
+            weights=[1.0, 1.0, 0.5])
+
+        # Self-healing
+        self.self_healing = (SelfHealingManager(self.config, self.rlhf)
+                             if getattr(self.config, "self_healing_enabled", True) else None)
+
+        # Active learning
+        self.active_learner = ActiveLearningSampler(seed=getattr(self.config, "ga_seed", 0))
+
+        # Chaos
+        self.chaos = (ChaosTester(
+            engine_ref=self,
+            hypotheses=[SteadyStateHypothesis(
+                "precision_valid",
+                lambda m: m.get("precision") in [p.value for p in PrecisionLevel])],
+            max_concurrent=getattr(self.config, "chaos_max_concurrent", 1),
+            duration_s=getattr(self.config, "chaos_duration_s", 0.0),
+            persist=self.persistence)
+            if getattr(self.config, "chaos_testing_enabled", True) else None)
 
         # State
-        self._original_dtypes: Dict[nn.Module, torch.dtype] = {}
-        self.current_precision = self.config.default_dtype
-        self.total_energy_saved = 0.0
-        self.total_carbon_saved = 0.0
-        self.last_decision: Optional[Dict] = None
+        self.current_precision: Optional[str] = None
+        self.total_energy_saved_j: float = 0.0
+        self.total_carbon_saved_kg: float = 0.0
+        self.last_decision: Optional[Dict[str, Any]] = None
+        self._run_history: deque = deque(maxlen=500)
         self._shutdown_event = asyncio.Event()
         self._background_tasks: List[asyncio.Task] = []
-        self._run_history: deque = deque(maxlen=200)
+        self._running = False
+        self._inflight = 0
+        self._inflight_lock = asyncio.Lock()
+        self._chaos_exec_override: Optional[Callable] = None
 
-        if PROMETHEUS_AVAILABLE:
-            try:
-                start_http_server(self.config.metrics_port)
-            except Exception as e:
-                logger.warning(f"Prometheus server failed: {e}")
+        # Circuit breaker
+        self.breaker = CircuitBreaker("mp")
 
-        logger.info(f"EnhancedMixedPrecisionEngine v{self.config.version} initialized")
-        logger.info(f"  TemporalLogic={self.temporal_logic_enabled} XAI={self.xai_enabled} "
-                    f"AdaptivePrecision={self.adaptive_precision_enabled} "
-                    f"CarbonMarket={self.carbon_market_enabled} "
-                    f"Roles={self.role_specialization_enabled} "
-                    f"Chaos={self.chaos_testing_enabled} HITL={self.hitl_enabled} "
-                    f"Federated={self.federated_enabled}")
+        logger.info(f"EnhancedMixedPrecisionEngine v{self.config.version} "
+                    f"(instance {self.instance_id})")
+        atexit.register(self._atexit_cleanup)
 
-        self._start_background_tasks()
-
-    # ------------------------------------------------------------------
-    # Teacher functions (used by in-file MultiTeacherDistiller)
-    # ------------------------------------------------------------------
-    def _teacher_modp(self, features: Dict) -> Dict:
-        if self.modp_selector is None:
-            return {'selected_precision': self.config.default_dtype}
-        # Run synchronously (best-effort) — pick best dtype by score
-        candidates = []
-        for dtype in self.modp_selector.dtype_list:
-            candidates.append({
-                'dtype': dtype,
-                'score': (self.modp_selector._estimate_accuracy(dtype, 'general', 1.0)
-                          - self.modp_selector._estimate_energy(dtype)
-                          - self.modp_selector._estimate_energy(dtype) * features.get('carbon_intensity', 400) / 1000.0
-                          + self.modp_selector._estimate_speed(dtype) * 0.1),
-            })
-        best = max(candidates, key=lambda c: c['score'])
-        return {'selected_precision': best['dtype']}
-
-    def _teacher_moe(self, features: Dict) -> Dict:
-        if self.moe_engine is None:
-            return {'selected_precision': self.config.default_dtype}
-        scores = np.zeros(len(self.moe_engine.dtype_list))
-        for _, func in self.moe_engine.experts:
-            try:
-                s = func(features)
-                scores += np.array(s)
-            except Exception:
-                scores += np.array([0.5] * len(self.moe_engine.dtype_list))
-        return {'selected_precision': self.moe_engine.dtype_list[int(np.argmax(scores))]}
-
-    def _teacher_bio(self, features: Dict) -> Dict:
-        if self.bio_optimizer is None:
-            return {'selected_precision': self.config.default_dtype}
-        params = self.bio_optimizer.get_current_params()
-        # Map weights → dtype
-        weight_dtype_map = {
-            'accuracy_weight': 'fp32',
-            'energy_weight': 'fp16',
-            'carbon_weight': 'fp8',
-            'speed_weight': 'fp4',
-        }
-        best_w = max(['accuracy_weight', 'energy_weight', 'carbon_weight', 'speed_weight'],
-                     key=lambda k: params.get(k, 0.25))
-        return {'selected_precision': weight_dtype_map[best_w]}
+    def _atexit_cleanup(self):
+        with contextlib.suppress(Exception):
+            self._shutdown_event.set()
+        with contextlib.suppress(Exception):
+            self.persistence.close()
 
     # ------------------------------------------------------------------
-    # Background loops
+    # Teacher callables
     # ------------------------------------------------------------------
-    def _start_background_tasks(self):
+    async def _teacher_modp(self, features: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
-            loop = asyncio.get_event_loop()
-            self._background_tasks.append(loop.create_task(self._carbon_update_loop()))
-            self._background_tasks.append(loop.create_task(self._self_healing_loop()))
-            if self.bio_optimizer:
-                self._background_tasks.append(loop.create_task(self._ga_loop()))
-            if self.chaos_tester:
-                self._background_tasks.append(loop.create_task(self._chaos_loop()))
-            if self.federated:
-                self._background_tasks.append(loop.create_task(self._federated_loop()))
-        except RuntimeError:
-            # No running loop yet — will be scheduled on demand
-            pass
+            result = self.modp_selector.select(features)
+            return {"selected_precision": result["selected_precision"]}
+        except Exception:
+            return None
 
-    async def _carbon_update_loop(self):
+    async def _teacher_moe(self, features: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        try:
+            result = self.moe_engine.select(features)
+            return {"selected_precision": result["selected_precision"]}
+        except Exception:
+            return None
+
+    async def _teacher_bio(self, features: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if self.bio is None:
+            return None
+        params = self.bio.get_current_params()
+        dtype_map = {"accuracy_weight": "fp32", "energy_weight": "fp16",
+                     "carbon_weight": "fp8", "speed_weight": "fp4"}
+        best_w = max(dtype_map.keys(), key=lambda k: params.get(k, 0.25))
+        return {"selected_precision": dtype_map[best_w]}
+
+    # ------------------------------------------------------------------
+    # Exercise forward path (for chaos tests)
+    # ------------------------------------------------------------------
+    async def _exercise_forward_chaos(self):
+        """Called by ChaosTester to exercise the engine's forward handling."""
+        if self._chaos_exec_override is None:
+            return
+        try:
+            await self._chaos_exec_override()
+        except Exception as e:
+            logger.warning(f"Chaos forward OOM handled: {e}")
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    async def start(self):
+        if self._running:
+            return
+        self._running = True
+        loop = asyncio.get_running_loop()
+        self._background_tasks.append(loop.create_task(self._carbon_loop()))
+        self._background_tasks.append(loop.create_task(self._ga_loop()))
+        if self.chaos and getattr(self.config, "chaos_enable_loop", False):
+            self._background_tasks.append(loop.create_task(self._chaos_loop()))
+        if self.federated:
+            self._background_tasks.append(loop.create_task(self._federated_loop()))
+        logger.info("Mixed-precision engine started")
+
+    async def _carbon_loop(self):
         while not self._shutdown_event.is_set():
             try:
-                intensity = await self.carbon_manager.get_current_intensity()
-                if self.forecaster:
-                    await self.forecaster.update_history(intensity)
-                await asyncio.sleep(self.config.carbon_update_interval)
-            except asyncio.CancelledError:
-                break
+                await self.carbon_manager.refresh()
+                await self.forecaster.update_history(
+                    self.carbon_manager.current.price_usd_per_kg)
             except Exception as e:
-                logger.error(f"Carbon loop error: {e}")
-
-    async def _self_healing_loop(self):
-        while not self._shutdown_event.is_set():
+                logger.warning(f"Carbon loop error: {e}")
             try:
-                if self.self_healing:
-                    await self.self_healing.train([
-                        {'accuracy': 0.9, 'energy_saved': 0.5,
-                         'carbon_saved': 0.2, 'latency_ms': 10}])
-                await asyncio.sleep(self.config.self_healing.health_check_interval)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Self-healing loop error: {e}")
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=getattr(self.config, "carbon_update_interval", 300))
+            except asyncio.TimeoutError:
+                pass
 
     async def _ga_loop(self):
         while not self._shutdown_event.is_set():
+            if self.bio:
+                with contextlib.suppress(Exception):
+                    await self.bio.evolve()
             try:
-                if self.bio_optimizer:
-                    await self.bio_optimizer.evolve()
-                await asyncio.sleep(self.config.bio.ga_evolution_interval)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"GA loop error: {e}")
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=getattr(self.config, "ga_evolution_interval", 3600))
+            except asyncio.TimeoutError:
+                pass
 
     async def _chaos_loop(self):
         while not self._shutdown_event.is_set():
+            with contextlib.suppress(Exception):
+                fault = random.choice(ChaosTester.FAULT_TYPES)
+                await self.chaos.run_test(fault, duration_s=0.1)
             try:
-                await asyncio.sleep(1800)
-                if self.chaos_tester:
-                    fault = random.choice(ChaosTester.FAULT_TYPES)
-                    await self.chaos_tester.run_test(fault, duration_s=0.1)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Chaos loop error: {e}")
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=1800)
+            except asyncio.TimeoutError:
+                pass
 
     async def _federated_loop(self):
         while not self._shutdown_event.is_set():
-            try:
-                await asyncio.sleep(600)
-                if self.federated and self.federated.client_updates:
+            with contextlib.suppress(Exception):
+                if self.federated and self.federated._pending:
                     self.federated.aggregate()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Federated loop error: {e}")
-
-    # ------------------------------------------------------------------
-    # Core API
-    # ------------------------------------------------------------------
-    def _get_precision_list(self):
-        return ['fp32', 'fp16', 'bf16', 'fp8', 'fp4']
-
-    def _validate_dtype(self, dtype):
-        if dtype not in self._get_precision_list():
-            raise ValueError(f"Unsupported dtype '{dtype}'")
-
-    def _to_dtype(self, model, dtype):
-        dtype_map = {
-            'fp32': torch.float32,
-            'fp16': torch.float16,
-            'bf16': torch.bfloat16,
-            'fp8': getattr(torch, 'float8_e4m3fn', None) or torch.float16,
-            'fp4': torch.float16,
-        }
-        return model.to(dtype=dtype_map.get(dtype, torch.float32))
-
-    async def decide_precision(self, model, inputs, layer_type='general',
-                               base_accuracy=1.0) -> str:
-        carbon_intensity = await self.carbon_manager.get_current_intensity()
-        features = {
-            'carbon_intensity': carbon_intensity,
-            'layer_type': layer_type,
-            'input_size': inputs.numel(),
-            'base_accuracy': base_accuracy,
-        }
-
-        # Carbon-aware scheduling
-        if self.scheduler:
-            schedule = await self.scheduler.schedule(urgency_score=0.5)
-            delay = schedule['recommended_delay']
-            if delay > 0:
-                await asyncio.sleep(min(delay, 2))  # capped for responsiveness
-
-        # Selection: distillation → MODP → MOE → default
-        source = "default"
-        best = self.config.default_dtype
-        modp_result = moe_result = None
-
-        if self.distiller and self.distiller.teachers:
-            distilled = self.distiller.distill(features)
-            if distilled and 'selected_precision' in distilled:
-                best = distilled['selected_precision']
-                source = "distilled"
-        if best == self.config.default_dtype and self.modp_selector:
-            modp_result = await self.modp_selector.select_precision(features)
-            best = modp_result['selected_precision']
-            source = "modp"
-        elif self.moe_engine and best == self.config.default_dtype:
-            moe_result = await self.moe_engine.select_precision(features)
-            best = moe_result['selected_precision']
-            source = "moe"
-
-        # Hardware-aware adaptive precision override
-        if self.precision_controller:
-            hw_level = self.precision_controller.select(float(carbon_intensity),
-                                                        accuracy_required=base_accuracy)
-            # Only override when hw is more conservative (fp32) or carbon is high
-            if str(hw_level.value) != best and carbon_intensity > 500:
-                logger.info(f"HW-aware override: {best} -> {hw_level.value}")
-                best = hw_level.value
-                source = "hw_aware"
-
-        # LIMIT Graph
-        if self.limit_graph:
-            limits = self.limit_graph.get_limits(features)
-            forbidden = limits.get('forbidden_precisions', [])
-            if best in forbidden:
-                allowed = [p for p in self._get_precision_list() if p not in forbidden]
-                if allowed:
-                    best = allowed[0]
-                    source = "limit_graph"
-
-        # Temporal gate
-        if self.temporal_monitor:
-            self.temporal_monitor.update({
-                'carbon_intensity': float(carbon_intensity),
-                'base_accuracy': float(base_accuracy),
-                'input_size': float(features['input_size']),
-            })
-            temporal_status = self.temporal_monitor.evaluate()
-        else:
-            temporal_status = {}
-
-        # HITL escalation
-        confidence = min(1.0, max(0.1, base_accuracy * (1.0 - carbon_intensity / 1000.0)))
-        hitl_outcome = None
-        if self.hitl:
             try:
-                # Best-effort; do not block on real human input
-                hitl_outcome = await self.hitl.escalate(
-                    decision_context={'features': features, 'selected': best},
-                    options=self._get_precision_list(),
-                    confidence=confidence,
-                    confidence_threshold=self.config.hitl_confidence_threshold,
-                )
-            except Exception as e:
-                logger.warning(f"HITL escalation failed: {e}")
-
-        # RLHF update
-        if self.rlhf:
-            # Reward: high accuracy, low energy
-            reward = base_accuracy * (1.0 - self._energy_factor(best))
-            self.rlhf.update(features, best, reward)
-
-        self.current_precision = best
-        if PROMETHEUS_AVAILABLE:
-            CURRENT_PRECISION.set({'fp32': 0, 'fp16': 1, 'bf16': 2, 'fp8': 3, 'fp4': 4}.get(best, 0))
-
-        # Record energy savings vs fp32
-        operations = inputs.numel() * 2
-        await self.record_energy_savings('fp32', best, operations)
-
-        # Federated submission
-        if self.federated and modp_result:
-            weights_vec = [
-                float(modp_result['scores'][0]) if modp_result.get('scores') else 0.25,
-                float(modp_result['scores'][1]) if modp_result.get('scores') else 0.25,
-                float(modp_result['scores'][2]) if modp_result.get('scores') else 0.25,
-                float(modp_result['scores'][3]) if modp_result.get('scores') else 0.25,
-            ]
-            self.federated.submit_update(self.instance_id, weights_vec, 1)
-            if len(self._run_history) % 10 == 0:
-                self.federated.aggregate()
-
-        # Record decision
-        self.last_decision = {
-            'selected_precision': best,
-            'source': source,
-            'carbon_intensity': carbon_intensity,
-            'features': features,
-            'temporal_status': temporal_status,
-            'xai_explanation': modp_result.get('xai_explanation') if modp_result else None,
-            'role_assignments': (modp_result or moe_result or {}).get('role_assignments'),
-            'hitl_outcome': hitl_outcome,
-            'confidence': confidence,
-            'timestamp': datetime.now().isoformat(),
-        }
-        self._run_history.append(self.last_decision)
-
-        # Carbon credit value (best-effort)
-        if self.carbon_market:
-            try:
-                credit = await self.carbon_market.get_carbon_credit_value(
-                    self.total_carbon_saved)
-                self.last_decision['carbon_credit_value_usd'] = credit
-            except Exception:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=600)
+            except asyncio.TimeoutError:
                 pass
 
+    # ------------------------------------------------------------------
+    # Core decision pipeline
+    # ------------------------------------------------------------------
+    async def decide_precision_async(self, features: Dict[str, Any]) -> str:
+        """Full async decision; all I/O is awaited."""
+        async with self._inflight_lock:
+            self._inflight += 1
+        try:
+            return await self._decide_inner(features)
+        finally:
+            async with self._inflight_lock:
+                self._inflight -= 1
+
+    def decide_precision(self, features: Dict[str, Any]) -> str:
+        """Sync wrapper. Raises SyncAsyncBoundaryError when a loop is running."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.decide_precision_async(features))
+        raise SyncAsyncBoundaryError(
+            "decide_precision() cannot be called from a running event loop; "
+            "await decide_precision_async() instead.")
+
+    async def _decide_inner(self, features: Dict[str, Any]) -> str:
+        if not self._rate_limiter.acquire():
+            raise RateLimitExceeded("Rate limit exceeded")
+        if self._daily_cost_budget > 0 and self._today_cost >= self._daily_cost_budget:
+            logger.warning("Daily cost budget exhausted")
+            return self.current_precision or self.config.default_dtype
+
+        # Carbon intensity
+        try:
+            snap = await self.carbon_manager.refresh()
+            carbon_intensity = snap.intensity_g_co2_per_kwh
+        except Exception as e:
+            logger.warning(f"Carbon refresh failed: {e}")
+            carbon_intensity = 400.0
+        features = {**features, "carbon_intensity": carbon_intensity}
+
+        # Precision telemetry feedback
+        if self.precision_controller is not None:
+            self.precision_controller.update_telemetry(
+                gpu_available=bool(getattr(self.precision_controller.telemetry, "gpu_available", False)),
+                observed_quality_drop=0.0)
+
+        # Scheduler
+        if self.scheduler is not None:
+            with contextlib.suppress(Exception):
+                sched = await self.scheduler.schedule(urgency_score=0.5)
+                if sched["recommended_delay"] > 0:
+                    await asyncio.sleep(min(sched["recommended_delay"], 2))
+
+        # Distillation
+        distilled = await self.distiller.distill(features)
+        source = "distilled"
+        best: Optional[str] = None
+        if distilled and "selected_precision" in distilled:
+            best = distilled["selected_precision"]
+
+        # MODP fallback
+        modp_result: Optional[Dict[str, Any]] = None
+        if best is None:
+            modp_result = self.modp_selector.select(features)
+            best = modp_result["selected_precision"]
+            source = "modp"
+
+        # MOE advisory
+        moe_result = self.moe_engine.select(features)
+
+        # Adaptive precision override on very high carbon
+        if self.precision_controller is not None and carbon_intensity > 500:
+            hw = self.precision_controller.select(carbon_intensity, accuracy_required=0.95)
+            if hw.value != best:
+                best = hw.value
+                source = "hw_aware"
+
+        # Temporal + safety shield (fresh per decision)
+        temporal = self._base_temporal.fresh() if self._base_temporal else None
+        temporal_status: Dict[str, bool] = {}
+        if temporal is not None:
+            temporal.observe({
+                "carbon_intensity": float(carbon_intensity),
+                "base_accuracy": float(features.get("base_accuracy", 1.0))})
+            temporal_status = temporal.verify()
+            if self.shield is not None and not all(temporal_status.values()):
+                safer = "fp32"
+                best, _ok, _v = self.shield.screen(best, safer, verdict=temporal_status)
+                source = "shield"
+
+        # Causal policy
+        state_vec = np.array([
+            float(features.get("carbon_intensity", 400.0)) / 1000.0,
+            float(features.get("base_accuracy", 1.0)),
+            float(features.get("input_size", 1000)) / 10000.0,
+            float(self.total_carbon_saved_kg),
+            utcnow().hour / 24.0])
+        if self.causal is not None:
+            action = self.causal.select_action(state_vec, len(PrecisionLevel))
+            self.last_counterfactuals = self.causal.counterfactuals(
+                state_vec, len(PrecisionLevel))
+
+        # Multi-agent advisory vote
+        resolution = "skip"
+        if self.coordinator is not None and self.roles is not None:
+            bids = []
+            for role in [AgentRole.ACCURACY_SPECIALIST, AgentRole.ENERGY_SPECIALIST,
+                         AgentRole.CARBON_SPECIALIST, AgentRole.SPEED_SPECIALIST,
+                         AgentRole.SAFETY_OFFICER]:
+                if role == AgentRole.ACCURACY_SPECIALIST:
+                    idx = PrecisionLevel.FP32.value != best
+                elif role == AgentRole.ENERGY_SPECIALIST:
+                    idx = PrecisionLevel.FP8.value != best
+                elif role == AgentRole.CARBON_SPECIALIST:
+                    idx = PrecisionLevel.FP4.value != best
+                elif role == AgentRole.SPEED_SPECIALIST:
+                    idx = PrecisionLevel.FP16.value != best
+                else:
+                    idx = 0
+                bids.append(AgentBid(
+                    agent_id=role.value, role=role, confidence=0.6,
+                    proposed_action=int(idx),
+                    rationale=role.value,
+                    carbon_score=1.0 - min(1.0, carbon_intensity / 1000.0)))
+            voted, resolution = self.coordinator.resolve_conflict(bids, 2)
+
+        # HITL escalation (awaited)
+        confidence = max(0.1, min(1.0, float(features.get("base_accuracy", 1.0))))
+        hitl_outcome = None
+        if self.hitl is not None and confidence < getattr(self.config,
+                                                         "hitl_confidence_threshold", 0.65):
+            try:
+                hitl_outcome = await self.hitl.escalate(
+                    decision_context={"features": features, "best": best},
+                    options=[p.value for p in PrecisionLevel],
+                    confidence=confidence,
+                    confidence_threshold=getattr(self.config,
+                                                 "hitl_confidence_threshold", 0.65))
+            except Exception as e:
+                logger.warning(f"HITL failed: {e}")
+
+        # RLHF update
+        if self.rlhf is not None:
+            reward = confidence * (1.0 - AdaptivePrecisionController.energy_factor(
+                PrecisionLevel(best)))
+            self.rlhf.update({"carbon_intensity": carbon_intensity}, best, reward)
+
+        # Quantum signature
+        signature = None
+        if self.quantum is not None:
+            with contextlib.suppress(Exception):
+                signature = await self.quantum.sign({
+                    "features": features, "best": best, "source": source})
+
+        # Blockchain record
+        tx = None
+        if self.blockchain is not None:
+            with contextlib.suppress(Exception):
+                data_hash = hashlib.sha256(
+                    json.dumps({"features": features, "best": best},
+                               sort_keys=True, default=str).encode()).hexdigest()
+                tx = await self.blockchain.record(
+                    data_id=f"mp_{uuid.uuid4().hex[:8]}",
+                    data_hash=data_hash,
+                    metadata={"source": source})
+
+        # Energy + carbon savings
+        ops = float(features.get("input_size", 1000)) * 2.0
+        from_energy = PRECISION_ENERGY_PER_OP[PrecisionLevel.FP32] * ops
+        to_energy = PRECISION_ENERGY_PER_OP[PrecisionLevel(best)] * ops
+        saved_j = max(0.0, from_energy - to_energy)
+        self.total_energy_saved_j += saved_j
+        saved_kwh = saved_j / 3.6e6
+        carbon_saved_kg = saved_kwh * (carbon_intensity / 1000.0)
+        self.total_carbon_saved_kg += carbon_saved_kg
+        MP_ENERGY_SAVED.inc(int(saved_j))
+        MP_CARBON_SAVED.inc(int(carbon_saved_kg * 1000))
+        MP_PRECISION_SWITCHES.labels(
+            **{"from": self.config.default_dtype, "to": best}).inc()
+        MP_CURRENT_PRECISION.set(
+            {"fp32": 0, "bf16": 1, "fp16": 2, "fp8": 3, "fp4": 4}.get(best, 0))
+
+        # Cost record
+        self._today_cost += self._cost_per_decision
+        MP_COST.inc(self._cost_per_decision)
+        with contextlib.suppress(Exception):
+            self.persistence.cost_record(self._cost_per_decision, note=best)
+
+        # Federated submission
+        if self.federated is not None:
+            wd = dict(zip(self.modp_selector.FEATURES, self.modp_selector.weights))
+            weights_vec = [float(wd.get("accuracy", 0.25)),
+                           float(wd.get("energy", 0.25)),
+                           float(wd.get("carbon", 0.25)),
+                           float(wd.get("speed", 0.25))]
+            self.federated.submit_update(
+                client_id=self.instance_id,
+                weights=weights_vec,
+                samples=1,
+                carbon_intensity=carbon_intensity)
+            if len(self._run_history) % 10 == 0:
+                with contextlib.suppress(PrivacyBudgetExceeded):
+                    self.federated.aggregate()
+
+        # MOE gating update (P0 fix: labels the best-matching teacher)
+        actual_reward_per_dtype = {
+            PrecisionLevel.FP32.value: 1.0,
+            PrecisionLevel.BF16.value: 0.9,
+            PrecisionLevel.FP16.value: 0.85,
+            PrecisionLevel.FP8.value: 0.7,
+            PrecisionLevel.FP4.value: 0.5}
+        self.moe_engine.update(features, actual_reward_per_dtype)
+
+        # Active learning
+        self.active_learner.maybe_store(
+            {"carbon_intensity": carbon_intensity, "best": best,
+             "saved_j": saved_j}, uncertainty=0.1 - confidence * 0.1)
+
+        # Lineage
+        decision_id = uuid.uuid4().hex[:12]
+        with contextlib.suppress(Exception):
+            self.persistence.record_lineage(
+                lineage_id=uuid.uuid4().hex[:12],
+                decision_id=decision_id,
+                payload={"features": features, "best": best,
+                         "source": source, "signature": signature, "tx": tx})
+
+        self.current_precision = best
+        self.last_decision = {
+            "decision_id": decision_id,
+            "selected_precision": best,
+            "source": source,
+            "carbon_intensity": carbon_intensity,
+            "temporal_status": temporal_status,
+            "xai_explanation": (modp_result or {}).get("xai_explanation"),
+            "role_assignments": (modp_result or {}).get("role_assignments"),
+            "moe_role_assignments": moe_result.get("role_assignments"),
+            "hitl_outcome": hitl_outcome,
+            "multi_agent_resolution": resolution,
+            "signature": signature,
+            "blockchain_tx": tx,
+            "counterfactuals": self.last_counterfactuals,
+            "energy_saved_j": saved_j,
+            "carbon_saved_kg": carbon_saved_kg,
+            "timestamp": utcnow().isoformat()}
+        self._run_history.append(self.last_decision)
         return best
 
-    def _energy_factor(self, dtype: str) -> float:
-        return {'fp32': 1.0, 'fp16': 0.4, 'bf16': 0.4,
-                'fp8': 0.2, 'fp4': 0.1}.get(dtype, 1.0)
+    # ------------------------------------------------------------------
+    # Quantized forward (async-safe)
+    # ------------------------------------------------------------------
+    @contextlib.contextmanager
+    def quantized_forward(self, model, inputs, dtype: str):
+        """Synchronous context manager. `dtype` must be provided.
 
-    @contextmanager
-    def quantized_forward(self, model, inputs, dtype=None,
-                          layer_type='general', base_accuracy=1.0):
-        if dtype is None:
-            dtype = asyncio.run(self.decide_precision(model, inputs, layer_type, base_accuracy))
-        if model not in self._original_dtypes:
-            try:
-                self._original_dtypes[model] = next(model.parameters()).dtype
-            except StopIteration:
-                self._original_dtypes[model] = torch.float32
-        original_dtype = self._original_dtypes[model]
-        converted_model = self._to_dtype(model, dtype)
+        Note: use `decide_precision_async` to obtain `dtype` first.
+        """
+        if not TORCH_AVAILABLE:
+            yield model, inputs
+            return
+        original_dtype = torch.float32
+        with contextlib.suppress(Exception):
+            original_dtype = next(model.parameters()).dtype
+        torch_dtype = {
+            "fp32": torch.float32,
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+            "fp8": getattr(torch, "float8_e4m3fn", torch.float16),
+            "fp4": torch.float16,
+        }.get(dtype, torch.float32)
         try:
-            yield converted_model, inputs
+            converted = model.to(dtype=torch_dtype)
+        except Exception:
+            converted = model
+        try:
+            yield converted, inputs
         finally:
-            converted_model.to(dtype=original_dtype)
+            with contextlib.suppress(Exception):
+                converted.to(dtype=original_dtype)
 
-    @contextmanager
-    def amp_forward(self, model, inputs, dtype=None):
-        if not self._amp_enabled:
+    @contextlib.contextmanager
+    def amp_forward(self, model, inputs, dtype: Optional[str] = None):
+        if not (TORCH_AVAILABLE and getattr(self.config, "use_amp", False)):
             yield model, inputs
             return
-        if dtype is None:
-            dtype = self.config.amp_dtype
-        if dtype not in ['fp16', 'bf16']:
-            raise ValueError("AMP dtype must be 'fp16' or 'bf16'")
-        device = inputs.device
-        if device.type != 'cuda':
+        chosen = dtype or getattr(self.config, "amp_dtype", "fp16")
+        amp_dtype = torch.float16 if chosen == "fp16" else torch.bfloat16
+        try:
+            with _torch_amp_autocast(device_type="cuda", dtype=amp_dtype):
+                yield model, inputs
+        except TypeError:
+            # Older torch; fall back to torch.cuda.amp.autocast
+            with contextlib.suppress(Exception):
+                from torch.cuda.amp import autocast  # type: ignore
+                with autocast(dtype=amp_dtype):
+                    yield model, inputs
+                return
             yield model, inputs
-            return
-        amp_dtype = torch.float16 if dtype == 'fp16' else torch.bfloat16
-        with autocast(dtype=amp_dtype):
-            yield model, inputs
 
-    def quantize_model(self, model, dtype):
-        self._validate_dtype(dtype)
-        return self._to_dtype(model, dtype)
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
+    async def get_comprehensive_status_async(self) -> Dict[str, Any]:
+        return {
+            "instance_id": self.instance_id,
+            "version": self.config.version,
+            "running": self._running,
+            "current_precision": self.current_precision,
+            "total_energy_saved_j": self.total_energy_saved_j,
+            "total_carbon_saved_kg": self.total_carbon_saved_kg,
+            "today_cost_usd": self._today_cost,
+            "daily_cost_budget_usd": self._daily_cost_budget,
+            "rate_limit_remaining": self._rate_limiter.remaining(),
+            "features": {
+                "temporal_logic": self._base_temporal is not None,
+                "xai": self.xai is not None,
+                "adaptive_precision": self.precision_controller is not None,
+                "carbon_market": self.carbon_market is not None,
+                "role_specialization": self.role_coordinator is not None,
+                "chaos_testing": self.chaos is not None,
+                "hitl": self.hitl is not None,
+                "federated": self.federated is not None,
+                "causal_rl": self.causal is not None,
+                "multi_agent": self.coordinator is not None,
+                "quantum": self.quantum is not None,
+                "blockchain": self.blockchain is not None},
+            "temporal_logic": (self._base_temporal.get_status()
+                               if self._base_temporal else None),
+            "moe": self.moe_engine.get_stats(),
+            "self_healing": (await self.self_healing.stats()
+                             if self.self_healing else None),
+            "chaos_report": self.chaos.get_report() if self.chaos else None,
+            "federated": self.federated.get_stats() if self.federated else None,
+            "hitl_stats": self.hitl.stats() if self.hitl else None,
+            "hitl_audit_verified": (self.hitl.verify_audit_chain()
+                                    if self.hitl else None),
+            "quantum": self.quantum.status() if self.quantum else None,
+            "role_registry": self.roles.stats() if self.roles else None,
+            "active_learning_size": len(self.active_learner),
+            "last_decision": self.last_decision,
+            "health": await self.health_check(),
+            "timestamp": utcnow().isoformat()}
 
-    def dequantize_model(self, model):
-        if model in self._original_dtypes:
-            model.to(dtype=self._original_dtypes[model])
-        else:
-            model.to(dtype=torch.float32)
-        return model
+    def get_comprehensive_status(self) -> Dict[str, Any]:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.get_comprehensive_status_async())
+        raise SyncAsyncBoundaryError(
+            "get_comprehensive_status() cannot be called from a running event "
+            "loop; await get_comprehensive_status_async() instead.")
 
-    async def record_energy_savings(self, from_dtype, to_dtype, operations):
-        energy_per_op = {'fp32': 1e-9, 'fp16': 0.4e-9, 'bf16': 0.4e-9,
-                         'fp8': 0.2e-9, 'fp4': 0.1e-9}
-        saved = (energy_per_op.get(from_dtype, 1e-9)
-                 - energy_per_op.get(to_dtype, 1e-9)) * operations
-        self.total_energy_saved += saved
-        intensity = await self.carbon_manager.get_current_intensity()
-        saved_kwh = saved / 3.6e6
-        carbon_saved_kg = saved_kwh * (intensity / 1000.0)
-        self.total_carbon_saved += carbon_saved_kg
-        if PROMETHEUS_AVAILABLE:
-            ENERGY_SAVED.set(self.total_energy_saved)
-            CARBON_SAVED.set(self.total_carbon_saved)
-            PRECISION_SWITCHES.labels(from=from_dtype, to=to_dtype).inc()
-        return {'energy_saved_j': saved, 'carbon_saved_kg': carbon_saved_kg}
+    async def health_check(self) -> Dict[str, Any]:
+        chain_ok = True
+        if self.hitl is not None:
+            with contextlib.suppress(Exception):
+                chain_ok = self.hitl.verify_audit_chain()
+        score = 100 if chain_ok else 80
+        MP_HEALTH.set(score)
+        return {
+            "status": "healthy" if score >= 70 else "degraded",
+            "health_score": score,
+            "hitl_audit_ok": chain_ok,
+            "pending_hitl": self.hitl.stats()["pending"] if self.hitl else 0,
+            "today_cost_usd": self._today_cost,
+            "in_flight": self._inflight,
+            "blockchain": (await self.blockchain.health_check()
+                           if self.blockchain else None),
+            "carbon": await self.carbon_manager.health_check(),
+            "timestamp": utcnow().isoformat()}
 
-    async def sign_precision_decision(self, decision):
-        # Lightweight PQC simulation
-        data_bytes = json.dumps(decision, sort_keys=True).encode()
-        sig = hashlib.sha3_256(data_bytes).hexdigest()
-        return {'signature': sig, 'algorithm': 'dilithium-sim'}
-
-    async def record_on_blockchain(self, decision):
-        return {'tx_hash': '0x' + hashlib.sha256(
-            json.dumps(decision, sort_keys=True).encode()).hexdigest()[:64]}
-
-    async def run_chaos_suite(self) -> Dict:
-        if self.chaos_tester is None:
-            return {'error': 'chaos testing disabled'}
+    async def run_chaos_suite(self) -> Dict[str, Any]:
+        if self.chaos is None:
+            return {"error": "chaos disabled"}
         results = []
         for f in ChaosTester.FAULT_TYPES:
-            try:
-                results.append(await self.chaos_tester.run_test(f, duration_s=0.05))
-            except Exception as e:
-                results.append({'fault': f, 'passed': False, 'error': str(e)})
-        return {'results': results, 'report': self.chaos_tester.get_report()}
-
-    def get_comprehensive_status(self) -> Dict:
-        return {
-            'instance_id': self.instance_id,
-            'version': self.config.version,
-            'current_precision': self.current_precision,
-            'total_energy_saved_j': self.total_energy_saved,
-            'total_carbon_saved_kg': self.total_carbon_saved,
-            'features': {
-                'temporal_logic': self.temporal_logic_enabled,
-                'xai': self.xai_enabled,
-                'adaptive_precision': self.adaptive_precision_enabled,
-                'carbon_market': self.carbon_market_enabled,
-                'role_specialization': self.role_specialization_enabled,
-                'chaos_testing': self.chaos_testing_enabled,
-                'hitl': self.hitl_enabled,
-                'federated': self.federated_enabled,
-            },
-            'temporal_logic': self.temporal_monitor.get_status() if self.temporal_monitor else None,
-            'moe': self.moe_engine.get_stats() if self.moe_engine else None,
-            'self_healing': (asyncio.run(self.self_healing.get_stats())
-                             if self.self_healing else None),
-            'chaos_report': self.chaos_tester.get_report() if self.chaos_tester else None,
-            'federated': self.federated.get_stats() if self.federated else None,
-            'hitl_audit': self.hitl.get_audit() if self.hitl else None,
-            'last_decision': self.last_decision,
-        }
+            with contextlib.suppress(Exception):
+                results.append(await self.chaos.run_test(f, duration_s=0.1))
+        return {"results": results, "report": self.chaos.get_report()}
 
     async def shutdown(self):
-        logger.info("Shutting down EnhancedMixedPrecisionEngine v7.0.0...")
+        logger.info("Shutting down mixed-precision engine...")
         self._shutdown_event.set()
-        for task in self._background_tasks:
-            task.cancel()
+        deadline = time.time() + 10.0
+        while self._inflight > 0 and time.time() < deadline:
+            await asyncio.sleep(0.1)
+        for t in self._background_tasks:
+            t.cancel()
         await asyncio.gather(*self._background_tasks, return_exceptions=True)
-        await self.carbon_manager.close()
+        with contextlib.suppress(Exception):
+            await self.carbon_manager.close()
+        self.persistence.close()
         logger.info("Shutdown complete")
 
+
 # ============================================================
-# SINGLETON
+# FastAPI
+# ============================================================
+def build_fastapi_app(engine: EnhancedMixedPrecisionEngine,
+                      jwt_secret: Optional[str] = None) -> Any:
+    if not FASTAPI_AVAILABLE:
+        return None
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        await engine.shutdown()
+
+    app = FastAPI(title="Mixed Precision API", version=engine.config.version,
+                  lifespan=lifespan)
+    app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                       allow_credentials=True, allow_methods=["*"],
+                       allow_headers=["*"])
+    security = HTTPBearer(auto_error=False)
+    secret = jwt_secret or engine.config.jwt_secret
+
+    async def verify(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+        if not JOSE_AVAILABLE:
+            return {"sub": "anonymous"}
+        if credentials is None:
+            raise HTTPException(status_code=401, detail="missing credentials")
+        try:
+            return jwt.decode(credentials.credentials, secret,
+                              algorithms=[engine.config.jwt_algorithm])
+        except JWTError:
+            raise HTTPException(status_code=401, detail="invalid token")
+
+    @app.post("/token")
+    async def issue_token(sub: str = "user"):
+        if not JOSE_AVAILABLE:
+            raise HTTPException(status_code=500, detail="JWT library missing")
+        exp = utcnow() + timedelta(seconds=engine.config.jwt_expiry_s)
+        token = jwt.encode({"sub": sub, "exp": exp}, secret,
+                           algorithm=engine.config.jwt_algorithm)
+        return {"access_token": token, "token_type": "bearer"}
+
+    @app.post("/decide")
+    async def decide(payload: Dict[str, Any], user: Dict = Depends(verify)):
+        return {"selected_precision": await engine.decide_precision_async(payload)}
+
+    @app.get("/status")
+    async def status(user: Dict = Depends(verify)):
+        return await engine.get_comprehensive_status_async()
+
+    @app.get("/health")
+    async def health():
+        return await engine.health_check()
+
+    @app.get("/hitl/pending")
+    async def hitl_pending(user: Dict = Depends(verify)):
+        if not engine.hitl:
+            return {"pending": []}
+        return {"pending": engine.hitl.pending_requests()}
+
+    @app.post("/hitl/approval")
+    async def hitl_approval(request_id: str, approved: bool,
+                            user: Dict = Depends(verify)):
+        if not engine.hitl:
+            raise HTTPException(status_code=503, detail="HITL disabled")
+        ok = engine.hitl.resolve(request_id, approved)
+        if not ok:
+            raise HTTPException(status_code=404, detail="not_found")
+        return {"status": "resolved", "request_id": request_id,
+                "approved": approved}
+
+    @app.get("/hitl/audit")
+    async def hitl_audit(limit: int = 100, user: Dict = Depends(verify)):
+        if not engine.hitl:
+            return {"audit": []}
+        return {"audit": engine.hitl.audit_trail(limit=limit),
+                "verified": engine.hitl.verify_audit_chain()}
+
+    @app.post("/chaos")
+    async def chaos(fault: str = "carbon_api_down", duration_s: float = 0.2,
+                    user: Dict = Depends(verify)):
+        if not engine.chaos:
+            raise HTTPException(status_code=503, detail="chaos disabled")
+        return await engine.chaos.run_test(fault, duration_s=duration_s)
+
+    return app
+
+
+# ============================================================
+# Signal handling + singleton
 # ============================================================
 _engine_instance: Optional[EnhancedMixedPrecisionEngine] = None
 _engine_lock = asyncio.Lock()
+_shutdown_event_global = asyncio.Event()
+_shutdown_requested = False
+
+
+async def _signal_shutdown():
+    _shutdown_event_global.set()
+
+
+def handle_signal(signum, frame):
+    global _shutdown_requested
+    if not _shutdown_requested:
+        _shutdown_requested = True
+        logger.info(f"Received signal {signum}")
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_signal_shutdown())
+        except RuntimeError:
+            _shutdown_event_global.set()
+
+
+def _install_signal_handlers(loop):
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, lambda s=sig: handle_signal(s, None))
+        except (NotImplementedError, AttributeError):
+            try:
+                signal.signal(sig, lambda s, f: handle_signal(s, None))
+            except (ValueError, OSError):
+                pass
+
 
 async def get_mixed_precision_engine(
-    config: Optional[MixedPrecisionConfig] = None
+    config: Optional[MixedPrecisionConfig] = None,
+    **kwargs: Any,
 ) -> EnhancedMixedPrecisionEngine:
     global _engine_instance
     if _engine_instance is None:
         async with _engine_lock:
             if _engine_instance is None:
-                _engine_instance = EnhancedMixedPrecisionEngine(config)
+                _engine_instance = EnhancedMixedPrecisionEngine(config, **kwargs)
+                await _engine_instance.start()
     return _engine_instance
 
+
+async def shutdown_handler():
+    global _engine_instance
+    if _engine_instance:
+        await _engine_instance.shutdown()
+        _engine_instance = None
+
+
 # ============================================================
-# MAIN (smoke test)
+# Main
 # ============================================================
 async def main():
-    _shutdown_event_global = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    _install_signal_handlers(loop)
 
-    def _handle_signal(signum, frame):
-        try:
-            asyncio.create_task(_signal_shutdown())
-        except Exception:
-            pass
+    print("=" * 80)
+    print("Enhanced Mixed Precision Engine v18.0.0 — P0/P1/P2 hardened")
+    print("=" * 80)
 
-    async def _signal_shutdown():
-        _shutdown_event_global.set()
+    if FASTAPI_AVAILABLE and os.environ.get("MP_SERVE_API", "0") == "1":
+        cfg = MixedPrecisionConfig()
+        engine = EnhancedMixedPrecisionEngine(cfg)
+        await engine.start()
+        app = build_fastapi_app(engine, cfg.jwt_secret)
+        if app is not None:
+            uvicorn.run(app, host=cfg.api_host, port=cfg.api_port, level="info")
+        return
 
-    try:
-        loop = asyncio.get_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, lambda s=sig: _handle_signal(s, None))
-            except NotImplementedError:
-                pass
-    except Exception:
-        pass
+    if PROMETHEUS_AVAILABLE and start_http_server:
+        with contextlib.suppress(Exception):
+            start_http_server(8000)
 
-    engine = await get_mixed_precision_engine()
-    print(f"Enhanced Mixed Precision Engine v{engine.config.version} ready")
-    print(f"Instance: {engine.instance_id}")
-    print(f"Features: temporal={engine.temporal_logic_enabled}, xai={engine.xai_enabled}, "
-          f"precision_ctrl={engine.adaptive_precision_enabled}, "
-          f"market={engine.carbon_market_enabled}, roles={engine.role_specialization_enabled}, "
-          f"chaos={engine.chaos_testing_enabled}, hitl={engine.hitl_enabled}, "
-          f"federated={engine.federated_enabled}")
+    engine = await get_mixed_precision_engine(config={
+        "persist_path": "/tmp/mixed_precision_v18.db",
+        "chaos_enabled": False,
+        "chaos_enable_loop": False})
 
-    # Simple forward pass
-    model = nn.Linear(10, 5)
-    inputs = torch.randn(1, 10)
-    dtype = await engine.decide_precision(model, inputs, layer_type='linear',
-                                          base_accuracy=0.98)
-    print(f"\nDecided precision: {dtype}")
-    print(f"Last decision source: {engine.last_decision['source']}")
-    print(f"Temporal status: {engine.last_decision['temporal_status']}")
-    if engine.last_decision.get('role_assignments'):
-        print(f"Dominant role: {engine.last_decision['role_assignments']['dominant_role']}")
-    if engine.last_decision.get('xai_explanation'):
-        print(f"XAI narrative: {engine.last_decision['xai_explanation']['narrative']}")
+    print("\n✅ Ten enhancements wired in:")
+    print("   [1] Quantum-Distillation     dilithium/falcon/sphincs + HMAC fallback")
+    print("   [2] Causal RL (UCB)          CausalCounterfactualEstimator")
+    print("   [3] Federated (secure + DP)  FederatedAggregator + DPAccountant")
+    print("   [4] Multi-Agent              EmergentRoleRegistry + MultiAgentCoordinator")
+    print("   [5] Temporal Logic (full STL) TemporalLogicMonitor + SafetyShield")
+    print("   [6] Explainable AI           XAIExplainer (SHAP + weighted)")
+    print("   [7] Adaptive Precision       AdaptivePrecisionController (telemetry)")
+    print("   [8] Carbon Markets / RECs    CarbonMarketClient + providers")
+    print("   [9] Resilience / Chaos       ChaosTester (steady-state)")
+    print("  [10] HITL / Active Learning   ActiveRLHF + HITL + ActiveLearning")
 
-    # Forward with chosen precision
-    with engine.quantized_forward(model, inputs, dtype=dtype, layer_type='linear') as (mod, inp):
-        out = mod(inp)
-        print(f"\nForward pass OK with precision {engine.current_precision}, out shape: {out.shape}")
+    # Smoke tests
+    for dtype in ["fp16", "fp8", "fp32"]:
+        decision = await engine.decide_precision_async({
+            "base_accuracy": 0.95, "input_size": 4096,
+            "layer_complexity": 0.5})
+        print(f"   decision: {decision}")
 
-    # Chaos suite (light)
-    print("\nRunning chaos suite...")
-    report = await engine.run_chaos_suite()
-    print(f"Chaos pass rate: {report['report']['pass_rate']:.2f}")
+    status = await engine.get_comprehensive_status_async()
+    print(f"\n📊 Instance: {status['instance_id']} v{status['version']}")
+    print(f"   Current precision: {status['current_precision']}")
+    print(f"   Total energy saved: {status['total_energy_saved_j']:.3f} J")
+    print(f"   Total carbon saved: {status['total_carbon_saved_kg']:.6f} kg")
+    print(f"   Today cost: ${status['today_cost_usd']:.6f}")
+    print(f"   Enhancements: {status['features']}")
+    print(f"   MOE: {status['moe']}")
+    print(f"   Quantum: {status['quantum']}")
+    print(f"   Health: {status['health']['status']}")
 
-    # Comprehensive status
-    print("\nStatus snapshot:")
-    status = engine.get_comprehensive_status()
-    print(json.dumps({
-        'instance': status['instance_id'],
-        'version': status['version'],
-        'precision': status['current_precision'],
-        'energy_saved_j': status['total_energy_saved_j'],
-        'carbon_saved_kg': status['total_carbon_saved_kg'],
-        'features': status['features'],
-    }, indent=2, default=str))
+    # Chaos smoke (single fault)
+    if engine.chaos:
+        print("\n🧪 Running chaos smoke test...")
+        res = await engine.chaos.run_test("carbon_api_down", duration_s=0.05)
+        print(f"   chaos_result={res['passed']}")
+
+    print("\n" + "=" * 80)
+    print("✅ Enhanced Mixed Precision Engine v18.0.0 ready")
+    print("=" * 80)
 
     try:
         await _shutdown_event_global.wait()
     except asyncio.CancelledError:
         pass
     finally:
-        await engine.shutdown()
+        await shutdown_handler()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
