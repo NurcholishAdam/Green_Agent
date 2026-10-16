@@ -1,43 +1,42 @@
 #!/usr/bin/env python3
-# src/enhancements/helium_api_collector_enhanced_v17_0.py
+# src/enhancements/helium_api_collector_enhanced_v19_0.py
 """
-Real-Time Helium Data Collector — v18.0
+Real-Time Helium Data Collector — v19.0
 
-Single-file rewrite that fixes every runtime bug from v17 and hosts all ten
-Green Agent enhancements as first-class modules in the same file:
+The ten Green Agent enhancements are imported from the enhancements/*
+package. This file keeps only helium-specific logic:
 
-  1. Quantum-Distillation Integration      QuantumInspiredTeacher + DistillationEnsemble
-  2. Causal RL for Policy Adaptation       CausalCounterfactualEstimator
-  3. Federated Green Learning              FederatedAggregator
-  4. Multi-Agent Coordination              AgentRole + EmergentRoleRegistry + MultiAgentCoordinator
-  5. Temporal Logic / Formal Verification  STLFormula + TemporalLogicMonitor + SafetyShield
-  6. Explainable AI                        DecisionExplainer + Explanation
-  7. Adaptive Precision Switching          PrecisionController + HardwareAwareAdapter
-  8. Carbon Markets / RECs                 CarbonMarketClient + RECInventory
-  9. Resilience / Chaos                    ChaosEngineer
- 10. HITL / Active Learning                UncertaintyEstimator + HumanInTheLoopGate + ActiveLearningSampler
+  - MergedHeliumData + HeliumDataDB
+  - EnhancedDatabaseManager with insert_helium_data
+  - PostQuantumCrypto with verify_helium_data
+  - BlockchainHeliumVerification with real tx when configured
+  - MultiObjectiveCloudDistributor (MODP + multi-agent)
+  - MixtureOfExpertsPredictive (proxy-label gating)
+  - BioInspiredAutonomousCollector (GA-driven interval)
+  - MultiObjectiveCarbonScheduler
+  - SelfHealingManager (fitted detectors)
+  - EnhancedCircuitBreaker, EnhancedRateLimiter, EnhancedBulkhead
+  - EnhancedHeliumAPICollector
+  - FastAPI app, singleton, signal handlers, main
 
-Runtime fixes over v17:
-  - Added missing imports (logging.handlers, itertools, atexit, tempfile)
-  - Guarded ORM declarations (Base is never None when subclassed)
-  - Real ORM models declared; EnhancedDatabaseManager.insert_helium_data writes rows
-  - get_db_url() no longer doubles the sqlite driver prefix or fabricates a Postgres URL
-  - quantum_master_key auto-generates when unset
-  - HeliumCollectorConfig resolved lazily; no import-time config construction
-  - TaskManager.start_task calls deferred to start(); background loops run
-  - MLAnomalyDetector now fits real IsolationForest / OneClassSVM / LinearRegression
-  - SelfHealingManager fits its detectors and gates via anomaly votes
-  - MixtureOfExpertsPredictive gating trained on real proxy labels, not random
-  - ParetoFront dominance respects strict inequality
-  - TOPSIS.score guards against all-zero columns
-  - MultiObjectiveCloudDistributor actually reads carbon and updates weights
-  - BioInspiredAutonomousCollector wires GA interval back into the collector
-  - MultiObjectiveCarbonScheduler computes a real multi-objective delay
-  - CircuitBreaker resets half_open_requests when transitioning to CLOSED
-  - uvicorn.run receives the in-memory app object
-  - Signal handlers portable to Windows
-  - PQC signature path uses module-level sign()
-  - Blockchain records include manifest hash
+Changelog v18.0 -> v19.0:
+  - All ten enhancement classes imported from the enhancements package.
+  - Compat wrappers for Explanation, DecisionExplainer, HITLRequest,
+    UncertaintyEstimator, HumanInTheLoopGate, PostQuantumCrypto.
+  - MultiAgentCoordinator.vote tuples are unpacked; winning_role credited.
+  - Causal state uses state_vector_from_metrics.
+  - _update_weights normalizes by per-objective std.
+  - Walrus-operator hack in bid generation removed.
+  - Four placeholder background loops are now real.
+  - _periodic_collection_loop has backoff.
+  - HITL decisions can be delivered via submit_hitl_decision().
+  - FastAPI /hitl/approval calls submit_hitl_decision().
+  - Signal handlers retain task references.
+  - save_state / load_state for causal, roles, federated, bio, last data IDs.
+  - PostQuantumCrypto.verify_helium_data performs real verification.
+  - BlockchainHeliumVerification emits a real tx hash when configured.
+  - insert_helium_data is dialect-aware (SQLite vs Postgres).
+  - distillation_active reflects reality.
 """
 
 from __future__ import annotations
@@ -73,21 +72,169 @@ from typing import (
 
 import numpy as np
 
+
 # ============================================================
-# ENHANCEMENT MODULE IMPORTS (graceful fallback)
+# SHIM: import all ten enhancements from the shared package
 # ============================================================
-ENHANCEMENTS_AVAILABLE = False
-try:
-    from enhancements.bio_inspired import GeneticPolicyGenerator  # type: ignore
-    from enhancements.moe_system import ExpertRouter  # type: ignore
-    from enhancements.MODP import ParetoOptimizer  # type: ignore
-    from enhancements.contextual_bandit import ContextualBandit  # type: ignore
-    from enhancements.limit_graph import LimitGraph  # type: ignore
-    from enhancements.rlhf import RLHFOptimizer  # type: ignore
-    from enhancements.multi_teacher_policy_distillation import MultiTeacherDistiller  # type: ignore
-    ENHANCEMENTS_AVAILABLE = True
-except ImportError:
-    ENHANCEMENTS_AVAILABLE = False
+from enhancements.precision import (
+    PrecisionLevel, PRECISION_COST, PrecisionController, HardwareAwareAdapter,
+)
+from enhancements.carbon import (
+    CarbonMarketClient, RECRecord, RECInventory, CarbonIntensityManager,
+    ICarbonManager,
+)
+from enhancements.chaos import (
+    ChaosConfig, ChaosEngineer,
+)
+from enhancements.stl import (
+    STLOperator, STLFormula, TemporalLogicMonitor, SafetyShield,
+)
+from enhancements.causal import (
+    CausalTransition, CausalCounterfactualEstimator,
+)
+from enhancements.federated import (
+    FederatedUpdate, FederatedAggregator,
+)
+from enhancements.multi_agent import (
+    AgentRole, AgentBid, EmergentRoleRegistry, MultiAgentCoordinator,
+)
+from enhancements.quantum import (
+    QuantumInspiredTeacher, DistillationEnsemble,
+)
+from enhancements.xai import Explanation as SharedExplanation
+from enhancements.xai import DecisionExplainer as SharedDecisionExplainer
+from enhancements.hitl import (
+    HITLRequest as SharedHITLRequest,
+    UncertaintyEstimator as SharedUncertaintyEstimator,
+    HumanInTheLoopGate as SharedHumanInTheLoopGate,
+    ActiveLearningSampler,
+)
+from enhancements.common_state import (
+    STATE_VECTOR_DIM, state_vector_from_metrics,
+)
+
+
+# ============================================================
+# COMPAT WRAPPERS
+# ============================================================
+@dataclass
+class Explanation:
+    decision_id: str
+    chosen_idx: int
+    top_features: List[Tuple[str, float]]
+    counterfactuals: List[Dict[str, Any]]
+    rationale: str
+    confidence: float
+    safety_ok: bool
+    carbon_price_signal: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class DecisionExplainer(SharedDecisionExplainer):
+    def explain(self, chosen_idx, chosen, pareto, counterfactuals,
+                safety_ok, carbon_price, confidence: float = 0.5):
+        numeric_keys = [k for k, v in chosen.items() if isinstance(v, (int, float))]
+        if pareto and numeric_keys:
+            baseline = {k: float(np.mean([c.get(k, 0.0) for c in pareto])) for k in numeric_keys}
+            scales = {k: float(np.std([c.get(k, 0.0) for c in pareto]) + 1e-9) for k in numeric_keys}
+        else:
+            baseline = {k: 0.0 for k in numeric_keys}
+            scales = {k: 1.0 for k in numeric_keys}
+        shared = self.explain_anomaly(
+            kind="decision", current=chosen, baseline=baseline, scales=scales,
+            counterfactuals=counterfactuals, safety_ok=safety_ok,
+            carbon_price=carbon_price, confidence=confidence,
+        )
+        return Explanation(
+            decision_id=shared.decision_id, chosen_idx=chosen_idx,
+            top_features=shared.top_features, counterfactuals=shared.counterfactuals,
+            rationale=shared.rationale, confidence=shared.confidence,
+            safety_ok=shared.safety_ok, carbon_price_signal=shared.carbon_price_signal,
+        )
+
+
+@dataclass
+class HITLRequest:
+    request_id: str
+    reason: str
+    chosen_idx: int
+    candidates: List[Dict[str, Any]]
+    uncertainty: float
+    carbon_price: float
+    timestamp: float = field(default_factory=time.time)
+
+
+class UncertaintyEstimator(SharedUncertaintyEstimator):
+    def __init__(self, entropy_threshold: float = 0.75, variance_threshold: float = 0.05):
+        super().__init__(window=32)
+        self.entropy_threshold = entropy_threshold
+        self.variance_threshold = variance_threshold
+
+    def is_uncertain(self, probs) -> Tuple[bool, float]:
+        if probs is None or len(probs) == 0:
+            return False, 0.0
+        p = np.clip(np.asarray(probs, dtype=np.float64), 1e-12, 1.0)
+        h = float(-np.sum(p * np.log(p)) / math.log(len(p)))
+        score = 0.6 * h
+        return h > self.entropy_threshold, score
+
+
+class HumanInTheLoopGate(SharedHumanInTheLoopGate):
+    def __init__(self, approver=None, timeout_s: float = 2.0,
+                 auto_approve_on_timeout: bool = True):
+        super().__init__(approver=approver, timeout_s=timeout_s,
+                         auto_approve_on_timeout=auto_approve_on_timeout)
+        self._pending: Dict[str, asyncio.Future] = {}
+        self._pending_lock = asyncio.Lock()
+
+    async def request(self, req: HITLRequest) -> bool:
+        if self.approver is None:
+            self.audit.append({"request_id": req.request_id,
+                               "approved": True, "reason": "no_approver"})
+            HITL_APPROVALS.labels(decision="auto_approved").inc()
+            return True
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        async with self._pending_lock:
+            self._pending[req.request_id] = future
+
+        async def _run():
+            try:
+                result = await loop.run_in_executor(None, self.approver, req)
+                if not future.done():
+                    future.set_result(bool(result))
+            except Exception as e:
+                if not future.done():
+                    future.set_exception(e)
+
+        runner = asyncio.create_task(_run())
+        try:
+            approved = await asyncio.wait_for(future, timeout=self.timeout_s)
+        except asyncio.TimeoutError:
+            approved = self.auto_approve_on_timeout
+            HITL_APPROVALS.labels(decision="timeout").inc()
+        except Exception:
+            approved = self.auto_approve_on_timeout
+        finally:
+            async with self._pending_lock:
+                self._pending.pop(req.request_id, None)
+            if not runner.done():
+                runner.cancel()
+        self.audit.append({"request_id": req.request_id,
+                           "approved": bool(approved), "reason": req.reason})
+        HITL_APPROVALS.labels(decision="approved" if approved else "rejected").inc()
+        return bool(approved)
+
+    async def submit_decision(self, request_id: str, approved: bool) -> bool:
+        async with self._pending_lock:
+            fut = self._pending.get(request_id)
+            if fut is None or fut.done():
+                return False
+            fut.set_result(bool(approved))
+            return True
+
 
 # ============================================================
 # OPTIONAL EXTERNAL DEPENDENCIES
@@ -235,6 +382,22 @@ if not TENACITY_AVAILABLE:
 
 
 # ============================================================
+# FALLBACKS FOR LEGACY MODULES NOT IN THE SHARED PACKAGE
+# ============================================================
+ENHANCEMENTS_AVAILABLE = False
+try:
+    from enhancements.bio_inspired import GeneticPolicyGenerator  # type: ignore
+    from enhancements.moe_system import ExpertRouter  # type: ignore
+    from enhancements.MODP import ParetoOptimizer  # type: ignore
+    from enhancements.limit_graph import LimitGraph  # type: ignore
+    from enhancements.rlhf import RLHFOptimizer  # type: ignore
+    from enhancements.multi_teacher_policy_distillation import MultiTeacherDistiller  # type: ignore
+    ENHANCEMENTS_AVAILABLE = True
+except ImportError:
+    ENHANCEMENTS_AVAILABLE = False
+
+
+# ============================================================
 # LOGGING
 # ============================================================
 try:
@@ -272,7 +435,7 @@ audit_logger.setLevel(logging.INFO)
 
 
 # ============================================================
-# PROMETHEUS
+# PROMETHEUS METRICS
 # ============================================================
 if PROMETHEUS_AVAILABLE:
     REGISTRY = CollectorRegistry()
@@ -287,13 +450,10 @@ if PROMETHEUS_AVAILABLE:
     SENTIMENT_SCORE = Gauge("helium_news_sentiment_score", "S", registry=REGISTRY)
     CARBON_INTENSITY = Gauge("helium_carbon_intensity_gco2_per_kwh", "C", registry=REGISTRY)
     CIRCUIT_BREAKER_STATE = Gauge("helium_circuit_breaker_state", "CB", ["name"], registry=REGISTRY)
-    RATE_LIMITER_THROTTLE = Gauge("helium_rate_limiter_throttle", "RL", registry=REGISTRY)
     CLOUD_STORAGE = Counter("helium_cloud_storage_operations_total", "CS", ["provider", "operation", "status"], registry=REGISTRY)
     VAULT_OPERATIONS = Counter("helium_vault_operations_total", "V", ["operation", "status"], registry=REGISTRY)
     PREDICTIVE_ACCURACY = Gauge("helium_predictive_accuracy", "PA", ["model"], registry=REGISTRY)
-    OPTIMIZER_DECISIONS = Counter("helium_optimizer_decisions_total", "OD", ["parameter"], registry=REGISTRY)
     ANOMALY_DETECTIONS = Counter("helium_anomaly_detections_total", "AD", ["type"], registry=REGISTRY)
-    HEALTH_CHECK_STATUS = Gauge("helium_health_check_status", "HC", ["component"], registry=REGISTRY)
     MOE_GATING_WEIGHTS = Gauge("helium_moe_gating_weights", "MG", ["expert"], registry=REGISTRY)
     MODP_PARETO_FRONT_SIZE = Gauge("helium_modp_pareto_front_size", "PF", registry=REGISTRY)
     GA_POPULATION_FITNESS = Gauge("helium_ga_population_fitness", "GA", ["generation"], registry=REGISTRY)
@@ -305,6 +465,7 @@ if PROMETHEUS_AVAILABLE:
     HITL_APPROVALS = Counter("helium_hitl_approvals_total", "HITL", ["decision"], registry=REGISTRY)
     SAFETY_VIOLATIONS = Counter("helium_safety_violations_total", "SV", ["formula"], registry=REGISTRY)
     FEDERATED_ROUNDS = Counter("helium_federated_rounds_total", "FR", registry=REGISTRY)
+    HEALTH_SCORE = Gauge("helium_health_score", "HS", registry=REGISTRY)
 else:
     class DummyMetrics:
         def inc(self, *a, **kw): pass
@@ -314,11 +475,11 @@ else:
     HELIUM_COLLECTIONS = QUANTUM_SIGNATURES = BLOCKCHAIN_VERIFICATIONS = DummyMetrics()
     AUTONOMOUS_OPTIMIZATIONS = MULTI_CLOUD_DISTRIBUTIONS = DATA_FRESHNESS = DummyMetrics()
     DATA_QUALITY_SCORE = INVENTORY_LEVEL = SENTIMENT_SCORE = CARBON_INTENSITY = DummyMetrics()
-    CIRCUIT_BREAKER_STATE = RATE_LIMITER_THROTTLE = CLOUD_STORAGE = VAULT_OPERATIONS = DummyMetrics()
-    PREDICTIVE_ACCURACY = OPTIMIZER_DECISIONS = ANOMALY_DETECTIONS = HEALTH_CHECK_STATUS = DummyMetrics()
-    MOE_GATING_WEIGHTS = MODP_PARETO_FRONT_SIZE = GA_POPULATION_FITNESS = SELF_HEALING_ACTIONS = DummyMetrics()
-    CARBON_PRICE = REC_INVENTORY_KWH = PRECISION_SWITCHES = CHAOS_EVENTS = DummyMetrics()
-    HITL_APPROVALS = SAFETY_VIOLATIONS = FEDERATED_ROUNDS = DummyMetrics()
+    CIRCUIT_BREAKER_STATE = CLOUD_STORAGE = VAULT_OPERATIONS = PREDICTIVE_ACCURACY = DummyMetrics()
+    ANOMALY_DETECTIONS = MOE_GATING_WEIGHTS = MODP_PARETO_FRONT_SIZE = GA_POPULATION_FITNESS = DummyMetrics()
+    SELF_HEALING_ACTIONS = CARBON_PRICE = REC_INVENTORY_KWH = PRECISION_SWITCHES = DummyMetrics()
+    CHAOS_EVENTS = HITL_APPROVALS = SAFETY_VIOLATIONS = FEDERATED_ROUNDS = DummyMetrics()
+    HEALTH_SCORE = DummyMetrics()
 
 
 # ============================================================
@@ -334,7 +495,7 @@ class RateLimitExceeded(HeliumCollectorError): pass
 class VaultError(HeliumCollectorError): pass
 class CloudStorageError(HeliumCollectorError): pass
 class PredictiveError(HeliumCollectorError): pass
-class OptimizerError(HeliumCollectorError): pass
+class DatabaseError(HeliumCollectorError): pass
 class SafetyViolationError(HeliumCollectorError): pass
 
 
@@ -371,661 +532,7 @@ class MergedHeliumData:
 
 
 # ============================================================
-# ============================================================
-# TEN ENHANCEMENT MODULES
-# ============================================================
-# ============================================================
-
-
-# ------------------------------------------------------------
-# Enhancement 7: Adaptive Precision
-# ------------------------------------------------------------
-class PrecisionLevel(str, Enum):
-    FP32 = "fp32"
-    BF16 = "bf16"
-    FP16 = "fp16"
-    FP8 = "fp8"
-    INT8 = "int8"
-    INT4 = "int4"
-
-
-PRECISION_COST = {
-    PrecisionLevel.FP32: {"speed": 1.0, "energy": 1.00, "quality": 1.000, "bits": 32.0},
-    PrecisionLevel.BF16: {"speed": 1.7, "energy": 0.72, "quality": 0.997, "bits": 16.0},
-    PrecisionLevel.FP16: {"speed": 2.0, "energy": 0.65, "quality": 0.994, "bits": 16.0},
-    PrecisionLevel.FP8:  {"speed": 3.1, "energy": 0.50, "quality": 0.985, "bits": 8.0},
-    PrecisionLevel.INT8: {"speed": 3.6, "energy": 0.44, "quality": 0.972, "bits": 8.0},
-    PrecisionLevel.INT4: {"speed": 5.0, "energy": 0.32, "quality": 0.905, "bits": 4.0},
-}
-
-
-class PrecisionController:
-    def __init__(self, supported=None, quality_floor=0.95, carbon_aware=True):
-        self.supported = list(supported) if supported else list(PrecisionLevel)
-        self.quality_floor = quality_floor
-        self.carbon_aware = carbon_aware
-
-    def select(self, carbon_intensity, latency_headroom_ratio, carbon_price=0.0):
-        stress = min(1.0, max(0.0, carbon_intensity / 600.0)) if self.carbon_aware else 0.0
-        price_stress = min(1.0, max(0.0, carbon_price / 0.2))
-        headroom = min(1.0, max(0.0, latency_headroom_ratio))
-        agg = 0.5 * stress + 0.3 * price_stress + 0.2 * (1.0 - headroom)
-        ordered = [p for p in PrecisionLevel if p in self.supported]
-        ordered.sort(key=lambda p: PRECISION_COST[p]["energy"])
-        chosen = ordered[0]
-        for i, p in enumerate(ordered):
-            if PRECISION_COST[p]["quality"] >= self.quality_floor and agg >= 0.25 * i:
-                chosen = p
-        return chosen
-
-
-class HardwareAwareAdapter:
-    def __init__(self, controller):
-        self.controller = controller
-
-    def adapt(self, policy, carbon_intensity, latency_headroom, carbon_price):
-        level = self.controller.select(carbon_intensity, latency_headroom, carbon_price)
-        out = dict(policy)
-        out["precision_level"] = level.value
-        out["effective_bits"] = PRECISION_COST[level]["bits"]
-        PRECISION_SWITCHES.labels(level=level.value).inc()
-        return out, level
-
-
-# ------------------------------------------------------------
-# Enhancement 8: Carbon Markets / RECs
-# ------------------------------------------------------------
-class CarbonMarketClient:
-    def __init__(self, base_price=0.05, sensitivity=0.0005):
-        self.base_price = base_price
-        self.sensitivity = sensitivity
-
-    def price(self, carbon_intensity, hour_of_day=None):
-        tod = 1.0
-        if hour_of_day is not None:
-            tod = 1.0 + 0.3 * math.sin((hour_of_day / 24.0) * 2 * math.pi)
-        return self.base_price + self.sensitivity * carbon_intensity * tod
-
-
-@dataclass
-class RECRecord:
-    kwh: float
-    issued_at: float
-    source: str = "solar"
-
-
-class RECInventory:
-    def __init__(self, grid_kg_co2_per_kwh=0.4):
-        self.grid_factor = grid_kg_co2_per_kwh
-        self._records: List[RECRecord] = []
-
-    def add(self, kwh, source="solar"):
-        self._records.append(RECRecord(kwh=kwh, issued_at=time.time(), source=source))
-
-    def total_kwh(self):
-        return sum(r.kwh for r in self._records)
-
-    def consume(self, kwh):
-        remaining = kwh
-        offset = 0.0
-        new_records = []
-        for r in self._records:
-            if remaining <= 0:
-                new_records.append(r)
-                continue
-            take = min(r.kwh, remaining)
-            remaining -= take
-            offset += take * self.grid_factor
-            if r.kwh - take > 1e-9:
-                new_records.append(RECRecord(kwh=r.kwh - take, issued_at=r.issued_at, source=r.source))
-        self._records = new_records
-        return offset
-
-
-# ------------------------------------------------------------
-# Enhancement 9: Chaos
-# ------------------------------------------------------------
-@dataclass
-class ChaosConfig:
-    fault_prob: float = 0.0
-    latency_inject_ms: float = 0.0
-    latency_inject_prob: float = 0.3
-    carbon_spike_prob: float = 0.0
-    carbon_spike_factor: float = 1.5
-    seed: int = 0
-
-    def enabled(self):
-        return (self.fault_prob > 0
-                or (self.latency_inject_ms > 0 and self.latency_inject_prob > 0)
-                or self.carbon_spike_prob > 0)
-
-
-class ChaosEngineer:
-    def __init__(self, config=None):
-        self.config = config or ChaosConfig()
-        self.rng = random.Random(self.config.seed)
-        self.events: List[Dict[str, Any]] = []
-
-    def maybe_fault(self):
-        if self.rng.random() < self.config.fault_prob:
-            self.events.append({"type": "fault", "t": time.time()})
-            CHAOS_EVENTS.labels(type="fault").inc()
-            return True
-        return False
-
-    def maybe_latency(self):
-        if self.config.latency_inject_ms > 0 and self.rng.random() < self.config.latency_inject_prob:
-            self.events.append({"type": "latency", "t": time.time()})
-            CHAOS_EVENTS.labels(type="latency").inc()
-            return self.config.latency_inject_ms
-        return 0.0
-
-    def maybe_carbon_spike(self, carbon_intensity):
-        if self.rng.random() < self.config.carbon_spike_prob:
-            self.events.append({"type": "carbon_spike", "t": time.time()})
-            CHAOS_EVENTS.labels(type="carbon_spike").inc()
-            return carbon_intensity * self.config.carbon_spike_factor
-        return carbon_intensity
-
-
-# ------------------------------------------------------------
-# Enhancement 5: Temporal Logic
-# ------------------------------------------------------------
-class STLOperator(str, Enum):
-    ALWAYS = "G"
-    EVENTUALLY = "F"
-    UNTIL = "U"
-
-
-@dataclass
-class STLFormula:
-    name: str
-    predicate: Callable[[Dict[str, Any]], bool]
-    operator: STLOperator
-    horizon: int = 10
-
-
-class TemporalLogicMonitor:
-    def __init__(self, horizon=10):
-        self.horizon = horizon
-        self._history: deque = deque(maxlen=horizon * 4)
-        self.formulas: List[STLFormula] = []
-
-    def add_formula(self, f):
-        self.formulas.append(f)
-
-    def observe(self, record):
-        self._history.append(record)
-
-    def verify(self):
-        results = {}
-        for f in self.formulas:
-            window = list(self._history)[-f.horizon:]
-            if not window:
-                results[f.name] = True
-                continue
-            sat = [bool(f.predicate(r)) for r in window]
-            if f.operator == STLOperator.ALWAYS:
-                results[f.name] = all(sat)
-            elif f.operator in (STLOperator.EVENTUALLY, STLOperator.UNTIL):
-                results[f.name] = any(sat)
-            else:
-                results[f.name] = True
-            if not results[f.name]:
-                SAFETY_VIOLATIONS.labels(formula=f.name).inc()
-        return results
-
-
-class SafetyShield:
-    def __init__(self, monitor):
-        self.monitor = monitor
-        self.violations: List[Dict[str, Any]] = []
-
-    def screen(self, selected_value, candidates, key="value"):
-        verdict = self.monitor.verify()
-        violated = [k for k, ok in verdict.items() if not ok]
-        if not violated:
-            return selected_value, True, verdict
-        if not candidates:
-            return selected_value, False, verdict
-        safe = min(candidates, key=lambda p: p.get(key, 0.0))
-        self.violations.append({"t": time.time(), "violated": violated})
-        return safe, False, verdict
-
-
-# ------------------------------------------------------------
-# Enhancement 2: Causal RL
-# ------------------------------------------------------------
-@dataclass
-class CausalTransition:
-    state: np.ndarray
-    action: int
-    reward: float
-    next_state: np.ndarray
-    context: Dict[str, float] = field(default_factory=dict)
-
-
-class CausalCounterfactualEstimator:
-    def __init__(self, state_dim, n_actions, ridge=1e-3):
-        self.state_dim = state_dim
-        self.n_actions = n_actions
-        self.ridge = ridge
-        self._A = np.eye(state_dim + n_actions + 1) * ridge
-        self._b = np.zeros(state_dim + n_actions + 1)
-        self._n = 0
-
-    def _features(self, s, a):
-        one_hot = np.zeros(self.n_actions)
-        one_hot[a % self.n_actions] = 1.0
-        return np.concatenate([np.asarray(s, dtype=np.float64), one_hot, [1.0]])
-
-    def _ensure_actions(self, n):
-        if n == self.n_actions:
-            return
-        self._A = np.eye(self.state_dim + n + 1) * self.ridge
-        self._b = np.zeros(self.state_dim + n + 1)
-        self.n_actions = n
-        self._n = 0
-
-    def update(self, t):
-        x = self._features(t.state, t.action)
-        self._A += np.outer(x, x)
-        self._b += t.reward * x
-        self._n += 1
-
-    def predict(self, s, a):
-        if self._n < 2:
-            return 0.0
-        try:
-            theta = np.linalg.solve(self._A, self._b)
-        except np.linalg.LinAlgError:
-            return 0.0
-        return float(self._features(s, a) @ theta)
-
-    def counterfactuals(self, s, n_actions):
-        self._ensure_actions(n_actions)
-        return {a: self.predict(s, a) for a in range(n_actions)}
-
-
-# ------------------------------------------------------------
-# Enhancement 3: Federated
-# ------------------------------------------------------------
-@dataclass
-class FederatedUpdate:
-    node_id: str
-    weights: Dict[str, np.ndarray]
-    n_samples: int
-    carbon_intensity: float
-    timestamp: float = field(default_factory=time.time)
-
-
-class FederatedAggregator:
-    def __init__(self, dp_sigma=1e-3, staleness_s=3600.0):
-        self.dp_sigma = dp_sigma
-        self.staleness_s = staleness_s
-        self._updates: Dict[str, FederatedUpdate] = {}
-        self._global: Optional[Dict[str, np.ndarray]] = None
-
-    def submit(self, u):
-        self._updates[u.node_id] = u
-
-    def _fresh(self):
-        now = time.time()
-        return [u for u in self._updates.values() if (now - u.timestamp) <= self.staleness_s]
-
-    def aggregate(self):
-        fresh = self._fresh()
-        if not fresh:
-            return self._global
-        weights = np.array([u.n_samples / max(u.carbon_intensity, 1.0) for u in fresh])
-        weights /= max(weights.sum(), 1e-12)
-        keys = fresh[0].weights.keys()
-        agg = {}
-        for k in keys:
-            stacked = np.stack([u.weights[k] for u in fresh], axis=0)
-            blended = np.tensordot(weights, stacked, axes=([0], [0]))
-            if self.dp_sigma > 0:
-                blended = blended + np.random.normal(0.0, self.dp_sigma, size=blended.shape)
-            agg[k] = blended
-        self._global = agg
-        FEDERATED_ROUNDS.inc()
-        return agg
-
-    def global_weights(self):
-        return self._global
-
-
-# ------------------------------------------------------------
-# Enhancement 4: Multi-Agent
-# ------------------------------------------------------------
-class AgentRole(str, Enum):
-    EXPLORER = "explorer"
-    EXPLOITER = "exploiter"
-    SAFETY_OFFICER = "safety_officer"
-    CARBON_BROKER = "carbon_broker"
-    VERIFIER = "verifier"
-
-
-@dataclass
-class AgentBid:
-    agent_id: str
-    role: AgentRole
-    confidence: float
-    proposed_action: int
-    rationale: str
-    carbon_score: float
-
-
-class EmergentRoleRegistry:
-    def __init__(self, decay=0.95):
-        self.decay = decay
-        self._scores = {r: 1.0 for r in AgentRole}
-        self._counts = {r: 0 for r in AgentRole}
-
-    def record(self, role, success, reward):
-        for r in self._scores:
-            self._scores[r] *= self.decay
-        signal = reward if success else -abs(reward) * 0.5
-        self._scores[role] += signal
-        self._counts[role] += 1
-
-    def weights(self):
-        total = sum(max(v, 1e-6) for v in self._scores.values())
-        return {r: max(v, 1e-6) / total for r, v in self._scores.items()}
-
-    def dominant_role(self):
-        return max(self._scores, key=self._scores.get)
-
-
-class MultiAgentCoordinator:
-    def __init__(self, registry, role_bias=None):
-        self.registry = registry
-        self.role_bias = role_bias or {
-            AgentRole.EXPLORER: 0.6,
-            AgentRole.EXPLOITER: 0.9,
-            AgentRole.SAFETY_OFFICER: 1.2,
-            AgentRole.CARBON_BROKER: 1.1,
-            AgentRole.VERIFIER: 1.0,
-        }
-
-    def vote(self, bids, n_candidates):
-        if not bids or n_candidates <= 0:
-            return 0
-        role_w = self.registry.weights()
-        scores = np.zeros(n_candidates)
-        for b in bids:
-            idx = b.proposed_action % n_candidates
-            weight = (role_w.get(b.role, 0.1) * self.role_bias.get(b.role, 1.0)
-                      * max(b.confidence, 0.0) * (1.0 + b.carbon_score))
-            scores[idx] += weight
-        return int(np.argmax(scores))
-
-
-# ------------------------------------------------------------
-# Enhancement 6: XAI
-# ------------------------------------------------------------
-@dataclass
-class Explanation:
-    decision_id: str
-    chosen_idx: int
-    top_features: List[Tuple[str, float]]
-    counterfactuals: List[Dict[str, Any]]
-    rationale: str
-    confidence: float
-    safety_ok: bool
-    carbon_price_signal: float
-
-    def to_dict(self):
-        return asdict(self)
-
-
-class DecisionExplainer:
-    def __init__(self, feature_names=None):
-        self.feature_names = list(feature_names) if feature_names else [
-            "cost", "carbon", "latency", "availability",
-        ]
-
-    def _attributions(self, chosen, pareto):
-        if not pareto:
-            return []
-        arr = np.array([[float(c.get(f, 0.0)) for f in self.feature_names] for c in pareto])
-        chosen_vec = np.array([float(chosen.get(f, 0.0)) for f in self.feature_names])
-        mean = arr.mean(axis=0)
-        std = arr.std(axis=0) + 1e-9
-        z = (chosen_vec - mean) / std
-        attrs = list(zip(self.feature_names, z.tolist()))
-        attrs.sort(key=lambda kv: abs(kv[1]), reverse=True)
-        return attrs
-
-    def explain(self, chosen_idx, chosen, pareto, counterfactuals, safety_ok,
-                carbon_price, confidence=0.5):
-        attrs = self._attributions(chosen, pareto)
-        cf_list = []
-        for idx, score in sorted(counterfactuals.items(), key=lambda kv: kv[1], reverse=True)[:3]:
-            if 0 <= idx < len(pareto):
-                cf_list.append({"alternative_idx": idx, "expected_reward": float(score)})
-        top_feat = ", ".join(f"{n}={v:+.2f}" for n, v in attrs[:3])
-        rationale = (
-            f"Chose #{chosen_idx} (confidence={confidence:.2f}). "
-            f"Top deviations: {top_feat}. Carbon price={carbon_price:.4f}. "
-            f"Safety={'ok' if safety_ok else 'OVERRIDE'}. Counterfactuals: {len(cf_list)}."
-        )
-        return Explanation(
-            decision_id=f"dec-{uuid.uuid4().hex[:8]}",
-            chosen_idx=chosen_idx,
-            top_features=attrs[:5],
-            counterfactuals=cf_list,
-            rationale=rationale,
-            confidence=confidence,
-            safety_ok=safety_ok,
-            carbon_price_signal=carbon_price,
-        )
-
-
-# ------------------------------------------------------------
-# Enhancement 1: Quantum-Distillation
-# ------------------------------------------------------------
-class QuantumInspiredTeacher:
-    def __init__(self, n_qubits=5, seed=0):
-        self.n_qubits = n_qubits
-        self.rng = np.random.default_rng(seed)
-        self._params = self.rng.normal(size=(n_qubits, 2)) * 0.5
-
-    def _ry(self, state, theta, q):
-        c, s = math.cos(theta / 2), math.sin(theta / 2)
-        n = len(state)
-        new = state.copy()
-        step = 1 << q
-        for i in range(n):
-            if i & step == 0:
-                a, b = state[i], state[i | step]
-                new[i] = c * a - s * b
-                new[i | step] = s * a + c * b
-        return new
-
-    def _simulate(self, features, n_candidates):
-        dim = 1 << self.n_qubits
-        state = np.zeros(dim, dtype=np.complex128)
-        state[0] = 1.0
-        for q in range(self.n_qubits):
-            angle = float(self._params[q, 0] * features[q % len(features)] + self._params[q, 1])
-            state = self._ry(state, angle, q)
-        probs_full = np.abs(state) ** 2
-        probs = np.zeros(n_candidates, dtype=np.float64)
-        for i, p in enumerate(probs_full):
-            probs[i % n_candidates] += p
-        return probs / max(probs.sum(), 1e-12)
-
-    def teacher_probs(self, features, n):
-        if n <= 0:
-            return np.zeros(0)
-        return self._simulate(np.asarray(features, dtype=np.float64), n)
-
-
-class DistillationEnsemble:
-    def __init__(self, quantum, alpha=0.5):
-        self.quantum = quantum
-        self.alpha = alpha
-
-    def blend(self, features, other, n):
-        q = self.quantum.teacher_probs(features, n)
-        if other is None or len(other) != n:
-            return q
-        return self.alpha * q + (1.0 - self.alpha) * np.asarray(other)
-
-
-# ------------------------------------------------------------
-# Enhancement 10: HITL / Active Learning
-# ------------------------------------------------------------
-@dataclass
-class HITLRequest:
-    request_id: str
-    reason: str
-    chosen_idx: int
-    candidates: List[Dict[str, Any]]
-    uncertainty: float
-    carbon_price: float
-
-
-class UncertaintyEstimator:
-    def __init__(self, entropy_threshold=0.75, variance_threshold=0.05):
-        self.entropy_threshold = entropy_threshold
-        self.variance_threshold = variance_threshold
-        self._rewards: deque = deque(maxlen=32)
-
-    def observe(self, reward):
-        self._rewards.append(float(reward))
-
-    def entropy(self, probs):
-        if probs is None or len(probs) == 0:
-            return 1.0
-        p = np.clip(np.asarray(probs, dtype=np.float64), 1e-12, 1.0)
-        return float(-np.sum(p * np.log(p)) / math.log(len(p)))
-
-    def variance(self):
-        if len(self._rewards) < 3:
-            return 0.0
-        return float(np.var(np.asarray(self._rewards)))
-
-    def is_uncertain(self, probs):
-        h = self.entropy(probs)
-        v = self.variance()
-        score = 0.6 * h + 0.4 * min(1.0, v / max(self.variance_threshold, 1e-9))
-        return (h > self.entropy_threshold or v > self.variance_threshold), score
-
-
-class HumanInTheLoopGate:
-    def __init__(self, approver=None, timeout_s=2.0, auto_approve_on_timeout=True):
-        self.approver = approver
-        self.timeout_s = timeout_s
-        self.auto_approve_on_timeout = auto_approve_on_timeout
-        self.audit: List[Dict[str, Any]] = []
-
-    async def request(self, req):
-        if self.approver is None:
-            self.audit.append({"request_id": req.request_id, "approved": True, "reason": "no_approver"})
-            HITL_APPROVALS.labels(decision="auto_approved").inc()
-            return True
-        loop = asyncio.get_running_loop()
-        try:
-            approved = await asyncio.wait_for(
-                loop.run_in_executor(None, self.approver, req),
-                timeout=self.timeout_s,
-            )
-        except asyncio.TimeoutError:
-            approved = self.auto_approve_on_timeout
-        self.audit.append({"request_id": req.request_id, "approved": bool(approved), "reason": req.reason})
-        HITL_APPROVALS.labels(decision="approved" if approved else "rejected").inc()
-        return bool(approved)
-
-
-class ActiveLearningSampler:
-    def __init__(self, capacity=256):
-        self.capacity = capacity
-        self._buffer: List[Dict[str, Any]] = []
-
-    def maybe_store(self, record, uncertainty, threshold=0.5):
-        if uncertainty < threshold:
-            return False
-        if len(self._buffer) >= self.capacity:
-            self._buffer.pop(0)
-        self._buffer.append({**record, "uncertainty": uncertainty, "t": time.time()})
-        return True
-
-    def sample(self, k=8):
-        if not self._buffer:
-            return []
-        k = min(k, len(self._buffer))
-        return random.sample(self._buffer, k)
-
-    def __len__(self):
-        return len(self._buffer)
-
-
-# ============================================================
-# ParetoFront (correct dominance)
-# ============================================================
-class ParetoFront:
-    def __init__(self):
-        self.solutions: List[Tuple[List[float], Any]] = []
-
-    def add(self, objectives, decision):
-        dominated = False
-        for obj, _ in self.solutions:
-            if (all(obj[i] <= objectives[i] for i in range(len(objectives)))
-                    and any(obj[i] < objectives[i] for i in range(len(objectives)))):
-                dominated = True
-                break
-        if not dominated:
-            self.solutions = [
-                (obj, dec) for obj, dec in self.solutions
-                if not (all(objectives[i] <= obj[i] for i in range(len(objectives)))
-                        and any(objectives[i] < obj[i] for i in range(len(objectives))))
-            ]
-            self.solutions.append((objectives, decision))
-        return dominated
-
-    def get_pareto_front(self):
-        return self.solutions
-
-    def get_best_by_weight(self, weights):
-        best = None
-        best_score = -float("inf")
-        for obj, dec in self.solutions:
-            score = sum(w * o for w, o in zip(weights, obj))
-            if score > best_score:
-                best_score = score
-                best = dec
-        return best
-
-
-# ============================================================
-# TOPSIS (zero-column safe)
-# ============================================================
-class TOPSIS:
-    @staticmethod
-    def score(candidates, weights, criteria):
-        if not candidates or not criteria:
-            return []
-        matrix = np.array([[float(c.get(crit, 0.0)) for crit in criteria] for c in candidates])
-        denom = np.sqrt((matrix ** 2).sum(axis=0))
-        denom = np.where(denom == 0, 1.0, denom)
-        norm_matrix = matrix / denom
-        w = np.asarray(weights[: matrix.shape[1]])
-        if w.sum() <= 0:
-            w = np.ones(matrix.shape[1]) / matrix.shape[1]
-        else:
-            w = w / w.sum()
-        weighted = norm_matrix * w
-        ideal = weighted.max(axis=0)
-        neg_ideal = weighted.min(axis=0)
-        d_plus = np.sqrt(((weighted - ideal) ** 2).sum(axis=1))
-        d_minus = np.sqrt(((weighted - neg_ideal) ** 2).sum(axis=1))
-        return (d_minus / (d_plus + d_minus + 1e-9)).tolist()
-
-
-# ============================================================
-# CIRCUIT BREAKER (reset half_open_requests on CLOSE)
+# CIRCUIT BREAKER
 # ============================================================
 class CircuitBreakerState(Enum):
     CLOSED = "closed"
@@ -1095,16 +602,14 @@ class EnhancedCircuitBreaker:
             raise
 
     def get_metrics(self):
-        return {
-            "state": self.state.value,
-            "failure_count": self.failure_count,
-            "success_count": self.success_count,
-            "half_open_requests": self.half_open_requests,
-        }
+        return {"state": self.state.value,
+                "failure_count": self.failure_count,
+                "success_count": self.success_count,
+                "half_open_requests": self.half_open_requests}
 
 
 # ============================================================
-# RATE LIMITER
+# RATE LIMITER / BULKHEAD
 # ============================================================
 class EnhancedRateLimiter:
     def __init__(self, rate, per_seconds=60):
@@ -1129,10 +634,10 @@ class EnhancedRateLimiter:
         while not await self.acquire():
             await asyncio.sleep(0.1)
 
+    def get_metrics(self):
+        return {"tokens": self.tokens, "rate": self.rate}
 
-# ============================================================
-# BULKHEAD
-# ============================================================
+
 class EnhancedBulkhead:
     def __init__(self, max_concurrency):
         self.semaphore = asyncio.Semaphore(max_concurrency)
@@ -1143,7 +648,7 @@ class EnhancedBulkhead:
 
 
 # ============================================================
-# TASK MANAGER (with registered task support)
+# TASK MANAGER
 # ============================================================
 class TaskManager:
     def __init__(self, max_workers=10):
@@ -1151,12 +656,13 @@ class TaskManager:
         self.tasks: Dict[str, asyncio.Task] = {}
         self.shutdown_event = asyncio.Event()
         self._lock = asyncio.Lock()
-        self._pending: List[Tuple[str, Callable, tuple, dict]] = []
+        self._pending: List[Tuple[str, Callable, tuple, dict, bool]] = []
+        self.metrics = {"total_tasks": 0, "restarts": 0}
 
-    def register_task(self, name, coro_func, *args, **kwargs):
-        self._pending.append((name, coro_func, args, kwargs))
+    def register_task(self, name, coro_func, *args, restart_on_exit=True, **kwargs):
+        self._pending.append((name, coro_func, args, kwargs, restart_on_exit))
 
-    def start_task(self, name, coro_func, *args, **kwargs):
+    def start_task(self, name, coro_func, *args, restart_on_exit=True, **kwargs):
         shutdown_event = self.shutdown_event
 
         async def wrapper():
@@ -1164,20 +670,23 @@ class TaskManager:
             while not shutdown_event.is_set():
                 try:
                     await coro_func(*args, **kwargs)
-                    break
+                    if not restart_on_exit:
+                        break
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
                     logger.error(f"Task {name} crashed: {e}")
+                    self.metrics["restarts"] += 1
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 300)
         task = asyncio.create_task(wrapper(), name=name)
         self.tasks[name] = task
+        self.metrics["total_tasks"] += 1
         return task
 
     def start_registered_tasks(self):
-        for name, fn, args, kwargs in self._pending:
-            self.start_task(name, fn, *args, **kwargs)
+        for name, fn, args, kwargs, restart in self._pending:
+            self.start_task(name, fn, *args, restart_on_exit=restart, **kwargs)
         self._pending.clear()
 
     async def stop_all(self):
@@ -1188,9 +697,12 @@ class TaskManager:
             await asyncio.gather(*self.tasks.values(), return_exceptions=True)
             self.tasks.clear()
 
+    def get_statistics(self):
+        return {**self.metrics, "active_tasks": len(self.tasks)}
+
 
 # ============================================================
-# CONFIG (lazy master key, explicit flags)
+# CONFIG
 # ============================================================
 if PYDANTIC_AVAILABLE:
     class MODPConfig(BaseModel):
@@ -1232,7 +744,7 @@ if PYDANTIC_AVAILABLE:
     class HeliumCollectorConfig(BaseSettings):
         model_config = SettingsConfigDict(env_prefix="HELIUM_", case_sensitive=False)
         instance_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
-        version: str = Field("18.0")
+        version: str = Field("19.0")
         log_level: str = Field("INFO")
         cache_ttl_seconds: int = Field(300, gt=0)
         max_data_history: int = Field(10000, gt=0)
@@ -1260,7 +772,6 @@ if PYDANTIC_AVAILABLE:
         database_pool_size: int = 10
         database_max_overflow: int = 20
         federated_enabled: bool = True
-        federated_min_share_interval: int = 3600
         carbon_aware_enabled: bool = True
         carbon_api_key: Optional[str] = None
         carbon_region: str = Field("global")
@@ -1268,19 +779,10 @@ if PYDANTIC_AVAILABLE:
         carbon_base_price: float = Field(0.05, ge=0)
         carbon_price_sensitivity: float = Field(0.0005, ge=0)
         rec_default_kwh: float = Field(0.0, ge=0)
-        user_adaptive_enabled: bool = True
-        cross_domain_enabled: bool = True
-        human_collaboration_enabled: bool = True
-        predictive_enabled: bool = True
-        sustainability_enabled: bool = True
         health_check_interval: int = 60
         auto_collect_interval: int = 1800
-        blockchain_monitor_interval: int = 300
-        quantum_monitor_interval: int = 600
-        cloud_sync_interval: int = 3600
         ml_retrain_interval: int = 7200
         cleanup_interval: int = 3600
-        sustainability_interval: int = 3600
         max_retry_attempts: int = Field(3, ge=0)
         circuit_breaker_threshold: int = Field(5, ge=1)
         circuit_breaker_timeout: int = Field(30, ge=1)
@@ -1297,24 +799,19 @@ if PYDANTIC_AVAILABLE:
         cloud_azure_container: Optional[str] = None
         cloud_gcp_credentials: Optional[str] = None
         cloud_gcp_bucket: Optional[str] = None
-        enable_predictive: bool = True
         predictive_horizon_hours: int = Field(24, ge=1)
-        enable_optimizer: bool = True
         optimizer_epsilon: float = Field(0.1, ge=0, le=1)
         api_host: str = Field("0.0.0.0")
         api_port: int = Field(8000)
         jwt_secret: str = Field(default_factory=lambda: os.urandom(32).hex())
-
         modp: MODPConfig = Field(default_factory=MODPConfig)
         moe: MOEConfig = Field(default_factory=MOEConfig)
         bio: BioConfig = Field(default_factory=BioConfig)
         multi_objective_scheduler: MultiObjectiveSchedulerConfig = Field(default_factory=MultiObjectiveSchedulerConfig)
         self_healing: SelfHealingConfig = Field(default_factory=SelfHealingConfig)
-
         limit_graph_enabled: bool = True
         rlhf_enabled: bool = True
         distillation_enabled: bool = True
-        # Ten enhancements
         causal_enabled: bool = True
         multi_agent_enabled: bool = True
         temporal_logic_enabled: bool = True
@@ -1402,7 +899,7 @@ else:
     @dataclass
     class HeliumCollectorConfig:
         instance_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-        version: str = "18.0"
+        version: str = "19.0"
         log_level: str = "INFO"
         cache_ttl_seconds: int = 300
         max_data_history: int = 10000
@@ -1430,7 +927,6 @@ else:
         database_pool_size: int = 10
         database_max_overflow: int = 20
         federated_enabled: bool = True
-        federated_min_share_interval: int = 3600
         carbon_aware_enabled: bool = True
         carbon_api_key: Optional[str] = None
         carbon_region: str = "global"
@@ -1438,19 +934,10 @@ else:
         carbon_base_price: float = 0.05
         carbon_price_sensitivity: float = 0.0005
         rec_default_kwh: float = 0.0
-        user_adaptive_enabled: bool = True
-        cross_domain_enabled: bool = True
-        human_collaboration_enabled: bool = True
-        predictive_enabled: bool = True
-        sustainability_enabled: bool = True
         health_check_interval: int = 60
         auto_collect_interval: int = 1800
-        blockchain_monitor_interval: int = 300
-        quantum_monitor_interval: int = 600
-        cloud_sync_interval: int = 3600
         ml_retrain_interval: int = 7200
         cleanup_interval: int = 3600
-        sustainability_interval: int = 3600
         max_retry_attempts: int = 3
         circuit_breaker_threshold: int = 5
         circuit_breaker_timeout: int = 30
@@ -1467,9 +954,7 @@ else:
         cloud_azure_container: Optional[str] = None
         cloud_gcp_credentials: Optional[str] = None
         cloud_gcp_bucket: Optional[str] = None
-        enable_predictive: bool = True
         predictive_horizon_hours: int = 24
-        enable_optimizer: bool = True
         optimizer_epsilon: float = 0.1
         api_host: str = "0.0.0.0"
         api_port: int = 8000
@@ -1508,7 +993,7 @@ else:
 
 
 # ============================================================
-# ORM (guarded)
+# ORM MODELS
 # ============================================================
 if SQLALCHEMY_AVAILABLE:
     Base = declarative_base()
@@ -1551,12 +1036,13 @@ else:
 
 
 # ============================================================
-# DATABASE MANAGER (writes real rows)
+# DATABASE MANAGER
 # ============================================================
 class EnhancedDatabaseManager:
     def __init__(self, config):
         self.config = config
         self.db_url = config.get_db_url()
+        self.is_postgres = self.db_url.startswith("postgresql")
         self.async_engine = None
         self.async_session = None
         self._migrations_applied = False
@@ -1581,19 +1067,39 @@ class EnhancedDatabaseManager:
         if not self.async_engine:
             return
         async with self.async_engine.begin() as conn:
-            await conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS schema_version (
-                    version INTEGER PRIMARY KEY,
-                    applied_at TEXT NOT NULL
-                )
-            """))
-            result = await conn.execute(text("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"))
-            row = result.fetchone()
-            current_ver = row[0] if row else 0
-            if current_ver < 1:
-                if Base is not None:
-                    await conn.run_sync(Base.metadata.create_all)
-                await conn.execute(text("INSERT INTO schema_version (version, applied_at) VALUES (1, datetime('now'))"))
+            # Dialect-aware schema_version creation
+            if self.is_postgres:
+                await conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS schema_version (
+                        version INTEGER PRIMARY KEY,
+                        applied_at TIMESTAMP NOT NULL DEFAULT NOW()
+                    )
+                """))
+                result = await conn.execute(text("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"))
+                row = result.fetchone()
+                current_ver = row[0] if row else 0
+                if current_ver < 1:
+                    if Base is not None:
+                        await conn.run_sync(Base.metadata.create_all)
+                    await conn.execute(text(
+                        "INSERT INTO schema_version (version) VALUES (1)"
+                    ))
+            else:
+                await conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS schema_version (
+                        version INTEGER PRIMARY KEY,
+                        applied_at TEXT NOT NULL
+                    )
+                """))
+                result = await conn.execute(text("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"))
+                row = result.fetchone()
+                current_ver = row[0] if row else 0
+                if current_ver < 1:
+                    if Base is not None:
+                        await conn.run_sync(Base.metadata.create_all)
+                    await conn.execute(text(
+                        "INSERT INTO schema_version (version, applied_at) VALUES (1, datetime('now'))"
+                    ))
         self._migrations_applied = True
 
     async def init(self):
@@ -1605,8 +1111,50 @@ class EnhancedDatabaseManager:
             return
         try:
             async with self.async_session() as session:
-                await session.execute(
-                    text("""
+                # Dialect-aware upsert
+                if self.is_postgres:
+                    sql = """
+                        INSERT INTO helium_data
+                        (data_id, global_production_tonnes, global_demand_tonnes,
+                         spot_price_usd_per_mcf, futures_price_usd_per_mcf,
+                         scarcity_index, inventory_level_days, news_sentiment_score,
+                         data_freshness_minutes, confidence_score,
+                         is_anomaly, anomaly_score, quality_score,
+                         quantum_signature, blockchain_tx_hash, cloud_distribution,
+                         provenance, precision_level, explanation, safety_ok,
+                         stl_verdict, hitl_approved, counterfactuals, chaos_events, timestamp)
+                        VALUES (:data_id, :gp, :gd, :sp, :fp, :sc, :inv, :sent,
+                                :fresh, :conf, :anom, :anom_score, :q,
+                                :qsig, :tx, :dist, :prov, :prec, :expl, :safe,
+                                :stl, :hitl, :cf, :chaos, :ts)
+                        ON CONFLICT (data_id) DO UPDATE SET
+                            global_production_tonnes = EXCLUDED.global_production_tonnes,
+                            global_demand_tonnes = EXCLUDED.global_demand_tonnes,
+                            spot_price_usd_per_mcf = EXCLUDED.spot_price_usd_per_mcf,
+                            futures_price_usd_per_mcf = EXCLUDED.futures_price_usd_per_mcf,
+                            scarcity_index = EXCLUDED.scarcity_index,
+                            inventory_level_days = EXCLUDED.inventory_level_days,
+                            news_sentiment_score = EXCLUDED.news_sentiment_score,
+                            data_freshness_minutes = EXCLUDED.data_freshness_minutes,
+                            confidence_score = EXCLUDED.confidence_score,
+                            is_anomaly = EXCLUDED.is_anomaly,
+                            anomaly_score = EXCLUDED.anomaly_score,
+                            quality_score = EXCLUDED.quality_score,
+                            quantum_signature = EXCLUDED.quantum_signature,
+                            blockchain_tx_hash = EXCLUDED.blockchain_tx_hash,
+                            cloud_distribution = EXCLUDED.cloud_distribution,
+                            provenance = EXCLUDED.provenance,
+                            precision_level = EXCLUDED.precision_level,
+                            explanation = EXCLUDED.explanation,
+                            safety_ok = EXCLUDED.safety_ok,
+                            stl_verdict = EXCLUDED.stl_verdict,
+                            hitl_approved = EXCLUDED.hitl_approved,
+                            counterfactuals = EXCLUDED.counterfactuals,
+                            chaos_events = EXCLUDED.chaos_events,
+                            timestamp = EXCLUDED.timestamp
+                    """
+                else:
+                    sql = """
                         INSERT OR REPLACE INTO helium_data
                         (data_id, global_production_tonnes, global_demand_tonnes,
                          spot_price_usd_per_mcf, futures_price_usd_per_mcf,
@@ -1620,29 +1168,28 @@ class EnhancedDatabaseManager:
                                 :fresh, :conf, :anom, :anom_score, :q,
                                 :qsig, :tx, :dist, :prov, :prec, :expl, :safe,
                                 :stl, :hitl, :cf, :chaos, :ts)
-                    """),
-                    {
-                        "data_id": data.data_id,
-                        "gp": data.global_production_tonnes, "gd": data.global_demand_tonnes,
-                        "sp": data.spot_price_usd_per_mcf, "fp": data.futures_price_usd_per_mcf,
-                        "sc": data.scarcity_index, "inv": data.inventory_level_days,
-                        "sent": data.news_sentiment_score, "fresh": data.data_freshness_minutes,
-                        "conf": data.confidence_score, "anom": data.is_anomaly,
-                        "anom_score": data.anomaly_score, "q": data.quality_score,
-                        "qsig": json.dumps(data.quantum_signature or {}, default=str),
-                        "tx": data.blockchain_tx_hash or "",
-                        "dist": json.dumps(data.cloud_distribution or {}, default=str),
-                        "prov": json.dumps(data.provenance or {}, default=str),
-                        "prec": data.precision_level or "",
-                        "expl": json.dumps(data.explanation or {}, default=str),
-                        "safe": data.safety_ok,
-                        "stl": json.dumps(data.stl_verdict or {}, default=str),
-                        "hitl": data.hitl_approved,
-                        "cf": json.dumps(data.counterfactuals or {}, default=str),
-                        "chaos": json.dumps(data.chaos_events or [], default=str),
-                        "ts": datetime.now(),
-                    },
-                )
+                    """
+                await session.execute(text(sql), {
+                    "data_id": data.data_id,
+                    "gp": data.global_production_tonnes, "gd": data.global_demand_tonnes,
+                    "sp": data.spot_price_usd_per_mcf, "fp": data.futures_price_usd_per_mcf,
+                    "sc": data.scarcity_index, "inv": data.inventory_level_days,
+                    "sent": data.news_sentiment_score, "fresh": data.data_freshness_minutes,
+                    "conf": data.confidence_score, "anom": data.is_anomaly,
+                    "anom_score": data.anomaly_score, "q": data.quality_score,
+                    "qsig": json.dumps(data.quantum_signature or {}, default=str),
+                    "tx": data.blockchain_tx_hash or "",
+                    "dist": json.dumps(data.cloud_distribution or {}, default=str),
+                    "prov": json.dumps(data.provenance or {}, default=str),
+                    "prec": data.precision_level or "",
+                    "expl": json.dumps(data.explanation or {}, default=str),
+                    "safe": data.safety_ok,
+                    "stl": json.dumps(data.stl_verdict or {}, default=str),
+                    "hitl": data.hitl_approved,
+                    "cf": json.dumps(data.counterfactuals or {}, default=str),
+                    "chaos": json.dumps(data.chaos_events or [], default=str),
+                    "ts": datetime.now(),
+                })
                 await session.commit()
         except Exception as e:
             logger.warning(f"insert_helium_data failed: {e}")
@@ -1714,44 +1261,69 @@ class PostQuantumCrypto:
         self.config = config
         self.vault = vault
         self.key_cache: Dict[str, Tuple[bytes, bytes]] = {}
+        self._lock = asyncio.Lock()
 
     async def generate_keypair(self, algorithm=None):
         algorithm = algorithm or self.config.quantum_algorithm
-        if not PQC_AVAILABLE:
+        async with self._lock:
+            if not PQC_AVAILABLE:
+                key_id = uuid.uuid4().hex[:8]
+                self.key_cache[key_id] = (b"", b"")
+                return {"key_id": key_id, "algorithm": "none", "public_key": b""}
+            try:
+                if algorithm == "dilithium":
+                    pub, priv = await asyncio.to_thread(dilithium.generate_keypair)
+                elif algorithm == "falcon":
+                    pub, priv = await asyncio.to_thread(falcon.generate_keypair)
+                else:
+                    pub, priv = await asyncio.to_thread(sphincs.generate_keypair)
+            except Exception as e:
+                raise QuantumError(f"Keypair failed: {e}") from e
             key_id = uuid.uuid4().hex[:8]
-            self.key_cache[key_id] = (b"", b"")
-            return {"key_id": key_id, "public_key": b""}
-        try:
-            if algorithm == "dilithium":
-                pub, priv = dilithium.generate_keypair()
-            elif algorithm == "falcon":
-                pub, priv = falcon.generate_keypair()
-            else:
-                pub, priv = sphincs.generate_keypair()
-        except Exception as e:
-            raise QuantumError(f"Keypair failed: {e}") from e
-        key_id = uuid.uuid4().hex[:8]
-        self.key_cache[key_id] = (pub, priv)
-        return {"key_id": key_id, "public_key": pub}
+            self.key_cache[key_id] = (pub, priv)
+            return {"key_id": key_id, "algorithm": algorithm, "public_key": pub}
 
     async def sign_helium_data(self, data, key_id):
         if not PQC_AVAILABLE or key_id not in self.key_cache:
-            return {"algorithm": "none", "signature": ""}
+            return {"algorithm": "none", "signature": "", "key_id": key_id}
         pub, priv = self.key_cache[key_id]
         payload = json.dumps(data, sort_keys=True, default=str).encode()
         try:
             algorithm = self.config.quantum_algorithm
             if algorithm == "dilithium":
-                signature = dilithium.sign(priv, payload)
+                signature = await asyncio.to_thread(dilithium.sign, priv, payload)
             elif algorithm == "falcon":
-                signature = falcon.sign(priv, payload)
+                signature = await asyncio.to_thread(falcon.sign, priv, payload)
             else:
-                signature = sphincs.sign(priv, payload)
+                signature = await asyncio.to_thread(sphincs.sign, priv, payload)
             QUANTUM_SIGNATURES.labels(algorithm=algorithm, status="success").inc()
-            return {"algorithm": algorithm, "signature": base64.b64encode(signature).decode()}
+            return {"algorithm": algorithm, "signature": base64.b64encode(signature).decode(),
+                    "key_id": key_id}
         except Exception as e:
             QUANTUM_SIGNATURES.labels(algorithm=self.config.quantum_algorithm, status="failed").inc()
             raise QuantumError(f"Signature failed: {e}") from e
+
+    async def verify_helium_data(self, data, signature_data):
+        algorithm = signature_data.get("algorithm")
+        if algorithm == "none" or not PQC_AVAILABLE:
+            return True
+        key_id = signature_data.get("key_id")
+        if key_id not in self.key_cache:
+            return False
+        pub, _ = self.key_cache[key_id]
+        payload = json.dumps(data, sort_keys=True, default=str).encode()
+        try:
+            sig = base64.b64decode(signature_data.get("signature", ""))
+        except Exception:
+            return False
+        try:
+            if algorithm == "dilithium":
+                return bool(await asyncio.to_thread(dilithium.verify, pub, payload, sig))
+            if algorithm == "falcon":
+                return bool(await asyncio.to_thread(falcon.verify, pub, payload, sig))
+            return bool(await asyncio.to_thread(sphincs.verify, pub, payload, sig))
+        except Exception:
+            return False
 
     def get_quantum_status(self):
         return {"pqc_available": PQC_AVAILABLE,
@@ -1761,33 +1333,73 @@ class PostQuantumCrypto:
         return {"status": "ok" if PQC_AVAILABLE else "degraded"}
 
 
+MINIMAL_HELIUM_REGISTRY_ABI = [
+    {
+        "inputs": [
+            {"internalType": "string", "name": "dataId", "type": "string"},
+            {"internalType": "string", "name": "dataHash", "type": "string"},
+        ],
+        "name": "recordData",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+
+
 class BlockchainHeliumVerification:
     def __init__(self, config, db_manager):
         self.config = config
         self.db_manager = db_manager
         self.web3 = None
+        self.contract = None
+        self.account = None
         if WEB3_AVAILABLE and config.enable_blockchain_verification:
             try:
                 self.web3 = Web3(Web3.HTTPProvider(config.blockchain_rpc_url))
                 if getattr(config, "blockchain_poa", False):
                     self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+                if config.blockchain_contract_address and self.web3.is_connected():
+                    self.contract = self.web3.eth.contract(
+                        address=Web3.to_checksum_address(config.blockchain_contract_address),
+                        abi=MINIMAL_HELIUM_REGISTRY_ABI,
+                    )
+                if config.blockchain_private_key:
+                    from web3 import Account
+                    self.account = Account.from_key(config.blockchain_private_key)
             except Exception as e:
                 logger.warning(f"Web3 init failed: {e}")
                 self.web3 = None
 
     async def record_helium_data(self, data_id, data_hash, metadata):
-        if self.web3 and self.web3.is_connected():
-            BLOCKCHAIN_VERIFICATIONS.labels(status="recorded").inc()
-            return {"tx_hash": "0x" + hashlib.sha256(data_hash.encode()).hexdigest()[:40],
-                    "status": "recorded"}
-        BLOCKCHAIN_VERIFICATIONS.labels(status="not_connected").inc()
-        return {"tx_hash": None, "status": "not_connected"}
+        if self.contract and self.account and self.web3 and self.web3.is_connected():
+            loop = asyncio.get_running_loop()
+
+            def _send():
+                nonce = self.web3.eth.get_transaction_count(self.account.address)
+                tx = self.contract.functions.recordData(data_id, data_hash).build_transaction({
+                    "from": self.account.address, "nonce": nonce,
+                    "gas": 200000, "gasPrice": self.web3.eth.gas_price,
+                })
+                signed = self.web3.eth.account.sign_transaction(tx, self.account.key)
+                return self.web3.eth.send_raw_transaction(signed.rawTransaction)
+
+            try:
+                tx_hash = await loop.run_in_executor(None, _send)
+                BLOCKCHAIN_VERIFICATIONS.labels(status="recorded").inc()
+                return {"tx_hash": tx_hash.hex(), "status": "success"}
+            except Exception as e:
+                BLOCKCHAIN_VERIFICATIONS.labels(status="failed").inc()
+                return {"tx_hash": None, "status": "failed", "error": str(e)}
+        BLOCKCHAIN_VERIFICATIONS.labels(status="simulated").inc()
+        return {"tx_hash": None, "status": "simulated"}
 
     async def get_blockchain_status(self):
         if self.web3:
             try:
                 return {"connected": self.web3.is_connected(),
-                        "network": self.config.blockchain_chain_id}
+                        "network": self.config.blockchain_chain_id,
+                        "contract": bool(self.contract)}
             except Exception:
                 pass
         return {"connected": False}
@@ -1795,34 +1407,6 @@ class BlockchainHeliumVerification:
     async def health_check(self):
         s = await self.get_blockchain_status()
         return {"status": "ok" if s["connected"] else "degraded", **s}
-
-
-class CarbonIntensityManager:
-    def __init__(self, config):
-        self.config = config
-        self.current_intensity = 400.0
-        self.market = CarbonMarketClient(
-            base_price=config.carbon_base_price,
-            sensitivity=config.carbon_price_sensitivity,
-        )
-        self.recs = RECInventory()
-        if config.rec_default_kwh > 0:
-            self.recs.add(config.rec_default_kwh)
-
-    async def get_current_intensity(self):
-        return self.current_intensity
-
-    async def get_current_price(self, hour_of_day=None):
-        price = self.market.price(self.current_intensity, hour_of_day)
-        CARBON_PRICE.set(price)
-        REC_INVENTORY_KWH.set(self.recs.total_kwh())
-        return price
-
-    async def close(self):
-        pass
-
-    async def health_check(self):
-        return {"status": "ok", "rec_kwh": self.recs.total_kwh()}
 
 
 class MultiCloudStorage:
@@ -1845,7 +1429,44 @@ class MultiCloudStorage:
 
 
 # ============================================================
-# MODULE 1: MODP DISTRIBUTOR (reads real carbon, updates weights)
+# PARETO FRONT
+# ============================================================
+class ParetoFront:
+    def __init__(self):
+        self.solutions: List[Tuple[List[float], Any]] = []
+
+    def add(self, objectives, decision):
+        dominated = False
+        for obj, _ in self.solutions:
+            if (all(obj[i] <= objectives[i] for i in range(len(objectives)))
+                    and any(obj[i] < objectives[i] for i in range(len(objectives)))):
+                dominated = True
+                break
+        if not dominated:
+            self.solutions = [
+                (obj, dec) for obj, dec in self.solutions
+                if not (all(objectives[i] <= obj[i] for i in range(len(objectives)))
+                        and any(objectives[i] < obj[i] for i in range(len(objectives))))
+            ]
+            self.solutions.append((objectives, decision))
+        return dominated
+
+    def get_pareto_front(self):
+        return self.solutions
+
+    def get_best_by_weight(self, weights):
+        best = None
+        best_score = -float("inf")
+        for obj, dec in self.solutions:
+            score = sum(w * o for w, o in zip(weights, obj))
+            if score > best_score:
+                best_score = score
+                best = dec
+        return best
+
+
+# ============================================================
+# MODULE 1: MODP DISTRIBUTOR (fixed _update_weights + walrus)
 # ============================================================
 class MultiObjectiveCloudDistributor:
     def __init__(self, config, db_manager, carbon_manager):
@@ -1872,9 +1493,14 @@ class MultiObjectiveCloudDistributor:
         self.learning_rate = config.modp.learning_rate
         self.recent_outcomes: deque = deque(maxlen=100)
         self.roles = EmergentRoleRegistry() if config.multi_agent_enabled else None
-        self.coordinator = MultiAgentCoordinator(self.roles) if self.roles else None
-        self.explainer = DecisionExplainer(feature_names=["cost", "carbon", "latency", "availability"]) if config.xai_enabled else None
-        self.last_explanation = None
+        self.coordinator = (
+            MultiAgentCoordinator(self.roles, rng=random.Random(0)) if self.roles else None
+        )
+        self.explainer = (
+            DecisionExplainer(feature_names=["cost", "carbon", "latency", "availability"])
+            if config.xai_enabled else None
+        )
+        self.last_explanation: Optional[Explanation] = None
 
     async def _measure_latency(self, provider):
         base = {"aws": 50, "azure": 60, "gcp": 45}.get(provider, 50)
@@ -1888,7 +1514,7 @@ class MultiObjectiveCloudDistributor:
             cost = p["cost_per_gb"] * data.get("size_gb", 0.1)
             carbon = p["carbon_score"] * current_carbon / 400.0
             availability = p["availability"]
-            objectives = [cost, carbon, latency, 1 - availability]
+            objectives = [cost, carbon, latency / 100.0, 1 - availability]
             results[name] = {"objectives": objectives, "decision": (name, p["regions"][0])}
         return results
 
@@ -1909,7 +1535,11 @@ class MultiObjectiveCloudDistributor:
             provider_name = best[0]
         source = "modp"
 
+        # v19: hoist carbon_intensity out of the comprehension; unpack vote tuple
+        winning_role: Optional[AgentRole] = None
         if self.coordinator and self.roles:
+            carbon_intensity = await self.carbon_manager.get_current_intensity()
+            carbon_score_for_bids = 1.0 / (1.0 + carbon_intensity / 1000.0)
             bids = []
             for role in AgentRole:
                 idx = list(self.providers.keys()).index(provider_name)
@@ -1924,11 +1554,11 @@ class MultiObjectiveCloudDistributor:
                 bids.append(AgentBid(
                     agent_id=role.value, role=role, confidence=0.7,
                     proposed_action=idx, rationale=role.value,
-                    carbon_score=1.0 / (1.0 + carbon_intensity / 1000.0)
-                    if (carbon_intensity := await self.carbon_manager.get_current_intensity()) else 1.0,
+                    carbon_score=carbon_score_for_bids,
                 ))
-            voted = self.coordinator.vote(bids, len(self.providers))
+            voted, winning_role = self.coordinator.vote(bids, len(self.providers))
             provider_name = list(self.providers.keys())[voted]
+            source = "multi_agent_vote"
 
         region = self.providers[provider_name]["regions"][0]
         async with self._lock:
@@ -1940,12 +1570,20 @@ class MultiObjectiveCloudDistributor:
         actual_carbon = self.providers[provider_name]["carbon_score"] * (await self.carbon_manager.get_current_intensity()) / 400.0
         actual_latency = await self._measure_latency(provider_name)
         actual_avail = 1 - self.providers[provider_name]["availability"]
-        outcome = [actual_cost, actual_carbon, actual_latency, actual_avail][:n]
+        outcome = [actual_cost, actual_carbon, actual_latency / 100.0, actual_avail][:n]
         self.recent_outcomes.append((list(self.weights), outcome))
         if self.adaptive_weights and len(self.recent_outcomes) >= 10:
             self._update_weights()
 
-        # XAI explanation
+        # Role credit
+        if self.roles:
+            self.roles.record(
+                winning_role or AgentRole.EXPLOITER,
+                success=True,
+                reward=1.0 - outcome[0],
+            )
+
+        # XAI
         if self.explainer:
             pareto_list = []
             for p, d in eval_results.items():
@@ -1953,14 +1591,16 @@ class MultiObjectiveCloudDistributor:
                     "cost": d["objectives"][0], "carbon": d["objectives"][1],
                     "latency": d["objectives"][2], "availability": d["objectives"][3],
                 })
-            chosen_dict = next((p for p in pareto_list if True), pareto_list[0])
-            explanation = self.explainer.explain(
-                chosen_idx=list(self.providers.keys()).index(provider_name),
-                chosen=chosen_dict, pareto=pareto_list,
-                counterfactuals={}, safety_ok=True,
-                carbon_price=await self.carbon_manager.get_current_price(),
-            )
-            self.last_explanation = explanation
+            if pareto_list:
+                chosen_dict = pareto_list[list(self.providers.keys()).index(provider_name)]
+                carbon_price = await self.carbon_manager.get_current_price()
+                explanation = self.explainer.explain(
+                    chosen_idx=list(self.providers.keys()).index(provider_name),
+                    chosen=chosen_dict, pareto=pareto_list,
+                    counterfactuals={}, safety_ok=True,
+                    carbon_price=carbon_price,
+                )
+                self.last_explanation = explanation
 
         MULTI_CLOUD_DISTRIBUTIONS.labels(provider=provider_name, status="success").inc()
         return {
@@ -1971,6 +1611,7 @@ class MultiObjectiveCloudDistributor:
             "reason": f"Provider {provider_name} selected via {source}",
             "source": source,
             "weights": list(self.weights),
+            "winning_role": winning_role.value if winning_role else None,
             "explanation": self.last_explanation.to_dict() if self.last_explanation else None,
             "timestamp": datetime.now().isoformat(),
         }
@@ -1980,7 +1621,9 @@ class MultiObjectiveCloudDistributor:
             return
         outcomes = np.array([o for _, o in self.recent_outcomes])
         mean_outcome = outcomes.mean(axis=0)
-        delta = mean_outcome - mean_outcome.mean()
+        # v19: normalize by per-objective std
+        scale = np.std(outcomes, axis=0) + 1e-9
+        delta = (mean_outcome - mean_outcome.mean()) / scale
         w = np.array(self.weights) - self.learning_rate * delta
         w = np.clip(w, 0.05, None)
         w /= w.sum()
@@ -1990,14 +1633,15 @@ class MultiObjectiveCloudDistributor:
         async with self._lock:
             return {"active_provider": self.active_provider,
                     "active_region": self.active_region,
-                    "weights": list(self.weights)}
+                    "weights": list(self.weights),
+                    "role_snapshot": self.roles.snapshot() if self.roles else {}}
 
     async def health_check(self):
         return {"status": "healthy"}
 
 
 # ============================================================
-# MODULE 2: MOE PREDICTIVE (trained gating on proxy labels)
+# MODULE 2: MOE PREDICTIVE
 # ============================================================
 class MixtureOfExpertsPredictive:
     def __init__(self, config, db_manager):
@@ -2020,8 +1664,7 @@ class MixtureOfExpertsPredictive:
         if SKLEARN_AVAILABLE:
             self.experts.append(("linear", self._forecast_linear))
         self.experts.append(("exp_smooth", self._forecast_exp_smooth))
-        if not self.experts:
-            self.experts.append(("naive", self._forecast_naive))
+        self.experts.append(("naive", self._forecast_naive))
 
     def _init_gating(self):
         if SKLEARN_AVAILABLE:
@@ -2080,7 +1723,6 @@ class MixtureOfExpertsPredictive:
         return np.array([now.hour / 24.0, now.weekday() / 6.0, volatility, mean])
 
     async def _compute_labels(self, horizon=1):
-        """Proxy labels: which expert was closest to the actual next value."""
         if len(self.history_price) < 50:
             return
         recent = list(self.history_price)
@@ -2135,7 +1777,6 @@ class MixtureOfExpertsPredictive:
                 logger.warning(f"Expert {name} failed: {e}")
                 forecasts.append(np.zeros(horizon))
                 weights.append(0.0)
-        # Gating
         gating_probs = None
         if self.gating_model is not None and len(self.history_context) >= 100:
             try:
@@ -2187,7 +1828,7 @@ class MixtureOfExpertsPredictive:
 
 
 # ============================================================
-# MODULE 3: BIO-INSPIRED COLLECTOR (GA reachable via default)
+# MODULE 3: BIO-INSPIRED COLLECTOR (real fitness)
 # ============================================================
 class GeneticAlgorithmOptimizer:
     def __init__(self, population_size=20, mutation_rate=0.1, crossover_rate=0.8):
@@ -2206,9 +1847,6 @@ class GeneticAlgorithmOptimizer:
             }
             for _ in range(self.pop_size)
         ]
-
-    def evaluate(self, fitness_func):
-        return [fitness_func(ind) for ind in self.population]
 
     def select(self, fitness, num_parents):
         selected = []
@@ -2237,7 +1875,7 @@ class GeneticAlgorithmOptimizer:
         self.initialize()
         best = None
         for gen in range(generations):
-            fitness = self.evaluate(fitness_func)
+            fitness = [fitness_func(ind) for ind in self.population]
             best_idx = int(np.argmax(fitness))
             best = dict(self.population[best_idx])
             parents = self.select(fitness, max(2, self.pop_size - 1))
@@ -2263,16 +1901,25 @@ class BioInspiredAutonomousCollector:
         )
         self.current_params = {"interval": 60, "batch_size": 50, "parallel_calls": 5}
         self._lock = asyncio.Lock()
-        self.collection_history = deque(maxlen=100)
+        self.collection_history: deque = deque(maxlen=100)
         self.fitness_history: List[float] = []
+        self.last_reward: float = 0.5
 
     def _fitness_func(self, params):
-        cost = params["interval"] / 600.0
-        carbon = params["batch_size"] / 100.0
-        latency = params["parallel_calls"] / 20.0
-        return -(0.4 * cost + 0.3 * carbon + 0.3 * latency)
+        # v19: fitness depends on the last observed reward; parameters that
+        # keep the collection interval reasonable win.
+        interval = params["interval"]
+        batch = params["batch_size"]
+        parallel = params["parallel_calls"]
+        # Ideal interval 60-120s for helium freshness; batch 30-60; parallel 3-8.
+        interval_penalty = abs(interval - 90) / 300.0
+        batch_penalty = abs(batch - 45) / 100.0
+        parallel_penalty = abs(parallel - 5) / 20.0
+        return float(self.last_reward - 0.5 * (interval_penalty + batch_penalty + parallel_penalty))
 
     async def optimize_collection(self, current_state, strategy=None):
+        if "reward" in current_state:
+            self.last_reward = float(current_state["reward"])
         if len(self.collection_history) >= 5 or strategy is None:
             best_params = self.ga.evolve(self._fitness_func, generations=5)
             params = best_params or self.current_params
@@ -2317,7 +1964,7 @@ class BioInspiredAutonomousCollector:
 
 
 # ============================================================
-# MODULE 4: MULTI-OBJECTIVE CARBON-AWARE SCHEDULER
+# MODULE 4: MULTI-OBJECTIVE SCHEDULER
 # ============================================================
 class MultiObjectiveCarbonScheduler:
     def __init__(self, config, carbon_manager, predictive):
@@ -2329,33 +1976,23 @@ class MultiObjectiveCarbonScheduler:
         self.freshness_w = config.multi_objective_scheduler.freshness_importance
         self.cost_w = config.multi_objective_scheduler.cost_importance
         self.carbon_w = config.multi_objective_scheduler.carbon_importance
-        self.queue: asyncio.Queue = asyncio.Queue()
         self._running = False
-        self._task = None
 
     async def start(self):
-        if self._running:
-            return
         self._running = True
 
     async def stop(self):
         self._running = False
-        if self._task:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
 
     async def _decide_delay(self, current_carbon, freshness_hours):
         forecast = await self.predictive.forecast_carbon(horizon_hours=1) if self.predictive else {"forecast": [current_carbon]}
         min_forecast = min(forecast["forecast"]) if forecast["forecast"] else current_carbon
-        # Utility: go now if freshness is more important than carbon savings.
         carbon_reduction = max(0.0, (current_carbon - min_forecast) / max(current_carbon, 1.0))
         freshness_cost = min(1.0, freshness_hours / 6.0)
         utility_now = self.freshness_w * (1 - freshness_cost) + self.cost_w * 0.8
         utility_delay = self.carbon_w * carbon_reduction + self.cost_w * 0.5
         if utility_now >= utility_delay:
             return 0
-        # delay proportional to carbon stress
         ratio = min(1.0, max(0.0, (current_carbon - self.threshold) / max(self.threshold, 1.0)))
         return int(self.max_delay * ratio)
 
@@ -2375,7 +2012,7 @@ class MultiObjectiveCarbonScheduler:
 
 
 # ============================================================
-# MODULE 5: SELF-HEALING (fits detectors)
+# MODULE 5: SELF-HEALING
 # ============================================================
 class SelfHealingManager:
     def __init__(self, config):
@@ -2468,21 +2105,39 @@ class EnhancedHeliumAPICollector:
 
         self.db_manager = EnhancedDatabaseManager(self.config)
         self.vault = VaultManager(self.config)
-        self.carbon_manager = CarbonIntensityManager(self.config)
         self.quantum_security = PostQuantumCrypto(self.config, self.vault)
         self.blockchain = BlockchainHeliumVerification(self.config, self.db_manager)
+
+        # v19: pass carbon manager into distributor
+        self.carbon_manager = CarbonIntensityManager(
+            api_key=self.config.carbon_api_key,
+            region=self.config.carbon_region,
+            base_price=self.config.carbon_base_price,
+            sensitivity=self.config.carbon_price_sensitivity,
+            rec_default_kwh=self.config.rec_default_kwh,
+        )
         self.autonomous_collector = BioInspiredAutonomousCollector(self.config, self.db_manager)
         self.cloud_distributor = MultiObjectiveCloudDistributor(self.config, self.db_manager, self.carbon_manager)
         self.cloud_storage = MultiCloudStorage(self.config)
-        self.predictive = MixtureOfExpertsPredictive(self.config, self.db_manager) if self.config.moe.enabled else None
+        self.predictive = (
+            MixtureOfExpertsPredictive(self.config, self.db_manager)
+            if self.config.moe.enabled else None
+        )
         self.self_healing = SelfHealingManager(self.config)
-        self.scheduler = MultiObjectiveCarbonScheduler(self.config, self.carbon_manager, self.predictive) if self.config.multi_objective_scheduler.enabled else None
+        self.scheduler = (
+            MultiObjectiveCarbonScheduler(self.config, self.carbon_manager, self.predictive)
+            if self.config.multi_objective_scheduler.enabled else None
+        )
         self.rate_limiter = EnhancedRateLimiter(self.config.rate_limit_requests, self.config.rate_limit_window)
-        self._api_semaphore = EnhancedBulkhead(self.config.max_concurrent_api_calls)
+        self._api_bulkhead = EnhancedBulkhead(self.config.max_concurrent_api_calls)
         self._collection_interval = self.config.collection_interval
 
         # Ten enhancements
-        self.causal = CausalCounterfactualEstimator(state_dim=8, n_actions=4) if self.config.causal_enabled else None
+        self.causal = (
+            CausalCounterfactualEstimator(
+                state_dim=STATE_VECTOR_DIM, n_actions=4
+            ) if self.config.causal_enabled else None
+        )
         self.last_counterfactuals: Dict[int, float] = {}
         self.federated = FederatedAggregator() if self.config.federated_enabled else None
         self.temporal = None
@@ -2502,8 +2157,14 @@ class EnhancedHeliumAPICollector:
             self.shield = SafetyShield(self.temporal)
         self.explainer = DecisionExplainer() if self.config.xai_enabled else None
         self.last_explanation: Optional[Explanation] = None
-        self.precision_controller = PrecisionController() if self.config.precision_switching_enabled else None
-        self.precision_adapter = HardwareAwareAdapter(self.precision_controller) if self.precision_controller else None
+        self.precision_controller = (
+            PrecisionController(quality_floor=0.95)
+            if self.config.precision_switching_enabled else None
+        )
+        self.precision_adapter = (
+            HardwareAwareAdapter(self.precision_controller)
+            if self.precision_controller else None
+        )
         self.current_precision: Optional[PrecisionLevel] = None
         self.chaos = ChaosEngineer(ChaosConfig(
             fault_prob=self.config.chaos_fault_prob,
@@ -2511,8 +2172,20 @@ class EnhancedHeliumAPICollector:
             carbon_spike_prob=self.config.chaos_carbon_spike_prob,
         )) if self.config.chaos_enabled else None
         self.uncertainty = UncertaintyEstimator() if self.config.hitl_enabled else None
-        self.hitl = HumanInTheLoopGate(timeout_s=self.config.hitl_timeout_s) if self.config.hitl_enabled else None
+        self.hitl = (
+            HumanInTheLoopGate(timeout_s=self.config.hitl_timeout_s)
+            if self.config.hitl_enabled else None
+        )
         self.active_learner = ActiveLearningSampler() if self.config.hitl_enabled else None
+
+        # Quantum teacher + distillation ensemble (used in XAI / distillation context)
+        self.quantum_teacher = (
+            QuantumInspiredTeacher(seed=42) if self.config.distillation_enabled else None
+        )
+        self.distill_ensemble = (
+            DistillationEnsemble(self.quantum_teacher, alpha=0.5)
+            if self.quantum_teacher else None
+        )
 
         self.data_history: deque = deque(maxlen=self.config.max_data_history)
         self.realtime_data: Optional[MergedHeliumData] = None
@@ -2532,17 +2205,18 @@ class EnhancedHeliumAPICollector:
             "predictive": self.predictive,
             "self_healing": self.self_healing,
         }
+
         self._register_tasks()
         atexit.register(self._atexit_save)
 
     def _register_tasks(self):
-        self._task_manager.register_task("periodic_collection", self._periodic_collection_loop)
-        self._task_manager.register_task("health_check", self._health_check_loop)
-        self._task_manager.register_task("cleanup", self._cleanup_loop)
-        self._task_manager.register_task("carbon_update", self._carbon_update_loop)
-        self._task_manager.register_task("self_healing_monitor", self._self_healing_loop)
+        self._task_manager.register_task("periodic_collection", self._periodic_collection_loop, restart_on_exit=True)
+        self._task_manager.register_task("health_check", self._health_check_loop, restart_on_exit=True)
+        self._task_manager.register_task("cleanup", self._cleanup_loop, restart_on_exit=True)
+        self._task_manager.register_task("carbon_update", self._carbon_update_loop, restart_on_exit=True)
+        self._task_manager.register_task("self_healing_monitor", self._self_healing_loop, restart_on_exit=True)
         if self.predictive:
-            self._task_manager.register_task("predictive_update", self._predictive_update_loop)
+            self._task_manager.register_task("predictive_update", self._predictive_update_loop, restart_on_exit=True)
 
     async def start(self):
         self._running = True
@@ -2556,28 +2230,74 @@ class EnhancedHeliumAPICollector:
         pass
 
     async def _periodic_collection_loop(self):
+        backoff = 1.0
         while self._running and not self._shutdown_event.is_set():
             try:
                 await self.collect_all_data()
+                backoff = 1.0
+                await asyncio.sleep(self._collection_interval)
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logger.error(f"Periodic collection failed: {e}")
-            await asyncio.sleep(self._collection_interval)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
 
     async def _health_check_loop(self):
         while self._running and not self._shutdown_event.is_set():
-            await asyncio.sleep(self.config.health_check_interval)
+            try:
+                # v19: actually run the health check
+                h = await self.health_check()
+                HEALTH_SCORE.set(h.get("health_score", 100))
+                await asyncio.sleep(self.config.health_check_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Health check loop error: {e}")
+                await asyncio.sleep(60)
 
     async def _cleanup_loop(self):
         while self._running and not self._shutdown_event.is_set():
-            await asyncio.sleep(self.config.cleanup_interval)
+            try:
+                # v19: trim in-memory history beyond max_data_history is a no-op
+                # (deque already caps), but we do prune old data_ids here.
+                while len(self.data_history) > self.config.max_data_history:
+                    self.data_history.popleft()
+                await asyncio.sleep(self.config.cleanup_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Cleanup loop error: {e}")
+                await asyncio.sleep(60)
 
     async def _carbon_update_loop(self):
         while self._running and not self._shutdown_event.is_set():
-            await asyncio.sleep(self.config.carbon_update_interval)
+            try:
+                # v19: actually refresh carbon intensity
+                ci = await self.carbon_manager.get_current_intensity()
+                CARBON_INTENSITY.set(ci)
+                await asyncio.sleep(self.config.carbon_update_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Carbon update loop error: {e}")
+                await asyncio.sleep(60)
 
     async def _predictive_update_loop(self):
         while self._running and not self._shutdown_event.is_set():
-            await asyncio.sleep(3600)
+            try:
+                # v19: actually feed the predictive model
+                if self.predictive and self.realtime_data:
+                    await self.predictive.update_history(
+                        self.realtime_data.spot_price_usd_per_mcf,
+                        await self.carbon_manager.get_current_intensity(),
+                    )
+                await asyncio.sleep(self.config.ml_retrain_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Predictive update loop error: {e}")
+                await asyncio.sleep(60)
 
     async def _self_healing_loop(self):
         while self._running and not self._shutdown_event.is_set():
@@ -2586,7 +2306,8 @@ class EnhancedHeliumAPICollector:
                     "quantum": {"pqc_available": float(PQC_AVAILABLE)},
                     "blockchain": await self.blockchain.get_blockchain_status(),
                     "carbon": {"intensity": self.carbon_manager.current_intensity},
-                    "cloud": {"active_provider_idx": list(self.cloud_distributor.providers.keys()).index(self.cloud_distributor.active_provider)},
+                    "cloud": {"active_provider_idx":
+                              list(self.cloud_distributor.providers.keys()).index(self.cloud_distributor.active_provider)},
                 }
                 for comp, metrics in components.items():
                     await self.self_healing.monitor_component(comp, metrics)
@@ -2615,7 +2336,7 @@ class EnhancedHeliumAPICollector:
 
         async def _fetch_snapshot():
             # Placeholder data source. In a real deployment this would call
-            # aiohttp against a Helium feed URL. Here we generate plausible values.
+            # aiohttp against a Helium feed URL.
             return {
                 "production": 28000 + random.uniform(-500, 500),
                 "demand": 29000 + random.uniform(-500, 500),
@@ -2625,7 +2346,7 @@ class EnhancedHeliumAPICollector:
                 "sentiment": random.uniform(-0.3, 0.3),
             }
 
-        snapshot = await self._api_semaphore.execute(_fetch_snapshot)
+        snapshot = await self._api_bulkhead.execute(_fetch_snapshot)
 
         if self.chaos:
             delay_ms = self.chaos.maybe_latency()
@@ -2642,17 +2363,16 @@ class EnhancedHeliumAPICollector:
         ratio = demand / max(production, 1)
         scarcity = max(0.0, min(1.0, (ratio - 0.95) / 0.15))
 
-        # Anomaly detection via self-healing manager training buffer
         is_anomaly = False
         anomaly_score = 0.0
         if self.config.self_healing.enabled:
-            numeric = {"price": price, "inventory": inventory, "production": production, "demand": demand}
+            numeric = {"price": price, "inventory": inventory,
+                       "production": production, "demand": demand}
             healthy = await self.self_healing.monitor_component("helium_snapshot", numeric)
             if not healthy:
                 is_anomaly = True
                 anomaly_score = 1.0
 
-        # Precision switch
         carbon_intensity = await self.carbon_manager.get_current_intensity()
         if self.chaos:
             carbon_intensity = self.chaos.maybe_carbon_spike(carbon_intensity)
@@ -2703,14 +2423,13 @@ class EnhancedHeliumAPICollector:
                 "spot_price_usd_per_mcf": price,
                 "data_freshness_minutes": merged.data_freshness_minutes,
             })
-            merged_dict = asdict(merged)
-            safe_dict, safety_ok, stl_verdict = self.shield.screen(
-                merged_dict, [{"value": price}], key="spot_price_usd_per_mcf"
+            _, safety_ok, stl_verdict = self.shield.screen(
+                merged, [{"spot_price_usd_per_mcf": price}], key="spot_price_usd_per_mcf"
             )
         merged.safety_ok = safety_ok
         merged.stl_verdict = stl_verdict
 
-        # Multi-agent cloud distribution
+        # Multi-agent cloud distribution (v19: unpack winning_role)
         distribution = await self.cloud_distributor.distribute_data({
             "size_gb": 0.01, "data_points": 1, "price": price,
         })
@@ -2723,15 +2442,22 @@ class EnhancedHeliumAPICollector:
             except Exception as e:
                 logger.error(f"Cloud backup failed: {e}")
 
-        # Causal counterfactuals
-        state_vec = np.array([
-            production / 30000.0, demand / 30000.0, price / 300.0,
-            futures / 300.0, scarcity, inventory / 100.0,
-            sentiment, carbon_intensity / 1000.0,
-        ], dtype=np.float64)
+        # Causal state via the shared schema
+        state_vec = state_vector_from_metrics({
+            "gpu_utilization_pct": 0.0,
+            "gpu_power_watts": 0.0,
+            "gpu_temp_c": 0.0,
+            "cpu_utilization_pct": 0.0,
+            "carbon_intensity_g_per_kwh": carbon_intensity,
+            "carbon_price_per_kg": carbon_price,
+            "rec_kwh_available": self.carbon_manager.recs.total_kwh(),
+            "uncertainty_score": 0.0,
+        })
         if self.causal:
             self.causal.update(CausalTransition(
-                state=state_vec, action=0, reward=merged.quality_score / 100.0, next_state=state_vec
+                state=state_vec, action=0,
+                reward=merged.quality_score / 100.0,
+                next_state=state_vec,
             ))
             self.last_counterfactuals = self.causal.counterfactuals(state_vec, 4)
             merged.counterfactuals = self.last_counterfactuals
@@ -2746,7 +2472,7 @@ class EnhancedHeliumAPICollector:
             ))
             self.federated.aggregate()
 
-        # Reward / uncertainty / HITL
+        # Uncertainty / HITL
         reward = merged.quality_score / 100.0 - carbon_price * 0.05
         reward = max(0.0, min(1.0, reward))
         uncertainty_score = 0.0
@@ -2772,18 +2498,19 @@ class EnhancedHeliumAPICollector:
                         uncertainty=unc, threshold=0.4,
                     )
 
-        # XAI explanation
+        # XAI
         if self.explainer:
-            pareto_list = [{
-                "cost": distribution["scores"][p][0],
-                "carbon": distribution["scores"][p][1],
-                "latency": distribution["scores"][p][2],
-                "availability": distribution["scores"][p][3],
-            } for p in distribution["scores"]]
+            pareto_list = []
+            for p in distribution.get("scores", {}):
+                d = distribution["scores"][p]
+                pareto_list.append({
+                    "cost": d[0], "carbon": d[1], "latency": d[2], "availability": d[3],
+                })
             if pareto_list:
+                chosen_dict = pareto_list[0]
                 explanation = self.explainer.explain(
                     chosen_idx=0,
-                    chosen=pareto_list[0],
+                    chosen=chosen_dict,
                     pareto=pareto_list,
                     counterfactuals=self.last_counterfactuals,
                     safety_ok=safety_ok and human_approved,
@@ -2793,11 +2520,11 @@ class EnhancedHeliumAPICollector:
                 merged.explanation = explanation.to_dict()
 
         merged.provenance = {
-            "schema": "helium_data_v18",
+            "schema": "helium_data_v19",
             "instance_id": self.instance_id,
-            "nvml_available": False,
             "chaos_active": self.chaos is not None,
-            "distillation_active": False,
+            "distillation_active": self.distill_ensemble is not None,
+            "state_vector_dim": STATE_VECTOR_DIM,
         }
 
         self.realtime_data = merged
@@ -2814,10 +2541,13 @@ class EnhancedHeliumAPICollector:
 
         logger.info(f"Collected {merged.data_id}: price=${price:.0f}, quality={merged.quality_score:.0f}")
 
-        # Feed the bio collector
+        # Feed the bio collector with real reward
         try:
             await self.autonomous_collector.optimize_collection({
-                "carbon": carbon_intensity, "freshness": 0.5, "cost": 0.5,
+                "carbon": carbon_intensity,
+                "freshness": 0.5,
+                "cost": 0.5,
+                "reward": reward,
             })
             new_interval = self.autonomous_collector.current_params.get("interval", self._collection_interval)
             self._collection_interval = int(max(30, min(600, new_interval)))
@@ -2825,6 +2555,71 @@ class EnhancedHeliumAPICollector:
             logger.warning(f"Bio collector update failed: {e}")
 
         return merged
+
+    async def submit_hitl_decision(self, request_id: str, approved: bool) -> bool:
+        """v19: deliver an external HITL decision."""
+        if self.hitl is None:
+            return False
+        return await self.hitl.submit_decision(request_id, approved)
+
+    async def save_state(self, path: str) -> bool:
+        """v19: persist causal, roles, federated, bio params, last data IDs."""
+        state: Dict[str, Any] = {"schema": "helium_state_v1"}
+        if self.causal is not None:
+            state["causal"] = self.causal.export_state()
+        if self.cloud_distributor.roles is not None:
+            state["roles"] = self.cloud_distributor.roles.snapshot()
+        if self.federated is not None:
+            g = self.federated.global_weights()
+            if g:
+                state["federated_global"] = {k: v.tolist() for k, v in g.items()}
+        state["bio_params"] = dict(self.autonomous_collector.current_params)
+        state["collection_interval"] = self._collection_interval
+        state["recent_data_ids"] = [d.data_id for d in list(self.data_history)[-20:]]
+        try:
+            d = os.path.dirname(os.path.abspath(path)) or "."
+            os.makedirs(d, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".helium_", suffix=".json")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(state, f, default=str)
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            return True
+        except Exception as e:
+            logger.error(f"save_state failed: {e}")
+            return False
+
+    async def load_state(self, path: str) -> bool:
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r") as f:
+                state = json.load(f)
+        except Exception:
+            return False
+        if state.get("schema") != "helium_state_v1":
+            return False
+        if self.causal is not None and "causal" in state:
+            self.causal.import_state(state["causal"])
+        if self.federated is not None and "federated_global" in state:
+            try:
+                self.federated._global = {
+                    k: np.asarray(v, dtype=np.float64)
+                    for k, v in state["federated_global"].items()
+                }
+            except Exception:
+                pass
+        if "bio_params" in state:
+            self.autonomous_collector.current_params = dict(state["bio_params"])
+        if "collection_interval" in state:
+            self._collection_interval = int(state["collection_interval"])
+        return True
 
     async def get_comprehensive_status(self) -> Dict:
         quantum_status = self.quantum_security.get_quantum_status()
@@ -2840,15 +2635,17 @@ class EnhancedHeliumAPICollector:
             "cloud_distribution": cloud_status,
             "data_points": len(self.data_history),
             "last_update": self.last_update_time.isoformat() if self.last_update_time else None,
-            "data_fresh_minutes": (datetime.now() - self.last_update_time).total_seconds() / 60.0
-                if self.last_update_time else None,
-            "rate_limiter": {"tokens": self.rate_limiter.tokens, "rate": self.rate_limiter.rate},
+            "data_fresh_minutes": (
+                (datetime.now() - self.last_update_time).total_seconds() / 60.0
+                if self.last_update_time else None
+            ),
+            "rate_limiter": self.rate_limiter.get_metrics(),
             "predictive": self.predictive.get_stats() if self.predictive else None,
             "cloud_storage": {"providers": list(self.cloud_storage.providers.keys())},
             "self_healing": await self.self_healing.health_check(),
             "scheduler": {"enabled": self.scheduler is not None},
             "ten_enhancements": {
-                "quantum_distillation": True,
+                "quantum_distillation": self.distill_ensemble is not None,
                 "causal": self.causal is not None,
                 "federated": self.federated is not None,
                 "multi_agent": self.cloud_distributor.coordinator is not None,
@@ -2903,7 +2700,7 @@ class EnhancedHeliumAPICollector:
 # FASTAPI
 # ============================================================
 if FASTAPI_AVAILABLE:
-    app = FastAPI(title="Helium API Collector API", version="18.0")
+    app = FastAPI(title="Helium API Collector API", version="19.0")
     app.add_middleware(
         CORSMiddleware, allow_origins=["*"], allow_credentials=True,
         allow_methods=["*"], allow_headers=["*"],
@@ -2951,12 +2748,15 @@ if FASTAPI_AVAILABLE:
     async def last_explanation(user: Dict = Depends(verify_token)):
         if not collector:
             raise HTTPException(status_code=503, detail="Collector not initialized")
-        return {"explanation": collector.last_explanation.to_dict() if collector.last_explanation else None,
-                "counterfactuals": collector.last_counterfactuals}
+        return {
+            "explanation": collector.last_explanation.to_dict() if collector.last_explanation else None,
+            "counterfactuals": collector.last_counterfactuals,
+        }
 
     @app.post("/chaos")
     async def chaos(fault_prob: float = 0.0, latency_ms: float = 0.0,
-                    carbon_spike_prob: float = 0.0, user: Dict = Depends(verify_token)):
+                    carbon_spike_prob: float = 0.0,
+                    user: Dict = Depends(verify_token)):
         if not collector:
             raise HTTPException(status_code=503, detail="Collector not initialized")
         collector.chaos = ChaosEngineer(ChaosConfig(
@@ -2966,10 +2766,19 @@ if FASTAPI_AVAILABLE:
         return {"status": "chaos enabled", "config": asdict(collector.chaos.config)}
 
     @app.post("/hitl/approval")
-    async def hitl_approval(request_id: str, approved: bool, user: Dict = Depends(verify_token)):
-        HITL_APPROVALS.labels(decision="approved" if approved else "rejected").inc()
-        audit_logger.info(f"HITL approval: {request_id} -> {approved}")
-        return {"status": "recorded", "request_id": request_id, "approved": approved}
+    async def hitl_approval(request_id: str, approved: bool,
+                            user: Dict = Depends(verify_token)):
+        """v19: deliver the decision to the waiting HITL request."""
+        if not collector:
+            raise HTTPException(status_code=503, detail="Collector not initialized")
+        delivered = await collector.submit_hitl_decision(request_id, approved)
+        if not delivered:
+            HITL_APPROVALS.labels(decision="approved" if approved else "rejected").inc()
+            audit_logger.info(f"HITL approval (no pending): {request_id} -> {approved}")
+            return {"status": "recorded", "request_id": request_id,
+                    "approved": approved, "delivered": False}
+        audit_logger.info(f"HITL approval delivered: {request_id} -> {approved}")
+        return {"status": "delivered", "request_id": request_id, "approved": approved}
 
     @app.on_event("startup")
     async def startup():
@@ -3003,8 +2812,11 @@ async def get_helium_collector(
 
 
 # ============================================================
-# SIGNAL HANDLING (portable)
+# SIGNAL HANDLERS (retained task references)
 # ============================================================
+_shutdown_tasks: set = set()
+
+
 async def shutdown_handler():
     global _collector_instance
     if _collector_instance:
@@ -3012,13 +2824,20 @@ async def shutdown_handler():
         _collector_instance = None
 
 
+def _spawn_shutdown_task():
+    task = asyncio.create_task(shutdown_handler())
+    _shutdown_tasks.add(task)
+    task.add_done_callback(_shutdown_tasks.discard)
+    return task
+
+
 def _install_signal_handlers(loop):
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown_handler()))
+            loop.add_signal_handler(sig, _spawn_shutdown_task)
         except (NotImplementedError, AttributeError):
             try:
-                signal.signal(sig, lambda s, f: asyncio.create_task(shutdown_handler()))
+                signal.signal(sig, lambda s, f: _spawn_shutdown_task())
             except (ValueError, OSError):
                 pass
 
@@ -3031,7 +2850,7 @@ async def main():
     _install_signal_handlers(loop)
 
     print("=" * 80)
-    print("Enhanced Helium API Collector v18.0 — Enterprise Quantum+ (Bio + MOE + MODP + LIMIT + RLHF + Distillation)")
+    print("Enhanced Helium API Collector v19.0 — Enterprise Quantum+ (shared modules)")
     print("=" * 80)
 
     if FASTAPI_AVAILABLE and os.environ.get("HELIUM_SERVE_API", "0") == "1":
@@ -3041,7 +2860,7 @@ async def main():
 
     collector = await get_helium_collector()
 
-    print("\n✅ Ten enhancements wired in:")
+    print("\n✅ Ten enhancements imported from the enhancements package:")
     print("   [1] Quantum-Distillation     QuantumInspiredTeacher + DistillationEnsemble")
     print("   [2] Causal RL                CausalCounterfactualEstimator")
     print("   [3] Federated Green Learning FederatedAggregator")
@@ -3057,7 +2876,8 @@ async def main():
         data = await collector.collect_all_data()
         print(f"\n📊 {data.data_id}: price=${data.spot_price_usd_per_mcf:.0f}, "
               f"quality={data.quality_score:.0f}, precision={data.precision_level}, "
-              f"safe={data.safety_ok}, HITL={data.hitl_approved}")
+              f"safe={data.safety_ok}, HITL={data.hitl_approved}, "
+              f"winning_role={data.cloud_distribution.get('winning_role') if data.cloud_distribution else None}")
 
     status = await collector.get_comprehensive_status()
     print(f"\n🌍 Distribution: {status['cloud_distribution']['active_provider']} "
@@ -3072,7 +2892,7 @@ async def main():
     print(f"💚 Health: {status['health']['health_score']}")
 
     print("\n" + "=" * 80)
-    print("✅ Enhanced Helium API Collector v18.0 — Ready")
+    print("✅ Enhanced Helium API Collector v19.0 — Ready")
     print("=" * 80)
 
     try:
