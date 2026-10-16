@@ -1,51 +1,26 @@
 """
-gpu_profiler.py — Enhanced v2
+gpu_profiler.py — Enhanced v4
 
-Real-time hardware metrics collector with all ten Green Agent enhancements
-hosted as first-class modules in the same file:
-
-  1. Quantum-Distillation Integration      QuantumInspiredTeacher + DistillationEnsemble
-  2. Causal RL for Policy Adaptation       CausalCounterfactualEstimator
-  3. Federated Green Learning              FederatedAggregator
-  4. Multi-Agent Coordination              EmergentRoleRegistry + MultiAgentCoordinator
-  5. Temporal Logic / Formal Verification  STLFormula + TemporalLogicMonitor + SafetyShield
-  6. Explainable AI                        DecisionExplainer + Explanation
-  7. Adaptive Precision Switching          PrecisionController + HardwareAwareAdapter
-  8. Carbon Markets / RECs                 CarbonMarketClient + RECInventory
-  9. Resilience / Chaos                    ChaosEngineer
- 10. HITL / Active Learning                UncertaintyEstimator + HumanInTheLoopGate + ActiveLearningSampler
-
-Bug fixes over v1:
-  - NVML import fallback no longer raises NameError when pynvml is missing
-  - avg_temp divide-by-zero guarded (device_count == 0)
-  - Cumulative energy integration respects idle gaps (no runaway on resume)
-  - SQLite uses autoincrement id (was timestamp PRIMARY KEY -> silent drops)
-  - SQLite batched writes (no commit per sample) + thread-safe connection
-  - CPU power model parameterized (was hardcoded 65 * util)
-  - tokens_per_sec contract explicit (external input, not silently zero)
-  - get_modp_utility reuses a cached ParetoOptimizer
-  - atexit cleanup + context manager protocol
-  - Schema-versioned, with instance_id / node_id provenance columns
-  - Callback list protected by lock
-  - NVML-unavailable path reports gpu_available = False
+Real-time hardware metrics collector. The ten Green Agent enhancements
+are now imported from their own modules (see enhancements/*.py). This file
+contains only profiler-specific logic.
 """
 
 from __future__ import annotations
 
 import atexit
-import hashlib
 import json
 import logging
-import math
 import os
 import random
+import signal
 import sqlite3
+import tempfile
 import threading
 import time
 import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
-from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -57,58 +32,89 @@ except ImportError:
     psutil = None
     PSUTIL_AVAILABLE = False
 
-
-# ============================================================
-# NVML import — fixes the original NameError bug
-# ============================================================
-pynvml = None
-NVML_AVAILABLE = False
-
 try:
-    import pynvml as _pynvml  # noqa: F401
-    pynvml = _pynvml
+    import pynvml
     try:
         pynvml.nvmlInit()
         NVML_AVAILABLE = True
-    except Exception as _nvml_init_err:  # noqa: BLE001
-        logging.getLogger(__name__).warning(
-            f"NVML init failed: {_nvml_init_err}. GPU metrics disabled."
-        )
+    except Exception:
         NVML_AVAILABLE = False
 except ImportError:
+    pynvml = None
     NVML_AVAILABLE = False
 
+from enhancements.common_state import (
+    STATE_VECTOR_DIM,
+    PROFILER_SCHEMA_VERSION,
+    state_vector_from_metrics,
+)
+from enhancements.precision import (
+    PrecisionLevel,
+    PRECISION_COST,
+    PrecisionController,
+    HardwareAwareAdapter,
+)
+from enhancements.carbon import (
+    CarbonMarketClient,
+    RECInventory,
+)
+from enhancements.chaos import (
+    ChaosConfig,
+    ChaosEngineer,
+)
+from enhancements.stl import (
+    STLOperator,
+    STLFormula,
+    TemporalLogicMonitor,
+    SafetyShield,
+)
+from enhancements.causal import (
+    CausalTransition,
+    CausalCounterfactualEstimator,
+)
+from enhancements.federated import (
+    FederatedUpdate,
+    FederatedAggregator,
+)
+from enhancements.multi_agent import (
+    AgentRole,
+    AgentBid,
+    EmergentRoleRegistry,
+    MultiAgentCoordinator,
+)
+from enhancements.xai import (
+    Explanation,
+    DecisionExplainer,
+)
+from enhancements.quantum import (
+    QuantumInspiredTeacher,
+    DistillationEnsemble,
+)
+from enhancements.hitl import (
+    HITLRequest,
+    UncertaintyEstimator,
+    HumanInTheLoopGate,
+    ActiveLearningSampler,
+)
 
-# ============================================================
-# Schema
-# ============================================================
-PROFILER_SCHEMA_VERSION = "gpu_profiler_v2"
-
-
-# ============================================================
-# External module fallbacks
-# ============================================================
 try:
-    from enhancements.MODP import ParetoOptimizer  # type: ignore
+    from enhancements.MODP import ParetoOptimizer
 except ImportError:
     class ParetoOptimizer:
         def evaluate(self, metrics, weights):
             return sum(metrics.get(k, 0.0) * weights.get(k, 1.0) for k in metrics)
 
-
 try:
-    from enhancements.bio_inspired import FitnessEvaluator  # type: ignore
+    from enhancements.bio_inspired import FitnessEvaluator
 except ImportError:
     class FitnessEvaluator:
         def evaluate(self, metrics, policy=None):
-            # Simple energy-efficiency fitness.
             tokens = metrics.get("tokens_per_sec", 0.0)
             power = max(metrics.get("gpu_power_watts", 1.0), 1.0)
             return tokens / power
 
-
 try:
-    from enhancements.moe_system import ContextEncoder  # type: ignore
+    from enhancements.moe_system import ContextEncoder
 except ImportError:
     class ContextEncoder:
         def encode(self, metrics):
@@ -120,9 +126,8 @@ except ImportError:
                 float(metrics.get("gpu_temp_c", 0.0)) / 100.0,
             ]
 
-
 try:
-    from enhancements.limit_graph import LimitGraph  # type: ignore
+    from enhancements.limit_graph import LimitGraph
 except ImportError:
     class LimitGraph:
         def __init__(self, *a, **kw): pass
@@ -130,9 +135,8 @@ except ImportError:
         def get_limits(self, context): return {}
         def update_from_feedback(self, feedback): pass
 
-
 try:
-    from enhancements.rlhf import RLHFOptimizer  # type: ignore
+    from enhancements.rlhf import RLHFOptimizer
 except ImportError:
     class RLHFOptimizer:
         def __init__(self, action_space, *a, **kw):
@@ -141,9 +145,8 @@ except ImportError:
         def sample_action(self, context):
             return self.actions[0] if self.actions else None
 
-
 try:
-    from enhancements.multi_teacher_policy_distillation import MultiTeacherDistiller  # type: ignore
+    from enhancements.multi_teacher_policy_distillation import MultiTeacherDistiller
 except ImportError:
     class MultiTeacherDistiller:
         def __init__(self, teachers, *a, **kw):
@@ -152,742 +155,31 @@ except ImportError:
             return self.teachers[0](context) if self.teachers else None
 
 
-# ============================================================
-# ============================================================
-# ENHANCEMENT MODULES
-# ============================================================
-# ============================================================
-
-
-# ------------------------------------------------------------
-# Enhancement 7: Adaptive Precision Switching
-# ------------------------------------------------------------
-class PrecisionLevel(str, Enum):
-    FP32 = "fp32"
-    BF16 = "bf16"
-    FP16 = "fp16"
-    FP8 = "fp8"
-    INT8 = "int8"
-    INT4 = "int4"
-
-
-PRECISION_COST: Dict[PrecisionLevel, Dict[str, float]] = {
-    PrecisionLevel.FP32: {"speed": 1.0, "energy": 1.00, "quality": 1.000, "memory": 1.00, "bits": 32.0},
-    PrecisionLevel.BF16: {"speed": 1.7, "energy": 0.72, "quality": 0.997, "memory": 0.50, "bits": 16.0},
-    PrecisionLevel.FP16: {"speed": 2.0, "energy": 0.65, "quality": 0.994, "memory": 0.50, "bits": 16.0},
-    PrecisionLevel.FP8:  {"speed": 3.1, "energy": 0.50, "quality": 0.985, "memory": 0.25, "bits": 8.0},
-    PrecisionLevel.INT8: {"speed": 3.6, "energy": 0.44, "quality": 0.972, "memory": 0.25, "bits": 8.0},
-    PrecisionLevel.INT4: {"speed": 5.0, "energy": 0.32, "quality": 0.905, "memory": 0.125, "bits": 4.0},
-}
-
-
-class PrecisionController:
-    """Chooses precision from carbon intensity, latency headroom, carbon price."""
-
-    def __init__(
-        self,
-        supported: Optional[Sequence[PrecisionLevel]] = None,
-        quality_floor: float = 0.95,
-        carbon_aware: bool = True,
-    ):
-        self.supported = list(supported) if supported else list(PrecisionLevel)
-        self.quality_floor = quality_floor
-        self.carbon_aware = carbon_aware
-
-    def select(
-        self,
-        carbon_intensity: float,
-        latency_headroom_ratio: float,
-        carbon_price: float = 0.0,
-    ) -> PrecisionLevel:
-        stress = min(1.0, max(0.0, carbon_intensity / 600.0)) if self.carbon_aware else 0.0
-        price_stress = min(1.0, max(0.0, carbon_price / 0.2))
-        headroom = min(1.0, max(0.0, latency_headroom_ratio))
-        agg = 0.5 * stress + 0.3 * price_stress + 0.2 * (1.0 - headroom)
-        ordered = [p for p in PrecisionLevel if p in self.supported]
-        ordered.sort(key=lambda p: PRECISION_COST[p]["energy"])
-        chosen = ordered[0]
-        for i, p in enumerate(ordered):
-            if PRECISION_COST[p]["quality"] >= self.quality_floor and agg >= 0.25 * i:
-                chosen = p
-        return chosen
-
-
-class HardwareAwareAdapter:
-    """Applies precision to a policy dict and reports the chosen level."""
-
-    def __init__(self, controller: PrecisionController):
-        self.controller = controller
-
-    def adapt(
-        self,
-        policy: Dict[str, Any],
-        carbon_intensity: float,
-        latency_headroom: float,
-        carbon_price: float,
-    ) -> Tuple[Dict[str, Any], PrecisionLevel]:
-        level = self.controller.select(carbon_intensity, latency_headroom, carbon_price)
-        out = dict(policy)
-        out["precision_level"] = level.value
-        out["effective_bits"] = PRECISION_COST[level]["bits"]
-        return out, level
-
-
-# ------------------------------------------------------------
-# Enhancement 8: Carbon Markets / RECs
-# ------------------------------------------------------------
-class CarbonMarketClient:
-    """In-process carbon price model, time-of-day aware."""
-
-    def __init__(self, base_price: float = 0.05, sensitivity: float = 0.0005):
-        self.base_price = base_price
-        self.sensitivity = sensitivity
-
-    def price(self, carbon_intensity: float, hour_of_day: Optional[int] = None) -> float:
-        tod = 1.0
-        if hour_of_day is not None:
-            tod = 1.0 + 0.3 * math.sin((hour_of_day / 24.0) * 2 * math.pi)
-        return self.base_price + self.sensitivity * carbon_intensity * tod
-
-
-@dataclass
-class RECRecord:
-    kwh: float
-    issued_at: float
-    source: str = "solar"
-
-
-class RECInventory:
-    """Renewable Energy Credits with carbon offset potential."""
-
-    def __init__(self, grid_kg_co2_per_kwh: float = 0.4):
-        self.grid_factor = grid_kg_co2_per_kwh
-        self._records: List[RECRecord] = []
-
-    def add(self, kwh: float, source: str = "solar") -> None:
-        self._records.append(RECRecord(kwh=kwh, issued_at=time.time(), source=source))
-
-    def total_kwh(self) -> float:
-        return sum(r.kwh for r in self._records)
-
-    def consume(self, kwh: float) -> float:
-        remaining = kwh
-        offset = 0.0
-        new_records: List[RECRecord] = []
-        for r in self._records:
-            if remaining <= 0:
-                new_records.append(r)
-                continue
-            take = min(r.kwh, remaining)
-            remaining -= take
-            offset += take * self.grid_factor
-            if r.kwh - take > 1e-9:
-                new_records.append(RECRecord(kwh=r.kwh - take, issued_at=r.issued_at, source=r.source))
-        self._records = new_records
-        return offset
-
-
-# ------------------------------------------------------------
-# Enhancement 9: Resilience / Chaos
-# ------------------------------------------------------------
-@dataclass
-class ChaosConfig:
-    fault_prob: float = 0.0
-    latency_inject_ms: float = 0.0
-    latency_inject_prob: float = 0.3
-    carbon_spike_prob: float = 0.0
-    carbon_spike_factor: float = 1.5
-    sensor_noise_std: float = 0.0
-    seed: int = 0
-
-    def enabled(self) -> bool:
-        return (
-            self.fault_prob > 0
-            or (self.latency_inject_ms > 0 and self.latency_inject_prob > 0)
-            or self.carbon_spike_prob > 0
-            or self.sensor_noise_std > 0
-        )
-
-
-class ChaosEngineer:
-    """Deterministic chaos injector for profiling."""
-
-    def __init__(self, config: Optional[ChaosConfig] = None):
-        self.config = config or ChaosConfig()
-        self.rng = random.Random(self.config.seed)
-        self.events: List[Dict[str, Any]] = []
-
-    def maybe_fault(self) -> bool:
-        if self.rng.random() < self.config.fault_prob:
-            self.events.append({"type": "fault", "t": time.time()})
-            return True
-        return False
-
-    def maybe_latency(self) -> float:
-        if self.config.latency_inject_ms > 0 and self.rng.random() < self.config.latency_inject_prob:
-            self.events.append({"type": "latency", "t": time.time()})
-            return self.config.latency_inject_ms
-        return 0.0
-
-    def maybe_carbon_spike(self, carbon_intensity: float) -> float:
-        if self.rng.random() < self.config.carbon_spike_prob:
-            self.events.append({"type": "carbon_spike", "t": time.time()})
-            return carbon_intensity * self.config.carbon_spike_factor
-        return carbon_intensity
-
-    def apply_sensor_noise(self, value: float) -> float:
-        if self.config.sensor_noise_std > 0:
-            return value + self.rng.gauss(0.0, self.config.sensor_noise_std)
-        return value
-
-
-# ------------------------------------------------------------
-# Enhancement 5: Temporal Logic
-# ------------------------------------------------------------
-class STLOperator(str, Enum):
-    ALWAYS = "G"
-    EVENTUALLY = "F"
-    UNTIL = "U"
-
-
-@dataclass
-class STLFormula:
-    name: str
-    predicate: Callable[[Dict[str, Any]], bool]
-    operator: STLOperator
-    horizon: int = 10
-
-
-class TemporalLogicMonitor:
-    """Runtime monitor over a rolling window."""
-
-    def __init__(self, horizon: int = 10):
-        self.horizon = horizon
-        self._history: deque = deque(maxlen=horizon * 4)
-        self.formulas: List[STLFormula] = []
-
-    def add_formula(self, f: STLFormula) -> None:
-        self.formulas.append(f)
-
-    def observe(self, record: Dict[str, Any]) -> None:
-        self._history.append(record)
-
-    def _window(self, f: STLFormula) -> List[Dict[str, Any]]:
-        return list(self._history)[-f.horizon:]
-
-    def verify(self) -> Dict[str, bool]:
-        results: Dict[str, bool] = {}
-        for f in self.formulas:
-            window = self._window(f)
-            if not window:
-                results[f.name] = True
-                continue
-            sat = [bool(f.predicate(r)) for r in window]
-            if f.operator == STLOperator.ALWAYS:
-                results[f.name] = all(sat)
-            elif f.operator in (STLOperator.EVENTUALLY, STLOperator.UNTIL):
-                results[f.name] = any(sat)
-            else:
-                results[f.name] = True
-        return results
-
-
-class SafetyShield:
-    """Reports violations and points to a fallback sensor profile."""
-
-    def __init__(self, monitor: TemporalLogicMonitor):
-        self.monitor = monitor
-        self.violations: List[Dict[str, Any]] = []
-
-    def screen(self) -> Tuple[bool, Dict[str, bool], Optional[str]]:
-        verdict = self.monitor.verify()
-        violated = [k for k, ok in verdict.items() if not ok]
-        if not violated:
-            return True, verdict, None
-        fallback = "safe_default"
-        self.violations.append({"t": time.time(), "violated": violated, "fallback": fallback})
-        return False, verdict, fallback
-
-
-# ------------------------------------------------------------
-# Enhancement 2: Causal RL
-# ------------------------------------------------------------
-@dataclass
-class CausalTransition:
-    state: np.ndarray
-    action: int
-    reward: float
-    next_state: np.ndarray
-    context: Dict[str, float] = field(default_factory=dict)
-
-
-class CausalCounterfactualEstimator:
-    """Ridge-regression SCM for counterfactual reward estimation."""
-
-    def __init__(self, state_dim: int, n_actions: int, ridge: float = 1e-3):
-        self.state_dim = state_dim
-        self.n_actions = n_actions
-        self.ridge = ridge
-        self._A = np.eye(state_dim + n_actions + 1) * ridge
-        self._b = np.zeros(state_dim + n_actions + 1)
-        self._n = 0
-
-    def _features(self, s: np.ndarray, a: int) -> np.ndarray:
-        one_hot = np.zeros(self.n_actions)
-        one_hot[a % self.n_actions] = 1.0
-        return np.concatenate([np.asarray(s, dtype=np.float64), one_hot, [1.0]])
-
-    def _ensure_actions(self, n: int) -> None:
-        if n == self.n_actions:
-            return
-        self._A = np.eye(self.state_dim + n + 1) * self.ridge
-        self._b = np.zeros(self.state_dim + n + 1)
-        self.n_actions = n
-        self._n = 0
-
-    def update(self, t: CausalTransition) -> None:
-        x = self._features(t.state, t.action)
-        self._A += np.outer(x, x)
-        self._b += t.reward * x
-        self._n += 1
-
-    def predict(self, s: np.ndarray, a: int) -> float:
-        if self._n < 2:
-            return 0.0
-        try:
-            theta = np.linalg.solve(self._A, self._b)
-        except np.linalg.LinAlgError:
-            return 0.0
-        return float(self._features(s, a) @ theta)
-
-    def counterfactuals(self, s: np.ndarray, n_actions: int) -> Dict[int, float]:
-        self._ensure_actions(n_actions)
-        return {a: self.predict(s, a) for a in range(n_actions)}
-
-
-# ------------------------------------------------------------
-# Enhancement 3: Federated Green Learning
-# ------------------------------------------------------------
-@dataclass
-class FederatedUpdate:
-    node_id: str
-    weights: Dict[str, np.ndarray]
-    n_samples: int
-    carbon_intensity: float
-    timestamp: float = field(default_factory=time.time)
-
-
-class FederatedAggregator:
-    """Carbon-weighted FedAvg with optional differential privacy."""
-
-    def __init__(self, dp_sigma: float = 1e-3, staleness_s: float = 3600.0):
-        self.dp_sigma = dp_sigma
-        self.staleness_s = staleness_s
-        self._updates: Dict[str, FederatedUpdate] = {}
-        self._global: Optional[Dict[str, np.ndarray]] = None
-        self._lock = threading.Lock()
-
-    def submit(self, u: FederatedUpdate) -> None:
-        with self._lock:
-            self._updates[u.node_id] = u
-
-    def _fresh(self) -> List[FederatedUpdate]:
-        now = time.time()
-        return [u for u in self._updates.values() if (now - u.timestamp) <= self.staleness_s]
-
-    def aggregate(self) -> Optional[Dict[str, np.ndarray]]:
-        with self._lock:
-            fresh = self._fresh()
-            if not fresh:
-                return self._global
-            weights = np.array(
-                [u.n_samples / max(u.carbon_intensity, 1.0) for u in fresh],
-                dtype=np.float64,
-            )
-            weights /= max(weights.sum(), 1e-12)
-            keys = fresh[0].weights.keys()
-            agg: Dict[str, np.ndarray] = {}
-            for k in keys:
-                stacked = np.stack([u.weights[k] for u in fresh], axis=0)
-                blended = np.tensordot(weights, stacked, axes=([0], [0]))
-                if self.dp_sigma > 0:
-                    blended = blended + np.random.normal(0.0, self.dp_sigma, size=blended.shape)
-                agg[k] = blended
-            self._global = agg
-            return agg
-
-    def global_weights(self) -> Optional[Dict[str, np.ndarray]]:
-        return self._global
-
-
-# ------------------------------------------------------------
-# Enhancement 4: Multi-Agent Coordination
-# ------------------------------------------------------------
-class AgentRole(str, Enum):
-    EXPLORER = "explorer"
-    EXPLOITER = "exploiter"
-    SAFETY_OFFICER = "safety_officer"
-    CARBON_BROKER = "carbon_broker"
-    VERIFIER = "verifier"
-
-
-@dataclass
-class AgentBid:
-    agent_id: str
-    role: AgentRole
-    confidence: float
-    proposed_action: int
-    rationale: str
-    carbon_score: float
-
-
-class EmergentRoleRegistry:
-    """Decay-weighted role performance tracker."""
-
-    def __init__(self, decay: float = 0.95):
-        self.decay = decay
-        self._scores: Dict[AgentRole, float] = {r: 1.0 for r in AgentRole}
-        self._counts: Dict[AgentRole, int] = {r: 0 for r in AgentRole}
-
-    def record(self, role: AgentRole, success: bool, reward: float) -> None:
-        for r in self._scores:
-            self._scores[r] *= self.decay
-        signal = reward if success else -abs(reward) * 0.5
-        self._scores[role] += signal
-        self._counts[role] += 1
-
-    def weights(self) -> Dict[AgentRole, float]:
-        total = sum(max(v, 1e-6) for v in self._scores.values())
-        return {r: max(v, 1e-6) / total for r, v in self._scores.items()}
-
-    def dominant_role(self) -> AgentRole:
-        return max(self._scores, key=self._scores.get)
-
-
-class MultiAgentCoordinator:
-    """Carbon-weighted voting across agent bids."""
-
-    def __init__(
-        self,
-        registry: EmergentRoleRegistry,
-        role_bias: Optional[Dict[AgentRole, float]] = None,
-    ):
-        self.registry = registry
-        self.role_bias = role_bias or {
-            AgentRole.EXPLORER: 0.6,
-            AgentRole.EXPLOITER: 0.9,
-            AgentRole.SAFETY_OFFICER: 1.2,
-            AgentRole.CARBON_BROKER: 1.1,
-            AgentRole.VERIFIER: 1.0,
-        }
-
-    def vote(self, bids: Sequence[AgentBid], n_candidates: int) -> int:
-        if not bids or n_candidates <= 0:
-            return 0
-        role_w = self.registry.weights()
-        scores = np.zeros(n_candidates)
-        for b in bids:
-            idx = b.proposed_action % n_candidates
-            weight = (
-                role_w.get(b.role, 0.1)
-                * self.role_bias.get(b.role, 1.0)
-                * max(b.confidence, 0.0)
-                * (1.0 + b.carbon_score)
-            )
-            scores[idx] += weight
-        return int(np.argmax(scores))
-
-
-# ------------------------------------------------------------
-# Enhancement 6: XAI
-# ------------------------------------------------------------
-@dataclass
-class Explanation:
-    decision_id: str
-    kind: str
-    top_features: List[Tuple[str, float]]
-    counterfactuals: List[Dict[str, Any]]
-    rationale: str
-    confidence: float
-    safety_ok: bool
-    carbon_price_signal: float
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-class DecisionExplainer:
-    """Attribution builder over a rolling metrics window."""
-
-    def __init__(self, feature_names: Optional[Sequence[str]] = None):
-        self.feature_names = list(feature_names) if feature_names else [
-            "gpu_utilization_pct",
-            "gpu_memory_used_mb",
-            "gpu_power_watts",
-            "gpu_temp_c",
-            "cpu_utilization_pct",
-            "energy_gpu_joules",
-            "net_recv_bandwidth_gbps",
-        ]
-
-    def _attributions(
-        self,
-        current: Dict[str, Any],
-        baseline: Dict[str, float],
-        scales: Dict[str, float],
-    ) -> List[Tuple[str, float]]:
-        attrs: List[Tuple[str, float]] = []
-        for f in self.feature_names:
-            v = float(current.get(f, 0.0))
-            mu = float(baseline.get(f, 0.0))
-            s = float(scales.get(f, 1.0)) + 1e-9
-            attrs.append((f, (v - mu) / s))
-        attrs.sort(key=lambda kv: abs(kv[1]), reverse=True)
-        return attrs
-
-    def explain_anomaly(
-        self,
-        kind: str,
-        current: Dict[str, Any],
-        baseline: Dict[str, float],
-        scales: Dict[str, float],
-        counterfactuals: Optional[Dict[int, float]] = None,
-        safety_ok: bool = True,
-        carbon_price: float = 0.0,
-        confidence: float = 0.5,
-    ) -> Explanation:
-        attrs = self._attributions(current, baseline, scales)
-        cf_list: List[Dict[str, Any]] = []
-        if counterfactuals:
-            for k, v in sorted(counterfactuals.items(), key=lambda kv: kv[1], reverse=True)[:3]:
-                cf_list.append({"alt_idx": int(k), "expected_reward": float(v)})
-        top = ", ".join(f"{n}={v:+.2f}" for n, v in attrs[:3])
-        rationale = (
-            f"Anomaly '{kind}' at t={current.get('timestamp', 0.0):.2f}. "
-            f"Top deviations vs rolling baseline: {top}. "
-            f"Safety={'ok' if safety_ok else 'VIOLATION'}. "
-            f"Carbon price={carbon_price:.4f}."
-        )
-        return Explanation(
-            decision_id=f"exp-{uuid.uuid4().hex[:8]}",
-            kind=kind,
-            top_features=attrs[:5],
-            counterfactuals=cf_list,
-            rationale=rationale,
-            confidence=confidence,
-            safety_ok=safety_ok,
-            carbon_price_signal=carbon_price,
-        )
-
-
-# ------------------------------------------------------------
-# Enhancement 1: Quantum-Distillation
-# ------------------------------------------------------------
-class QuantumInspiredTeacher:
-    """Small state-vector simulation blended with a carbon-aware prior."""
-
-    def __init__(self, n_qubits: int = 5, seed: int = 0):
-        self.n_qubits = n_qubits
-        self.rng = np.random.default_rng(seed)
-        self._params = self.rng.normal(size=(n_qubits, 2)) * 0.5
-
-    def _ry(self, state: np.ndarray, theta: float, q: int) -> np.ndarray:
-        c, s = math.cos(theta / 2), math.sin(theta / 2)
-        n = len(state)
-        new = state.copy()
-        step = 1 << q
-        for i in range(n):
-            if i & step == 0:
-                a, b = state[i], state[i | step]
-                new[i] = c * a - s * b
-                new[i | step] = s * a + c * b
-        return new
-
-    def _simulate(self, features: np.ndarray, n: int) -> np.ndarray:
-        dim = 1 << self.n_qubits
-        state = np.zeros(dim, dtype=np.complex128)
-        state[0] = 1.0
-        for q in range(self.n_qubits):
-            angle = float(self._params[q, 0] * features[q % len(features)] + self._params[q, 1])
-            state = self._ry(state, angle, q)
-        probs_full = np.abs(state) ** 2
-        probs = np.zeros(n, dtype=np.float64)
-        for i, p in enumerate(probs_full):
-            probs[i % n] += p
-        return probs / max(probs.sum(), 1e-12)
-
-    def teacher_probs(self, features: np.ndarray, n_candidates: int) -> np.ndarray:
-        if n_candidates <= 0:
-            return np.zeros(0)
-        return self._simulate(np.asarray(features, dtype=np.float64), n_candidates)
-
-
-class DistillationEnsemble:
-    """Blends a quantum teacher with an existing probability vector."""
-
-    def __init__(self, quantum: QuantumInspiredTeacher, alpha: float = 0.5):
-        self.quantum = quantum
-        self.alpha = alpha
-
-    def blend(self, features: np.ndarray, other_probs: Optional[np.ndarray], n: int) -> np.ndarray:
-        q = self.quantum.teacher_probs(features, n)
-        if other_probs is None or len(other_probs) != n:
-            return q
-        return self.alpha * q + (1.0 - self.alpha) * np.asarray(other_probs)
-
-
-# ------------------------------------------------------------
-# Enhancement 10: HITL / Active Learning
-# ------------------------------------------------------------
-@dataclass
-class HITLRequest:
-    request_id: str
-    reason: str
-    metric_name: str
-    value: float
-    uncertainty: float
-    carbon_price: float
-    timestamp: float = field(default_factory=time.time)
-
-
-class UncertaintyEstimator:
-    """Rolling-window standard deviation for key metrics."""
-
-    def __init__(self, window: int = 32, entropy_threshold: float = 0.75):
-        self.window = window
-        self.entropy_threshold = entropy_threshold
-        self._history: Dict[str, deque] = {}
-
-    def observe(self, metrics: Dict[str, Any]) -> None:
-        for k, v in metrics.items():
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                d = self._history.setdefault(k, deque(maxlen=self.window))
-                d.append(float(v))
-
-    def std(self, key: str) -> float:
-        d = self._history.get(key)
-        if d is None or len(d) < 3:
-            return 0.0
-        arr = np.asarray(d, dtype=np.float64)
-        return float(np.std(arr))
-
-    def mean(self, key: str) -> float:
-        d = self._history.get(key)
-        if d is None or not d:
-            return 0.0
-        return float(np.mean(np.asarray(d, dtype=np.float64)))
-
-    def z_score(self, key: str, value: float) -> float:
-        s = self.std(key)
-        if s < 1e-9:
-            return 0.0
-        return (value - self.mean(key)) / s
-
-    def is_anomalous(self, key: str, value: float, z_thresh: float = 3.0) -> Tuple[bool, float]:
-        z = abs(self.z_score(key, value))
-        return z > z_thresh, z
-
-    def snapshot_stats(self) -> Dict[str, Dict[str, float]]:
-        out: Dict[str, Dict[str, float]] = {}
-        for k, d in self._history.items():
-            if len(d) < 2:
-                continue
-            arr = np.asarray(d, dtype=np.float64)
-            out[k] = {"mean": float(arr.mean()), "std": float(arr.std())}
-        return out
-
-
-class HumanInTheLoopGate:
-    """Async approval gate with timeout and audit trail."""
-
-    def __init__(
-        self,
-        approver: Optional[Callable[[HITLRequest], bool]] = None,
-        timeout_s: float = 2.0,
-        auto_approve_on_timeout: bool = True,
-    ):
-        self.approver = approver
-        self.timeout_s = timeout_s
-        self.auto_approve_on_timeout = auto_approve_on_timeout
-        self.audit: List[Dict[str, Any]] = []
-
-    def request_sync(self, req: HITLRequest) -> bool:
-        """Synchronous approval (safe to call from sampler thread)."""
-        if self.approver is None:
-            self.audit.append({"request_id": req.request_id, "approved": True, "reason": "no_approver"})
-            return True
-        try:
-            approved = bool(self.approver(req))
-        except Exception as e:  # noqa: BLE001
-            self.audit.append({"request_id": req.request_id, "approved": False, "error": str(e)})
-            return False
-        self.audit.append({"request_id": req.request_id, "approved": approved, "reason": req.reason})
-        return approved
-
-
-class ActiveLearningSampler:
-    """Uncertainty-prioritized anomaly buffer."""
-
-    def __init__(self, capacity: int = 256):
-        self.capacity = capacity
-        self._buffer: List[Dict[str, Any]] = []
-        self._lock = threading.Lock()
-
-    def maybe_store(
-        self, record: Dict[str, Any], uncertainty: float, threshold: float = 0.5,
-    ) -> bool:
-        if uncertainty < threshold:
-            return False
-        with self._lock:
-            if len(self._buffer) >= self.capacity:
-                self._buffer.pop(0)
-            self._buffer.append({**record, "uncertainty": uncertainty, "t": time.time()})
-        return True
-
-    def sample(self, k: int = 8) -> List[Dict[str, Any]]:
-        with self._lock:
-            if not self._buffer:
-                return []
-            k = min(k, len(self._buffer))
-            return random.sample(self._buffer, k)
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._buffer)
-
-
-# ============================================================
-# ProfilerConfig
-# ============================================================
 @dataclass
 class ProfilerConfig:
-    """Configuration for the profiler."""
     sample_interval: float = 0.5
     enable_history: bool = True
     history_db_path: str = "gpu_metrics.db"
     history_batch_size: int = 10
     max_history_days: int = 7
+    max_pending_rows: int = 10_000
     enable_callbacks: bool = True
     callback_cooldown: float = 0.1
     enable_limit_graph: bool = True
     enable_rlhf: bool = True
     enable_distillation: bool = True
 
-    # Instance / node identity (provenance)
     instance_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
     node_id: str = "local"
 
-    # CPU power model (was hardcoded 65 W)
     cpu_tdp_watts: float = 65.0
     cpu_idle_fraction: float = 0.2
 
-    # Carbon market inputs
     carbon_intensity_g_per_kwh: float = 400.0
     carbon_market_base_price: float = 0.05
     carbon_market_sensitivity: float = 0.0005
     rec_default_kwh: float = 0.0
 
-    # Enhancement flags
     enable_quantum_teacher: bool = True
     enable_causal: bool = True
     enable_federated: bool = True
@@ -899,24 +191,36 @@ class ProfilerConfig:
     enable_chaos: bool = False
     enable_hitl: bool = True
 
-    # Chaos config (used if enable_chaos)
     chaos_fault_prob: float = 0.0
     chaos_latency_ms: float = 0.0
     chaos_carbon_spike_prob: float = 0.0
     chaos_sensor_noise_std: float = 0.0
 
-    # HITL
     hitl_timeout_s: float = 2.0
     hitl_auto_approve: bool = True
 
+    uncertainty_anomaly_z: float = 3.0
+    uncertainty_observation_keys: Tuple[str, ...] = (
+        "gpu_power_watts", "gpu_temp_c", "energy_gpu_joules",
+    )
+    sampler_error_backoff_initial: float = 1.0
+    sampler_error_backoff_max: float = 60.0
 
-# ============================================================
-# GPUProfiler
-# ============================================================
+    def __post_init__(self):
+        if self.sample_interval <= 0:
+            raise ValueError("sample_interval must be > 0")
+        if self.history_batch_size < 1:
+            raise ValueError("history_batch_size must be >= 1")
+        if self.max_history_days < 1:
+            raise ValueError("max_history_days must be >= 1")
+        if self.max_pending_rows < 1:
+            raise ValueError("max_pending_rows must be >= 1")
+
+
 class GPUProfiler:
     """
-    Enhanced profiler with multi-GPU support, cumulative energy, persistent
-    SQLite history, streaming callbacks, and all ten Green Agent enhancements.
+    Enhanced profiler with all ten Green Agent enhancements imported from
+    the enhancements package.
     """
 
     def __init__(
@@ -929,6 +233,8 @@ class GPUProfiler:
         rlhf_optimizer: Optional[Any] = None,
         distiller: Optional[Any] = None,
         hitl_approver: Optional[Callable[[HITLRequest], bool]] = None,
+        token_source: Optional[Callable[[], float]] = None,
+        carbon_source: Optional[Callable[[], float]] = None,
     ):
         self.config = config or ProfilerConfig()
         self.modp_weights = modp_weights or {
@@ -940,7 +246,9 @@ class GPUProfiler:
         self.bio = bio_evaluator if bio_evaluator else FitnessEvaluator()
         self.moe = moe_encoder if moe_encoder else ContextEncoder()
 
-        # --- External module integrations ---
+        self._token_source = token_source
+        self._carbon_source = carbon_source
+
         self.limit_graph = limit_graph if (self.config.enable_limit_graph and limit_graph) else (
             LimitGraph() if self.config.enable_limit_graph else None
         )
@@ -950,28 +258,25 @@ class GPUProfiler:
         )
         self.distiller = distiller if (self.config.enable_distillation and distiller) else None
 
-        # --- Enhancement 1: Quantum-Distillation ---
         self.quantum_teacher = QuantumInspiredTeacher(seed=0) if self.config.enable_quantum_teacher else None
         self.distill_ensemble = (
             DistillationEnsemble(self.quantum_teacher, alpha=0.5)
             if self.quantum_teacher else None
         )
 
-        # --- Enhancement 2: Causal RL ---
-        # state dim: 8 numeric features; n_actions: role count
         self.causal: Optional[CausalCounterfactualEstimator] = (
-            CausalCounterfactualEstimator(state_dim=8, n_actions=len(AgentRole))
-            if self.config.enable_causal else None
+            CausalCounterfactualEstimator(
+                state_dim=STATE_VECTOR_DIM, n_actions=len(AgentRole)
+            ) if self.config.enable_causal else None
         )
 
-        # --- Enhancement 3: Federated ---
         self.federated = FederatedAggregator() if self.config.enable_federated else None
 
-        # --- Enhancement 4: Multi-Agent ---
         self.roles = EmergentRoleRegistry() if self.config.enable_multi_agent else None
-        self.coordinator = MultiAgentCoordinator(self.roles) if self.roles else None
+        self.coordinator = (
+            MultiAgentCoordinator(self.roles, rng=random.Random(0)) if self.roles else None
+        )
 
-        # --- Enhancement 5: Temporal Logic ---
         self.temporal: Optional[TemporalLogicMonitor] = None
         self.shield: Optional[SafetyShield] = None
         if self.config.enable_temporal_logic:
@@ -994,13 +299,18 @@ class GPUProfiler:
                 operator=STLOperator.EVENTUALLY,
                 horizon=20,
             ))
+            self.temporal.add_formula(STLFormula(
+                name="carbon_bounded_until_idle",
+                predicate=lambda r: r.get("net_carbon_g", 0.0) <= 50.0,
+                operator=STLOperator.UNTIL,
+                horizon=15,
+                until_predicate=lambda r: r.get("gpu_utilization_pct", 1.0) < 0.1,
+            ))
             self.shield = SafetyShield(self.temporal)
 
-        # --- Enhancement 6: XAI ---
         self.explainer = DecisionExplainer() if self.config.enable_xai else None
         self.last_explanation: Optional[Explanation] = None
 
-        # --- Enhancement 7: Precision Switching ---
         self.precision_controller = (
             PrecisionController(quality_floor=0.95)
             if self.config.enable_precision_switching else None
@@ -1011,7 +321,6 @@ class GPUProfiler:
         )
         self.current_precision: Optional[PrecisionLevel] = None
 
-        # --- Enhancement 8: Carbon Market / RECs ---
         if self.config.enable_carbon_market:
             self.carbon_market: Optional[CarbonMarketClient] = CarbonMarketClient(
                 base_price=self.config.carbon_market_base_price,
@@ -1024,7 +333,6 @@ class GPUProfiler:
             self.carbon_market = None
             self.recs = None
 
-        # --- Enhancement 9: Chaos ---
         self.chaos: Optional[ChaosEngineer] = None
         if self.config.enable_chaos:
             self.chaos = ChaosEngineer(ChaosConfig(
@@ -1034,25 +342,25 @@ class GPUProfiler:
                 sensor_noise_std=self.config.chaos_sensor_noise_std,
             ))
 
-        # --- Enhancement 10: HITL / Active Learning ---
         self.uncertainty = UncertaintyEstimator() if self.config.enable_hitl else None
         self.hitl = (
             HumanInTheLoopGate(
                 approver=hitl_approver,
                 timeout_s=self.config.hitl_timeout_s,
                 auto_approve_on_timeout=self.config.hitl_auto_approve,
-            )
-            if self.config.enable_hitl else None
+            ) if self.config.enable_hitl else None
         )
         self.active_learner = ActiveLearningSampler() if self.config.enable_hitl else None
 
-        # --- Internal state ---
+        # Internal state
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._conn_lock = threading.Lock()
         self._callbacks_lock = threading.Lock()
         self._latest_metrics: Dict[str, Any] = {}
-        self._callbacks: List[Tuple[Callable, float, float]] = []
+        self._callbacks: Dict[int, Dict[str, Any]] = {}
+        self._next_callback_id = 0
 
         self._disk_io_start = None
         self._net_io_start = None
@@ -1062,12 +370,10 @@ class GPUProfiler:
         self._energy_cumulative_cpu_joules = 0.0
         self._last_power_sample_time = time.time()
 
-        # External token rate (contract: caller sets this)
         self._external_tokens_per_sec: float = 0.0
+        self._external_tokens_per_sec_set: bool = False
 
-        # --- History ---
         self._conn: Optional[sqlite3.Connection] = None
-        self._conn_lock = threading.Lock()
         self._pending_rows: List[Tuple] = []
         self._samples_since_flush = 0
 
@@ -1082,12 +388,30 @@ class GPUProfiler:
         if self.config.enable_history:
             self._init_history()
 
-        # Cleanup registration
         atexit.register(self._atexit_cleanup)
+        self._install_signal_handlers()
 
     # ------------------------------------------------------------------
-    # Context manager
+    # Signal / cleanup
     # ------------------------------------------------------------------
+    def _install_signal_handlers(self) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            return
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                prev = signal.getsignal(sig)
+
+                def _handler(signum, frame, prev=prev):
+                    try:
+                        self.stop()
+                    finally:
+                        if callable(prev):
+                            prev(signum, frame)
+
+                signal.signal(sig, _handler)
+            except (ValueError, OSError):
+                pass
+
     def __enter__(self) -> "GPUProfiler":
         self.start()
         return self
@@ -1102,7 +426,7 @@ class GPUProfiler:
             pass
 
     # ------------------------------------------------------------------
-    # History (SQLite)
+    # History
     # ------------------------------------------------------------------
     def _init_history(self) -> None:
         try:
@@ -1162,7 +486,7 @@ class GPUProfiler:
     def _queue_row(self, metrics: Dict[str, Any]) -> None:
         if not self._conn:
             return
-        chaos_events = metrics.get("chaos_events") or []
+        chaos_events = list(metrics.get("chaos_events") or [])
         row = (
             metrics.get("timestamp", time.time()),
             self.config.instance_id,
@@ -1190,20 +514,22 @@ class GPUProfiler:
             json.dumps(metrics.get("provenance", {})),
         )
         with self._conn_lock:
+            if len(self._pending_rows) >= self.config.max_pending_rows:
+                self._pending_rows.pop(0)
             self._pending_rows.append(row)
-        self._samples_since_flush += 1
+            self._samples_since_flush += 1
         if self._samples_since_flush >= self.config.history_batch_size:
             self._flush_rows()
 
     def _flush_rows(self) -> None:
-        if not self._conn or not self._pending_rows:
+        if not self._conn:
             return
-        rows = None
         with self._conn_lock:
             if not self._pending_rows:
                 return
             rows = self._pending_rows
             self._pending_rows = []
+            self._samples_since_flush = 0
         try:
             with self._conn_lock:
                 self._conn.executemany("""
@@ -1223,8 +549,10 @@ class GPUProfiler:
                 self._conn.commit()
         except Exception as e:
             logging.warning(f"Failed to flush history rows: {e}")
-        finally:
-            self._samples_since_flush = 0
+            with self._conn_lock:
+                space = max(0, self.config.max_pending_rows - len(self._pending_rows))
+                self._pending_rows = rows[:space] + self._pending_rows
+                self._samples_since_flush = len(self._pending_rows)
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -1233,26 +561,36 @@ class GPUProfiler:
         self,
         callback: Callable[[Dict[str, Any]], None],
         cooldown: float = 0.1,
-    ) -> None:
+    ) -> int:
         with self._callbacks_lock:
-            self._callbacks.append((callback, cooldown, 0.0))
+            cb_id = self._next_callback_id
+            self._next_callback_id += 1
+            self._callbacks[cb_id] = {
+                "callback": callback, "cooldown": cooldown, "last": 0.0,
+            }
+            return cb_id
+
+    def unregister_callback(self, cb_id: int) -> bool:
+        with self._callbacks_lock:
+            return self._callbacks.pop(cb_id, None) is not None
 
     def _trigger_callbacks(self, metrics: Dict[str, Any]) -> None:
         now = time.time()
         with self._callbacks_lock:
-            callbacks = list(self._callbacks)
-        for i, (cb, cd, last) in enumerate(callbacks):
-            if now - last >= cd:
-                try:
-                    cb(metrics)
-                except Exception as e:
-                    logging.error(f"Callback error: {e}")
-                with self._callbacks_lock:
-                    if i < len(self._callbacks):
-                        self._callbacks[i] = (cb, cd, now)
+            entries = [(cid, dict(v)) for cid, v in self._callbacks.items()]
+        for cid, entry in entries:
+            if now - entry["last"] < entry["cooldown"]:
+                continue
+            try:
+                entry["callback"](metrics)
+            except Exception as e:
+                logging.error(f"Callback error: {e}")
+            with self._callbacks_lock:
+                if cid in self._callbacks:
+                    self._callbacks[cid]["last"] = now
 
     # ------------------------------------------------------------------
-    # Core sampling
+    # Sampling
     # ------------------------------------------------------------------
     def _snapshot(self) -> Dict[str, Any]:
         metrics: Dict[str, Any] = {}
@@ -1261,14 +599,12 @@ class GPUProfiler:
         metrics["instance_id"] = self.config.instance_id
         metrics["node_id"] = self.config.node_id
 
-        # Chaos: fault
+        chaos_faulted = False
         if self.chaos and self.chaos.maybe_fault():
-            metrics["gpu_available"] = False
-            metrics["chaos_events"] = list(self.chaos.events[-1:])
-            return metrics
+            chaos_faulted = True
+            metrics["chaos_events"] = list(self.chaos.events)[-1:]
 
-        # --- GPU (NVML) ---
-        if NVML_AVAILABLE and pynvml is not None:
+        if NVML_AVAILABLE and pynvml is not None and not chaos_faulted:
             try:
                 device_count = pynvml.nvmlDeviceGetCount()
                 metrics["gpu_count"] = device_count
@@ -1306,19 +642,16 @@ class GPUProfiler:
         else:
             metrics["gpu_available"] = False
 
-        # Chaos: sensor noise on GPU signals
-        if self.chaos:
+        if self.chaos and not chaos_faulted:
             for k in ("gpu_power_watts", "gpu_temp_c", "gpu_utilization_pct"):
                 if k in metrics:
                     metrics[k] = self.chaos.apply_sensor_noise(metrics[k])
 
-        # --- CPU / memory ---
-        if PSUTIL_AVAILABLE:
+        if PSUTIL_AVAILABLE and not chaos_faulted:
             vm = psutil.virtual_memory()
             metrics["cpu_memory_total_mb"] = vm.total / 1024 ** 2
             metrics["cpu_memory_free_mb"] = vm.available / 1024 ** 2
             metrics["cpu_memory_used_mb"] = vm.used / 1024 ** 2
-            # NOTE: psutil's first call returns 0.0; call twice with tiny sleep.
             try:
                 psutil.cpu_percent(interval=None)
                 cpu_pct = psutil.cpu_percent(interval=0.0)
@@ -1328,8 +661,7 @@ class GPUProfiler:
         else:
             metrics["cpu_utilization_pct"] = 0.0
 
-        # --- Disk / net I/O ---
-        if PSUTIL_AVAILABLE:
+        if PSUTIL_AVAILABLE and not chaos_faulted:
             try:
                 disk_io = psutil.disk_io_counters()
             except Exception:
@@ -1362,9 +694,7 @@ class GPUProfiler:
             self._net_io_start = net_io
             self._last_net_time = now
 
-        # --- Cumulative energy (idle-gap safe) ---
         elapsed = now - self._last_power_sample_time
-        # Clamp elapsed to avoid runaway integration after long idle / resume
         elapsed = max(0.0, min(elapsed, self.config.sample_interval * 4.0))
         gpu_power = float(metrics.get("gpu_power_watts", 0.0))
         cpu_util = float(metrics.get("cpu_utilization_pct", 0.0))
@@ -1377,16 +707,27 @@ class GPUProfiler:
         metrics["energy_cpu_joules"] = self._energy_cumulative_cpu_joules
         self._last_power_sample_time = now
 
-        # --- External token rate contract ---
+        if self._token_source is not None:
+            try:
+                self._external_tokens_per_sec = float(self._token_source())
+                self._external_tokens_per_sec_set = True
+            except Exception:
+                pass
         metrics["tokens_per_sec"] = self._external_tokens_per_sec
+        metrics["tokens_per_sec_source"] = (
+            "external" if self._external_tokens_per_sec_set else "default"
+        )
 
-        # --- Carbon intensity (with chaos spike) ---
         carbon_intensity = self.config.carbon_intensity_g_per_kwh
+        if self._carbon_source is not None:
+            try:
+                carbon_intensity = float(self._carbon_source())
+            except Exception:
+                pass
         if self.chaos:
             carbon_intensity = self.chaos.maybe_carbon_spike(carbon_intensity)
         metrics["carbon_intensity_g_per_kwh"] = carbon_intensity
 
-        # --- Carbon price ---
         carbon_price = 0.0
         if self.carbon_market:
             carbon_price = self.carbon_market.price(
@@ -1394,7 +735,6 @@ class GPUProfiler:
             )
         metrics["carbon_price_per_kg"] = carbon_price
 
-        # --- Net carbon after REC offset ---
         energy_kwh = (self._energy_cumulative_gpu_joules + self._energy_cumulative_cpu_joules) / 3.6e6
         gross_carbon_g = energy_kwh * carbon_intensity
         rec_offset_kg = 0.0
@@ -1402,20 +742,17 @@ class GPUProfiler:
             rec_offset_kg = self.recs.consume(min(energy_kwh, self.recs.total_kwh()))
         metrics["gross_carbon_g"] = gross_carbon_g
         metrics["rec_offset_kg"] = rec_offset_kg
+        metrics["rec_kwh_available"] = self.recs.total_kwh() if self.recs else 0.0
         metrics["net_carbon_g"] = max(0.0, gross_carbon_g - rec_offset_kg * 1000.0)
 
-        # --- Derived metrics ---
         metrics["energy_efficiency"] = self._compute_energy_efficiency(metrics)
         metrics["carbon_efficiency"] = self._compute_carbon_efficiency(metrics)
         metrics["memory_efficiency"] = self._compute_memory_efficiency(metrics)
         metrics["throughput"] = metrics.get("tokens_per_sec", 0.0)
 
-        # --- Precision switching ---
         if self.precision_adapter:
-            headroom = 0.5  # caller may override
-            _, level = self.precision_adapter.adapt(
-                {}, carbon_intensity, headroom, carbon_price
-            )
+            headroom = 0.5
+            _, level = self.precision_adapter.adapt({}, carbon_intensity, headroom, carbon_price)
             self.current_precision = level
             metrics["precision_level"] = level.value
             metrics["effective_bits"] = PRECISION_COST[level]["bits"]
@@ -1423,19 +760,13 @@ class GPUProfiler:
             metrics["precision_level"] = None
             metrics["effective_bits"] = 0.0
 
-        # --- Uncertainty observation (before emitting) ---
         if self.uncertainty:
             self.uncertainty.observe(metrics)
-            metrics["uncertainty_score"] = float(np.mean([
-                self.uncertainty.std(k)
-                for k in ("gpu_power_watts", "gpu_temp_c", "energy_gpu_joules")
-                if self.uncertainty.std(k) > 0
-            ]) if any(self.uncertainty.std(k) > 0 for k in
-                     ("gpu_power_watts", "gpu_temp_c", "energy_gpu_joules")) else 0.0)
+            keys = self.config.uncertainty_observation_keys
+            metrics["uncertainty_score"] = self.uncertainty.composite_uncertainty(keys)
         else:
             metrics["uncertainty_score"] = 0.0
 
-        # --- Temporal logic monitor ---
         safety_ok = True
         stl_verdict: Dict[str, bool] = {}
         if self.temporal and self.shield:
@@ -1444,25 +775,21 @@ class GPUProfiler:
         metrics["safety_ok"] = safety_ok
         metrics["stl_verdict"] = stl_verdict
 
-        # --- XAI on anomaly ---
-        if self.explainer and self.uncertainty:
-            # Detect anomaly: z-score of gpu_power_watts > 3
-            gpu_power = float(metrics.get("gpu_power_watts", 0.0))
-            is_anom, z = self.uncertainty.is_anomalous("gpu_power_watts", gpu_power, z_thresh=3.0)
+        if self.explainer and self.uncertainty and not chaos_faulted:
+            gpu_power_v = float(metrics.get("gpu_power_watts", 0.0))
+            is_anom, z = self.uncertainty.is_anomalous(
+                "gpu_power_watts", gpu_power_v,
+                z_thresh=self.config.uncertainty_anomaly_z,
+            )
             if is_anom or not safety_ok:
-                baseline = {
-                    k: self.uncertainty.mean(k)
-                    for k in self.explainer.feature_names
-                }
-                scales = {
-                    k: self.uncertainty.std(k)
-                    for k in self.explainer.feature_names
-                }
+                baseline = {k: self.uncertainty.mean(k) for k in self.explainer.feature_names}
+                scales = {k: self.uncertainty.std(k) for k in self.explainer.feature_names}
                 explanation = self.explainer.explain_anomaly(
                     kind="power_anomaly" if is_anom else "safety_violation",
                     current=metrics,
                     baseline=baseline,
                     scales=scales,
+                    counterfactuals=self.causal_counterfactuals(metrics),
                     safety_ok=safety_ok,
                     carbon_price=carbon_price,
                     confidence=min(1.0, abs(z) / 5.0) if is_anom else 0.9,
@@ -1470,7 +797,6 @@ class GPUProfiler:
                 self.last_explanation = explanation
                 metrics["explanation"] = explanation.to_dict()
 
-                # HITL gate for high-uncertainty anomalies
                 if self.hitl and self.uncertainty:
                     unc = float(metrics.get("uncertainty_score", 0.0))
                     if unc > 0.5 or not safety_ok:
@@ -1478,7 +804,7 @@ class GPUProfiler:
                             request_id=uuid.uuid4().hex[:8],
                             reason="high_uncertainty" if unc > 0.5 else "safety_violation",
                             metric_name="gpu_power_watts",
-                            value=gpu_power,
+                            value=gpu_power_v,
                             uncertainty=unc,
                             carbon_price=carbon_price,
                         )
@@ -1487,45 +813,37 @@ class GPUProfiler:
                         if not approved:
                             metrics["action"] = "fallback_safe_profile"
 
-                # Active learning storage
                 if self.active_learner:
+                    numeric = {k: v for k, v in metrics.items()
+                               if isinstance(v, (int, float)) and not isinstance(v, bool)}
                     self.active_learner.maybe_store(
-                        {"metrics": {k: v for k, v in metrics.items()
-                                     if isinstance(v, (int, float))}},
+                        {"metrics": numeric},
                         uncertainty=float(metrics.get("uncertainty_score", 0.0)),
                         threshold=0.4,
                     )
 
-        # --- Causal update from controller callbacks (stored, not learned here) ---
-        # The controller can call profiler.update_feedback(context, action, reward)
-        # to push transitions into the causal estimator.
-
-        # --- Federated export (only if consumer calls export_federated_update) ---
-        # (No auto submit here to avoid spamming the aggregator.)
-
-        # --- Provenance ---
         metrics["provenance"] = {
             "schema": PROFILER_SCHEMA_VERSION,
             "instance_id": self.config.instance_id,
             "node_id": self.config.node_id,
             "nvml_available": NVML_AVAILABLE,
             "chaos_active": self.chaos is not None,
+            "chaos_config": (asdict(self.chaos.config) if self.chaos else None),
+            "state_vector_dim": STATE_VECTOR_DIM,
         }
+
+        if "chaos_events" not in metrics:
+            metrics["chaos_events"] = []
 
         return metrics
 
-    # ------------------------------------------------------------------
-    # Derived metric helpers
-    # ------------------------------------------------------------------
     def _compute_energy_efficiency(self, metrics: Dict[str, Any]) -> float:
         tokens = float(metrics.get("tokens_per_sec", 0.0))
         total_power = (
             float(metrics.get("gpu_power_watts", 0.0))
             + float(metrics.get("gpu_power_watts_cpu_model", 0.0))
         )
-        if total_power > 0:
-            return tokens / total_power
-        return 0.0
+        return tokens / total_power if total_power > 0 else 0.0
 
     def _compute_carbon_efficiency(self, metrics: Dict[str, Any]) -> float:
         carbon_intensity = float(metrics.get("carbon_intensity_g_per_kwh", 0.0))
@@ -1536,16 +854,12 @@ class GPUProfiler:
         energy_kwh = total_energy_j / 3.6e6
         carbon_kg = energy_kwh * carbon_intensity / 1000.0
         tokens = float(metrics.get("tokens_per_sec", 0.0))
-        if carbon_kg > 0:
-            return tokens / carbon_kg
-        return 0.0
+        return tokens / carbon_kg if carbon_kg > 0 else 0.0
 
     def _compute_memory_efficiency(self, metrics: Dict[str, Any]) -> float:
         total = float(metrics.get("gpu_memory_total_mb", 0.0))
         used = float(metrics.get("gpu_memory_used_mb", 0.0))
-        if total > 0:
-            return used / total
-        return 0.0
+        return used / total if total > 0 else 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -1553,16 +867,18 @@ class GPUProfiler:
     def start(self) -> None:
         if self._running:
             return
+        if self.config.enable_history and self._conn is None:
+            self._init_history()
         self._running = True
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
+        was_running = self._running
         self._running = False
         if self._thread:
             self._thread.join(timeout=2.0)
             self._thread = None
-        # Flush pending rows
         try:
             self._flush_rows()
         except Exception:
@@ -1574,33 +890,43 @@ class GPUProfiler:
             except Exception:
                 pass
             self._conn = None
+        with self._conn_lock:
+            self._pending_rows = []
+            self._samples_since_flush = 0
+        if was_running:
+            logging.getLogger(__name__).info("GPUProfiler stopped")
 
     def _sample_loop(self) -> None:
+        backoff = self.config.sampler_error_backoff_initial
         while self._running:
             try:
                 metrics = self._snapshot()
-                with self._lock:
+                with self._state_lock:
                     self._latest_metrics = metrics
                 if self.config.enable_history:
                     self._queue_row(metrics)
                 if self.config.enable_callbacks:
                     self._trigger_callbacks(metrics)
+                backoff = self.config.sampler_error_backoff_initial
             except Exception as e:
                 logging.error(f"Sampler error: {e}")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, self.config.sampler_error_backoff_max)
+                continue
             time.sleep(self.config.sample_interval)
 
     def get_current_metrics(self) -> Dict[str, Any]:
         if self._running:
-            with self._lock:
+            with self._state_lock:
                 return dict(self._latest_metrics)
         return self._snapshot()
 
-    # ------------------------------------------------------------------
-    # External input contract
-    # ------------------------------------------------------------------
     def set_token_rate(self, tokens_per_sec: float) -> None:
-        """Set the external token rate used in efficiency metrics."""
         self._external_tokens_per_sec = float(tokens_per_sec)
+        self._external_tokens_per_sec_set = True
+
+    def set_carbon_source(self, source: Optional[Callable[[], float]]) -> None:
+        self._carbon_source = source
 
     # ------------------------------------------------------------------
     # Integration interfaces
@@ -1627,7 +953,6 @@ class GPUProfiler:
         return self.moe.encode(self.get_current_metrics())
 
     def get_policy_from_distillation(self, context: Optional[Dict] = None) -> str:
-        """Blend quantum teacher with distiller output (Enhancement 1)."""
         if context is None:
             context = self.get_current_metrics()
         if self.distiller is not None:
@@ -1640,7 +965,6 @@ class GPUProfiler:
         if self.distill_ensemble is None:
             return base_policy
 
-        # Quantum teacher produces a distribution over the three default actions.
         actions = ["balanced", "performance", "power_save"]
         features = np.array([
             float(context.get("gpu_utilization_pct", 0.0)),
@@ -1678,7 +1002,6 @@ class GPUProfiler:
             return {}
 
     def update_feedback(self, context: Dict, action: str, reward: float) -> None:
-        """Update RLHF, LIMIT Graph, and causal estimator with feedback."""
         if self.rlhf:
             try:
                 self.rlhf.update(context, action, reward)
@@ -1687,59 +1010,47 @@ class GPUProfiler:
         if self.limit_graph:
             try:
                 self.limit_graph.update_from_feedback({
-                    "context": context,
-                    "action": action,
-                    "reward": reward,
+                    "context": context, "action": action, "reward": reward,
                 })
             except Exception:
                 pass
 
-        # Causal estimator update
         if self.causal is not None:
             try:
-                state = self._state_vector(context)
+                state = state_vector_from_metrics(context)
+                if state.size != STATE_VECTOR_DIM:
+                    state = np.pad(state, (0, max(0, STATE_VECTOR_DIM - state.size)))[:STATE_VECTOR_DIM]
                 actions = ["balanced", "performance", "power_save"]
                 a_idx = actions.index(action) if action in actions else 0
                 self.causal.update(CausalTransition(
-                    state=state,
-                    action=a_idx,
-                    reward=float(reward),
-                    next_state=state,
+                    state=state, action=a_idx, reward=float(reward), next_state=state,
                 ))
             except Exception:
                 pass
 
-        # Multi-agent role registry update
         if self.roles is not None:
-            try:
-                role = AgentRole.EXPLOITER
+            role: Optional[AgentRole] = None
+            if self.coordinator is not None:
+                lv = self.coordinator.last_vote() or {}
+                roles_seen = lv.get("winning_roles") or []
+                if roles_seen:
+                    try:
+                        role = AgentRole(roles_seen[0])
+                    except ValueError:
+                        role = None
+            if role is None:
                 if "carbon" in action:
                     role = AgentRole.CARBON_BROKER
                 elif "power" in action:
                     role = AgentRole.SAFETY_OFFICER
-                elif "performance" in action:
+                else:
                     role = AgentRole.EXPLOITER
-                self.roles.record(role, success=reward > 0.5, reward=reward)
-            except Exception:
-                pass
+            self.roles.record(role, success=reward > 0.5, reward=reward)
 
     def _state_vector(self, context: Dict) -> np.ndarray:
-        return np.array([
-            float(context.get("gpu_utilization_pct", 0.0)),
-            float(context.get("gpu_power_watts", 0.0)) / 400.0,
-            float(context.get("gpu_temp_c", 0.0)) / 100.0,
-            float(context.get("cpu_utilization_pct", 0.0)),
-            float(context.get("carbon_intensity_g_per_kwh", 400.0)) / 1000.0,
-            float(context.get("carbon_price_per_kg", 0.0)) / 0.5,
-            float(context.get("rec_kwh_available", 0.0)) / 100.0,
-            float(context.get("uncertainty_score", 0.0)),
-        ], dtype=np.float64)
+        return state_vector_from_metrics(context)
 
-    # ------------------------------------------------------------------
-    # Multi-agent / causal / federated helpers
-    # ------------------------------------------------------------------
     def vote_metric_emphasis(self, metrics: Optional[Dict[str, Any]] = None) -> str:
-        """Multi-agent vote over which metric to emphasize (Enhancement 4)."""
         if metrics is None:
             metrics = self.get_current_metrics()
         if self.coordinator is None or self.roles is None:
@@ -1770,7 +1081,8 @@ class GPUProfiler:
                 rationale=role.value,
                 carbon_score=1.0 / (1.0 + metrics.get("net_carbon_g", 0.0)),
             ))
-        return objectives[self.coordinator.vote(bids, len(objectives))]
+        winner_idx, _role = self.coordinator.vote(bids, len(objectives))
+        return objectives[winner_idx]
 
     def causal_counterfactuals(
         self, context: Optional[Dict] = None, n_actions: int = 3,
@@ -1785,7 +1097,6 @@ class GPUProfiler:
             return {}
 
     def export_federated_update(self) -> Optional[Dict[str, Any]]:
-        """Package a compact local update for a federated aggregator."""
         if self.federated is None:
             return None
         m = self.get_current_metrics()
@@ -1802,7 +1113,8 @@ class GPUProfiler:
             n_samples=1,
             carbon_intensity=float(m.get("carbon_intensity_g_per_kwh", 400.0)),
         )
-        self.federated.submit(update)
+        if not self.federated.submit(update):
+            return None
         return {"node_id": update.node_id, "vec": vec.tolist()}
 
     def aggregate_federated(self) -> Optional[Dict[str, np.ndarray]]:
@@ -1810,9 +1122,45 @@ class GPUProfiler:
             return None
         return self.federated.aggregate()
 
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
+    def save_state(self, path: str) -> bool:
+        state: Dict[str, Any] = {"schema": PROFILER_SCHEMA_VERSION}
+        if self.causal is not None:
+            state["causal"] = self.causal.export_state()
+        if self.roles is not None:
+            state["roles"] = self.roles.snapshot()
+        try:
+            d = os.path.dirname(os.path.abspath(path)) or "."
+            os.makedirs(d, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp_", suffix=".json")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(state, f)
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            return True
+        except Exception as e:
+            logging.error(f"save_state failed: {e}")
+            return False
+
+    def load_state(self, path: str) -> bool:
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r") as f:
+                state = json.load(f)
+        except Exception:
+            return False
+        if state.get("schema") != PROFILER_SCHEMA_VERSION:
+            return False
+        if self.causal is not None and "causal" in state:
+            self.causal.import_state(state["causal"])
+        return True
+
     def get_stats(self) -> Dict[str, Any]:
         return {
             "schema": PROFILER_SCHEMA_VERSION,
@@ -1840,13 +1188,10 @@ class GPUProfiler:
             ),
             "active_learning_buffer_size": len(self.active_learner) if self.active_learner else 0,
             "hitl_audit_size": len(self.hitl.audit) if self.hitl else 0,
-            "stl_verdict": (
-                self.shield.monitor.verify() if self.shield else {}
-            ),
-            "role_weights": (
-                {r.value: w for r, w in self.roles.weights().items()}
-                if self.roles else {}
-            ),
+            "stl_verdict": (self.temporal.verify() if self.temporal else {}),
+            "role_snapshot": (self.roles.snapshot() if self.roles else {}),
+            "last_vote": (self.coordinator.last_vote() if self.coordinator else None),
+            "state_vector_dim": STATE_VECTOR_DIM,
         }
 
     def get_history(
@@ -1858,7 +1203,6 @@ class GPUProfiler:
             return []
         if end_time is None:
             end_time = time.time()
-        # Flush pending rows first so recent samples are visible.
         self._flush_rows()
         try:
             with self._conn_lock:
@@ -1897,8 +1241,8 @@ class GPUProfiler:
                 "disk_write_bandwidth_gbps": row[10],
                 "net_recv_bandwidth_gbps": row[11],
                 "net_sent_bandwidth_gbps": row[12],
-                "energy_gpu_joules": row[13],  # cumulative since profiler start
-                "energy_cpu_joules": row[14],  # cumulative since profiler start
+                "energy_gpu_joules": row[13],
+                "energy_cpu_joules": row[14],
                 "precision_level": row[15],
                 "effective_bits": row[16],
                 "carbon_intensity_g_per_kwh": row[17],
@@ -1912,9 +1256,6 @@ class GPUProfiler:
         return out
 
 
-# ============================================================
-# Example usage
-# ============================================================
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
