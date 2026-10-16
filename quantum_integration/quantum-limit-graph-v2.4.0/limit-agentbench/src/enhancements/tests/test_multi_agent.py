@@ -20,10 +20,13 @@ from multi_agent import (
     Coalition,
     EmergentRoleRegistry,
     MultiAgentCoordinator,
+    MultiAgentTeam,
     NegotiationConfig,
     NegotiationResult,
     RegistryConfig,
     RoleStats,
+    TeamConfig,
+    TeamResult,
     VoteResult,
     VotingConfig,
 )
@@ -51,6 +54,36 @@ def make_coordinator(
         allow_safety_veto=allow_safety_veto,
     )
     return MultiAgentCoordinator(reg, vcfg, rng=random.Random(seed))
+
+
+def make_team(
+    *,
+    enable_negotiation: bool = True,
+    enable_coalitions: bool = True,
+    quorum_min_roles: int = 1,
+    allow_safety_veto: bool = True,
+    max_rounds: int = 3,
+    defection_probability: float = 0.5,
+    low_confidence_threshold: float = 0.5,
+    seed: int = 0,
+) -> MultiAgentTeam:
+    vcfg = VotingConfig(
+        role_bias=uniform_bias(),
+        quorum_min_roles=quorum_min_roles,
+        allow_safety_veto=allow_safety_veto,
+    )
+    ncfg = NegotiationConfig(
+        max_rounds=max_rounds,
+        defection_probability=defection_probability,
+        low_confidence_threshold=low_confidence_threshold,
+    )
+    cfg = TeamConfig(
+        voting=vcfg,
+        negotiation=ncfg,
+        enable_negotiation=enable_negotiation,
+        enable_coalitions=enable_coalitions,
+    )
+    return MultiAgentTeam(cfg, seed=seed)
 
 
 # --------------------------------------------------------------------------- #
@@ -141,7 +174,6 @@ class TestEmergentRoleRegistry(unittest.TestCase):
             config=RegistryConfig(exploration=1.0), rng=random.Random(0)
         )
         seen = {reg.sample_role() for _ in range(200)}
-        # With exploration=1.0, we should hit several roles.
         self.assertGreater(len(seen), 1)
 
     def test_snapshot_has_expected_keys(self):
@@ -180,7 +212,6 @@ class TestVotingCore(unittest.TestCase):
         winner, role = coord.vote(bids, 3)
         self.assertEqual(winner, 0)
         self.assertEqual(role, AgentRole.EXPLOITER)
-        # role_totals exposes the breakdown.
         totals = coord.last_vote().role_totals
         self.assertGreater(totals[AgentRole.EXPLOITER], totals[AgentRole.EXPLORER])
 
@@ -214,8 +245,8 @@ class TestCarbonSemantics(unittest.TestCase):
     def test_higher_carbon_score_wins(self):
         coord = make_coordinator()
         bids = [
-            AgentBid("a1", AgentRole.EXPLORER, 0.5, 0, "", 0.1),  # low carbon
-            AgentBid("a2", AgentRole.EXPLORER, 0.5, 1, "", 0.9),  # high carbon
+            AgentBid("a1", AgentRole.EXPLORER, 0.5, 0, "", 0.1),
+            AgentBid("a2", AgentRole.EXPLORER, 0.5, 1, "", 0.9),
         ]
         winner, _ = coord.vote(bids, 2)
         self.assertEqual(winner, 1)
@@ -230,11 +261,10 @@ class TestCarbonSemantics(unittest.TestCase):
         self.assertTrue(coord.last_vote().tied)
 
     def test_carbon_clamped_at_bid_level(self):
-        # Even after clamping, high raw carbon should still dominate.
         coord = make_coordinator()
         bids = [
-            AgentBid("a1", AgentRole.EXPLORER, 0.5, 0, "", -5.0),  # → 0.0
-            AgentBid("a2", AgentRole.EXPLORER, 0.5, 1, "", 99.0),  # → 1.0
+            AgentBid("a1", AgentRole.EXPLORER, 0.5, 0, "", -5.0),
+            AgentBid("a2", AgentRole.EXPLORER, 0.5, 1, "", 99.0),
         ]
         winner, _ = coord.vote(bids, 2)
         self.assertEqual(winner, 1)
@@ -247,17 +277,15 @@ class TestSafetyAndQuorum(unittest.TestCase):
     def test_safety_veto_triggers(self):
         coord = make_coordinator(allow_safety_veto=True)
         bids = [
-            # Proposal 0 with more weight than the safety officer's proposal 1.
             AgentBid("a1", AgentRole.EXPLOITER, 0.9, 0, "", 0.9),
             AgentBid("a2", AgentRole.SAFETY_OFFICER, 0.9, 1, "", 0.5),
         ]
         winner, role = coord.vote(bids, 2)
         self.assertEqual(winner, 0)
-        self.assertIsNone(role)  # vetoed → no winning role
+        self.assertIsNone(role)
         self.assertTrue(coord.last_vote().vetoed)
 
     def test_safety_no_veto_below_threshold(self):
-        # Safety officer confidence below threshold → no veto.
         coord = make_coordinator(allow_safety_veto=True)
         bids = [
             AgentBid("a1", AgentRole.EXPLOITER, 0.9, 0, "", 0.9),
@@ -329,9 +357,7 @@ class TestSerialization(unittest.TestCase):
 
     def test_coordinator_roundtrip(self):
         coord = make_coordinator()
-        coord.vote(
-            [AgentBid("a", AgentRole.EXPLORER, 0.7, 0, "", 0.5)], 1
-        )
+        coord.vote([AgentBid("a", AgentRole.EXPLORER, 0.7, 0, "", 0.5)], 1)
         data = coord.to_dict()
         coord2 = MultiAgentCoordinator.from_dict(data, rng=random.Random(0))
         self.assertEqual(
@@ -347,9 +373,7 @@ class TestSerialization(unittest.TestCase):
 
     def test_vote_result_serializable(self):
         coord = make_coordinator()
-        coord.vote(
-            [AgentBid("a", AgentRole.EXPLORER, 0.7, 0, "", 0.5)], 1
-        )
+        coord.vote([AgentBid("a", AgentRole.EXPLORER, 0.7, 0, "", 0.5)], 1)
         d = coord.last_vote_dict()
         self.assertIn("winner", d)
         self.assertIn("role_totals", d)
@@ -364,9 +388,7 @@ class TestHooks(unittest.TestCase):
         coord = make_coordinator()
         seen = []
         coord.add_hook(seen.append)
-        coord.vote(
-            [AgentBid("a", AgentRole.EXPLORER, 0.7, 0, "", 0.5)], 1
-        )
+        coord.vote([AgentBid("a", AgentRole.EXPLORER, 0.7, 0, "", 0.5)], 1)
         self.assertEqual(len(seen), 1)
         self.assertIsInstance(seen[0], VoteResult)
 
@@ -377,7 +399,6 @@ class TestHooks(unittest.TestCase):
             raise RuntimeError("boom")
 
         coord.add_hook(bad_hook)
-        # Should not raise.
         winner, _ = coord.vote(
             [AgentBid("a", AgentRole.EXPLORER, 0.7, 0, "", 0.5)], 1
         )
@@ -429,8 +450,8 @@ class TestNegotiation(unittest.TestCase):
         coord = make_coordinator(seed=0)
         cfg = NegotiationConfig(
             max_rounds=2,
-            convergence_threshold=2.0,       # never converge on its own
-            defection_probability=1.0,       # always defect
+            convergence_threshold=2.0,
+            defection_probability=1.0,
             low_confidence_threshold=0.9,
         )
         bids = [
@@ -438,7 +459,6 @@ class TestNegotiation(unittest.TestCase):
             AgentBid("weak", AgentRole.EXPLORER, 0.1, 1, "", 0.5),
         ]
         result = coord.negotiate(bids, 2, config=cfg)
-        # After the first round, "weak" should have shifted to action 0.
         self.assertIn("weak", result.rounds[0].shifted_agents)
 
     def test_negotiation_empty_bids(self):
@@ -471,7 +491,6 @@ class TestCoalitions(unittest.TestCase):
         ]
         cos = coord.form_coalitions(bids, 2)
         self.assertEqual(len(cos), 2)
-        # The 2-agent coalition should rank first (higher total weight).
         self.assertEqual(cos[0].action, 0)
         self.assertEqual(len(cos[0].agent_ids), 2)
         self.assertEqual(cos[1].action, 1)
@@ -550,7 +569,6 @@ class TestByzantine(unittest.TestCase):
             trim_quantile=0.0,
             min_reputation=0.5,
         )
-        # Ensure the "byzantine" agent has low reputation.
         coord.get_reputation("byz").score = 0.0
         coord.get_reputation("honest1").score = 0.9
         coord.get_reputation("honest2").score = 0.9
@@ -558,7 +576,6 @@ class TestByzantine(unittest.TestCase):
         bids = [
             AgentBid("honest1", AgentRole.EXPLORER, 0.5, 0, "", 0.5),
             AgentBid("honest2", AgentRole.EXPLORER, 0.5, 0, "", 0.5),
-            # Without filtering, this would win (high conf + high carbon).
             AgentBid("byz", AgentRole.EXPLORER, 0.99, 1, "", 0.99),
         ]
         winner, _ = coord.vote(bids, 2)
@@ -566,15 +583,252 @@ class TestByzantine(unittest.TestCase):
 
     def test_byzantine_config_roundtrip(self):
         coord = make_coordinator()
-        coord.byzantine_config = ByzantineConfig(
-            enabled=True, min_reputation=0.4
-        )
+        coord.byzantine_config = ByzantineConfig(enabled=True, min_reputation=0.4)
         coord.get_reputation("a1").score = 0.77
         data = coord.to_dict()
         coord2 = MultiAgentCoordinator.from_dict(data, rng=random.Random(0))
         self.assertTrue(coord2.byzantine_config.enabled)
         self.assertAlmostEqual(
             coord2.get_reputation("a1").score, 0.77, places=6
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 11. MultiAgentTeam façade
+# --------------------------------------------------------------------------- #
+class TestMultiAgentTeam(unittest.TestCase):
+    # ---- basic pipeline ------------------------------------------------ #
+    def test_decide_returns_full_team_result(self):
+        team = make_team()
+        bids = [
+            AgentBid("a1", AgentRole.EXPLORER, 0.9, 0, "", 0.5),
+            AgentBid("a2", AgentRole.EXPLOITER, 0.5, 1, "", 0.5),
+        ]
+        result = team.decide(bids, 2)
+        self.assertIsInstance(result, TeamResult)
+        self.assertIsInstance(result.final_vote, VoteResult)
+        self.assertIsInstance(result.negotiation, NegotiationResult)
+        self.assertGreaterEqual(len(result.coalitions), 1)
+        self.assertEqual(result.final_bids, result.negotiation.final_bids)
+
+    def test_decide_deterministic_with_seed(self):
+        bids = [
+            AgentBid("a1", AgentRole.EXPLORER, 0.5, 0, "", 0.5),
+            AgentBid("a2", AgentRole.EXPLORER, 0.5, 1, "", 0.5),
+        ]
+        r1 = make_team(seed=42).decide(bids, 2)
+        r2 = make_team(seed=42).decide(bids, 2)
+        self.assertEqual(r1.winner, r2.winner)
+        self.assertEqual(r1.rounds_used, r2.rounds_used)
+
+    def test_skip_negotiation(self):
+        team = make_team(enable_negotiation=False)
+        bids = [
+            AgentBid("a1", AgentRole.EXPLORER, 0.9, 0, "", 0.5),
+            AgentBid("a2", AgentRole.EXPLORER, 0.1, 1, "", 0.5),
+        ]
+        result = team.decide(bids, 2)
+        self.assertIsNone(result.negotiation)
+        self.assertTrue(result.converged)
+        self.assertEqual(result.rounds_used, 0)
+        self.assertEqual(result.final_bids, bids)
+        self.assertEqual(result.winner, 0)
+
+    def test_skip_coalitions(self):
+        team = make_team(enable_coalitions=False)
+        bids = [
+            AgentBid("a1", AgentRole.EXPLORER, 0.9, 0, "", 0.5),
+            AgentBid("a2", AgentRole.EXPLORER, 0.5, 1, "", 0.5),
+        ]
+        result = team.decide(bids, 2)
+        self.assertEqual(result.coalitions, [])
+        self.assertIsInstance(result.final_vote, VoteResult)
+
+    def test_per_call_override_of_stages(self):
+        team = make_team(enable_negotiation=True, enable_coalitions=True)
+        bids = [AgentBid("a", AgentRole.EXPLORER, 0.5, 0, "", 0.5)]
+        result = team.decide(bids, 1, negotiate=False, form_coalitions=False)
+        self.assertIsNone(result.negotiation)
+        self.assertEqual(result.coalitions, [])
+
+    # ---- guard paths --------------------------------------------------- #
+    def test_empty_bids(self):
+        team = make_team()
+        result = team.decide([], 3)
+        self.assertEqual(result.winner, 0)
+        self.assertIsNone(result.winning_role)
+        self.assertEqual(result.rounds_used, 0)
+        self.assertEqual(result.coalitions, [])
+
+    def test_zero_candidates(self):
+        team = make_team()
+        result = team.decide(
+            [AgentBid("a", AgentRole.EXPLORER, 0.5, 0, "", 0.5)], 0
+        )
+        self.assertEqual(result.winner, 0)
+        self.assertEqual(result.rounds_used, 0)
+
+    # ---- negotiation effects on final vote ----------------------------- #
+    def test_negotiation_can_change_winner(self):
+        team = make_team(
+            seed=0,
+            max_rounds=3,
+            low_confidence_threshold=0.9,
+            defection_probability=1.0,
+        )
+        bids = [
+            AgentBid("strong", AgentRole.EXPLORER, 0.9, 0, "", 0.5),
+            AgentBid("weak1", AgentRole.EXPLORER, 0.1, 1, "", 0.5),
+            AgentBid("weak2", AgentRole.EXPLORER, 0.1, 1, "", 0.5),
+        ]
+        result = team.decide(bids, 2)
+        self.assertEqual(result.winner, 0)
+        shifted = {b.agent_id for b in result.final_bids if b.proposed_action == 0}
+        self.assertIn("weak1", shifted)
+        self.assertIn("weak2", shifted)
+
+    # ---- coalitions reflect final bids --------------------------------- #
+    def test_coalitions_use_negotiated_bids(self):
+        team = make_team(
+            seed=0,
+            max_rounds=2,
+            low_confidence_threshold=0.9,
+            defection_probability=1.0,
+        )
+        bids = [
+            AgentBid("strong", AgentRole.EXPLORER, 0.9, 0, "", 0.5),
+            AgentBid("weak", AgentRole.EXPLORER, 0.1, 1, "", 0.5),
+        ]
+        result = team.decide(bids, 2)
+        action_0_coalition = next(
+            (c for c in result.coalitions if c.action == 0), None
+        )
+        self.assertIsNotNone(action_0_coalition)
+        self.assertIn("weak", action_0_coalition.agent_ids)
+
+    def test_coalitions_sorted_by_weight(self):
+        team = make_team(enable_negotiation=False)
+        bids = [
+            AgentBid("heavy", AgentRole.EXPLORER, 0.95, 0, "", 0.9),
+            AgentBid("light", AgentRole.EXPLORER, 0.05, 1, "", 0.05),
+        ]
+        result = team.decide(bids, 2)
+        self.assertGreaterEqual(
+            result.coalitions[0].total_weight,
+            result.coalitions[-1].total_weight,
+        )
+
+    # ---- outcome feedback ---------------------------------------------- #
+    def test_observe_outcome_updates_reputation(self):
+        team = make_team(enable_negotiation=False)
+        bids = [
+            AgentBid("a1", AgentRole.EXPLORER, 0.9, 0, "", 0.5),
+            AgentBid("a2", AgentRole.EXPLORER, 0.5, 1, "", 0.5),
+        ]
+        team.decide(bids, 2)
+        before = team.coordinator.get_reputation("a1").score
+        team.observe_outcome(
+            winner=0, bids=bids, n_candidates=2, reward=1.0, success=True
+        )
+        after = team.coordinator.get_reputation("a1").score
+        self.assertGreater(after, before)
+        self.assertLess(team.coordinator.get_reputation("a2").score, before)
+
+    def test_observe_outcome_updates_registry(self):
+        team = make_team(enable_negotiation=False)
+        bids = [AgentBid("a1", AgentRole.EXPLORER, 0.9, 0, "", 0.5)]
+        team.decide(bids, 1)
+        before = team.registry.success_rate(AgentRole.EXPLORER)
+        team.observe_outcome(
+            winner=0, bids=bids, n_candidates=1, reward=1.0, success=True
+        )
+        self.assertGreater(team.registry.success_rate(AgentRole.EXPLORER), before)
+
+    def test_observe_outcome_noop_on_degenerate_input(self):
+        team = make_team()
+        team.observe_outcome(0, [], 0, reward=1.0, success=True)
+
+    # ---- run_episode --------------------------------------------------- #
+    def test_run_episode_calls_outcome_fn(self):
+        team = make_team(enable_negotiation=False)
+        calls = []
+
+        def outcome_fn(winner, role):
+            calls.append((winner, role))
+            return True, 2.5
+
+        bids = [AgentBid("a1", AgentRole.EXPLORER, 0.9, 0, "", 0.5)]
+        result = team.run_episode(bids, 1, outcome_fn)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], result.winner)
+        self.assertEqual(calls[0][1], result.winning_role)
+
+    def test_run_episode_updates_after_success(self):
+        team = make_team(enable_negotiation=False)
+        bids = [AgentBid("a1", AgentRole.EXPLORER, 0.9, 0, "", 0.5)]
+        before_rep = team.coordinator.get_reputation("a1").score
+        before_reg = team.registry.success_rate(AgentRole.EXPLORER)
+        team.run_episode(bids, 1, lambda w, r: (True, 1.0))
+        self.assertGreater(team.coordinator.get_reputation("a1").score, before_rep)
+        self.assertGreater(
+            team.registry.success_rate(AgentRole.EXPLORER), before_reg
+        )
+
+    # ---- serialization ------------------------------------------------- #
+    def test_team_result_serializable(self):
+        team = make_team()
+        bids = [AgentBid("a", AgentRole.EXPLORER, 0.5, 0, "", 0.5)]
+        result = team.decide(bids, 1)
+        d = result.to_dict()
+        for key in (
+            "winner", "winning_role", "final_vote",
+            "negotiation", "coalitions", "converged",
+            "rounds_used", "final_bids",
+        ):
+            self.assertIn(key, d)
+
+    def test_team_roundtrip(self):
+        team = make_team()
+        team.decide([AgentBid("a", AgentRole.EXPLORER, 0.9, 0, "", 0.5)], 1)
+        team.observe_outcome(
+            winner=0,
+            bids=[AgentBid("a", AgentRole.EXPLORER, 0.9, 0, "", 0.5)],
+            n_candidates=1,
+            reward=1.0,
+            success=True,
+        )
+        data = team.to_dict()
+        team2 = MultiAgentTeam.from_dict(data, seed=0)
+        self.assertAlmostEqual(
+            team2.coordinator.get_reputation("a").score,
+            team.coordinator.get_reputation("a").score,
+            places=6,
+        )
+        self.assertEqual(
+            team2.config.enable_negotiation, team.config.enable_negotiation
+        )
+        self.assertEqual(
+            set(team2.config.voting.role_bias.keys()),
+            set(team.config.voting.role_bias.keys()),
+        )
+
+    def test_team_last_result_accessor(self):
+        team = make_team()
+        self.assertIsNone(team.last_result())
+        team.decide([AgentBid("a", AgentRole.EXPLORER, 0.5, 0, "", 0.5)], 1)
+        self.assertIsNotNone(team.last_result())
+        self.assertIsNotNone(team.last_result_dict())
+
+    # ---- integration: multi-episode learning --------------------------- #
+    def test_multi_episode_reputation_diverges(self):
+        team = make_team(enable_negotiation=False, seed=0)
+        honest = AgentBid("honest", AgentRole.EXPLORER, 0.9, 0, "", 0.5)
+        byz = AgentBid("byz", AgentRole.EXPLORER, 0.1, 1, "", 0.5)
+        for _ in range(10):
+            team.run_episode([honest, byz], 2, lambda w, r: (True, 1.0))
+        self.assertGreater(
+            team.coordinator.get_reputation("honest").score,
+            team.coordinator.get_reputation("byz").score,
         )
 
 
