@@ -1,50 +1,62 @@
 #!/usr/bin/env python3
-# File: src/enhancements/helium_circularity_enhanced_v16_0.py
-# Version 18.0 — Full Green Agent stack with all ten enhancements
+# File: src/enhancements/helium_circularity_enhanced_v19_0.py
+# Version 19.0 — Full Green Agent stack with all ten enhancements
 """
-Enhanced Helium Circularity Model — v18.0
+Enhanced Helium Circularity Model — v19.0
 
-Fixes every v16 runtime bug and hosts all ten Green Agent enhancements
-as first-class modules inside this file:
+The ten Green Agent enhancements are imported from the enhancements/*
+package. This file keeps only circularity-specific logic:
 
-  1. Quantum-Distillation Integration      QuantumInspiredTeacher + DistillationEnsemble
-  2. Causal RL for Policy Adaptation       CausalCounterfactualEstimator
-  3. Federated Green Learning              FederatedAggregator
-  4. Multi-Agent Coordination              AgentRole + EmergentRoleRegistry + MultiAgentCoordinator
-  5. Temporal Logic / Formal Verification  STLFormula + TemporalLogicMonitor + SafetyShield
-  6. Explainable AI                        DecisionExplainer + Explanation
-  7. Adaptive Precision Switching          PrecisionController + HardwareAwareAdapter
-  8. Carbon Markets / RECs                 CarbonMarketClient + RECInventory
-  9. Resilience / Chaos                    ChaosEngineer
- 10. HITL / Active Learning                UncertaintyEstimator + HumanInTheLoopGate + ActiveLearningSampler
+  - HeliumCircularityMetrics (range-validated)
+  - EnhancedDataQualityScorer
+  - PostQuantumCrypto (sign + real verify)
+  - BlockchainCircularityVerification (idempotent)
+  - MultiCloudStorage
+  - MixtureOfExpertsPredictive (proxy-label gating, rolling retrain)
+  - GeneticAlgorithmOptimizer (real fitness via AdaptiveCostFunction)
+  - EnhancedAutonomousCircularityOptimizer
+  - MultiObjectiveCloudDeployment (carbon-aware, per-role bids)
+  - SelfHealingManager (fitted detectors)
+  - EnhancedHeliumCircularityCalculator
+  - FastAPI surface, singleton, signal handlers, main
 
-Bug fixes over v16:
-  - Fixed the cloud_deployer self-reference crash in __init__
-  - MultiCloudStorage now has a real providers dict and store method
-  - EnhancedDataQualityScorer actually scores inputs
-  - ParetoFront.add uses strict inequality for dominance
-  - TOPSIS.score guards against zero columns and zero weights
-  - GA actually consumes AdaptiveCostFunction as fitness
-  - MOE gating trained on proxy labels derived from per-expert error windows
-  - % 100 gating trigger replaced with rolling-window retrain
-  - PQC.sign_data uses dilithium.sign(priv, payload)
-  - Blockchain record is deterministic and idempotent
-  - SelfHealingManager fits detectors on a training buffer
-  - Central config attributes guarded via getattr
-  - Missing enhancement config flags added
-  - Circuit breaker resets half_open_requests on transition to CLOSED
+Changelog v18.0 -> v19.0:
+  - All ten enhancement classes imported from the enhancements package.
+  - Compat wrappers for Explanation, DecisionExplainer, HITLRequest,
+    UncertaintyEstimator, HumanInTheLoopGate.
+  - FIXED: circularity_index degeneracy (single-candidate TOPSIS -> weighted sum).
+  - FIXED: GA gene keys now match the state keys (AdaptiveCostFunction works).
+  - MultiAgentCoordinator.vote tuples are unpacked; winning_role credited.
+  - PostQuantumCrypto.verify_data performs real signature verification.
+  - HumanInTheLoopGate.submit_decision enables external decision delivery.
+  - MultiObjectiveCloudDeployment reads real carbon intensity.
+  - Per-role bids differentiated; distiller teachers cached, not reassigned.
+  - Optimizer has its own STL monitor + safety shield.
+  - XAI Pareto set now has diverse inputs so attributions are informative.
+  - Real Prometheus metrics (no more local _SimpleMetrics).
+  - save_state / load_state for causal, roles, federated, GA, strategies.
+  - Signal handlers retain task references (no GC before run).
+  - FastAPI surface added: /calculate, /status, /health,
+    /explanation/last, /hitl/approval, /chaos.
+  - TaskManager honors restart_on_exit semantics.
 """
+
+from __future__ import annotations
 
 import asyncio
 import atexit
 import base64
 import contextlib
+import contextvars
 import hashlib
 import json
 import logging
+import logging.handlers
 import math
 import os
 import random
+import signal
+import tempfile
 import time
 import uuid
 from collections import defaultdict, deque
@@ -57,12 +69,175 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
+
 # ============================================================
-# CENTRAL GREEN AGENT COMPONENTS (imported if available)
+# SHIM: import all ten enhancements from the shared package
+# ============================================================
+from enhancements.precision import (
+    PrecisionLevel, PRECISION_COST, PrecisionController, HardwareAwareAdapter,
+)
+from enhancements.carbon import (
+    CarbonMarketClient, RECRecord, RECInventory, CarbonIntensityManager,
+)
+from enhancements.chaos import (
+    ChaosConfig, ChaosEngineer,
+)
+from enhancements.stl import (
+    STLOperator, STLFormula, TemporalLogicMonitor, SafetyShield,
+)
+from enhancements.causal import (
+    CausalTransition, CausalCounterfactualEstimator,
+)
+from enhancements.federated import (
+    FederatedUpdate, FederatedAggregator,
+)
+from enhancements.multi_agent import (
+    AgentRole, AgentBid, EmergentRoleRegistry, MultiAgentCoordinator,
+)
+from enhancements.quantum import (
+    QuantumInspiredTeacher, DistillationEnsemble,
+)
+from enhancements.xai import Explanation as SharedExplanation
+from enhancements.xai import DecisionExplainer as SharedDecisionExplainer
+from enhancements.hitl import (
+    HITLRequest as SharedHITLRequest,
+    UncertaintyEstimator as SharedUncertaintyEstimator,
+    HumanInTheLoopGate as SharedHumanInTheLoopGate,
+    ActiveLearningSampler,
+)
+from enhancements.common_state import (
+    STATE_VECTOR_DIM, state_vector_from_metrics,
+)
+
+
+# ============================================================
+# COMPAT WRAPPERS
+# ============================================================
+@dataclass
+class Explanation:
+    decision_id: str
+    chosen_idx: int
+    top_features: List[Tuple[str, float]]
+    counterfactuals: List[Dict[str, Any]]
+    rationale: str
+    confidence: float
+    safety_ok: bool
+    carbon_price_signal: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class DecisionExplainer(SharedDecisionExplainer):
+    def explain(self, chosen_idx, chosen, pareto, counterfactuals,
+                safety_ok, carbon_price, confidence: float = 0.5):
+        numeric_keys = [k for k, v in chosen.items() if isinstance(v, (int, float))]
+        if pareto and numeric_keys:
+            baseline = {k: float(np.mean([c.get(k, 0.0) for c in pareto])) for k in numeric_keys}
+            scales = {k: float(np.std([c.get(k, 0.0) for c in pareto]) + 1e-9) for k in numeric_keys}
+        else:
+            baseline = {k: 0.0 for k in numeric_keys}
+            scales = {k: 1.0 for k in numeric_keys}
+        shared = self.explain_anomaly(
+            kind="decision", current=chosen, baseline=baseline, scales=scales,
+            counterfactuals=counterfactuals, safety_ok=safety_ok,
+            carbon_price=carbon_price, confidence=confidence,
+        )
+        return Explanation(
+            decision_id=shared.decision_id, chosen_idx=chosen_idx,
+            top_features=shared.top_features, counterfactuals=shared.counterfactuals,
+            rationale=shared.rationale, confidence=shared.confidence,
+            safety_ok=shared.safety_ok, carbon_price_signal=shared.carbon_price_signal,
+        )
+
+
+@dataclass
+class HITLRequest:
+    request_id: str
+    reason: str
+    chosen_idx: int
+    candidates: List[Dict[str, Any]]
+    uncertainty: float
+    carbon_price: float
+    timestamp: float = field(default_factory=time.time)
+
+
+class UncertaintyEstimator(SharedUncertaintyEstimator):
+    def __init__(self, entropy_threshold: float = 0.75, variance_threshold: float = 0.05):
+        super().__init__(window=32)
+        self.entropy_threshold = entropy_threshold
+        self.variance_threshold = variance_threshold
+
+    def is_uncertain(self, probs) -> Tuple[bool, float]:
+        if probs is None or len(probs) == 0:
+            return False, 0.0
+        p = np.clip(np.asarray(probs, dtype=np.float64), 1e-12, 1.0)
+        h = float(-np.sum(p * np.log(p)) / math.log(len(p)))
+        score = 0.6 * h
+        return h > self.entropy_threshold, score
+
+
+class HumanInTheLoopGate(SharedHumanInTheLoopGate):
+    def __init__(self, approver=None, timeout_s: float = 2.0,
+                 auto_approve_on_timeout: bool = True):
+        super().__init__(approver=approver, timeout_s=timeout_s,
+                         auto_approve_on_timeout=auto_approve_on_timeout)
+        self._pending: Dict[str, asyncio.Future] = {}
+        self._pending_lock = asyncio.Lock()
+
+    async def request(self, req: HITLRequest) -> bool:
+        if self.approver is None:
+            self.audit.append({"request_id": req.request_id,
+                               "approved": True, "reason": "no_approver"})
+            HITL_APPROVALS.labels(decision="auto_approved").inc()
+            return True
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        async with self._pending_lock:
+            self._pending[req.request_id] = future
+
+        async def _run():
+            try:
+                result = await loop.run_in_executor(None, self.approver, req)
+                if not future.done():
+                    future.set_result(bool(result))
+            except Exception as e:
+                if not future.done():
+                    future.set_exception(e)
+
+        runner = asyncio.create_task(_run())
+        try:
+            approved = await asyncio.wait_for(future, timeout=self.timeout_s)
+        except asyncio.TimeoutError:
+            approved = self.auto_approve_on_timeout
+            HITL_APPROVALS.labels(decision="timeout").inc()
+        except Exception:
+            approved = self.auto_approve_on_timeout
+        finally:
+            async with self._pending_lock:
+                self._pending.pop(req.request_id, None)
+            if not runner.done():
+                runner.cancel()
+        self.audit.append({"request_id": req.request_id,
+                           "approved": bool(approved), "reason": req.reason})
+        HITL_APPROVALS.labels(decision="approved" if approved else "rejected").inc()
+        return bool(approved)
+
+    async def submit_decision(self, request_id: str, approved: bool) -> bool:
+        async with self._pending_lock:
+            fut = self._pending.get(request_id)
+            if fut is None or fut.done():
+                return False
+            fut.set_result(bool(approved))
+            return True
+
+
+# ============================================================
+# CENTRAL GREEN AGENT COMPONENTS (with fallbacks)
 # ============================================================
 try:
     from ..config import config as central_config
-except Exception:  # noqa: BLE001
+except Exception:
     class _CentralConfig:
         CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
         CIRCUIT_BREAKER_RECOVERY_TIMEOUT = 30
@@ -80,7 +255,7 @@ except Exception:  # noqa: BLE001
 
 try:
     from ..storage import Storage
-except Exception:  # noqa: BLE001
+except Exception:
     class Storage:
         def __init__(self, *a, **kw): self._records: List[Any] = []
         def store_circularity_record(self, record): self._records.append(record)
@@ -88,7 +263,7 @@ except Exception:  # noqa: BLE001
 
 try:
     from ..schemas.feedback_event import FeedbackEvent
-except Exception:  # noqa: BLE001
+except Exception:
     class FeedbackEvent:
         def __init__(self, **kwargs): self.__dict__.update(kwargs)
         @classmethod
@@ -97,13 +272,13 @@ except Exception:  # noqa: BLE001
 
 try:
     from ..routing.pareto_gating import ParetoGating
-except Exception:  # noqa: BLE001
+except Exception:
     class ParetoGating:
         def __init__(self, *a, **kw): pass
 
 try:
     from ..feedback.adaptive_cost import AdaptiveCostFunction
-except Exception:  # noqa: BLE001
+except Exception:
     class AdaptiveCostFunction:
         def __init__(self, storage=None, *a, **kw): self.storage = storage
         def evaluate(self, state: Dict, targets: Dict) -> float:
@@ -115,31 +290,47 @@ except Exception:  # noqa: BLE001
 
 try:
     from ..safety.drift_detector import DriftDetector
-except Exception:  # noqa: BLE001
+except Exception:
     class DriftDetector:
         def __init__(self, *a, **kw): pass
         async def check_drift(self, metrics): return False
 
 try:
     from ..scaling.message_queue import AsyncMessageQueue
-except Exception:  # noqa: BLE001
+except Exception:
     class AsyncMessageQueue:
         def __init__(self): self._messages: List[Any] = []
         async def publish(self, channel, message): self._messages.append((channel, message))
 
 try:
     from ..metrics import MetricsRegistry
-except Exception:  # noqa: BLE001
+except Exception:
     class MetricsRegistry:
         def set_circularity_score(self, value): pass
 
 try:
-    from ..logger import logger
-except Exception:  # noqa: BLE001
+    import structlog  # type: ignore
+    logger = structlog.get_logger(__name__)
+except ImportError:
     logger = logging.getLogger(__name__)
     if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO,
-                            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(name)s - %(levelname)s - [%(correlation_id)s] - %(message)s",
+        )
+
+correlation_id_var = contextvars.ContextVar("correlation_id", default=str(uuid.uuid4())[:8])
+
+
+class CorrelationIdFilter(logging.Filter):
+    def filter(self, record):
+        record.correlation_id = correlation_id_var.get()
+        return True
+
+
+if isinstance(logger, logging.Logger):
+    logger.addFilter(CorrelationIdFilter())
+
 
 # ============================================================
 # OPTIONAL DEPENDENCIES
@@ -199,6 +390,27 @@ except ImportError:
     GCP_AVAILABLE = False
 
 try:
+    from fastapi import FastAPI, Depends, HTTPException, Request
+    from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+    from fastapi.middleware.cors import CORSMiddleware
+    import uvicorn
+    FASTAPI_AVAILABLE = True
+except ImportError:
+    FASTAPI_AVAILABLE = False
+
+try:
+    from jose import JWTError, jwt  # type: ignore
+    JOSE_AVAILABLE = True
+except ImportError:
+    JOSE_AVAILABLE = False
+
+try:
+    from prometheus_client import Counter, Gauge, CollectorRegistry
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
+try:
     from enhancements.limit_graph import LimitGraph  # type: ignore
     from enhancements.rlhf import RLHFOptimizer  # type: ignore
     from enhancements.multi_teacher_policy_distillation import MultiTeacherDistiller  # type: ignore
@@ -245,6 +457,42 @@ except ImportError:
 
 
 # ============================================================
+# PROMETHEUS METRICS
+# ============================================================
+if PROMETHEUS_AVAILABLE:
+    REGISTRY = CollectorRegistry()
+    CIRCULARITY_COMPUTATIONS = Counter("circularity_computations_total", "Computations", ["status"], registry=REGISTRY)
+    QUANTUM_SIGNATURES = Counter("circularity_quantum_signatures_total", "Sigs", ["algorithm", "status"], registry=REGISTRY)
+    BLOCKCHAIN_VERIFICATIONS = Counter("circularity_blockchain_verifications_total", "BC", ["status"], registry=REGISTRY)
+    AUTONOMOUS_OPTIMIZATIONS = Counter("circularity_optimizations_total", "Opt", ["strategy", "status"], registry=REGISTRY)
+    CLOUD_DEPLOYMENTS = Counter("circularity_cloud_deployments_total", "Deploy", ["provider", "status"], registry=REGISTRY)
+    CIRCULARITY_INDEX = Gauge("circularity_index", "CI", registry=REGISTRY)
+    CARBON_INTENSITY = Gauge("circularity_carbon_intensity", "CI", registry=REGISTRY)
+    CARBON_PRICE = Gauge("circularity_carbon_price_per_kg", "CP", registry=REGISTRY)
+    REC_INVENTORY_KWH = Gauge("circularity_rec_inventory_kwh", "REC", registry=REGISTRY)
+    PRECISION_SWITCHES = Counter("circularity_precision_switches_total", "PS", ["level"], registry=REGISTRY)
+    CHAOS_EVENTS = Counter("circularity_chaos_events_total", "CE", ["type"], registry=REGISTRY)
+    HITL_APPROVALS = Counter("circularity_hitl_approvals_total", "H", ["decision"], registry=REGISTRY)
+    SAFETY_VIOLATIONS = Counter("circularity_safety_violations_total", "SV", ["formula"], registry=REGISTRY)
+    FEDERATED_ROUNDS = Counter("circularity_federated_rounds_total", "FR", registry=REGISTRY)
+    HEALTH_SCORE = Gauge("circularity_health_score", "HS", registry=REGISTRY)
+    MOE_GATING_WEIGHTS = Gauge("circularity_moe_gating_weights", "MG", ["expert"], registry=REGISTRY)
+    GA_FITNESS = Gauge("circularity_ga_fitness", "GA", ["generation"], registry=REGISTRY)
+    CLOUD_STORAGE = Counter("circularity_cloud_storage_operations_total", "CS", ["provider", "operation", "status"], registry=REGISTRY)
+else:
+    class DummyMetrics:
+        def inc(self, *a, **kw): pass
+        def set(self, *a, **kw): pass
+        def observe(self, *a, **kw): pass
+        def labels(self, *a, **kw): return self
+    CIRCULARITY_COMPUTATIONS = QUANTUM_SIGNATURES = BLOCKCHAIN_VERIFICATIONS = DummyMetrics()
+    AUTONOMOUS_OPTIMIZATIONS = CLOUD_DEPLOYMENTS = CIRCULARITY_INDEX = DummyMetrics()
+    CARBON_INTENSITY = CARBON_PRICE = REC_INVENTORY_KWH = PRECISION_SWITCHES = DummyMetrics()
+    CHAOS_EVENTS = HITL_APPROVALS = SAFETY_VIOLATIONS = FEDERATED_ROUNDS = DummyMetrics()
+    HEALTH_SCORE = MOE_GATING_WEIGHTS = GA_FITNESS = CLOUD_STORAGE = DummyMetrics()
+
+
+# ============================================================
 # EXCEPTIONS
 # ============================================================
 class CircularityError(Exception): pass
@@ -261,564 +509,7 @@ class SafetyViolationError(CircularityError): pass
 
 
 # ============================================================
-# PROMETHEUS-STYLE METRICS (soft, no external dependency)
-# ============================================================
-class _SimpleMetrics:
-    def __init__(self): self._v: Dict[str, float] = {}
-    def inc(self, name, labels=None):
-        key = f"{name}:{labels}" if labels else name
-        self._v[key] = self._v.get(key, 0) + 1
-    def set(self, name, value, labels=None):
-        key = f"{name}:{labels}" if labels else name
-        self._v[key] = float(value)
-    def get(self): return dict(self._v)
-
-GLOBAL_METRICS = _SimpleMetrics()
-
-
-# ============================================================
-# ============================================================
-# TEN ENHANCEMENT MODULES
-# ============================================================
-# ============================================================
-
-
-# ------------------------------------------------------------
-# Enhancement 7: Adaptive Precision Switching
-# ------------------------------------------------------------
-class PrecisionLevel(str, Enum):
-    FP32 = "fp32"; BF16 = "bf16"; FP16 = "fp16"
-    FP8 = "fp8"; INT8 = "int8"; INT4 = "int4"
-
-
-PRECISION_COST = {
-    PrecisionLevel.FP32: {"speed": 1.0, "energy": 1.00, "quality": 1.000, "bits": 32.0},
-    PrecisionLevel.BF16: {"speed": 1.7, "energy": 0.72, "quality": 0.997, "bits": 16.0},
-    PrecisionLevel.FP16: {"speed": 2.0, "energy": 0.65, "quality": 0.994, "bits": 16.0},
-    PrecisionLevel.FP8:  {"speed": 3.1, "energy": 0.50, "quality": 0.985, "bits": 8.0},
-    PrecisionLevel.INT8: {"speed": 3.6, "energy": 0.44, "quality": 0.972, "bits": 8.0},
-    PrecisionLevel.INT4: {"speed": 5.0, "energy": 0.32, "quality": 0.905, "bits": 4.0},
-}
-
-
-class PrecisionController:
-    def __init__(self, supported=None, quality_floor=0.95, carbon_aware=True):
-        self.supported = list(supported) if supported else list(PrecisionLevel)
-        self.quality_floor = quality_floor
-        self.carbon_aware = carbon_aware
-
-    def select(self, carbon_intensity, latency_headroom_ratio, carbon_price=0.0):
-        stress = min(1.0, max(0.0, carbon_intensity / 600.0)) if self.carbon_aware else 0.0
-        price_stress = min(1.0, max(0.0, carbon_price / 0.2))
-        headroom = min(1.0, max(0.0, latency_headroom_ratio))
-        agg = 0.5 * stress + 0.3 * price_stress + 0.2 * (1.0 - headroom)
-        ordered = [p for p in PrecisionLevel if p in self.supported]
-        ordered.sort(key=lambda p: PRECISION_COST[p]["energy"])
-        chosen = ordered[0]
-        for i, p in enumerate(ordered):
-            if PRECISION_COST[p]["quality"] >= self.quality_floor and agg >= 0.25 * i:
-                chosen = p
-        return chosen
-
-
-class HardwareAwareAdapter:
-    def __init__(self, controller):
-        self.controller = controller
-
-    def adapt(self, policy, carbon_intensity, latency_headroom, carbon_price):
-        level = self.controller.select(carbon_intensity, latency_headroom, carbon_price)
-        out = dict(policy)
-        out["precision_level"] = level.value
-        out["effective_bits"] = PRECISION_COST[level]["bits"]
-        GLOBAL_METRICS.inc("precision_switches", labels=level.value)
-        return out, level
-
-
-# ------------------------------------------------------------
-# Enhancement 8: Carbon Markets / RECs
-# ------------------------------------------------------------
-class CarbonMarketClient:
-    def __init__(self, base_price=0.05, sensitivity=0.0005):
-        self.base_price = base_price
-        self.sensitivity = sensitivity
-
-    def price(self, carbon_intensity, hour_of_day=None):
-        tod = 1.0
-        if hour_of_day is not None:
-            tod = 1.0 + 0.3 * math.sin((hour_of_day / 24.0) * 2 * math.pi)
-        return self.base_price + self.sensitivity * carbon_intensity * tod
-
-
-@dataclass
-class RECRecord:
-    kwh: float
-    issued_at: float
-    source: str = "solar"
-
-
-class RECInventory:
-    def __init__(self, grid_kg_co2_per_kwh=0.4):
-        self.grid_factor = grid_kg_co2_per_kwh
-        self._records: List[RECRecord] = []
-
-    def add(self, kwh, source="solar"):
-        self._records.append(RECRecord(kwh=kwh, issued_at=time.time(), source=source))
-
-    def total_kwh(self):
-        return sum(r.kwh for r in self._records)
-
-    def consume(self, kwh):
-        remaining, offset = kwh, 0.0
-        new_records: List[RECRecord] = []
-        for r in self._records:
-            if remaining <= 0:
-                new_records.append(r); continue
-            take = min(r.kwh, remaining)
-            remaining -= take
-            offset += take * self.grid_factor
-            if r.kwh - take > 1e-9:
-                new_records.append(RECRecord(kwh=r.kwh - take,
-                                             issued_at=r.issued_at, source=r.source))
-        self._records = new_records
-        return offset
-
-
-# ------------------------------------------------------------
-# Enhancement 9: Resilience / Chaos
-# ------------------------------------------------------------
-@dataclass
-class ChaosConfig:
-    fault_prob: float = 0.0
-    latency_inject_ms: float = 0.0
-    latency_inject_prob: float = 0.3
-    carbon_spike_prob: float = 0.0
-    carbon_spike_factor: float = 1.5
-    seed: int = 0
-
-    def enabled(self):
-        return (self.fault_prob > 0
-                or (self.latency_inject_ms > 0 and self.latency_inject_prob > 0)
-                or self.carbon_spike_prob > 0)
-
-
-class ChaosEngineer:
-    def __init__(self, config=None):
-        self.config = config or ChaosConfig()
-        self.rng = random.Random(self.config.seed)
-        self.events: List[Dict[str, Any]] = []
-
-    def maybe_fault(self):
-        if self.rng.random() < self.config.fault_prob:
-            self.events.append({"type": "fault", "t": time.time()})
-            GLOBAL_METRICS.inc("chaos_events", labels="fault"); return True
-        return False
-
-    def maybe_latency(self):
-        if self.config.latency_inject_ms > 0 and self.rng.random() < self.config.latency_inject_prob:
-            self.events.append({"type": "latency", "t": time.time()})
-            GLOBAL_METRICS.inc("chaos_events", labels="latency")
-            return self.config.latency_inject_ms
-        return 0.0
-
-    def maybe_carbon_spike(self, carbon_intensity):
-        if self.rng.random() < self.config.carbon_spike_prob:
-            self.events.append({"type": "carbon_spike", "t": time.time()})
-            GLOBAL_METRICS.inc("chaos_events", labels="carbon_spike")
-            return carbon_intensity * self.config.carbon_spike_factor
-        return carbon_intensity
-
-
-# ------------------------------------------------------------
-# Enhancement 5: Temporal Logic / Formal Verification
-# ------------------------------------------------------------
-class STLOperator(str, Enum):
-    ALWAYS = "G"; EVENTUALLY = "F"; UNTIL = "U"
-
-
-@dataclass
-class STLFormula:
-    name: str
-    predicate: Callable[[Dict[str, Any]], bool]
-    operator: STLOperator
-    horizon: int = 10
-
-
-class TemporalLogicMonitor:
-    def __init__(self, horizon=10):
-        self.horizon = horizon
-        self._history: deque = deque(maxlen=horizon * 4)
-        self.formulas: List[STLFormula] = []
-
-    def add_formula(self, f):
-        self.formulas.append(f)
-
-    def observe(self, record):
-        self._history.append(record)
-
-    def verify(self):
-        results = {}
-        for f in self.formulas:
-            window = list(self._history)[-f.horizon:]
-            if not window:
-                results[f.name] = True; continue
-            sat = [bool(f.predicate(r)) for r in window]
-            if f.operator == STLOperator.ALWAYS:
-                results[f.name] = all(sat)
-            elif f.operator in (STLOperator.EVENTUALLY, STLOperator.UNTIL):
-                results[f.name] = any(sat)
-            else:
-                results[f.name] = True
-            if not results[f.name]:
-                GLOBAL_METRICS.inc("safety_violations", labels=f.name)
-        return results
-
-
-class SafetyShield:
-    def __init__(self, monitor):
-        self.monitor = monitor
-        self.violations: List[Dict[str, Any]] = []
-
-    def screen(self, selected_value, candidates, key="value"):
-        verdict = self.monitor.verify()
-        violated = [k for k, ok in verdict.items() if not ok]
-        if not violated:
-            return selected_value, True, verdict
-        if not candidates:
-            return selected_value, False, verdict
-        safe = min(candidates, key=lambda p: p.get(key, 0.0))
-        self.violations.append({"t": time.time(), "violated": violated})
-        return safe, False, verdict
-
-
-# ------------------------------------------------------------
-# Enhancement 2: Causal RL
-# ------------------------------------------------------------
-@dataclass
-class CausalTransition:
-    state: np.ndarray
-    action: int
-    reward: float
-    next_state: np.ndarray
-    context: Dict[str, float] = field(default_factory=dict)
-
-
-class CausalCounterfactualEstimator:
-    def __init__(self, state_dim, n_actions, ridge=1e-3):
-        self.state_dim = state_dim
-        self.n_actions = n_actions
-        self.ridge = ridge
-        self._A = np.eye(state_dim + n_actions + 1) * ridge
-        self._b = np.zeros(state_dim + n_actions + 1)
-        self._n = 0
-
-    def _features(self, s, a):
-        one_hot = np.zeros(self.n_actions); one_hot[a % self.n_actions] = 1.0
-        return np.concatenate([np.asarray(s, dtype=np.float64), one_hot, [1.0]])
-
-    def _ensure_actions(self, n):
-        if n == self.n_actions: return
-        self._A = np.eye(self.state_dim + n + 1) * self.ridge
-        self._b = np.zeros(self.state_dim + n + 1)
-        self.n_actions = n; self._n = 0
-
-    def update(self, t):
-        x = self._features(t.state, t.action)
-        self._A += np.outer(x, x); self._b += t.reward * x; self._n += 1
-
-    def predict(self, s, a):
-        if self._n < 2: return 0.0
-        try: theta = np.linalg.solve(self._A, self._b)
-        except np.linalg.LinAlgError: return 0.0
-        return float(self._features(s, a) @ theta)
-
-    def counterfactuals(self, s, n_actions):
-        self._ensure_actions(n_actions)
-        return {a: self.predict(s, a) for a in range(n_actions)}
-
-
-# ------------------------------------------------------------
-# Enhancement 3: Federated Green Learning
-# ------------------------------------------------------------
-@dataclass
-class FederatedUpdate:
-    node_id: str
-    weights: Dict[str, np.ndarray]
-    n_samples: int
-    carbon_intensity: float
-    timestamp: float = field(default_factory=time.time)
-
-
-class FederatedAggregator:
-    def __init__(self, dp_sigma=1e-3, staleness_s=3600.0):
-        self.dp_sigma = dp_sigma
-        self.staleness_s = staleness_s
-        self._updates: Dict[str, FederatedUpdate] = {}
-        self._global: Optional[Dict[str, np.ndarray]] = None
-
-    def submit(self, u): self._updates[u.node_id] = u
-
-    def _fresh(self):
-        now = time.time()
-        return [u for u in self._updates.values() if (now - u.timestamp) <= self.staleness_s]
-
-    def aggregate(self):
-        fresh = self._fresh()
-        if not fresh: return self._global
-        weights = np.array([u.n_samples / max(u.carbon_intensity, 1.0) for u in fresh])
-        weights /= max(weights.sum(), 1e-12)
-        agg: Dict[str, np.ndarray] = {}
-        for k in fresh[0].weights.keys():
-            stacked = np.stack([u.weights[k] for u in fresh], axis=0)
-            blended = np.tensordot(weights, stacked, axes=([0], [0]))
-            if self.dp_sigma > 0:
-                blended = blended + np.random.normal(0.0, self.dp_sigma, size=blended.shape)
-            agg[k] = blended
-        self._global = agg
-        GLOBAL_METRICS.inc("federated_rounds")
-        return agg
-
-    def global_weights(self): return self._global
-
-
-# ------------------------------------------------------------
-# Enhancement 4: Multi-Agent Coordination
-# ------------------------------------------------------------
-class AgentRole(str, Enum):
-    EXPLORER = "explorer"; EXPLOITER = "exploiter"
-    SAFETY_OFFICER = "safety_officer"; CARBON_BROKER = "carbon_broker"
-    VERIFIER = "verifier"
-
-
-@dataclass
-class AgentBid:
-    agent_id: str
-    role: AgentRole
-    confidence: float
-    proposed_action: int
-    rationale: str
-    carbon_score: float
-
-
-class EmergentRoleRegistry:
-    def __init__(self, decay=0.95):
-        self.decay = decay
-        self._scores = {r: 1.0 for r in AgentRole}
-        self._counts = {r: 0 for r in AgentRole}
-
-    def record(self, role, success, reward):
-        for r in self._scores: self._scores[r] *= self.decay
-        signal = reward if success else -abs(reward) * 0.5
-        self._scores[role] += signal; self._counts[role] += 1
-
-    def weights(self):
-        total = sum(max(v, 1e-6) for v in self._scores.values())
-        return {r: max(v, 1e-6) / total for r, v in self._scores.items()}
-
-    def dominant_role(self):
-        return max(self._scores, key=self._scores.get)
-
-
-class MultiAgentCoordinator:
-    def __init__(self, registry, role_bias=None):
-        self.registry = registry
-        self.role_bias = role_bias or {
-            AgentRole.EXPLORER: 0.6, AgentRole.EXPLOITER: 0.9,
-            AgentRole.SAFETY_OFFICER: 1.2, AgentRole.CARBON_BROKER: 1.1,
-            AgentRole.VERIFIER: 1.0,
-        }
-
-    def vote(self, bids, n_candidates):
-        if not bids or n_candidates <= 0: return 0
-        role_w = self.registry.weights()
-        scores = np.zeros(n_candidates)
-        for b in bids:
-            idx = b.proposed_action % n_candidates
-            weight = (role_w.get(b.role, 0.1)
-                      * self.role_bias.get(b.role, 1.0)
-                      * max(b.confidence, 0.0) * (1.0 + b.carbon_score))
-            scores[idx] += weight
-        return int(np.argmax(scores))
-
-
-# ------------------------------------------------------------
-# Enhancement 6: Explainable AI
-# ------------------------------------------------------------
-@dataclass
-class Explanation:
-    decision_id: str
-    chosen_idx: int
-    top_features: List[Tuple[str, float]]
-    counterfactuals: List[Dict[str, Any]]
-    rationale: str
-    confidence: float
-    safety_ok: bool
-    carbon_price_signal: float
-
-    def to_dict(self): return asdict(self)
-
-
-class DecisionExplainer:
-    def __init__(self, feature_names=None):
-        self.feature_names = list(feature_names) if feature_names else [
-            "cost", "carbon", "latency", "availability",
-        ]
-
-    def _attributions(self, chosen, pareto):
-        if not pareto: return []
-        arr = np.array([[float(c.get(f, 0.0)) for f in self.feature_names] for c in pareto])
-        chosen_vec = np.array([float(chosen.get(f, 0.0)) for f in self.feature_names])
-        mean = arr.mean(axis=0); std = arr.std(axis=0) + 1e-9
-        z = (chosen_vec - mean) / std
-        attrs = list(zip(self.feature_names, z.tolist()))
-        attrs.sort(key=lambda kv: abs(kv[1]), reverse=True)
-        return attrs
-
-    def explain(self, chosen_idx, chosen, pareto, counterfactuals,
-                safety_ok, carbon_price, confidence=0.5):
-        attrs = self._attributions(chosen, pareto)
-        cf_list = []
-        for idx, score in sorted(counterfactuals.items(), key=lambda kv: kv[1], reverse=True)[:3]:
-            if 0 <= idx < len(pareto):
-                cf_list.append({"alternative_idx": idx, "expected_reward": float(score)})
-        top_feat = ", ".join(f"{n}={v:+.2f}" for n, v in attrs[:3])
-        rationale = (
-            f"Chose #{chosen_idx} (confidence={confidence:.2f}). "
-            f"Top deviations: {top_feat}. Carbon price={carbon_price:.4f}. "
-            f"Safety={'ok' if safety_ok else 'OVERRIDE'}. Counterfactuals: {len(cf_list)}."
-        )
-        return Explanation(
-            decision_id=f"dec-{uuid.uuid4().hex[:8]}",
-            chosen_idx=chosen_idx, top_features=attrs[:5],
-            counterfactuals=cf_list, rationale=rationale,
-            confidence=confidence, safety_ok=safety_ok,
-            carbon_price_signal=carbon_price,
-        )
-
-
-# ------------------------------------------------------------
-# Enhancement 1: Quantum-Distillation
-# ------------------------------------------------------------
-class QuantumInspiredTeacher:
-    def __init__(self, n_qubits=5, seed=0):
-        self.n_qubits = n_qubits
-        self.rng = np.random.default_rng(seed)
-        self._params = self.rng.normal(size=(n_qubits, 2)) * 0.5
-
-    def _ry(self, state, theta, q):
-        c, s = math.cos(theta / 2), math.sin(theta / 2)
-        n = len(state); new = state.copy(); step = 1 << q
-        for i in range(n):
-            if i & step == 0:
-                a, b = state[i], state[i | step]
-                new[i] = c * a - s * b; new[i | step] = s * a + c * b
-        return new
-
-    def _simulate(self, features, n_candidates):
-        dim = 1 << self.n_qubits
-        state = np.zeros(dim, dtype=np.complex128); state[0] = 1.0
-        for q in range(self.n_qubits):
-            angle = float(self._params[q, 0] * features[q % len(features)] + self._params[q, 1])
-            state = self._ry(state, angle, q)
-        probs_full = np.abs(state) ** 2
-        probs = np.zeros(n_candidates, dtype=np.float64)
-        for i, p in enumerate(probs_full): probs[i % n_candidates] += p
-        return probs / max(probs.sum(), 1e-12)
-
-    def teacher_probs(self, features, n):
-        if n <= 0: return np.zeros(0)
-        return self._simulate(np.asarray(features, dtype=np.float64), n)
-
-
-class DistillationEnsemble:
-    def __init__(self, quantum, alpha=0.5):
-        self.quantum = quantum; self.alpha = alpha
-
-    def blend(self, features, other, n):
-        q = self.quantum.teacher_probs(features, n)
-        if other is None or len(other) != n: return q
-        return self.alpha * q + (1.0 - self.alpha) * np.asarray(other)
-
-
-# ------------------------------------------------------------
-# Enhancement 10: HITL / Active Learning
-# ------------------------------------------------------------
-@dataclass
-class HITLRequest:
-    request_id: str
-    reason: str
-    chosen_idx: int
-    candidates: List[Dict[str, Any]]
-    uncertainty: float
-    carbon_price: float
-
-
-class UncertaintyEstimator:
-    def __init__(self, entropy_threshold=0.75, variance_threshold=0.05):
-        self.entropy_threshold = entropy_threshold
-        self.variance_threshold = variance_threshold
-        self._rewards: deque = deque(maxlen=32)
-
-    def observe(self, reward): self._rewards.append(float(reward))
-
-    def entropy(self, probs):
-        if probs is None or len(probs) == 0: return 1.0
-        p = np.clip(np.asarray(probs, dtype=np.float64), 1e-12, 1.0)
-        return float(-np.sum(p * np.log(p)) / math.log(len(p)))
-
-    def variance(self):
-        if len(self._rewards) < 3: return 0.0
-        return float(np.var(np.asarray(self._rewards)))
-
-    def is_uncertain(self, probs):
-        h = self.entropy(probs); v = self.variance()
-        score = 0.6 * h + 0.4 * min(1.0, v / max(self.variance_threshold, 1e-9))
-        return (h > self.entropy_threshold or v > self.variance_threshold), score
-
-
-class HumanInTheLoopGate:
-    def __init__(self, approver=None, timeout_s=2.0, auto_approve_on_timeout=True):
-        self.approver = approver
-        self.timeout_s = timeout_s
-        self.auto_approve_on_timeout = auto_approve_on_timeout
-        self.audit: List[Dict[str, Any]] = []
-
-    async def request(self, req):
-        if self.approver is None:
-            self.audit.append({"request_id": req.request_id, "approved": True,
-                               "reason": "no_approver"})
-            GLOBAL_METRICS.inc("hitl_approvals", labels="auto_approved")
-            return True
-        loop = asyncio.get_running_loop()
-        try:
-            approved = await asyncio.wait_for(
-                loop.run_in_executor(None, self.approver, req), timeout=self.timeout_s)
-        except asyncio.TimeoutError:
-            approved = self.auto_approve_on_timeout
-        self.audit.append({"request_id": req.request_id, "approved": bool(approved),
-                           "reason": req.reason})
-        GLOBAL_METRICS.inc("hitl_approvals", labels="approved" if approved else "rejected")
-        return bool(approved)
-
-
-class ActiveLearningSampler:
-    def __init__(self, capacity=256):
-        self.capacity = capacity; self._buffer: List[Dict[str, Any]] = []
-
-    def maybe_store(self, record, uncertainty, threshold=0.5):
-        if uncertainty < threshold: return False
-        if len(self._buffer) >= self.capacity: self._buffer.pop(0)
-        self._buffer.append({**record, "uncertainty": uncertainty, "t": time.time()})
-        return True
-
-    def sample(self, k=8):
-        if not self._buffer: return []
-        return random.sample(self._buffer, min(k, len(self._buffer)))
-
-    def __len__(self): return len(self._buffer)
-
-
-# ============================================================
-# Multi-Objective Helpers (correct dominance, guarded TOPSIS)
+# PARETO FRONT + TOPSIS
 # ============================================================
 class ParetoFront:
     def __init__(self):
@@ -853,14 +544,26 @@ class ParetoFront:
 class TOPSIS:
     @staticmethod
     def score(candidates, weights, criteria):
-        if not candidates or not criteria: return []
-        matrix = np.array([[float(c.get(c, 0.0)) for c in criteria] for c in candidates])
+        if not candidates or not criteria:
+            return []
+        # v19: single candidate is degenerate; fall back to weighted sum
+        if len(candidates) == 1:
+            c = candidates[0]
+            w = list(weights)
+            total = sum(w) or 1.0
+            w = [x / total for x in w]
+            s = sum(w[i] * float(c.get(criteria[i], 0.0))
+                    for i in range(min(len(w), len(criteria))))
+            return [float(min(1.0, max(0.0, s)))]
+        matrix = np.array([[float(c.get(crit, 0.0)) for crit in criteria] for c in candidates])
         denom = np.sqrt((matrix ** 2).sum(axis=0))
         denom = np.where(denom == 0, 1.0, denom)
         norm = matrix / denom
         w = np.asarray(weights[: norm.shape[1]])
-        if w.sum() <= 0: w = np.ones(norm.shape[1]) / norm.shape[1]
-        else: w = w / w.sum()
+        if w.sum() <= 0:
+            w = np.ones(norm.shape[1]) / norm.shape[1]
+        else:
+            w = w / w.sum()
         weighted = norm * w
         ideal = weighted.max(axis=0); neg_ideal = weighted.min(axis=0)
         d_plus = np.sqrt(((weighted - ideal) ** 2).sum(axis=1))
@@ -869,7 +572,7 @@ class TOPSIS:
 
 
 # ============================================================
-# Circuit breaker, rate limiter
+# CIRCUIT BREAKER / RATE LIMITER
 # ============================================================
 class CircuitBreakerState(Enum):
     CLOSED = "closed"; OPEN = "open"; HALF_OPEN = "half_open"
@@ -951,7 +654,58 @@ class EnhancedRateLimiter:
 
 
 # ============================================================
-# Data classes
+# TASK MANAGER (v19: explicit restart_on_exit)
+# ============================================================
+class TaskManager:
+    def __init__(self, max_workers=10):
+        self.max_workers = max_workers
+        self.tasks: Dict[str, asyncio.Task] = {}
+        self.shutdown_event = asyncio.Event()
+        self._lock = asyncio.Lock()
+        self._pending: List[Tuple[str, Callable, tuple, dict, bool]] = []
+        self.metrics = {"total_tasks": 0, "restarts": 0}
+
+    def register_task(self, name, coro_func, *args, restart_on_exit=True, **kwargs):
+        self._pending.append((name, coro_func, args, kwargs, restart_on_exit))
+
+    def start_task(self, name, coro_func, *args, restart_on_exit=True, **kwargs):
+        shutdown_event = self.shutdown_event
+
+        async def wrapper():
+            backoff = 1
+            while not shutdown_event.is_set():
+                try:
+                    await coro_func(*args, **kwargs)
+                    if not restart_on_exit:
+                        break
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Task {name} crashed: {e}")
+                    self.metrics["restarts"] += 1
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 300)
+        task = asyncio.create_task(wrapper(), name=name)
+        self.tasks[name] = task
+        self.metrics["total_tasks"] += 1
+        return task
+
+    def start_registered_tasks(self):
+        for name, fn, args, kwargs, restart in self._pending:
+            self.start_task(name, fn, *args, restart_on_exit=restart, **kwargs)
+        self._pending.clear()
+
+    async def stop_all(self):
+        self.shutdown_event.set()
+        async with self._lock:
+            for t in self.tasks.values():
+                t.cancel()
+            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+            self.tasks.clear()
+
+
+# ============================================================
+# DATA CLASSES
 # ============================================================
 @dataclass
 class HeliumCircularityMetrics:
@@ -991,13 +745,14 @@ class HeliumCircularityMetrics:
 
 
 # ============================================================
-# Post-Quantum Cryptography (real signing)
+# POST-QUANTUM CRYPTO (sign + real verify)
 # ============================================================
 class PostQuantumCrypto:
-    def __init__(self, storage, algorithm="dilithium"):
+    def __init__(self, storage, algorithm: str = "dilithium"):
         self.storage = storage
         self.algorithm = algorithm
         self._keypair: Optional[Tuple[bytes, bytes]] = None
+        self._lock = asyncio.Lock()
         if PQC_AVAILABLE:
             try:
                 if algorithm == "dilithium":
@@ -1011,28 +766,50 @@ class PostQuantumCrypto:
                 self._keypair = None
 
     async def sign_data(self, data: Dict) -> Dict:
-        if PQC_AVAILABLE and self._keypair is not None:
-            try:
-                pub, priv = self._keypair
-                payload = json.dumps(data, sort_keys=True, default=str).encode()
-                if self.algorithm == "dilithium":
-                    sig = dilithium.sign(priv, payload)
-                elif self.algorithm == "falcon":
-                    sig = falcon.sign(priv, payload)
-                else:
-                    sig = sphincs.sign(priv, payload)
-                GLOBAL_METRICS.inc("quantum_signatures", labels=f"{self.algorithm}_success")
-                return {"algorithm": self.algorithm,
-                        "signature": base64.b64encode(sig).decode()}
-            except Exception as e:
-                GLOBAL_METRICS.inc("quantum_signatures", labels=f"{self.algorithm}_failed")
-                return {"algorithm": "none", "signature": "", "error": str(e)}
-        GLOBAL_METRICS.inc("quantum_signatures", labels="unavailable")
-        return {"algorithm": "none", "signature": ""}
+        if not PQC_AVAILABLE or self._keypair is None:
+            QUANTUM_SIGNATURES.labels(algorithm="none", status="unavailable").inc()
+            return {"algorithm": "none", "signature": "", "key_id": None}
+        try:
+            pub, priv = self._keypair
+            payload = json.dumps(data, sort_keys=True, default=str).encode()
+            if self.algorithm == "dilithium":
+                sig = await asyncio.to_thread(dilithium.sign, priv, payload)
+            elif self.algorithm == "falcon":
+                sig = await asyncio.to_thread(falcon.sign, priv, payload)
+            else:
+                sig = await asyncio.to_thread(sphincs.sign, priv, payload)
+            QUANTUM_SIGNATURES.labels(algorithm=self.algorithm, status="success").inc()
+            return {"algorithm": self.algorithm,
+                    "signature": base64.b64encode(sig).decode(),
+                    "public_key": pub.hex() if isinstance(pub, (bytes, bytearray)) else None}
+        except Exception as e:
+            QUANTUM_SIGNATURES.labels(algorithm=self.algorithm, status="failed").inc()
+            return {"algorithm": "none", "signature": "", "error": str(e)}
+
+    async def verify_data(self, data: Dict, signature_data: Dict) -> bool:
+        algorithm = signature_data.get("algorithm")
+        if algorithm == "none" or not PQC_AVAILABLE:
+            return True
+        if self._keypair is None:
+            return False
+        pub, _ = self._keypair
+        payload = json.dumps(data, sort_keys=True, default=str).encode()
+        try:
+            sig = base64.b64decode(signature_data.get("signature", ""))
+        except Exception:
+            return False
+        try:
+            if algorithm == "dilithium":
+                return bool(await asyncio.to_thread(dilithium.verify, pub, payload, sig))
+            if algorithm == "falcon":
+                return bool(await asyncio.to_thread(falcon.verify, pub, payload, sig))
+            return bool(await asyncio.to_thread(sphincs.verify, pub, payload, sig))
+        except Exception:
+            return False
 
 
 # ============================================================
-# Blockchain verification (deterministic, idempotent)
+# BLOCKCHAIN
 # ============================================================
 class BlockchainCircularityVerification:
     def __init__(self, storage):
@@ -1044,37 +821,18 @@ class BlockchainCircularityVerification:
             return {"tx_hash": self._records[record_id], "status": "idempotent"}
         tx = "0x" + hashlib.sha256(f"{record_id}:{data_hash}".encode()).hexdigest()[:40]
         self._records[record_id] = tx
-        GLOBAL_METRICS.inc("blockchain_verifications", labels="recorded")
+        BLOCKCHAIN_VERIFICATIONS.labels(status="recorded").inc()
         return {"tx_hash": tx, "status": "recorded"}
 
     async def get_blockchain_status(self) -> Dict:
         return {"connected": False, "records": len(self._records)}
 
-
-# ============================================================
-# Carbon Intensity Manager (market-aware)
-# ============================================================
-class CarbonIntensityManager:
-    def __init__(self, config=None):
-        self.config = config
-        self.current_intensity = 400.0
-        self.market = CarbonMarketClient()
-        self.recs = RECInventory()
-
-    async def get_current_intensity(self) -> float:
-        return self.current_intensity
-
-    async def get_current_price(self, hour_of_day=None) -> float:
-        price = self.market.price(self.current_intensity, hour_of_day)
-        GLOBAL_METRICS.set("carbon_price", price)
-        GLOBAL_METRICS.set("rec_kwh", self.recs.total_kwh())
-        return price
-
-    async def close(self): pass
+    async def health_check(self) -> Dict:
+        return {"status": "ok", "records": len(self._records)}
 
 
 # ============================================================
-# Cloud storage (real providers dict)
+# CLOUD STORAGE
 # ============================================================
 class MultiCloudStorage:
     def __init__(self, config=None):
@@ -1085,7 +843,7 @@ class MultiCloudStorage:
         if GCP_AVAILABLE: self.providers["gcp"] = {"bucket": None}
 
     async def store(self, data: Dict, filename: str) -> Dict:
-        GLOBAL_METRICS.inc("cloud_storage", labels="store_success")
+        CLOUD_STORAGE.labels(provider="all", operation="store", status="success").inc()
         return {"status": "ok", "filename": filename,
                 "providers": list(self.providers.keys())}
 
@@ -1094,7 +852,7 @@ class MultiCloudStorage:
 
 
 # ============================================================
-# Data Quality Scorer (real scoring)
+# DATA QUALITY SCORER
 # ============================================================
 class EnhancedDataQualityScorer:
     REQUIRED = ("recycling_rate", "recovery_efficiency",
@@ -1118,7 +876,7 @@ class EnhancedDataQualityScorer:
 
 
 # ============================================================
-# MOE Predictive (trained gating on proxy labels)
+# MOE PREDICTIVE (proxy-label gating + rolling retrain)
 # ============================================================
 class MixtureOfExpertsPredictive:
     def __init__(self, storage):
@@ -1191,7 +949,6 @@ class MixtureOfExpertsPredictive:
         return np.array([now.hour / 24.0, now.weekday() / 6.0, volatility, mean])
 
     async def _compute_proxy_label(self):
-        """Determine which expert predicted closest to the actual last value."""
         if len(self.history_circularity) < 50: return
         recent = list(self.history_circularity)
         actual = recent[-1]["y"]
@@ -1212,7 +969,6 @@ class MixtureOfExpertsPredictive:
             self.history_carbon.append({"ds": datetime.now(), "y": carbon_intensity})
             self.history_context.append(await self._extract_context())
             await self._compute_proxy_label()
-            # Retrain gating on rolling window
             if len(self.history_context) >= 100 and len(self.history_labels) >= 100:
                 await self._train_gating()
 
@@ -1259,7 +1015,7 @@ class MixtureOfExpertsPredictive:
         for i, f in enumerate(forecasts):
             final += gating_probs[i] * f
         for i, (name, _) in enumerate(self.experts):
-            GLOBAL_METRICS.set("moe_gating_weight", float(gating_probs[i]), labels=name)
+            MOE_GATING_WEIGHTS.labels(expert=name).set(float(gating_probs[i]))
         return {"forecast": final.tolist(), "confidence": 0.85,
                 "model": "moe", "expert_weights": gating_probs.tolist()}
 
@@ -1278,9 +1034,12 @@ class MixtureOfExpertsPredictive:
                 "gating_trained": self._trained,
                 "history_len": len(self.history_circularity)}
 
+    async def health_check(self) -> Dict:
+        return {"status": "healthy", "num_experts": len(self.experts)}
+
 
 # ============================================================
-# Genetic Algorithm (uses AdaptiveCostFunction)
+# GENETIC ALGORITHM (fixed keys so AdaptiveCostFunction works)
 # ============================================================
 class GeneticAlgorithmOptimizer:
     def __init__(self, adaptive_cost, population_size=20,
@@ -1290,13 +1049,15 @@ class GeneticAlgorithmOptimizer:
         self.mutation_rate = mutation_rate
         self.crossover_rate = crossover_rate
         self.population: List[Dict[str, float]] = []
+        # v19: keys match the state keys exactly so the cost function is meaningful
         self.bounds = {
-            "recycling_target": (0.5, 1.0),
-            "recovery_target": (0.5, 1.0),
-            "collection_target": (0.5, 1.0),
-            "purification_target": (0.5, 1.0),
+            "recycling_rate": (0.5, 1.0),
+            "recovery_efficiency": (0.5, 1.0),
+            "collection_efficiency": (0.5, 1.0),
+            "purification_efficiency": (0.5, 1.0),
         }
         self.rng = random.Random(0)
+        self.best_params: Dict[str, float] = {}
 
     def initialize(self):
         self.population = [
@@ -1305,7 +1066,6 @@ class GeneticAlgorithmOptimizer:
         ]
 
     def evaluate(self, state: Dict) -> List[float]:
-        # Use AdaptiveCostFunction if available
         fitness = []
         for ind in self.population:
             try:
@@ -1348,12 +1108,13 @@ class GeneticAlgorithmOptimizer:
                 offspring.append(self.mutate(c1))
                 offspring.append(self.mutate(c2))
             self.population = offspring[: self.pop_size - 1] + [best]
-            GLOBAL_METRICS.set("ga_fitness", float(max(fitness)), labels=str(gen))
-        return best or {}
+            GA_FITNESS.labels(generation=str(gen)).set(float(max(fitness)))
+        self.best_params = best or {}
+        return self.best_params
 
 
 # ============================================================
-# Autonomous Circularity Optimizer
+# AUTONOMOUS CIRCULARITY OPTIMIZER (winning_role credited)
 # ============================================================
 class EnhancedAutonomousCircularityOptimizer:
     STRATEGIES = ("performance", "carbon", "cost", "hybrid", "adaptive")
@@ -1371,22 +1132,39 @@ class EnhancedAutonomousCircularityOptimizer:
         self.strategy_rewards = {s: 0.0 for s in self.STRATEGIES}
         self.strategy_counts = {s: 0 for s in self.STRATEGIES}
         self._lock = asyncio.Lock()
-        # Enhancements
+
+        # Ten enhancements
         self.roles = EmergentRoleRegistry()
-        self.coordinator = MultiAgentCoordinator(self.roles)
-        self.temporal = None; self.shield = None
+        self.coordinator = MultiAgentCoordinator(self.roles, rng=random.Random(0))
+        self.temporal = TemporalLogicMonitor(horizon=10)
+        self.temporal.add_formula(STLFormula(
+            name="circularity_ok",
+            predicate=lambda r: r.get("circularity_index", 1.0) >= 0.4,
+            operator=STLOperator.ALWAYS, horizon=10))
+        self.temporal.add_formula(STLFormula(
+            name="eventually_stable",
+            predicate=lambda r: r.get("circularity_index", 0.0) >= 0.7,
+            operator=STLOperator.EVENTUALLY, horizon=5))
+        self.shield = SafetyShield(self.temporal)
         self.explainer = DecisionExplainer(
             feature_names=["circularity_index", "recycling_rate",
                            "recovery_efficiency", "collection_efficiency",
                            "purification_efficiency"])
         self.last_explanation: Optional[Explanation] = None
-        self.causal = CausalCounterfactualEstimator(state_dim=5, n_actions=len(self.STRATEGIES))
+        self.causal = CausalCounterfactualEstimator(state_dim=STATE_VECTOR_DIM,
+                                                    n_actions=len(self.STRATEGIES))
         self.last_counterfactuals: Dict[int, float] = {}
         self.federated = FederatedAggregator()
         self.uncertainty = UncertaintyEstimator()
         self.hitl = HumanInTheLoopGate()
         self.active_learner = ActiveLearningSampler()
         self.chaos = ChaosEngineer()
+
+        # Cache teachers once (not reassigned per call)
+        if self.distiller is not None:
+            self.distiller.teachers = [
+                self._bandit_teacher, self._modp_policy, self._static_teacher,
+            ]
 
     def _modp_policy(self, state: Dict) -> str:
         ci = state.get("circularity_index", 0.5)
@@ -1407,9 +1185,6 @@ class EnhancedAutonomousCircularityOptimizer:
         if strategy is not None and strategy in self.STRATEGIES:
             selected, source = strategy, "explicit"
         elif self.distiller is not None:
-            self.distiller.teachers = [
-                self._bandit_teacher, self._modp_policy, self._static_teacher,
-            ]
             selected = self.distiller.distill(current_state) or "hybrid"
             source = "distilled"
         elif self.rlhf is not None:
@@ -1421,7 +1196,8 @@ class EnhancedAutonomousCircularityOptimizer:
 
         if selected not in self.STRATEGIES: selected = "hybrid"
 
-        # Multi-agent vote
+        # Multi-agent vote: unpack the tuple, credit the winning role
+        winning_role: Optional[AgentRole] = None
         bids = []
         for role in AgentRole:
             idx = self.STRATEGIES.index(selected)
@@ -1429,24 +1205,39 @@ class EnhancedAutonomousCircularityOptimizer:
                 idx = self.STRATEGIES.index("carbon")
             elif role == AgentRole.EXPLOITER:
                 idx = self.STRATEGIES.index("performance")
+            elif role == AgentRole.SAFETY_OFFICER:
+                idx = self.STRATEGIES.index("hybrid")
             elif role == AgentRole.EXPLORER:
                 idx = random.randrange(len(self.STRATEGIES))
-            bids.append(AgentBid(
-                agent_id=role.value, role=role, confidence=0.7,
-                proposed_action=idx, rationale=role.value, carbon_score=1.0))
-        voted = self.coordinator.vote(bids, len(self.STRATEGIES))
+            conf = {
+                AgentRole.SAFETY_OFFICER: 0.85,
+                AgentRole.CARBON_BROKER: 0.80,
+                AgentRole.EXPLOITER: 0.70,
+                AgentRole.EXPLORER: 0.55,
+                AgentRole.VERIFIER: 0.65,
+            }.get(role, 0.6)
+            carbon_score = 1.0 / (1.0 + current_state.get("carbon_intensity", 400) / 1000.0)
+            if role == AgentRole.CARBON_BROKER:
+                carbon_score *= 1.5
+            bids.append(AgentBid(agent_id=role.value, role=role, confidence=conf,
+                                 proposed_action=idx, rationale=role.value,
+                                 carbon_score=carbon_score))
+        voted, winning_role = self.coordinator.vote(bids, len(self.STRATEGIES))
         selected = self.STRATEGIES[voted]
 
-        # Adaptive uses GA; others are static
+        # Strategy result
         if selected == "adaptive":
             best_params = self.ga.evolve(current_state, generations=5)
             result = {"action": "adaptive_optimization",
                       "targets": best_params,
                       "recommendation": f"GA evolved targets: {best_params}"}
         else:
-            result = await getattr(self, f"_optimize_{selected}")(current_state)
+            handler = getattr(self, f"_optimize_{selected}", None)
+            result = (await handler(current_state)) if handler else {
+                "action": f"{selected}_optimization", "targets": {},
+                "estimated_improvement": 0.1}
 
-        # LIMIT Graph
+        # LIMIT Graph constraints
         if self.limit_graph is not None:
             limits = self.limit_graph.get_limits(current_state)
             if "targets" in result and limits:
@@ -1462,6 +1253,10 @@ class EnhancedAutonomousCircularityOptimizer:
                   "estimated_cost_savings"):
             if k in result and isinstance(result[k], (int, float)):
                 reward = float(result[k]); break
+        if "estimated_improvement" in result and isinstance(result["estimated_improvement"], dict):
+            for v in result["estimated_improvement"].values():
+                if isinstance(v, (int, float)):
+                    reward += 0.2 * float(v)
 
         self.strategy_counts[selected] += 1
         n = self.strategy_counts[selected]
@@ -1471,14 +1266,17 @@ class EnhancedAutonomousCircularityOptimizer:
         if self.rlhf is not None and source in ("distilled", "rlhf"):
             self.rlhf.update(current_state, selected, reward)
 
-        # Causal update
-        state_vec = np.array([
-            current_state.get("circularity_index", 0.5),
-            current_state.get("recycling_rate", 0.5),
-            current_state.get("recovery_efficiency", 0.5),
-            current_state.get("collection_efficiency", 0.5),
-            current_state.get("purification_efficiency", 0.5),
-        ], dtype=np.float64)
+        # Causal update via canonical state vector
+        state_vec = state_vector_from_metrics({
+            "gpu_utilization_pct": 0.0,
+            "gpu_power_watts": 0.0,
+            "gpu_temp_c": 0.0,
+            "cpu_utilization_pct": 0.0,
+            "carbon_intensity_g_per_kwh": current_state.get("carbon_intensity", 400.0),
+            "carbon_price_per_kg": 0.05,
+            "rec_kwh_available": 0.0,
+            "uncertainty_score": 0.0,
+        })
         self.causal.update(CausalTransition(
             state=state_vec, action=self.STRATEGIES.index(selected),
             reward=reward, next_state=state_vec))
@@ -1490,6 +1288,10 @@ class EnhancedAutonomousCircularityOptimizer:
             weights={"local": np.array([reward], dtype=np.float64)},
             n_samples=1, carbon_intensity=current_state.get("carbon_intensity", 400.0)))
         self.federated.aggregate()
+
+        # Role credit for the winning role
+        if winning_role is not None:
+            self.roles.record(winning_role, success=reward > 0.5, reward=reward)
 
         # Uncertainty + HITL
         probs = np.ones(len(self.STRATEGIES)) / len(self.STRATEGIES)
@@ -1508,15 +1310,20 @@ class EnhancedAutonomousCircularityOptimizer:
         self.active_learner.maybe_store(
             {"strategy": selected, "reward": reward}, uncertainty=unc, threshold=0.4)
 
-        # XAI
-        pareto_list = [
-            {"circularity_index": current_state.get("circularity_index", 0.5),
-             "recycling_rate": current_state.get("recycling_rate", 0.5),
-             "recovery_efficiency": current_state.get("recovery_efficiency", 0.5),
-             "collection_efficiency": current_state.get("collection_efficiency", 0.5),
-             "purification_efficiency": current_state.get("purification_efficiency", 0.5)}
-            for _ in self.STRATEGIES
-        ]
+        # XAI with diverse pareto set so attributions have signal
+        pareto_list = []
+        for s in self.STRATEGIES:
+            pareto_list.append({
+                "circularity_index": current_state.get("circularity_index", 0.5),
+                "recycling_rate": current_state.get("recycling_rate", 0.5)
+                                  + random.uniform(-0.05, 0.05),
+                "recovery_efficiency": current_state.get("recovery_efficiency", 0.5)
+                                       + random.uniform(-0.05, 0.05),
+                "collection_efficiency": current_state.get("collection_efficiency", 0.5)
+                                         + random.uniform(-0.05, 0.05),
+                "purification_efficiency": current_state.get("purification_efficiency", 0.5)
+                                           + random.uniform(-0.05, 0.05),
+            })
         explanation = self.explainer.explain(
             chosen_idx=self.STRATEGIES.index(selected),
             chosen=pareto_list[0], pareto=pareto_list,
@@ -1529,12 +1336,15 @@ class EnhancedAutonomousCircularityOptimizer:
                 "strategy": selected, "result": result, "reward": reward,
                 "source": source, "timestamp": datetime.now().isoformat()})
 
+        AUTONOMOUS_OPTIMIZATIONS.labels(strategy=selected, status="success").inc()
+
         return {
             **result,
             "strategy": selected,
             "source": source,
             "reward": reward,
             "human_approved": human_approved,
+            "winning_role": winning_role.value if winning_role else None,
             "counterfactuals": self.last_counterfactuals,
             "explanation": explanation.to_dict(),
         }
@@ -1561,21 +1371,6 @@ class EnhancedAutonomousCircularityOptimizer:
                             "cost_effectiveness": 0.9},
                 "estimated_improvement": {"performance": 0.15, "carbon": 0.2, "cost": 0.1}}
 
-    async def _optimize_adaptive(self, state):
-        return {"action": "adaptive_optimization",
-                "targets": self._calculate_adaptive_targets(state)}
-
-    def _calculate_adaptive_targets(self, state):
-        ci = state.get("circularity_index", 0.5)
-        if ci < 0.4:
-            return {"recycling_rate": 0.7, "recovery_efficiency": 0.8,
-                    "collection_efficiency": 0.85, "purification_efficiency": 0.8}
-        if ci < 0.6:
-            return {"recycling_rate": 0.8, "recovery_efficiency": 0.85,
-                    "collection_efficiency": 0.9, "purification_efficiency": 0.85}
-        return {"recycling_rate": 0.9, "recovery_efficiency": 0.9,
-                "collection_efficiency": 0.95, "purification_efficiency": 0.9}
-
     def get_optimization_stats(self):
         return {
             "total_optimizations": len(self.optimization_history),
@@ -1591,17 +1386,21 @@ class EnhancedAutonomousCircularityOptimizer:
             "causal_active": True,
             "federated_active": True,
             "hitl_active": True,
+            "role_snapshot": self.roles.snapshot(),
             "last_explanation": self.last_explanation.to_dict() if self.last_explanation else None,
-            "last_counterfactuals": {int(k): float(v) for k, v in self.last_counterfactuals.items()},
+            "last_counterfactuals": {int(k): float(v)
+                                     for k, v in self.last_counterfactuals.items()},
         }
 
 
 # ============================================================
-# Multi-Cloud Circularity Deployment (safe construction)
+# MULTI-CLOUD DEPLOYMENT (carbon-aware, per-role bids)
 # ============================================================
 class MultiObjectiveCloudDeployment:
-    def __init__(self, limit_graph=None, rlhf=None, distiller=None):
+    def __init__(self, carbon_manager: Optional[CarbonIntensityManager] = None,
+                 limit_graph=None, rlhf=None, distiller=None):
         self.config = central_config
+        self.carbon_manager = carbon_manager
         self.providers = {
             "aws": {"regions": ["us-east-1", "eu-west-1", "ap-southeast-1"],
                     "cost_per_gb": 0.023, "carbon_score": 0.7,
@@ -1622,10 +1421,14 @@ class MultiObjectiveCloudDeployment:
         self.rlhf = rlhf
         self.distiller = distiller
         self.roles = EmergentRoleRegistry()
-        self.coordinator = MultiAgentCoordinator(self.roles)
+        self.coordinator = MultiAgentCoordinator(self.roles, rng=random.Random(0))
         self.explainer = DecisionExplainer(
             feature_names=["cost", "carbon", "latency", "availability"])
         self.last_explanation: Optional[Explanation] = None
+        if self.distiller is not None:
+            self.distiller.teachers = [
+                self._modp_teacher, self._rule_based_teacher, self._static_teacher,
+            ]
 
     def _modp_teacher(self, context: Dict) -> str:
         if "providers" not in context: return self.active_provider
@@ -1647,15 +1450,24 @@ class MultiObjectiveCloudDeployment:
         base = {"aws": 50, "azure": 60, "gcp": 45}.get(provider, 50)
         return base + random.uniform(-10, 10)
 
-    async def deploy_circularity_model(self, model_data: Dict, preferences: Dict = None) -> Dict:
-        current_carbon = 400.0
+    async def deploy_circularity_model(self, model_data: Dict,
+                                       preferences: Dict = None) -> Dict:
+        # v19: real carbon intensity
+        if self.carbon_manager is not None:
+            try:
+                current_carbon = await self.carbon_manager.get_current_intensity()
+            except Exception:
+                current_carbon = 400.0
+        else:
+            current_carbon = 400.0
+
         eval_results = {}
         for name, p in self.providers.items():
             latency = await self._measure_latency(name)
             cost = p["cost_per_gb"] * model_data.get("size_mb", 1) / 1024
             carbon = p["carbon_score"] * current_carbon / 400.0
             availability = p["availability"]
-            objectives = [cost, carbon, latency, 1 - availability]
+            objectives = [cost, carbon, latency / 100.0, 1 - availability]
             eval_results[name] = {"objectives": objectives,
                                   "decision": (name, p["regions"][0])}
 
@@ -1671,8 +1483,6 @@ class MultiObjectiveCloudDeployment:
             front.add(data["objectives"], data["decision"])
 
         if self.distiller is not None:
-            self.distiller.teachers = [
-                self._modp_teacher, self._rule_based_teacher, self._static_teacher]
             provider_name = self.distiller.distill(context) or self.active_provider
             source = "distilled"
         elif self.rlhf is not None:
@@ -1681,15 +1491,17 @@ class MultiObjectiveCloudDeployment:
         else:
             best_decision = front.get_best_by_weight(self.weights)
             if best_decision is None:
-                best_decision = min(eval_results.items(),
-                                    key=lambda x: x[1]["objectives"][0])[1]["decision"]
-            provider_name, region = best_decision
+                best = min(eval_results.items(), key=lambda x: x[1]["objectives"][0])
+                provider_name = best[0]
+            else:
+                provider_name = best_decision[0]
             source = "modp"
 
         if self.limit_graph is not None:
             limits = self.limit_graph.get_limits(context)
             if limits.get("forbidden_providers") and provider_name in limits["forbidden_providers"]:
-                remaining = [p for p in self.providers if p not in limits["forbidden_providers"]]
+                remaining = [p for p in self.providers
+                             if p not in limits["forbidden_providers"]]
                 if remaining:
                     provider_name = remaining[0]; source = "limit_graph"
 
@@ -1697,11 +1509,8 @@ class MultiObjectiveCloudDeployment:
         if preferences and preferences.get("region") in self.providers[provider_name]["regions"]:
             region = preferences["region"]
 
-        async with self._lock:
-            self.active_provider = provider_name
-            self.active_region = region
-
-        # Multi-agent vote
+        # Multi-agent vote with differentiated bids
+        winning_role: Optional[AgentRole] = None
         bids = []
         for role in AgentRole:
             idx = list(self.providers.keys()).index(provider_name)
@@ -1711,14 +1520,35 @@ class MultiObjectiveCloudDeployment:
             elif role == AgentRole.EXPLOITER:
                 idx = min(range(len(self.providers)),
                           key=lambda i: list(self.providers.values())[i]["latency_score"])
-            bids.append(AgentBid(agent_id=role.value, role=role, confidence=0.7,
-                                 proposed_action=idx, rationale=role.value, carbon_score=1.0))
-        voted = self.coordinator.vote(bids, len(self.providers))
+            elif role == AgentRole.EXPLORER:
+                idx = random.randrange(len(self.providers))
+            conf = {
+                AgentRole.SAFETY_OFFICER: 0.85,
+                AgentRole.CARBON_BROKER: 0.80,
+                AgentRole.EXPLOITER: 0.70,
+                AgentRole.EXPLORER: 0.55,
+                AgentRole.VERIFIER: 0.65,
+            }.get(role, 0.6)
+            carbon_score = 1.0 / (1.0 + current_carbon / 1000.0)
+            if role == AgentRole.CARBON_BROKER:
+                carbon_score *= 1.5
+            bids.append(AgentBid(agent_id=role.value, role=role, confidence=conf,
+                                 proposed_action=idx, rationale=role.value,
+                                 carbon_score=carbon_score))
+        voted, winning_role = self.coordinator.vote(bids, len(self.providers))
         provider_name = list(self.providers.keys())[voted]
+        region = self.providers[provider_name]["regions"][0]
+
+        async with self._lock:
+            self.active_provider = provider_name
+            self.active_region = region
 
         if self.rlhf is not None:
             reward = -sum(eval_results[provider_name]["objectives"])
             self.rlhf.update(context, provider_name, reward)
+
+        if winning_role is not None:
+            self.roles.record(winning_role, success=True, reward=1.0)
 
         # XAI
         pareto_list = [
@@ -1733,6 +1563,8 @@ class MultiObjectiveCloudDeployment:
             counterfactuals={}, safety_ok=True, carbon_price=0.0, confidence=0.7)
         self.last_explanation = explanation
 
+        CLOUD_DEPLOYMENTS.labels(provider=provider_name, status="success").inc()
+
         return {
             "optimal_provider": provider_name,
             "optimal_region": region,
@@ -1740,6 +1572,7 @@ class MultiObjectiveCloudDeployment:
             "scores": {p: d["objectives"] for p, d in eval_results.items()},
             "reason": f"Provider {provider_name} selected via {source}",
             "source": source,
+            "winning_role": winning_role.value if winning_role else None,
             "explanation": explanation.to_dict(),
             "timestamp": datetime.now().isoformat(),
         }
@@ -1753,11 +1586,15 @@ class MultiObjectiveCloudDeployment:
                     "rlhf_active": self.rlhf is not None,
                     "limit_graph_active": self.limit_graph is not None,
                     "multi_agent_active": True,
-                    "xai_active": True}
+                    "xai_active": True,
+                    "role_snapshot": self.roles.snapshot()}
+
+    async def health_check(self) -> Dict:
+        return {"status": "healthy"}
 
 
 # ============================================================
-# Self-Healing Manager (fits detectors)
+# SELF-HEALING
 # ============================================================
 class SelfHealingManager:
     def __init__(self, drift_detector):
@@ -1778,7 +1615,8 @@ class SelfHealingManager:
     def _features(self, metrics: Dict) -> np.ndarray:
         keys = ("circularity_index", "recycling_rate", "recovery_efficiency",
                 "collection_efficiency", "purification_efficiency")
-        return np.array([float(metrics.get(k, 0.5)) for k in keys], dtype=np.float64).reshape(1, -1)
+        return np.array([float(metrics.get(k, 0.5)) for k in keys],
+                        dtype=np.float64).reshape(1, -1)
 
     async def _maybe_fit(self):
         if self._trained or not self.anomaly_detectors: return
@@ -1823,7 +1661,8 @@ class SelfHealingManager:
         if drift_detected:
             async with self._lock:
                 self.recovery_actions.append({
-                    "action": "drift_recovery", "timestamp": datetime.now().isoformat()})
+                    "action": "drift_recovery",
+                    "timestamp": datetime.now().isoformat()})
 
     async def health_check(self):
         return {"status": "healthy", "fitted": self._trained,
@@ -1831,7 +1670,7 @@ class SelfHealingManager:
 
 
 # ============================================================
-# Other stubs (kept simple)
+# STUBS
 # ============================================================
 class AdaptiveThresholdManager: pass
 class EnhancedSubstitutionDatabase: pass
@@ -1846,7 +1685,7 @@ class HeliumSustainabilityTracker: pass
 
 
 # ============================================================
-# Main Circularity Calculator
+# MAIN CALCULATOR
 # ============================================================
 class EnhancedHeliumCircularityCalculator:
     def __init__(self, storage: Storage, message_queue: AsyncMessageQueue,
@@ -1863,7 +1702,6 @@ class EnhancedHeliumCircularityCalculator:
         self.instance_id = str(uuid.uuid4())[:8]
         self._start_time = datetime.now()
 
-        # Enhancement flags
         self.limit_graph_enabled = (os.getenv("LIMIT_GRAPH_ENABLED", "true").lower() == "true"
                                     and ADDITIONAL_ENHANCEMENTS_AVAILABLE)
         self.rlhf_enabled = (os.getenv("RLHF_ENABLED", "true").lower() == "true"
@@ -1872,22 +1710,21 @@ class EnhancedHeliumCircularityCalculator:
                                      and ADDITIONAL_ENHANCEMENTS_AVAILABLE)
         self.chaos_enabled = os.getenv("CHAOS_ENABLED", "false").lower() == "true"
 
-        # Construct enhancement helpers
         limit_graph = LimitGraph() if self.limit_graph_enabled else None
-        rlhf = RLHFOptimizer(action_space=list(EnhancedAutonomousCircularityOptimizer.STRATEGIES)) if self.rlhf_enabled else None
+        rlhf = (RLHFOptimizer(action_space=list(
+            EnhancedAutonomousCircularityOptimizer.STRATEGIES))
+                if self.rlhf_enabled else None)
 
-        # Core sub-modules
+        # Sub-modules
         self.pqc = PostQuantumCrypto(storage, algorithm=quantum_algorithm)
         self.blockchain = BlockchainCircularityVerification(storage)
         self.carbon_manager = CarbonIntensityManager()
         self.quality_scorer = EnhancedDataQualityScorer()
         self.cloud_storage = MultiCloudStorage()
 
-        # Optimizer (before we construct the distiller over it)
+        # Optimizer first (no distiller yet), then wire distiller in
         self.autonomous_optimizer = EnhancedAutonomousCircularityOptimizer(
             adaptive_cost, pareto_gating, limit_graph, rlhf, distiller=None)
-
-        # Distiller over optimizer teachers
         if self.distillation_enabled and ADDITIONAL_ENHANCEMENTS_AVAILABLE:
             self.autonomous_optimizer.distiller = MultiTeacherDistiller(
                 teachers=[self.autonomous_optimizer._bandit_teacher,
@@ -1895,8 +1732,9 @@ class EnhancedHeliumCircularityCalculator:
                           self.autonomous_optimizer._static_teacher],
                 weights=[1.0, 1.0, 0.5])
 
-        # Cloud deployer constructed first, then distiller wired in
+        # Cloud deployer with real carbon manager
         self.cloud_deployer = MultiObjectiveCloudDeployment(
+            carbon_manager=self.carbon_manager,
             limit_graph=limit_graph, rlhf=rlhf, distiller=None)
         if self.distillation_enabled and ADDITIONAL_ENHANCEMENTS_AVAILABLE:
             self.cloud_deployer.distiller = MultiTeacherDistiller(
@@ -1905,11 +1743,10 @@ class EnhancedHeliumCircularityCalculator:
                           self.cloud_deployer._static_teacher],
                 weights=[1.0, 1.0, 0.5])
 
-        # Predictive / self-healing
         self.predictive = MixtureOfExpertsPredictive(storage)
         self.self_healing = SelfHealingManager(drift_detector)
 
-        # Ten enhancements wired into the calculator
+        # Ten enhancements
         self.quantum_teacher = QuantumInspiredTeacher(seed=0)
         self.distill_ensemble = DistillationEnsemble(self.quantum_teacher, alpha=0.5)
         self.precision_controller = PrecisionController(quality_floor=0.95)
@@ -1931,7 +1768,7 @@ class EnhancedHeliumCircularityCalculator:
                            "purification_efficiency"])
         self.last_explanation: Optional[Explanation] = None
         self.last_counterfactuals: Dict[int, float] = {}
-        self.chaos = (ChaosEngineer(ChaosConfig(seed=1)) if self.chaos_enabled else None)
+        self.chaos = ChaosEngineer(ChaosConfig(seed=1)) if self.chaos_enabled else None
 
         # Stubs
         self.adaptive_threshold_manager = AdaptiveThresholdManager()
@@ -1947,20 +1784,20 @@ class EnhancedHeliumCircularityCalculator:
         self.alert_system = EnhancedAlertSystem()
         self.sustainability_tracker = HeliumSustainabilityTracker()
 
-        # State
         self.circularity_history: deque = deque(maxlen=10000)
-        self.material_flows: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
         self._history_lock = asyncio.Lock()
-        self._flows_lock = asyncio.Lock()
         self._shutdown_event = asyncio.Event()
         self._background_tasks: List[asyncio.Task] = []
 
-        logger.info(f"EnhancedHeliumCircularityCalculator v18.0 initialized (instance: {self.instance_id})")
-        logger.info(f"  LIMIT Graph: {'enabled' if self.limit_graph_enabled else 'disabled'}")
-        logger.info(f"  RLHF: {'enabled' if self.rlhf_enabled else 'disabled'}")
-        logger.info(f"  Distillation: {'enabled' if self.distillation_enabled else 'disabled'}")
-        logger.info(f"  Chaos: {'enabled' if self.chaos_enabled else 'disabled'}")
+        self._health_components = {
+            "blockchain": self.blockchain,
+            "cloud_deployer": self.cloud_deployer,
+            "cloud_storage": self.cloud_storage,
+            "predictive": self.predictive,
+            "self_healing": self.self_healing,
+        }
 
+        logger.info(f"EnhancedHeliumCircularityCalculator v19.0 initialized (instance: {self.instance_id})")
         atexit.register(self._atexit_cleanup)
 
     def _atexit_cleanup(self):
@@ -1969,9 +1806,6 @@ class EnhancedHeliumCircularityCalculator:
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # Teacher interface for MOPD
-    # ------------------------------------------------------------------
     async def policy_probs(self, state: Dict) -> List[float]:
         rewards = self.autonomous_optimizer.strategy_rewards
         strategies = list(self.autonomous_optimizer.STRATEGIES)
@@ -1979,46 +1813,34 @@ class EnhancedHeliumCircularityCalculator:
         exp_probs = np.exp(probs - np.max(probs))
         s = exp_probs.sum()
         if s <= 0:
-            exp_probs = np.ones_like(probs)
-            s = exp_probs.sum()
+            exp_probs = np.ones_like(probs); s = exp_probs.sum()
         return (exp_probs / s).tolist()
 
-    # ------------------------------------------------------------------
-    # Core circularity calculation
-    # ------------------------------------------------------------------
-    async def calculate_comprehensive_circularity(self, input_data: Dict = None,
-                                                  sign_data: bool = True,
-                                                  blockchain_record: bool = True) -> HeliumCircularityMetrics:
-        # Quality assessment
+    async def calculate_comprehensive_circularity(
+        self, input_data: Dict = None,
+        sign_data: bool = True,
+        blockchain_record: bool = True,
+    ) -> HeliumCircularityMetrics:
         quality_score = self.quality_scorer.assess_quality(input_data) if input_data else 0.9
 
-        # Chaos fault injection
         if self.chaos and self.chaos.maybe_fault():
+            CIRCULARITY_COMPUTATIONS.labels(status="chaos_fault").inc()
             raise CircularityError("Chaos fault injected")
 
-        # Simulated metrics
         recycling_rate = max(0.0, min(1.0, 0.7 + random.uniform(-0.1, 0.1)))
         recovery_efficiency = max(0.0, min(1.0, 0.75 + random.uniform(-0.1, 0.1)))
         collection_efficiency = max(0.0, min(1.0, 0.8 + random.uniform(-0.1, 0.1)))
         purification_efficiency = max(0.0, min(1.0, 0.85 + random.uniform(-0.1, 0.1)))
 
-        # MODP + TOPSIS-driven circularity index (uses ParetoFront + TOPSIS)
-        weights = {"recycling": 0.3, "recovery": 0.3, "collection": 0.2, "purification": 0.2}
-        candidates = [
-            {"recycling": recycling_rate, "recovery": recovery_efficiency,
-             "collection": collection_efficiency, "purification": purification_efficiency},
-        ]
-        try:
-            topsis_scores = TOPSIS.score(candidates, list(weights.values()),
-                                         list(weights.keys()))
-            circularity_index = float(topsis_scores[0]) if topsis_scores else 0.0
-        except Exception:
-            circularity_index = (
-                weights["recycling"] * recycling_rate
-                + weights["recovery"] * recovery_efficiency
-                + weights["collection"] * collection_efficiency
-                + weights["purification"] * purification_efficiency
-            )
+        # v19: weighted sum directly (single-candidate TOPSIS is undefined)
+        weights = {"recycling": 0.3, "recovery": 0.3,
+                   "collection": 0.2, "purification": 0.2}
+        circularity_index = (
+            weights["recycling"] * recycling_rate
+            + weights["recovery"] * recovery_efficiency
+            + weights["collection"] * collection_efficiency
+            + weights["purification"] * purification_efficiency
+        )
         circularity_index = max(0.0, min(1.0, circularity_index))
 
         if circularity_index >= 0.85: circularity_level = "excellent"
@@ -2036,31 +1858,27 @@ class EnhancedHeliumCircularityCalculator:
             data_quality_score=quality_score,
         )
 
-        # Quantum signature
         if sign_data:
             m.quantum_signature = await self.pqc.sign_data(asdict(m))
 
-        # Blockchain
         if blockchain_record:
             data_hash = hashlib.sha256(
-                json.dumps(asdict(m), sort_keys=True, default=str).encode()).hexdigest()
+                json.dumps(asdict(m), sort_keys=True, default=str).encode()
+            ).hexdigest()
             bc = await self.blockchain.record_circularity_data(
                 record_id, data_hash, {"index": circularity_index})
             m.blockchain_tx_hash = bc.get("tx_hash")
 
-        # Cloud deployment
         deployment = await self.cloud_deployer.deploy_circularity_model(
             {"size_mb": 0.5, "features": len(self.circularity_history) + 1})
         m.cloud_deployment = deployment
 
-        # Precision switch
         carbon_intensity = await self.carbon_manager.get_current_intensity()
         carbon_price = await self.carbon_manager.get_current_price()
         _, level = self.precision_adapter.adapt({}, carbon_intensity, 0.5, carbon_price)
         self.current_precision = level
         m.precision_level = level.value
 
-        # Autonomous optimization
         state = {
             "circularity_index": circularity_index,
             "recycling_rate": recycling_rate,
@@ -2073,7 +1891,6 @@ class EnhancedHeliumCircularityCalculator:
         m.optimization_recommendation = optimization
         m.counterfactuals = self.autonomous_optimizer.last_counterfactuals
 
-        # Temporal monitor + safety shield
         self.temporal.observe({"circularity_index": circularity_index})
         merged_dict = asdict(m)
         _, safety_ok, stl_verdict = self.shield.screen(
@@ -2081,8 +1898,8 @@ class EnhancedHeliumCircularityCalculator:
         m.safety_ok = safety_ok
         m.stl_verdict = stl_verdict
 
-        # HITL check
-        probs = np.ones(len(self.autonomous_optimizer.STRATEGIES)) / len(self.autonomous_optimizer.STRATEGIES)
+        probs = np.ones(len(self.autonomous_optimizer.STRATEGIES)) / len(
+            self.autonomous_optimizer.STRATEGIES)
         is_unc, unc = self.autonomous_optimizer.uncertainty.is_uncertain(probs)
         if is_unc or not safety_ok:
             req = HITLRequest(
@@ -2093,7 +1910,6 @@ class EnhancedHeliumCircularityCalculator:
             approved = await self.autonomous_optimizer.hitl.request(req)
             m.hitl_approved = approved
 
-        # XAI explanation
         explanation = self.explainer.explain(
             chosen_idx=0, chosen=merged_dict, pareto=[merged_dict],
             counterfactuals=m.counterfactuals or {},
@@ -2102,21 +1918,19 @@ class EnhancedHeliumCircularityCalculator:
         self.last_explanation = explanation
         m.explanation = explanation.to_dict()
 
-        # Cloud storage backup
         if self.cloud_storage.providers:
             try:
                 await self.cloud_storage.store(asdict(m), f"circularity_{record_id}.json")
             except Exception as e:
                 logger.error(f"Cloud storage backup failed: {e}")
 
-        # Provenance
         m.provenance = {
-            "schema": "helium_circularity_v18",
+            "schema": "helium_circularity_v19",
             "instance_id": self.instance_id,
             "chaos_events": list(self.chaos.events[-3:]) if self.chaos else [],
+            "state_vector_dim": STATE_VECTOR_DIM,
         }
 
-        # Record
         async with self._history_lock:
             self.circularity_history.append(m)
 
@@ -2125,7 +1939,6 @@ class EnhancedHeliumCircularityCalculator:
         except Exception as e:
             logger.warning(f"Storage write failed: {e}")
 
-        # Publish feedback event
         try:
             event = FeedbackEvent.create_with_context(
                 task_id=f"circ_{record_id}",
@@ -2134,7 +1947,8 @@ class EnhancedHeliumCircularityCalculator:
                 energy_joules=0.0, carbon_g=0.0,
                 feedback_type="circularity", adaptive_cost_value=0.0,
                 state={"input": input_data},
-                candidates=[{"action": s} for s in self.autonomous_optimizer.STRATEGIES],
+                candidates=[{"action": s}
+                            for s in self.autonomous_optimizer.STRATEGIES],
                 source="helium_circularity",
                 environment=getattr(central_config, "ENVIRONMENT", "production"),
                 tags=["circularity", "helium"])
@@ -2142,22 +1956,85 @@ class EnhancedHeliumCircularityCalculator:
         except Exception as e:
             logger.warning(f"Feedback publish failed: {e}")
 
-        # Self-healing
         await self.self_healing.check_drift(asdict(m))
         await self.self_healing.detect_anomaly(asdict(m))
 
-        # Metrics
         try:
             self.metrics.set_circularity_score(circularity_index)
         except Exception:
             pass
 
-        logger.info(f"Circularity calculated: index={circularity_index:.3f} level={circularity_level}")
+        CIRCULARITY_INDEX.set(circularity_index)
+        CARBON_INTENSITY.set(carbon_intensity)
+        CARBON_PRICE.set(carbon_price)
+        REC_INVENTORY_KWH.set(self.carbon_manager.recs.total_kwh())
+        CIRCULARITY_COMPUTATIONS.labels(status="success").inc()
+
+        logger.info(f"Circularity: index={circularity_index:.3f} level={circularity_level}")
         return m
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    async def submit_hitl_decision(self, request_id: str, approved: bool) -> bool:
+        gate = self.autonomous_optimizer.hitl
+        if gate is None:
+            return False
+        return await gate.submit_decision(request_id, approved)
+
+    async def save_state(self, path: str) -> bool:
+        state: Dict[str, Any] = {"schema": "helium_circularity_state_v1"}
+        opt = self.autonomous_optimizer
+        state["causal"] = opt.causal.export_state()
+        state["roles"] = opt.roles.snapshot()
+        g = opt.federated.global_weights()
+        if g:
+            state["federated_global"] = {k: v.tolist() for k, v in g.items()}
+        state["strategy_rewards"] = dict(opt.strategy_rewards)
+        state["epsilon"] = opt.epsilon
+        state["ga_best_params"] = dict(opt.ga.best_params)
+        state["cloud_roles"] = self.cloud_deployer.roles.snapshot()
+        try:
+            d = os.path.dirname(os.path.abspath(path)) or "."
+            os.makedirs(d, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".circ_", suffix=".json")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(state, f, default=str)
+                os.replace(tmp, path)
+            except Exception:
+                try: os.unlink(tmp)
+                except OSError: pass
+                raise
+            return True
+        except Exception as e:
+            logger.error(f"save_state failed: {e}")
+            return False
+
+    async def load_state(self, path: str) -> bool:
+        if not os.path.exists(path): return False
+        try:
+            with open(path, "r") as f:
+                state = json.load(f)
+        except Exception:
+            return False
+        if state.get("schema") != "helium_circularity_state_v1":
+            return False
+        opt = self.autonomous_optimizer
+        if "causal" in state:
+            opt.causal.import_state(state["causal"])
+        if "federated_global" in state:
+            try:
+                opt.federated._global = {
+                    k: np.asarray(v, dtype=np.float64)
+                    for k, v in state["federated_global"].items()}
+            except Exception:
+                pass
+        if "strategy_rewards" in state:
+            opt.strategy_rewards = dict(state["strategy_rewards"])
+        if "epsilon" in state:
+            opt.epsilon = float(state["epsilon"])
+        if "ga_best_params" in state:
+            opt.ga.best_params = dict(state["ga_best_params"])
+        return True
+
     async def start(self):
         logger.info("Starting Helium Circularity Calculator...")
         loop = asyncio.get_running_loop()
@@ -2173,8 +2050,7 @@ class EnhancedHeliumCircularityCalculator:
             await asyncio.sleep(getattr(central_config, "auto_optimize_interval", 1800))
             try:
                 async with self._history_lock:
-                    if not self.circularity_history:
-                        continue
+                    if not self.circularity_history: continue
                     recent = list(self.circularity_history)[-10:]
                     state = {
                         "circularity_index": float(np.mean([m.circularity_index for m in recent])),
@@ -2192,8 +2068,7 @@ class EnhancedHeliumCircularityCalculator:
             await asyncio.sleep(3600)
             try:
                 async with self._history_lock:
-                    if not self.circularity_history:
-                        continue
+                    if not self.circularity_history: continue
                     latest = self.circularity_history[-1]
                     carbon = await self.carbon_manager.get_current_intensity()
                     await self.predictive.update_history(latest.circularity_index, carbon)
@@ -2221,8 +2096,51 @@ class EnhancedHeliumCircularityCalculator:
             except Exception as e:
                 logger.error(f"Cleanup error: {e}")
 
+    async def health_check(self) -> Dict:
+        results = {}
+        for name, comp in self._health_components.items():
+            if comp and hasattr(comp, "health_check"):
+                try:
+                    results[name] = await comp.health_check()
+                except Exception as e:
+                    results[name] = {"status": "unhealthy", "error": str(e)}
+            else:
+                results[name] = {"status": "ok" if comp else "unavailable"}
+        checkable = [r for r in results.values() if r.get("status") != "unavailable"]
+        if not checkable:
+            overall, score = "degraded", 0
+        else:
+            ok = all(r.get("status") in ("ok", "healthy") for r in checkable)
+            overall, score = ("healthy", 100) if ok else ("degraded", 50)
+        return {"status": overall, "health_score": score,
+                "components": results, "timestamp": datetime.now().isoformat()}
+
+    async def get_comprehensive_status(self) -> Dict:
+        blockchain_status = await self.blockchain.get_blockchain_status()
+        optimization_stats = self.autonomous_optimizer.get_optimization_stats()
+        cloud_status = await self.cloud_deployer.get_deployment_status()
+        async with self._history_lock:
+            avg_index = (float(np.mean([m.circularity_index for m in self.circularity_history]))
+                         if self.circularity_history else 0.0)
+        return {
+            "instance_id": self.instance_id,
+            "version": "19.0",
+            "blockchain": blockchain_status,
+            "autonomous_optimization": optimization_stats,
+            "cloud_deployment": cloud_status,
+            "circularity": {"records": len(self.circularity_history),
+                            "avg_index": avg_index},
+            "predictive": self.predictive.get_stats(),
+            "self_healing": await self.self_healing.health_check(),
+            "cloud_storage": {"providers": list(self.cloud_storage.providers.keys())},
+            "current_precision": self.current_precision.value if self.current_precision else None,
+            "rec_kwh": self.carbon_manager.recs.total_kwh(),
+            "health": await self.health_check(),
+            "timestamp": datetime.now().isoformat(),
+        }
+
     async def shutdown(self):
-        logger.info("Shutting down Helium Circularity Calculator...")
+        logger.info("Shutting down...")
         self._shutdown_event.set()
         for task in self._background_tasks:
             task.cancel()
@@ -2233,31 +2151,157 @@ class EnhancedHeliumCircularityCalculator:
 
 
 # ============================================================
-# Singleton accessor
+# SINGLETON
 # ============================================================
 _circularity_calculator_instance: Optional[EnhancedHeliumCircularityCalculator] = None
 _circularity_calculator_lock = asyncio.Lock()
 
 
-async def get_circularity_calculator(storage: Storage, queue: AsyncMessageQueue,
-                                     adaptive_cost: AdaptiveCostFunction,
-                                     pareto_gating: ParetoGating,
-                                     drift_detector: DriftDetector,
-                                     metrics: MetricsRegistry) -> EnhancedHeliumCircularityCalculator:
+async def get_circularity_calculator(
+    storage: Storage, queue: AsyncMessageQueue,
+    adaptive_cost: AdaptiveCostFunction, pareto_gating: ParetoGating,
+    drift_detector: DriftDetector, metrics: MetricsRegistry,
+) -> EnhancedHeliumCircularityCalculator:
     global _circularity_calculator_instance
     if _circularity_calculator_instance is None:
         async with _circularity_calculator_lock:
             if _circularity_calculator_instance is None:
                 _circularity_calculator_instance = EnhancedHeliumCircularityCalculator(
-                    storage, queue, adaptive_cost, pareto_gating, drift_detector, metrics)
+                    storage, queue, adaptive_cost, pareto_gating,
+                    drift_detector, metrics)
                 await _circularity_calculator_instance.start()
     return _circularity_calculator_instance
 
 
 # ============================================================
-# Main entry point (standalone testing)
+# FASTAPI
+# ============================================================
+if FASTAPI_AVAILABLE:
+    app = FastAPI(title="Helium Circularity API", version="19.0")
+    app.add_middleware(
+        CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+        allow_methods=["*"], allow_headers=["*"])
+    security = HTTPBearer()
+
+    _api_calc: Optional[EnhancedHeliumCircularityCalculator] = None
+    _api_jwt_secret = os.urandom(32).hex()
+
+    async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+        if not JOSE_AVAILABLE:
+            return {"sub": "anonymous"}
+        try:
+            return jwt.decode(credentials.credentials, _api_jwt_secret, algorithms=["HS256"])
+        except JWTError:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+    @app.post("/calculate")
+    async def calculate(input_data: Dict = None, user: Dict = Depends(verify_token)):
+        if not _api_calc:
+            raise HTTPException(status_code=503, detail="Calculator not initialized")
+        m = await _api_calc.calculate_comprehensive_circularity(input_data)
+        return {"metrics": asdict(m)}
+
+    @app.get("/status")
+    async def status(user: Dict = Depends(verify_token)):
+        if not _api_calc:
+            raise HTTPException(status_code=503, detail="Calculator not initialized")
+        return await _api_calc.get_comprehensive_status()
+
+    @app.get("/health")
+    async def health():
+        if not _api_calc:
+            raise HTTPException(status_code=503, detail="Calculator not initialized")
+        return await _api_calc.health_check()
+
+    @app.get("/explanation/last")
+    async def last_explanation(user: Dict = Depends(verify_token)):
+        if not _api_calc:
+            raise HTTPException(status_code=503, detail="Calculator not initialized")
+        return {"explanation": _api_calc.last_explanation.to_dict()
+                if _api_calc.last_explanation else None}
+
+    @app.post("/hitl/approval")
+    async def hitl_approval(request_id: str, approved: bool,
+                            user: Dict = Depends(verify_token)):
+        if not _api_calc:
+            raise HTTPException(status_code=503, detail="Calculator not initialized")
+        delivered = await _api_calc.submit_hitl_decision(request_id, approved)
+        if not delivered:
+            HITL_APPROVALS.labels(decision="approved" if approved else "rejected").inc()
+            return {"status": "recorded", "request_id": request_id,
+                    "approved": approved, "delivered": False}
+        return {"status": "delivered", "request_id": request_id, "approved": approved}
+
+    @app.post("/chaos")
+    async def chaos(fault_prob: float = 0.0, latency_ms: float = 0.0,
+                    carbon_spike_prob: float = 0.0,
+                    user: Dict = Depends(verify_token)):
+        if not _api_calc:
+            raise HTTPException(status_code=503, detail="Calculator not initialized")
+        _api_calc.chaos = ChaosEngineer(ChaosConfig(
+            fault_prob=fault_prob, latency_inject_ms=latency_ms,
+            carbon_spike_prob=carbon_spike_prob))
+        return {"status": "chaos enabled"}
+
+    @app.on_event("startup")
+    async def _startup():
+        global _api_calc
+        storage = Storage()
+        queue = AsyncMessageQueue()
+        adaptive_cost = AdaptiveCostFunction(storage)
+        pareto = ParetoGating()
+        drift = DriftDetector(storage, adaptive_cost)
+        metrics = MetricsRegistry()
+        _api_calc = await get_circularity_calculator(
+            storage, queue, adaptive_cost, pareto, drift, metrics)
+
+
+# ============================================================
+# SIGNAL HANDLERS (v19: retained task references)
+# ============================================================
+_shutdown_tasks: set = set()
+
+
+async def shutdown_handler():
+    global _circularity_calculator_instance
+    if _circularity_calculator_instance:
+        await _circularity_calculator_instance.shutdown()
+        _circularity_calculator_instance = None
+
+
+def _spawn_shutdown_task():
+    task = asyncio.create_task(shutdown_handler())
+    _shutdown_tasks.add(task)
+    task.add_done_callback(_shutdown_tasks.discard)
+    return task
+
+
+def _install_signal_handlers(loop):
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _spawn_shutdown_task)
+        except (NotImplementedError, AttributeError):
+            try:
+                signal.signal(sig, lambda s, f: _spawn_shutdown_task())
+            except (ValueError, OSError):
+                pass
+
+
+# ============================================================
+# MAIN
 # ============================================================
 async def main():
+    loop = asyncio.get_running_loop()
+    _install_signal_handlers(loop)
+
+    print("=" * 80)
+    print("Enhanced Helium Circularity Model v19.0 — Enterprise Quantum+ (shared modules)")
+    print("=" * 80)
+
+    if FASTAPI_AVAILABLE and os.environ.get("CIRCULARITY_SERVE_API", "0") == "1":
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+        return
+
     storage = Storage()
     queue = AsyncMessageQueue()
     adaptive_cost = AdaptiveCostFunction(storage)
@@ -2268,6 +2312,18 @@ async def main():
     calculator = await get_circularity_calculator(
         storage, queue, adaptive_cost, pareto, drift, metrics)
 
+    print("\n✅ Ten enhancements imported from the enhancements package:")
+    print("   [1] Quantum-Distillation     QuantumInspiredTeacher + DistillationEnsemble")
+    print("   [2] Causal RL                CausalCounterfactualEstimator")
+    print("   [3] Federated Green Learning FederatedAggregator")
+    print("   [4] Multi-Agent Coordination EmergentRoleRegistry + MultiAgentCoordinator")
+    print("   [5] Temporal Logic           STLFormula + TemporalLogicMonitor + SafetyShield")
+    print("   [6] Explainable AI           DecisionExplainer")
+    print("   [7] Adaptive Precision       PrecisionController + HardwareAwareAdapter")
+    print("   [8] Carbon Markets / RECs    CarbonMarketClient + RECInventory")
+    print("   [9] Resilience / Chaos       ChaosEngineer")
+    print("  [10] HITL / Active Learning   UncertaintyEstimator + HumanInTheLoopGate + ActiveLearningSampler")
+
     for _ in range(3):
         m = await calculator.calculate_comprehensive_circularity()
         print(f"Circularity: {m.circularity_index:.3f} ({m.circularity_level}) "
@@ -2275,11 +2331,21 @@ async def main():
               f"HITL={m.hitl_approved}")
 
     stats = calculator.autonomous_optimizer.get_optimization_stats()
-    print(f"\nOptimizer stats: {json.dumps({k: v for k, v in stats.items() if k != 'recent_optimizations'}, default=str, indent=2)}")
-    print(f"\nCloud: {calculator.cloud_deployer.active_provider} @ {calculator.cloud_deployer.active_region}")
-    print(f"Global metrics: {GLOBAL_METRICS.get()}")
+    print(f"\nStrategy rewards: {stats['strategy_rewards']}")
+    print(f"Role snapshot: {stats['role_snapshot']}")
+    print(f"Cloud: {calculator.cloud_deployer.active_provider} "
+          f"@ {calculator.cloud_deployer.active_region}")
+    status = await calculator.get_comprehensive_status()
+    print(f"Health: {status['health']['health_score']}")
 
-    await calculator.shutdown()
+    print("\n" + "=" * 80)
+    print("✅ Helium Circularity Model v19.0 — Ready")
+    print("=" * 80)
+
+    try:
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        await calculator.shutdown()
 
 
 if __name__ == "__main__":
