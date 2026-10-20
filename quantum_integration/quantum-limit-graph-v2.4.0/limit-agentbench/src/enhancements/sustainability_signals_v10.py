@@ -1,29 +1,30 @@
 #!/usr/bin/env python3
 # =============================================================================
 # FILE: src/enhancements/sustainability_signals_enhanced_v16_0.py
-# VERSION: 17.0.0
+# VERSION: 17.1.0  (Phase 1-3 enhancements applied — see changelog at bottom)
 # =============================================================================
 """
-Enhanced Sustainability Signals System v17.0.0
+Enhanced Sustainability Signals System v17.1.0
 
-v16.0.0 features preserved:
-    GA + MoE + Pareto + Forecasting + Federated + Drift + Active Learning
-    + LIMIT Graph + RLHF + Multi-Teacher Distillation.
+v16.0.0 features preserved: GA + MoE + Pareto + Forecasting + Federated
++ Drift + Active Learning + LIMIT Graph + RLHF + Multi-Teacher Distillation.
 
-v17.0.0 adds (all in-file):
-    • Temporal Logic Verification (G/F/U/->)
-    • Explainable AI (XAI) — feature attribution + narrative
-    • Adaptive Precision Switching (fp32/fp16/bf16/fp8/fp4)
-    • Carbon Markets + Renewable Energy Credits (RECs)
-    • Multi-Agent Role Specialization (emergent, softmax affinity)
-    • Chaos Testing as first-class citizen
-    • Active RLHF (uncertainty-triggered human queries)
-    • Human-in-the-Loop Coordinator
-    • Federated Green Learning (proper FedAvg)
-    • Causal RL hooks (IPW / ATE)
+v17.0.0 base: Temporal Logic, XAI, Adaptive Precision, Carbon Markets,
+Role Specialization, Chaos Testing, Active RLHF, HITL, Federated Green
+Learning, Causal RL hooks.
 
-Also fixes: async __init__ on ESGState, self.websocket init order,
-missing comprehensive_sustainability_assessment method, config key errors.
+v17.1.0 (Phase 1-3) adds:
+    [P1] Precision-unit fix, RLHF policy wiring, carbon cache TTL,
+         signal registration, chaos-env gating, federated/distillation/Pareto
+         wiring, drift detection wiring, data-quality computation,
+         score clamping, HITL confidence gate fix, baseline-aware credit calc.
+    [P2] aiosqlite-backed storage (async), CircuitBreaker lock,
+         bounded temporal violations, new Prometheus metrics
+         (latency histogram, active gauge, drift counter),
+         correlation_id propagation, bounded metadata snapshot.
+    [P3] Pluggable live carbon API (aiohttp), real ARIMA forecasting
+         with EMA fallback, supply-chain scoring, scenario analysis,
+         financial impact, RLHF/state persistence to disk.
 """
 
 import asyncio
@@ -61,6 +62,12 @@ try:
     AIOSQLITE_AVAILABLE = True
 except ImportError:
     AIOSQLITE_AVAILABLE = False
+
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
 
 try:
     from sklearn.neural_network import MLPRegressor, MLPClassifier
@@ -107,21 +114,32 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s '
+               '[cid=%(correlation_id)s]')
 
 audit_logger = logging.getLogger('esg_audit')
 if not audit_logger.handlers:
     try:
         h = logging.handlers.RotatingFileHandler(
-            'esg_audit_v17.log', maxBytes=50*1024*1024, backupCount=5)
+            'esg_audit_v17.log', maxBytes=50 * 1024 * 1024, backupCount=5)
         h.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
         audit_logger.addHandler(h)
     except Exception:
         audit_logger.addHandler(logging.StreamHandler())
 audit_logger.setLevel(logging.INFO)
 
+
+class _CorrelationFilter(logging.Filter):
+    def filter(self, record):
+        record.correlation_id = correlation_id_var.get()
+        return True
+
+
+for _h in logger.handlers:
+    _h.addFilter(_CorrelationFilter())
+
 # -----------------------------------------------------------------------------
-# Prometheus metrics
+# Prometheus metrics — [P2] add latency, active, drift
 # -----------------------------------------------------------------------------
 if PROMETHEUS_AVAILABLE:
     REGISTRY = CollectorRegistry()
@@ -136,6 +154,14 @@ if PROMETHEUS_AVAILABLE:
     SC_CARBON_CREDITS = Counter('sc_carbon_credits_usd_total', 'Carbon credits', registry=REGISTRY)
     SC_XAI = Counter('sc_xai_explanations_total', 'XAI', registry=REGISTRY)
     SC_PRECISION = Counter('sc_precision_selections_total', 'Precision', ['level'], registry=REGISTRY)
+    # [P2] new metrics
+    SC_ASSESSMENT_LATENCY = Histogram(
+        'sc_assessment_latency_seconds', 'Assessment latency',
+        buckets=(0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0), registry=REGISTRY)
+    SC_ACTIVE_ASSESSMENTS = Gauge('sc_active_assessments', 'Active assessments', registry=REGISTRY)
+    SC_DRIFT = Counter('sc_drift_events_total', 'Drift events', ['metric'], registry=REGISTRY)
+    SC_CARBON_INTENSITY = Gauge('sc_carbon_intensity_g_per_kwh',
+                                 'Current grid carbon intensity', registry=REGISTRY)
 else:
     class DummyMetric:
         def labels(self, **kwargs): return self
@@ -145,6 +171,8 @@ else:
     SUSTAINABILITY_ASSESSMENTS = ESG_SCORE = DummyMetric()
     SC_TEMPORAL_VIOLATIONS = SC_CHAOS = SC_HITL = DummyMetric()
     SC_FEDERATED = SC_CARBON_CREDITS = SC_XAI = SC_PRECISION = DummyMetric()
+    SC_ASSESSMENT_LATENCY = SC_ACTIVE_ASSESSMENTS = SC_DRIFT = DummyMetric()
+    SC_CARBON_INTENSITY = DummyMetric()
 
 
 # =============================================================================
@@ -167,14 +195,16 @@ class AgentRole(str, Enum):
 
 # =============================================================================
 # v17.0.0 MODULE A — TEMPORAL LOGIC MONITOR
+# [P2] violations bounded to 100 entries
 # =============================================================================
 class TemporalLogicMonitor:
     """Lightweight LTL monitor: G(φ), F(φ), φ U ψ, φ -> ψ."""
-    def __init__(self, history_len: int = 200):
+
+    def __init__(self, history_len: int = 200, max_violations: int = 100):
         self.formulas: Dict[str, str] = {}
         self.compiled: Dict[str, Callable] = {}
         self.history: deque = deque(maxlen=history_len)
-        self.violations: List[Dict] = []
+        self.violations: deque = deque(maxlen=max_violations)  # [P2]
 
     def add_formula(self, name: str, formula: str):
         self.formulas[name] = formula
@@ -248,7 +278,7 @@ class TemporalLogicMonitor:
 
     def get_status(self) -> Dict:
         return {'formulas': self.formulas, 'last_results': self.evaluate(),
-                'violations': self.violations[-5:]}
+                'violations': list(self.violations)[-5:]}
 
 
 # =============================================================================
@@ -281,8 +311,12 @@ class XAIExplainer:
 
 # =============================================================================
 # v17.0.0 MODULE C — ADAPTIVE PRECISION CONTROLLER
+# [P1] threshold & callers use gCO2/kWh units; documented
 # =============================================================================
 class AdaptivePrecisionController:
+    """Precision selector. `select()` expects carbon_intensity in **gCO2/kWh**
+    (e.g. ~400 typical). Callers must pass `carbon_intensity_kg * 1000`."""
+
     def __init__(self):
         self.telemetry = {'gpu_available': False, 'memory_gb': 16.0, 'utilization': 0.3}
         self.last_precision = PrecisionLevel.FP32
@@ -290,13 +324,17 @@ class AdaptivePrecisionController:
     def update_telemetry(self, **kwargs):
         self.telemetry.update(kwargs)
 
-    def select(self, carbon_intensity: float, accuracy_required: float = 0.95) -> PrecisionLevel:
+    def select(self, carbon_intensity_g_per_kwh: float,
+               accuracy_required: float = 0.95) -> PrecisionLevel:
+        # [P1] explicitly document units and pick sensibly
         if accuracy_required > 0.99:
             self.last_precision = PrecisionLevel.FP32
-        elif carbon_intensity > 500:
+        elif carbon_intensity_g_per_kwh > 500:
             self.last_precision = PrecisionLevel.FP8
-        elif self.telemetry.get('gpu_available') and carbon_intensity < 350:
+        elif carbon_intensity_g_per_kwh > 350:
             self.last_precision = PrecisionLevel.FP16
+        elif self.telemetry.get('gpu_available'):
+            self.last_precision = PrecisionLevel.BF16
         else:
             self.last_precision = PrecisionLevel.FP16
         SC_PRECISION.labels(level=self.last_precision.value).inc()
@@ -313,9 +351,10 @@ class AdaptivePrecisionController:
 # v17.0.0 MODULE D — CARBON MARKET CLIENT
 # =============================================================================
 class CarbonMarketClient:
-    def __init__(self):
-        self.carbon_price_per_ton = 50.0
-        self.rec_price_per_mwh = 30.0
+    def __init__(self, carbon_price_per_ton: float = 50.0,
+                 rec_price_per_mwh: float = 30.0):
+        self.carbon_price_per_ton = carbon_price_per_ton
+        self.rec_price_per_mwh = rec_price_per_mwh
         self.grid_intensity_kg_per_mwh = 400.0
         self.trades: List[Dict] = []
 
@@ -347,10 +386,10 @@ class RoleSpecializationCoordinator:
         self.roles = list(AgentRole)
         if NUMPY_AVAILABLE:
             self.affinity = np.array([
-                [0.7, 0.9, 0.4, 0.6],   # leader
-                [0.4, 0.5, 0.9, 0.5],   # worker
-                [0.9, 0.4, 0.3, 0.7],   # verifier
-                [0.3, 0.2, 0.3, 0.3],   # observer
+                [0.7, 0.9, 0.4, 0.6],
+                [0.4, 0.5, 0.9, 0.5],
+                [0.9, 0.4, 0.3, 0.7],
+                [0.3, 0.2, 0.3, 0.3],
             ])
         else:
             self.affinity = None
@@ -448,10 +487,10 @@ class ChaosTester:
 
 # =============================================================================
 # v17.0.0 MODULE G — ACTIVE RLHF
+# [P1] get_policy_probs now returns trained policy
+# [P3] persistent save/load
 # =============================================================================
 class ActiveRLHF:
-    """Superset of the legacy RLHFManager; preserves record_feedback,
-    train_reward_model, get_policy_probs."""
     def __init__(self, action_space: List[str], uncertainty_threshold: float = 0.35,
                  human_timeout_s: float = 300.0):
         self.actions = list(action_space)
@@ -463,7 +502,6 @@ class ActiveRLHF:
         self.feedback_buffer: List[Dict] = []
         self.reward_model = MLPRegressor(hidden_layer_sizes=(16,), max_iter=200,
                                           random_state=42) if SKLEARN_AVAILABLE else None
-        self.policy_weights = np.array([1/4]*4) if NUMPY_AVAILABLE else [1/4]*4
         self._lock = asyncio.Lock()
 
     def _state_to_features(self, state):
@@ -491,16 +529,16 @@ class ActiveRLHF:
         try:
             X = [f['state'] for f in self.feedback_buffer]
             y = [f['reward'] for f in self.feedback_buffer]
-            self.reward_model.fit(X, y)
+            await asyncio.to_thread(self.reward_model.fit, X, y)
             self.feedback_buffer.clear()
             logger.info("ActiveRLHF trained on %d samples", len(X))
         except Exception as e:
             logger.warning("ActiveRLHF train failed: %s", e)
 
     async def get_policy_probs(self, state):
-        if NUMPY_AVAILABLE:
-            return self.policy_weights.tolist()
-        return list(self.policy_weights)
+        # [P1] return the actual trained/preference-based policy
+        probs = self._policy(state)
+        return probs.tolist() if NUMPY_AVAILABLE else list(probs)
 
     def update(self, context, action, reward):
         if action in self.actions:
@@ -511,8 +549,9 @@ class ActiveRLHF:
     def _policy(self, context):
         if not NUMPY_AVAILABLE:
             return [0.25] * len(self.actions)
-        raw = np.array([self.preference_counts[a] for a in self.actions], dtype=float)
-        if raw.sum() == 0:
+        raw = np.array([self.preference_counts.get(a, 0.0) for a in self.actions],
+                       dtype=float)
+        if raw.sum() <= 0:
             raw = np.ones(len(self.actions))
         e = np.exp(raw - raw.max())
         return e / e.sum()
@@ -527,7 +566,7 @@ class ActiveRLHF:
         if NUMPY_AVAILABLE:
             probs = self._policy(context)
             ent = -np.sum(probs * np.log(probs + 1e-12))
-            return float(ent / np.log(len(self.actions))) if self.actions else 0.0
+            return float(ent / np.log(len(self.actions))) if len(self.actions) > 1 else 0.0
         return 0.0
 
     async def maybe_query_human(self, context, options):
@@ -549,6 +588,35 @@ class ActiveRLHF:
         self.update(q['context'], chosen, rating)
         return q
 
+    # ---- [P3] Persistence ----
+    async def save(self, path: str) -> None:
+        try:
+            data = {
+                'preference_counts': dict(self.preference_counts),
+                'history': self.history[-500:],
+            }
+            def _write():
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).write_text(json.dumps(data, default=str))
+            await asyncio.to_thread(_write)
+        except Exception as e:
+            logger.warning("RLHF save failed: %s", e)
+
+    async def load(self, path: str) -> None:
+        try:
+            p = Path(path)
+            if not p.exists():
+                return
+            def _read():
+                return json.loads(p.read_text())
+            data = await asyncio.to_thread(_read)
+            self.preference_counts = defaultdict(float, data.get('preference_counts', {}))
+            self.history = data.get('history', [])
+            logger.info("RLHF loaded %d preference entries from %s",
+                        len(self.preference_counts), path)
+        except Exception as e:
+            logger.warning("RLHF load failed: %s", e)
+
 
 # =============================================================================
 # v17.0.0 MODULE H — HUMAN-IN-THE-LOOP COORDINATOR
@@ -561,11 +629,14 @@ class HumanInTheLoopCoordinator:
 
     async def escalate(self, decision_context, options, confidence,
                         confidence_threshold=0.65):
-        needs_human = confidence < confidence_threshold
-        query = await self.rlhf.maybe_query_human(decision_context, options)
+        # [P1] explicit reasons; escalate when EITHER uncertain OR low-confidence
+        low_confidence = confidence < confidence_threshold
+        query = await self.rlhf.maybe_query_human(decision_context, options) if self.rlhf else None
+        high_uncertainty = query is not None
 
-        if query is None and not needs_human:
-            choice = self.rlhf.sample_action(decision_context)
+        if not low_confidence and not high_uncertainty:
+            choice = self.rlhf.sample_action(decision_context) if self.rlhf else (
+                options[0] if options else 'noop')
             self.audit_log.append({'decision': 'auto', 'chosen': choice,
                                    'confidence': confidence})
             SC_HITL.labels(status='auto').inc()
@@ -573,12 +644,15 @@ class HumanInTheLoopCoordinator:
 
         if query is None:
             query = {'id': str(uuid.uuid4()), 'options': options,
-                     'context': decision_context, 'status': 'pending'}
-        auto_choice = self.rlhf.sample_action(decision_context)
+                     'context': decision_context, 'status': 'pending',
+                     'reason': 'low_confidence' if low_confidence else 'high_uncertainty'}
+        auto_choice = self.rlhf.sample_action(decision_context) if self.rlhf else (
+            options[0] if options else 'noop')
         self.audit_log.append({'decision': 'escalated',
                                'query_id': query.get('id'),
                                'auto_fallback': auto_choice,
                                'confidence': confidence,
+                               'reason': query.get('reason'),
                                'timestamp': datetime.now().isoformat()})
         SC_HITL.labels(status='escalated').inc()
         return {'escalated': True, 'query': query, 'chosen': auto_choice,
@@ -592,7 +666,7 @@ class HumanInTheLoopCoordinator:
 # v17.0.0 MODULE I — FEDERATED AGGREGATOR
 # =============================================================================
 class FederatedAggregator:
-    def __init__(self, num_params: int = 4):
+    def __init__(self, num_params: int = 3):
         self.round = 0
         self.num_params = num_params
         self.global_weights: List[float] = [1.0 / num_params] * num_params
@@ -654,12 +728,12 @@ class CausalRewardShaper:
 
 
 # =============================================================================
-# ORIGINAL CONFIG (extended with v17.0.0 flags)
+# CONFIG — [P3] new fields for live carbon API, baselines, persistence
 # =============================================================================
 if PYDANTIC_AVAILABLE:
     class ESGConfig(BaseModel):
         instance_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
-        version: str = Field("17.0.0")
+        version: str = Field("17.1.0")
         log_level: str = Field("INFO")
         db_path: str = Field("/tmp/esg_system_v17.db")
         carbon_region: str = Field("global")
@@ -670,7 +744,7 @@ if PYDANTIC_AVAILABLE:
         master_key_env: str = Field("ESG_MASTER_KEY")
         mopd_weights: Dict[str, float] = Field(default_factory=lambda: {
             'environmental': 0.4, 'social': 0.3, 'governance': 0.3})
-        # v16 flags preserved
+        # legacy flags
         ga_enabled: bool = True
         ga_population_size: int = 20
         ga_generations: int = 5
@@ -690,7 +764,7 @@ if PYDANTIC_AVAILABLE:
         distillation_enabled: bool = True
         distillation_temperature: float = 2.0
         distillation_interval: int = 300
-        # ============ v17.0.0 flags ============
+        # v17.0.0
         temporal_logic_enabled: bool = True
         xai_enabled: bool = True
         adaptive_precision_enabled: bool = True
@@ -700,6 +774,13 @@ if PYDANTIC_AVAILABLE:
         hitl_enabled: bool = True
         hitl_confidence_threshold: float = 0.65
         causal_rl_enabled: bool = True
+        # ---- [P3] new ----
+        carbon_api_url: str = Field("")  # empty → simulated
+        carbon_baseline_g_per_kwh: float = Field(400.0)
+        compute_energy_kwh_per_assessment: float = Field(1.0)
+        rlhf_state_path: str = Field("/tmp/esg_rlhf_v17.json")
+        state_persist_path: str = Field("/tmp/esg_state_v17.json")
+        chaos_env_gate: bool = Field(True)  # only run inline chaos if ESG_ENV=chaos
 
         @field_validator('log_level')
         @classmethod
@@ -724,7 +805,7 @@ else:
     @dataclass
     class ESGConfig:
         instance_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-        version: str = "17.0.0"
+        version: str = "17.1.0"
         log_level: str = "INFO"
         db_path: str = "/tmp/esg_system_v17.db"
         carbon_region: str = "global"
@@ -763,6 +844,12 @@ else:
         hitl_enabled: bool = True
         hitl_confidence_threshold: float = 0.65
         causal_rl_enabled: bool = True
+        carbon_api_url: str = ""
+        carbon_baseline_g_per_kwh: float = 400.0
+        compute_energy_kwh_per_assessment: float = 1.0
+        rlhf_state_path: str = "/tmp/esg_rlhf_v17.json"
+        state_persist_path: str = "/tmp/esg_state_v17.json"
+        chaos_env_gate: bool = True
 
         def get_master_key(self) -> bytes:
             key_hex = os.getenv(self.master_key_env)
@@ -775,7 +862,8 @@ else:
 
 
 # =============================================================================
-# ORIGINAL CIRCUIT BREAKER + RATE LIMITER
+# CIRCUIT BREAKER + RATE LIMITER
+# [P2] asyncio.Lock inside CircuitBreaker
 # =============================================================================
 class CircuitBreaker:
     def __init__(self, failure_threshold=5, recovery_timeout=30.0, name="default"):
@@ -785,24 +873,30 @@ class CircuitBreaker:
         self._failures = 0
         self._last_failure_time = None
         self._state = "CLOSED"
+        self._lock = asyncio.Lock()  # [P2]
 
     async def call(self, func, *args, **kwargs):
-        if self._state == "OPEN":
-            if (datetime.now() - self._last_failure_time).total_seconds() > self.recovery_timeout:
-                self._state = "HALF_OPEN"
-            else:
-                raise Exception(f"Circuit breaker {self.name} is OPEN")
+        async with self._lock:
+            if self._state == "OPEN":
+                if (self._last_failure_time is not None and
+                        (datetime.now() - self._last_failure_time).total_seconds()
+                        > self.recovery_timeout):
+                    self._state = "HALF_OPEN"
+                else:
+                    raise Exception(f"Circuit breaker {self.name} is OPEN")
         try:
             result = await func(*args, **kwargs)
-            if self._state == "HALF_OPEN":
-                self._state = "CLOSED"
-                self._failures = 0
+            async with self._lock:
+                if self._state == "HALF_OPEN":
+                    self._state = "CLOSED"
+                    self._failures = 0
             return result
         except Exception as e:
-            self._failures += 1
-            self._last_failure_time = datetime.now()
-            if self._failures >= self.failure_threshold:
-                self._state = "OPEN"
+            async with self._lock:
+                self._failures += 1
+                self._last_failure_time = datetime.now()
+                if self._failures >= self.failure_threshold:
+                    self._state = "OPEN"
             raise e
 
 
@@ -831,18 +925,25 @@ class RateLimiter:
 
 
 # =============================================================================
-# ORIGINAL ENHANCED STORAGE (in-memory + SQLite backed)
+# STORAGE — [P2] aiosqlite with asyncio.to_thread fallback
+# [P1] cache with timestamp for TTL
 # =============================================================================
 class EnhancedStorage:
     def __init__(self, config: ESGConfig):
         self.config = config
         self.db_path = config.db_path
-        self.cache = {}
+        self.cache: Dict[str, Any] = {}
         self.cache_ttl = config.cache_ttl
         self._esg_assessments: deque = deque(maxlen=1000)
         self._optimisations: deque = deque(maxlen=500)
         self._pareto_front: List[Dict] = []
-        self._conn = None
+        self._conn = None          # sync sqlite3 handle (fallback)
+        self._aioconn = None       # aiosqlite handle
+        self._conn_lock = asyncio.Lock()
+        if not AIOSQLITE_AVAILABLE:
+            self._init_sync()
+
+    def _init_sync(self):
         try:
             self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -853,16 +954,44 @@ class EnhancedStorage:
         except Exception as e:
             logger.warning("Storage init failed: %s", e)
 
+    async def _ensure_aioconn(self):
+        if not AIOSQLITE_AVAILABLE:
+            return
+        if self._aioconn is not None:
+            return
+        async with self._conn_lock:
+            if self._aioconn is not None:
+                return
+            try:
+                self._aioconn = await aiosqlite.connect(self.db_path)
+                await self._aioconn.execute("PRAGMA journal_mode=WAL")
+                for tbl in ['esg_assessments', 'optimisation_history']:
+                    await self._aioconn.execute(
+                        f"CREATE TABLE IF NOT EXISTS {tbl} "
+                        f"(id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT)")
+                await self._aioconn.commit()
+            except Exception as e:
+                logger.warning("aiosqlite init failed, using sync fallback: %s", e)
+                self._aioconn = None
+                if self._conn is None:
+                    self._init_sync()
+
     async def save_esg_assessment(self, assessment: 'SustainabilityAssessmentResult'):
         self._esg_assessments.append(assessment)
-        if self._conn:
-            try:
-                self._conn.execute(
-                    "INSERT INTO esg_assessments (data) VALUES (?)",
-                    (json.dumps(asdict(assessment), default=str),))
-                self._conn.commit()
-            except Exception:
-                pass
+        payload = json.dumps(asdict(assessment), default=str)
+        try:
+            await self._ensure_aioconn()
+            if self._aioconn is not None:
+                await self._aioconn.execute(
+                    "INSERT INTO esg_assessments (data) VALUES (?)", (payload,))
+                await self._aioconn.commit()
+            elif self._conn is not None:
+                await asyncio.to_thread(
+                    lambda: (self._conn.execute(
+                        "INSERT INTO esg_assessments (data) VALUES (?)", (payload,)),
+                             self._conn.commit()))
+        except Exception as e:
+            logger.debug("save_esg_assessment failed: %s", e)
 
     async def save_optimisation(self, strategy: str, result: Dict):
         self._optimisations.append({'strategy': strategy, 'result': result,
@@ -878,16 +1007,25 @@ class EnhancedStorage:
         return self._pareto_front
 
     async def save_state(self, key: str, value: str):
-        self.cache[key] = value
+        self.cache[f"state_{key}"] = value
 
     async def get_state(self, key: str) -> Optional[str]:
-        return self.cache.get(key)
+        return self.cache.get(f"state_{key}")
 
-    async def get_carbon_intensity(self, region: str, hours_ago: int = 1) -> Optional[float]:
-        return self.cache.get(f"carbon_{region}")
+    async def get_carbon_intensity(self, region: str,
+                                   ttl: Optional[float] = None) -> Optional[float]:
+        # [P1] TTL-aware cache
+        rec = self.cache.get(f"carbon_{region}")
+        if rec is None:
+            return None
+        if isinstance(rec, dict):
+            if ttl is not None and (time.time() - rec.get('ts', 0)) > ttl:
+                return None
+            return rec.get('value')
+        return rec  # legacy
 
     async def save_carbon_intensity(self, region: str, intensity: float):
-        self.cache[f"carbon_{region}"] = intensity
+        self.cache[f"carbon_{region}"] = {'value': intensity, 'ts': time.time()}
 
     async def save_node_data(self, node_id: str, helium: float, material: float):
         self.cache[f"node_{node_id}"] = {'helium_index': helium, 'material_index': material}
@@ -895,33 +1033,93 @@ class EnhancedStorage:
     async def get_node_data(self, node_id: str) -> Optional[Dict]:
         return self.cache.get(f"node_{node_id}")
 
-    def dispose(self):
+    async def dispose(self):
+        if self._aioconn is not None:
+            try: await self._aioconn.close()
+            except Exception: pass
+            self._aioconn = None
         if self._conn:
             try: self._conn.close()
             except Exception: pass
 
 
 # =============================================================================
-# ORIGINAL CARBON INTENSITY MANAGER
+# CARBON INTENSITY MANAGER — [P3] live API + baseline + circuit breaker
 # =============================================================================
 class CarbonIntensityManager:
     def __init__(self, config: ESGConfig, storage: EnhancedStorage):
         self.config = config
         self.storage = storage
         self.region = config.carbon_region
-        self._circuit_breaker = CircuitBreaker(name="carbon_api")
+        self._circuit_breaker = CircuitBreaker(name="carbon_api",
+                                               failure_threshold=3,
+                                               recovery_timeout=60.0)
         self._rate_limiter = RateLimiter(rate=10, window=60)
+        self._api_url = config.carbon_api_url or os.getenv('ESG_CARBON_API_URL', '')
+        self._baseline = config.carbon_baseline_g_per_kwh
+        self._last_known = 400.0  # gCO2/kWh
+        self._session: Optional[Any] = None
+
+    async def _get_session(self):
+        if not AIOHTTP_AVAILABLE:
+            return None
+        if self._session is None or getattr(self._session, 'closed', False):
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=5))
+        return self._session
+
+    async def _fetch_live_g_per_kwh(self) -> Optional[float]:
+        if not self._api_url or not AIOHTTP_AVAILABLE:
+            return None
+        if not await self._rate_limiter.acquire():
+            return None
+
+        async def _do():
+            sess = await self._get_session()
+            if sess is None:
+                return None
+            async with sess.get(self._api_url) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                # Accept common shapes; user can adapt this parser
+                return float(data.get('carbon_intensity')
+                              or data.get('intensity', {}).get('actual')
+                              or 400.0)
+
+        try:
+            return await self._circuit_breaker.call(_do)
+        except Exception as e:
+            logger.debug("carbon API fetch failed: %s", e)
+            return None
 
     async def get_current_intensity(self) -> float:
-        cached = await self.storage.get_carbon_intensity(self.region)
+        """Returns current grid intensity in kgCO2/kWh (e.g. 0.4)."""
+        cached = await self.storage.get_carbon_intensity(
+            self.region, ttl=self.config.carbon_update_interval)
         if cached is not None:
             return cached / 1000.0
-        intensity = 400.0
-        await self.storage.save_carbon_intensity(self.region, intensity)
-        return intensity / 1000.0
+        live = await self._fetch_live_g_per_kwh()
+        if live is None:
+            # Simulated: small noise around baseline
+            live = self._baseline + random.uniform(-20.0, 20.0)
+        self._last_known = live
+        await self.storage.save_carbon_intensity(self.region, live)
+        SC_CARBON_INTENSITY.set(live)
+        return live / 1000.0
+
+    @property
+    def baseline_g_per_kwh(self) -> float:
+        return self._baseline
+
+    @property
+    def last_known_g_per_kwh(self) -> float:
+        return self._last_known
 
     async def close(self):
-        pass
+        if self._session is not None and not self._session.closed:
+            try: await self._session.close()
+            except Exception: pass
 
 
 class NodeRegistry:
@@ -942,7 +1140,7 @@ class NodeRegistry:
 
 
 # =============================================================================
-# ORIGINAL LIMIT GRAPH MANAGER
+# LIMIT GRAPH MANAGER
 # =============================================================================
 class LimitGraphManager:
     def __init__(self, config: ESGConfig):
@@ -992,7 +1190,7 @@ class LimitGraphManager:
 
 
 # =============================================================================
-# ORIGINAL GA / MoE / Pareto / MTOP / Student
+# GA / MoE / Pareto / MTOP / Student
 # =============================================================================
 class GeneticStrategyOptimizer:
     def __init__(self, config: ESGConfig, storage: EnhancedStorage):
@@ -1139,6 +1337,9 @@ class MoEGatingNetwork:
             expert_idx = 0
         async with self._lock:
             self._training_data.append((features, expert_idx))
+            # [P1] prune training buffer to prevent unbounded growth
+            if len(self._training_data) > 1000:
+                self._training_data = self._training_data[-500:]
             if len(self._training_data) % 10 == 0:
                 self._train_gating()
 
@@ -1181,24 +1382,7 @@ class ParetoFrontOptimizer:
 
 
 # =============================================================================
-# ORIGINAL FEDERATED LEARNER (simplified)
-# =============================================================================
-class FederatedESGLearner:
-    def __init__(self, storage, instance_id, interval):
-        self.storage = storage
-        self.instance_id = instance_id
-        self.interval = interval
-        self.insights = deque(maxlen=100)
-
-    async def share_esg_insight(self, insight):
-        self.insights.append(insight)
-
-    async def apply_federated_insights(self, params):
-        return params
-
-
-# =============================================================================
-# ORIGINAL DRIFT DETECTOR
+# DRIFT DETECTOR — [P1] now invoked from carbon loop
 # =============================================================================
 class DriftDetector:
     def __init__(self, storage, config):
@@ -1220,19 +1404,45 @@ class DriftDetector:
 
 
 # =============================================================================
-# ORIGINAL CARBON FORECASTER (ARIMA)
+# CARBON FORECASTER — [P3] real ARIMA + EMA fallback
 # =============================================================================
 class CarbonForecaster:
     def __init__(self, storage, config):
         self.storage = storage
         self.config = config
+        self.history = deque(maxlen=200)
 
-    async def get_forecast(self, hours_ahead=24):
-        return 0.4  # Simulated
+    async def update(self, intensity_kg_per_kwh: float) -> None:
+        self.history.append(float(intensity_kg_per_kwh))
+
+    async def get_forecast(self, hours_ahead: int = 24) -> float:
+        vals = list(self.history)
+        if not vals:
+            return 0.4
+        if len(vals) < 5:
+            return float(vals[-1])
+        # ARIMA if possible
+        if STATSMODELS_AVAILABLE and NUMPY_AVAILABLE and len(vals) >= 15:
+            try:
+                def _fit():
+                    return ARIMA(vals, order=(1, 0, 0)).fit()
+                res = await asyncio.to_thread(_fit)
+                steps = max(1, min(hours_ahead, 24))
+                fc = res.forecast(steps=steps)
+                if len(fc) > 0:
+                    return float(np.mean(fc))
+            except Exception as e:
+                logger.debug("ARIMA forecast failed, using EMA: %s", e)
+        # EMA fallback
+        alpha = 0.3
+        ema = vals[0]
+        for v in vals[1:]:
+            ema = alpha * v + (1 - alpha) * ema
+        return float(ema)
 
 
 # =============================================================================
-# ORIGINAL ACTIVE USER PREFERENCE LEARNER
+# ACTIVE USER PREFERENCE LEARNER (legacy)
 # =============================================================================
 class ActiveUserPreferenceLearner:
     def __init__(self, storage, websocket):
@@ -1261,7 +1471,7 @@ class ActiveUserPreferenceLearner:
 
 
 # =============================================================================
-# ORIGINAL WEBSOCKET SERVER (implemented)
+# WEBSOCKET SERVER
 # =============================================================================
 class EnhancedWebSocketServer:
     def __init__(self, port):
@@ -1311,7 +1521,7 @@ class EnhancedWebSocketServer:
 
 
 # =============================================================================
-# ORIGINAL: Quantum + Blockchain stubs
+# Quantum + Blockchain stubs
 # =============================================================================
 class QuantumResilientESGSecurity:
     def __init__(self, config, storage):
@@ -1363,7 +1573,7 @@ class MultiCloudESGDistribution:
 
 
 # =============================================================================
-# ORIGINAL: Data Classes
+# Data classes — [P3] new fields
 # =============================================================================
 @dataclass
 class SupplierNode:
@@ -1386,10 +1596,10 @@ class SustainabilityAssessmentResult:
     governance_score: float
     data_quality_score: float = 100.0
     assessment_time_ms: float = 0.0
-    supply_chain_analysis: Dict = field(default_factory=dict)
-    financial_impact: Dict = field(default_factory=dict)
+    supply_chain_analysis: Dict = field(default_factory=dict)   # [P3]
+    financial_impact: Dict = field(default_factory=dict)        # [P3]
     emerging_topics: Dict = field(default_factory=dict)
-    scenario_analysis: Dict = field(default_factory=dict)
+    scenario_analysis: Dict = field(default_factory=dict)       # [P3]
     trend_analysis: Dict = field(default_factory=dict)
     peer_comparison: Dict = field(default_factory=dict)
     quantum_signature: Optional[Dict] = None
@@ -1398,7 +1608,7 @@ class SustainabilityAssessmentResult:
     autonomous_optimization: Optional[Dict] = None
     company_name: str = "N/A"
     sector: str = "general"
-    # v17.0.0 fields
+    # v17.0.0
     temporal_status: Optional[Dict] = None
     xai_explanation: Optional[Dict] = None
     precision_used: Optional[str] = None
@@ -1410,9 +1620,11 @@ class SustainabilityAssessmentResult:
     federated_round: Optional[int] = None
     causal_ates: Optional[Dict] = None
     limit_graph_summary: Optional[Dict] = None
+    # v17.1.0 additions
+    carbon_forecast_g_per_kwh: Optional[float] = None           # [P3]
+    correlation_id: Optional[str] = None                        # [P2]
 
 
-# ESGDataInput — flexible fallback
 if PYDANTIC_AVAILABLE:
     class ESGDataInput(BaseModel):
         company_name: str = "N/A"
@@ -1449,11 +1661,12 @@ else:
 
 
 # =============================================================================
-# FIXED ESGState (async-load instead of async __init__)
+# ESGState — [P3] persistence
 # =============================================================================
 class ESGState:
-    def __init__(self, storage: EnhancedStorage):
+    def __init__(self, storage: EnhancedStorage, persist_path: Optional[str] = None):
         self.storage = storage
+        self.persist_path = persist_path
         self.confidence = 0.5
         self.uncertainty = 0.1
         self.historical_success_rate = 0.5
@@ -1465,19 +1678,44 @@ class ESGState:
 
     async def load(self):
         try:
-            self.confidence = float(await self.storage.get_state('confidence') or 0.5)
-            self.carbon_budget_remaining = float(
-                await self.storage.get_state('carbon_budget') or 100.0)
-            self.mopd_weights = json.loads(
-                await self.storage.get_state('mopd_weights')
-                or '{"environmental":0.4,"social":0.3,"governance":0.3}')
+            v = await self.storage.get_state('confidence')
+            if v is not None:
+                self.confidence = float(v)
+            v = await self.storage.get_state('carbon_budget')
+            if v is not None:
+                self.carbon_budget_remaining = float(v)
+            v = await self.storage.get_state('mopd_weights')
+            if v is not None:
+                self.mopd_weights = json.loads(v)
         except Exception as e:
             logger.warning("ESGState load failed: %s", e)
+        # [P3] also try file-based state
+        if self.persist_path and Path(self.persist_path).exists():
+            try:
+                data = await asyncio.to_thread(
+                    lambda: json.loads(Path(self.persist_path).read_text()))
+                self.mopd_weights = data.get('mopd_weights', self.mopd_weights)
+                self.confidence = float(data.get('confidence', self.confidence))
+            except Exception as e:
+                logger.debug("ESGState file load failed: %s", e)
 
     async def save(self):
-        await self.storage.save_state('confidence', str(self.confidence))
-        await self.storage.save_state('carbon_budget', str(self.carbon_budget_remaining))
-        await self.storage.save_state('mopd_weights', json.dumps(self.mopd_weights))
+        try:
+            await self.storage.save_state('confidence', str(self.confidence))
+            await self.storage.save_state('carbon_budget', str(self.carbon_budget_remaining))
+            await self.storage.save_state('mopd_weights', json.dumps(self.mopd_weights))
+        except Exception as e:
+            logger.debug("ESGState save failed: %s", e)
+        if self.persist_path:
+            try:
+                data = {'mopd_weights': self.mopd_weights,
+                        'confidence': self.confidence}
+                def _write():
+                    Path(self.persist_path).parent.mkdir(parents=True, exist_ok=True)
+                    Path(self.persist_path).write_text(json.dumps(data, default=str))
+                await asyncio.to_thread(_write)
+            except Exception as e:
+                logger.debug("ESGState file save failed: %s", e)
 
     async def trigger_reflection(self, trigger_type, **kwargs):
         self.reflection_count += 1
@@ -1491,7 +1729,7 @@ class ESGState:
 
 
 # =============================================================================
-# ORIGINAL AUTONOMOUS ESG OPTIMIZER (with v17 modules wired in)
+# AUTONOMOUS OPTIMIZER
 # =============================================================================
 class AutonomousESGOptimizer:
     def __init__(self, config, storage, state,
@@ -1511,35 +1749,51 @@ class AutonomousESGOptimizer:
         self.causal_shaper = causal_shaper
 
     async def optimize_esg(self, current_state, strategy=None):
-        carbon_intensity = current_state.get('carbon_intensity', 400)
+        carbon_intensity = current_state.get('carbon_intensity', 0.4)
 
         selected_expert = 'balanced'
         weights = {'environmental': 0.4, 'social': 0.3, 'governance': 0.3}
         source = 'moe'
 
-        # Priority: RLHF > Distillation > MoE
+        # [P1] priority: RLHF > Distillation > MoE
         if self.rlhf and self.rlhf.history:
             probs = await self.rlhf.get_policy_probs(current_state)
             names = ['environmental_focused', 'social_focused',
                      'governance_focused', 'balanced']
-            idx = int(np.argmax(probs)) % len(names) if NUMPY_AVAILABLE else 0
+            if NUMPY_AVAILABLE and probs:
+                idx = int(np.argmax(probs)) % len(names)
+            else:
+                idx = 0
             selected_expert = names[idx]
-            weights = {'environmental': float(probs[0]) if len(probs) > 0 else 0.4,
-                       'social': float(probs[1]) if len(probs) > 1 else 0.3,
-                       'governance': float(probs[2]) if len(probs) > 2 else 0.3}
+            if len(probs) >= 3 and sum(probs[:3]) > 0:
+                s = probs[0] + probs[1] + probs[2]
+                weights = {'environmental': float(probs[0] / s),
+                           'social': float(probs[1] / s),
+                           'governance': float(probs[2] / s)}
             source = 'rlhf'
-        elif self.distillation and self.distillation.get_student_probs() != [0.25] * 4:
+        elif self.distillation:
             probs = self.distillation.get_student_probs()
-            names = ['environmental_focused', 'social_focused',
-                     'governance_focused', 'balanced']
-            idx = int(np.argmax(probs)) % len(names) if NUMPY_AVAILABLE else 0
-            selected_expert = names[idx]
-            source = 'distillation'
-        elif self.moe_gating and self.config.moe_enabled:
+            if NUMPY_AVAILABLE:
+                is_uniform = np.allclose(probs, [0.25, 0.25, 0.25, 0.25])
+            else:
+                is_uniform = probs == [0.25] * 4
+            if not is_uniform:
+                names = ['environmental_focused', 'social_focused',
+                         'governance_focused', 'balanced']
+                idx = int(np.argmax(probs)) % len(names) if NUMPY_AVAILABLE else 0
+                selected_expert = names[idx]
+                if sum(probs[:3]) > 0:
+                    s = probs[0] + probs[1] + probs[2]
+                    weights = {'environmental': float(probs[0] / s),
+                               'social': float(probs[1] / s),
+                               'governance': float(probs[2] / s)}
+                source = 'distillation'
+        if source == 'moe' and self.moe_gating and self.config.moe_enabled:
             selected_expert, weights = await self.moe_gating.select_expert(
-                current_state, carbon_intensity, {})
+                current_state, carbon_intensity * 1000.0, {})  # [P1] pass gCO2/kWh
+            source = 'moe'
 
-        # LIMIT Graph adjustment
+        # LIMIT graph adjustment
         if self.limit_graph:
             await self.limit_graph.update_constraint('carbon', carbon_intensity)
             influence = await self.limit_graph.evaluate_path('carbon', 'cost')
@@ -1557,7 +1811,6 @@ class AutonomousESGOptimizer:
         }
         await self.storage.save_optimisation(selected_expert, result)
 
-        # GA weight evolution
         if self.ga_optimizer and self.config.ga_enabled:
             best_weights = await self.ga_optimizer.optimize()
             if best_weights:
@@ -1568,9 +1821,9 @@ class AutonomousESGOptimizer:
 
     async def record_outcome(self, reward, context):
         if self.moe_gating and self.config.moe_enabled:
-            carbon_intensity = context.get('carbon_intensity', 400)
+            carbon_intensity = context.get('carbon_intensity', 0.4)
             await self.moe_gating.add_training_sample(
-                context, carbon_intensity, {},
+                context, carbon_intensity * 1000.0, {},  # [P1] gCO2/kWh
                 context.get('selected_strategy', 'balanced'), reward)
         if self.causal_shaper:
             try:
@@ -1591,7 +1844,7 @@ class AutonomousESGOptimizer:
 
 
 # =============================================================================
-# ORIGINAL MTOP / Distillation (kept for API compat)
+# MTOP / Distillation
 # =============================================================================
 class ESGTeacherEnsemble:
     def __init__(self, config):
@@ -1618,7 +1871,9 @@ class MultiTeacherPolicyDistillation:
         if not self.moe_engine or not NUMPY_AVAILABLE:
             return
         try:
-            _, weights = await self.moe_engine.select_expert(state, 400, {})
+            carbon_kg = state.get('carbon_intensity', 0.4)
+            _, weights = await self.moe_engine.select_expert(
+                state, carbon_kg * 1000.0, {})
             teacher = np.array([weights.get('environmental', 0.4),
                                 weights.get('social', 0.3),
                                 weights.get('governance', 0.3),
@@ -1642,14 +1897,26 @@ class MultiTeacherPolicyDistillation:
 
 
 # =============================================================================
-# ENHANCED SUSTAINABILITY SYSTEM v17.0.0
+# FEDERATED LEARNER (legacy — kept for compat)
+# =============================================================================
+class FederatedESGLearner:
+    def __init__(self, storage, instance_id, interval):
+        self.storage = storage
+        self.instance_id = instance_id
+        self.interval = interval
+        self.insights = deque(maxlen=100)
+
+    async def share_esg_insight(self, insight):
+        self.insights.append(insight)
+
+    async def apply_federated_insights(self, params):
+        return params
+
+
+# =============================================================================
+# ENHANCED SUSTAINABILITY SYSTEM v17.1.0
 # =============================================================================
 class EnhancedSustainabilitySystemV17:
-    """
-    Enhanced sustainability system v17.0.0 with all ten v17 enhancement areas.
-    Preserves v16 APIs.
-    """
-
     def __init__(self, config: Optional[ESGConfig] = None):
         self.config = config or ESGConfig()
         self.instance_id = self.config.instance_id
@@ -1657,7 +1924,8 @@ class EnhancedSustainabilitySystemV17:
 
         # Core
         self.storage = EnhancedStorage(self.config)
-        self.state = ESGState(self.storage)
+        self.state = ESGState(self.storage,
+                               persist_path=self.config.state_persist_path)  # [P3]
         self.quantum_security = QuantumResilientESGSecurity(self.config, self.storage)
         self.blockchain = BlockchainESGVerification(self.config, self.storage)
         self.carbon_client = CarbonIntensityManager(self.config, self.storage)
@@ -1688,7 +1956,6 @@ class EnhancedSustainabilitySystemV17:
         self.role_coordinator = RoleSpecializationCoordinator() \
             if self.role_specialization_enabled else None
 
-        # Active RLHF + HITL
         self.rlhf = ActiveRLHF(
             action_space=['environmental_focused', 'social_focused',
                           'governance_focused', 'balanced'],
@@ -1696,16 +1963,13 @@ class EnhancedSustainabilitySystemV17:
         self.hitl = HumanInTheLoopCoordinator(self.rlhf) \
             if (self.hitl_enabled and self.rlhf) else None
 
-        # Federated + Causal
         self.federated = FederatedAggregator(num_params=3)
         self.causal_shaper = CausalRewardShaper(num_actions=4) \
             if self.config.causal_rl_enabled else None
 
-        # LIMIT Graph
         self.limit_graph = LimitGraphManager(self.config) \
             if self.config.limit_graph_enabled else None
 
-        # Distillation + Autonomous optimizer (wired with v17 modules)
         self.distillation = MultiTeacherPolicyDistillation(
             self.config, None, self.role_coordinator,
         ) if self.config.distillation_enabled else None
@@ -1717,11 +1981,9 @@ class EnhancedSustainabilitySystemV17:
             role_coordinator=self.role_coordinator,
             causal_shaper=self.causal_shaper,
         )
-        # Wire MoE into distillation for teacher policy source
         if self.distillation:
             self.distillation.moe_engine = self.autonomous_optimizer.moe_gating
 
-        # Legacy compat
         self.federated_learner = FederatedESGLearner(
             self.storage, self.instance_id, 3600)
         self.drift_detector = DriftDetector(self.storage, self.config) \
@@ -1729,17 +1991,13 @@ class EnhancedSustainabilitySystemV17:
         self.forecaster = CarbonForecaster(self.storage, self.config) \
             if self.config.forecast_enabled else None
 
-        # WebSocket (BEFORE user_pref_learner to fix init order bug)
         self.websocket = EnhancedWebSocketServer(self.config.websocket_port)
-
         self.user_pref_learner = ActiveUserPreferenceLearner(
             self.storage, self.websocket) \
             if self.config.user_preference_learning_enabled else None
 
-        # Chaos tester (needs system ref)
         self.chaos_tester = ChaosTester(self) if self.chaos_testing_enabled else None
 
-        # Rate limiter + circuit breakers
         self.rate_limiter = RateLimiter(rate=100, window=60)
         self.circuit_breakers = {
             'esg_api': CircuitBreaker(name="esg_api"),
@@ -1754,9 +2012,11 @@ class EnhancedSustainabilitySystemV17:
         self._shutdown_event = asyncio.Event()
         self._running = False
         self._carbon_saved_kg_total = 0.0
-        self._last_metadata: Optional[Dict] = None
+        # [P2] bounded snapshot deque + lock
+        self._metadata_history: deque = deque(maxlen=50)
+        self._metadata_lock = asyncio.Lock()
+        self._carbon_total_lock = asyncio.Lock()
 
-        # Benchmarks
         self.industry_benchmarks = {
             'technology': {'e': 65, 's': 70, 'g': 68, 'overall': 67},
             'manufacturing': {'e': 55, 's': 60, 'g': 62, 'overall': 59},
@@ -1773,12 +2033,14 @@ class EnhancedSustainabilitySystemV17:
         logger.info("EnhancedSustainabilitySystemV17 v%s initialized "
                     "(instance %s)", self.config.version, self.instance_id)
 
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Lifecycle
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     async def start(self):
         self._running = True
         await self.state.load()
+        if self.rlhf:
+            await self.rlhf.load(self.config.rlhf_state_path)  # [P3]
         await self.websocket.start()
 
         try:
@@ -1792,7 +2054,7 @@ class EnhancedSustainabilitySystemV17:
                 loop.create_task(self._ga_loop()),
                 loop.create_task(self._cleanup_loop()),
             ]
-            if self.chaos_tester:
+            if self.chaos_tester and not self.config.chaos_env_gate:
                 self._background_tasks.append(loop.create_task(self._chaos_loop()))
         except RuntimeError:
             pass
@@ -1801,12 +2063,21 @@ class EnhancedSustainabilitySystemV17:
     async def _carbon_update_loop(self):
         while not self._shutdown_event.is_set():
             try:
-                await self.carbon_client.get_current_intensity()
+                ci = await self.carbon_client.get_current_intensity()
+                # [P1] drift detection + forecaster wired in
+                if self.drift_detector:
+                    drift = await self.drift_detector.check_carbon_drift(ci)
+                    if drift:
+                        SC_DRIFT.labels(metric='carbon').inc()
+                        logger.warning("Carbon drift detected: %.3f kg/kWh", ci)
+                if self.forecaster:
+                    await self.forecaster.update(ci)
                 await asyncio.sleep(self.config.carbon_update_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Carbon loop error: %s", e)
+                await asyncio.sleep(30)
 
     async def _limit_graph_loop(self):
         while not self._shutdown_event.is_set():
@@ -1825,6 +2096,7 @@ class EnhancedSustainabilitySystemV17:
             try:
                 if self.rlhf:
                     await self.rlhf.train_reward_model()
+                    await self.rlhf.save(self.config.rlhf_state_path)  # [P3]
                 await asyncio.sleep(self.config.rlhf_training_interval)
             except asyncio.CancelledError:
                 break
@@ -1838,6 +2110,14 @@ class EnhancedSustainabilitySystemV17:
                     ci = await self.carbon_client.get_current_intensity()
                     await self.distillation.distill(
                         {'carbon_intensity': ci, 'node_data': {}})
+                    # [P1] wire distillation output into model weights
+                    probs = self.distillation.get_student_probs()
+                    if len(probs) >= 3 and sum(probs[:3]) > 0:
+                        s = probs[0] + probs[1] + probs[2]
+                        self.state.mopd_weights['environmental'] = probs[0] / s
+                        self.state.mopd_weights['social'] = probs[1] / s
+                        self.state.mopd_weights['governance'] = probs[2] / s
+                        await self.state.save()
                 await asyncio.sleep(self.config.distillation_interval)
             except asyncio.CancelledError:
                 break
@@ -1849,7 +2129,13 @@ class EnhancedSustainabilitySystemV17:
             try:
                 await asyncio.sleep(600)
                 if self.federated.client_updates:
-                    self.federated.aggregate()
+                    agg = self.federated.aggregate()
+                    # [P1] apply federated weights to model
+                    if agg['round'] > 0 and len(agg['weights']) == 3:
+                        self.state.mopd_weights['environmental'] = agg['weights'][0]
+                        self.state.mopd_weights['social'] = agg['weights'][1]
+                        self.state.mopd_weights['governance'] = agg['weights'][2]
+                        await self.state.save()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1884,257 +2170,417 @@ class EnhancedSustainabilitySystemV17:
             except Exception as e:
                 logger.error("Chaos loop error: %s", e)
 
-    # ----------------------------------------------------------------------
-    # MAIN: comprehensive_sustainability_assessment (the missing method)
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Helpers — [P3]
+    # ------------------------------------------------------------------
+    def _compute_data_quality(self, validated: ESGDataInput) -> float:
+        score = 50.0
+        if getattr(validated, 'company_ticker', None):
+            score += 5.0
+        if getattr(validated, 'sustainability_report_available', False):
+            score += 10.0
+        if getattr(validated, 'audited_emissions', False):
+            score += 15.0
+        if getattr(validated, 'double_materiality_assessed', False):
+            score += 10.0
+        if getattr(validated, 'supplier_assessments_performed', False):
+            score += 5.0
+        docs = getattr(validated, 'documents', []) or []
+        if docs:
+            score += min(5.0, float(len(docs)))
+        return min(100.0, score)
+
+    def _analyze_supply_chain(self, validated: ESGDataInput) -> Dict:
+        suppliers = getattr(validated, 'suppliers', []) or []
+        if not suppliers:
+            return {'supplier_count': 0, 'avg_esg': 0.0, 'avg_risk': 0.0,
+                    'high_risk_count': 0, 'tier_breakdown': {}}
+        esg_scores, risks = [], []
+        tier_breakdown = defaultdict(lambda: {'count': 0, 'sum_esg': 0.0})
+        for s in suppliers:
+            e = float(s.get('esg_score', 50.0))
+            r = float(s.get('risk_score', 50.0))
+            esg_scores.append(e)
+            risks.append(r)
+            t = int(s.get('tier', 1))
+            tier_breakdown[t]['count'] += 1
+            tier_breakdown[t]['sum_esg'] += e
+        avg_esg = sum(esg_scores) / len(esg_scores)
+        avg_risk = sum(risks) / len(risks)
+        high_risk = sum(1 for r in risks if r > 60.0)
+        return {
+            'supplier_count': len(suppliers),
+            'avg_esg': round(avg_esg, 2),
+            'avg_risk': round(avg_risk, 2),
+            'high_risk_count': high_risk,
+            'tier_breakdown': {
+                k: {'count': v['count'],
+                    'avg_esg': round(v['sum_esg'] / max(1, v['count']), 2)}
+                for k, v in tier_breakdown.items()},
+        }
+
+    def _compute_financial_impact(self, validated: ESGDataInput,
+                                   financial_data: Optional[Dict],
+                                   overall: float,
+                                   carbon_intensity_kg: float) -> Dict:
+        if not financial_data:
+            return {}
+        try:
+            revenue = float(financial_data.get('revenue', 0.0))
+            margin = float(financial_data.get('profit_margin', 0.0))
+        except Exception:
+            return {}
+        gap = max(0.0, 100.0 - overall)
+        compliance_cost = revenue * (gap / 100.0) * 0.02
+        mitigation_capex = revenue * (carbon_intensity_kg / 1.0) * 0.001
+        return {
+            'revenue': revenue,
+            'profit_margin': margin,
+            'compliance_exposure_usd': round(compliance_cost, 2),
+            'mitigation_capex_estimate_usd': round(mitigation_capex, 2),
+            'esg_gap_score': round(gap, 2),
+        }
+
+    def _compute_scenarios(self, base_env: float, carbon_intensity_kg: float,
+                            weights: Dict[str, float]) -> Dict:
+        out = {}
+        for name, delta in [('optimistic', -0.2), ('base', 0.0), ('pessimistic', 0.2)]:
+            ci = max(0.0, carbon_intensity_kg * (1 + delta))
+            env = max(0.0, min(100.0, 100.0 - ci * 1000.0 / 10.0))
+            out[name] = {
+                'carbon_intensity_kg': round(ci, 4),
+                'environmental_score': round(env, 2),
+                'overall_delta': round(
+                    (env - base_env) * weights.get('environmental', 0.4), 3),
+            }
+        return out
+
+    async def get_last_metadata(self) -> Optional[Dict]:
+        async with self._metadata_lock:
+            return dict(self._metadata_history[-1]) if self._metadata_history else None
+
+    # ------------------------------------------------------------------
+    # MAIN ASSESSMENT
+    # ------------------------------------------------------------------
     async def comprehensive_sustainability_assessment(
         self, esg_data: Dict, financial_data: Optional[Dict] = None,
         user_id: Optional[str] = None, run_scenarios: bool = False
     ) -> SustainabilityAssessmentResult:
-        async with self._assessment_semaphore:
-            await self.rate_limiter.wait_and_acquire()
-            start = time.time()
+        # [P2] correlation id propagation
+        cid = str(uuid.uuid4())[:12]
+        token = correlation_id_var.set(cid)
+        try:
+            async with self._assessment_semaphore:
+                SC_ACTIVE_ASSESSMENTS.inc()
+                try:
+                    return await self._assess_inner(
+                        esg_data, financial_data, user_id, run_scenarios, cid)
+                finally:
+                    SC_ACTIVE_ASSESSMENTS.dec()
+        finally:
+            correlation_id_var.reset(token)
 
-            # Validate input
+    async def _assess_inner(self, esg_data, financial_data, user_id,
+                            run_scenarios, cid):
+        await self.rate_limiter.wait_and_acquire()
+        start = time.time()
+
+        try:
+            validated = ESGDataInput(**esg_data)
+        except Exception as e:
+            logger.warning("ESGDataInput validation failed: %s", e)
+            validated = ESGDataInput()
+
+        # --- Carbon intensity (kg/kWh internally) ---
+        carbon_intensity = await self.carbon_client.get_current_intensity()
+        carbon_intensity_g = carbon_intensity * 1000.0
+
+        # --- [P1] Precision: pass gCO2/kWh ---
+        precision = PrecisionLevel.FP32
+        if self.precision_controller:
+            precision = self.precision_controller.select(carbon_intensity_g, 0.95)
+
+        # --- [P3] Carbon forecast ---
+        forecast_g = None
+        if self.forecaster:
             try:
-                validated = ESGDataInput(**esg_data)
+                forecast_kg = await self.forecaster.get_forecast(24)
+                forecast_g = round(forecast_kg * 1000.0, 2)
             except Exception as e:
-                logger.warning("ESGDataInput validation failed: %s", e)
-                validated = ESGDataInput()
+                logger.debug("forecast failed: %s", e)
 
-            # Carbon intensity
-            carbon_intensity = await self.carbon_client.get_current_intensity()
+        # --- Temporal gate ---
+        temporal_status = {}
+        if self.temporal_monitor:
+            self.temporal_monitor.update({
+                'esg_score': 75.0,
+                'carbon': float(carbon_intensity)})
+            temporal_status = self.temporal_monitor.evaluate()
 
-            # Adaptive precision
-            precision = PrecisionLevel.FP32
-            if self.precision_controller:
-                precision = self.precision_controller.select(carbon_intensity, 0.95)
+        # --- [P1] Base ESG scores + clamping ---
+        env_score = max(0.0, 100.0 - getattr(validated, 'carbon_intensity', 200) / 10)
+        if hasattr(validated, 'renewable_energy_pct'):
+            env_score = (env_score + validated.renewable_energy_pct * 0.8) / 2
+        social_score = (70 + getattr(validated, 'employee_satisfaction', 70)) / 2
+        governance_score = (65 + getattr(validated, 'board_diversity_pct', 40) * 1.2) / 2
+        env_score = max(0.0, min(100.0, env_score))
+        social_score = max(0.0, min(100.0, social_score))
+        governance_score = max(0.0, min(100.0, governance_score))
 
-            # Temporal gate
-            temporal_status = {}
-            if self.temporal_monitor:
-                self.temporal_monitor.update({
-                    'esg_score': 75.0,
-                    'carbon': float(carbon_intensity)})
-                temporal_status = self.temporal_monitor.evaluate()
+        # --- MOPD weights ---
+        weights = dict(self.state.mopd_weights)
+        overall = (env_score * weights.get('environmental', 0.4) +
+                   social_score * weights.get('social', 0.3) +
+                   governance_score * weights.get('governance', 0.3))
 
-            # Base ESG scores
-            env_score = max(0.0, 100.0 - getattr(validated, 'carbon_intensity', 200) / 10)
-            if hasattr(validated, 'renewable_energy_pct'):
-                env_score = (env_score + validated.renewable_energy_pct * 0.8) / 2
-            social_score = (70 + getattr(validated, 'employee_satisfaction', 70)) / 2
-            governance_score = (65 + getattr(validated, 'board_diversity_pct', 40) * 1.2) / 2
+        # --- LIMIT constraint ---
+        if self.limit_graph:
+            await self.limit_graph.update_constraint('carbon', carbon_intensity)
+            influence = await self.limit_graph.evaluate_path('carbon', 'cost')
+            if influence > 0.5:
+                overall *= 0.95
+        overall = max(0.0, min(100.0, overall))
 
-            # MOPD weights
-            weights = self.state.mopd_weights
-            overall = (env_score * weights.get('environmental', 0.4) +
-                       social_score * weights.get('social', 0.3) +
-                       governance_score * weights.get('governance', 0.3))
-
-            # LIMIT graph constraint
-            if self.limit_graph:
-                await self.limit_graph.update_constraint('carbon', carbon_intensity)
-                influence = await self.limit_graph.evaluate_path('carbon', 'cost')
-                if influence > 0.5:
-                    overall *= 0.95  # small penalty when carbon influence high
-
-            # Autonomous optimizer (RLHF > Distillation > MoE)
-            state = {'esg_score': overall, 'carbon_intensity': carbon_intensity,
+        # --- Autonomous optimizer ---
+        opt_state = {'esg_score': overall,
+                     'carbon_intensity': carbon_intensity,
                      'cost_budget': self.state.carbon_budget_remaining,
                      'sector': getattr(validated, 'sector', 'general')}
-            opt = await self.autonomous_optimizer.optimize_esg(state)
-            selected_strategy = opt['selected_strategy']
-            await self.autonomous_optimizer.record_outcome(
-                overall / 100.0, {'carbon_intensity': carbon_intensity,
-                                   'selected_strategy': selected_strategy})
+        opt = await self.autonomous_optimizer.optimize_esg(opt_state)
+        selected_strategy = opt['selected_strategy']
+        await self.autonomous_optimizer.record_outcome(
+            overall / 100.0, {'carbon_intensity': carbon_intensity,
+                               'selected_strategy': selected_strategy})
 
-            # XAI explanation
-            xai_out = None
-            if self.xai:
-                cand = {'environmental': env_score, 'social': social_score,
-                        'governance': governance_score}
-                xai_out = self.xai.explain(cand, weights, [cand])
+        # --- XAI ---
+        xai_out = None
+        if self.xai:
+            cand = {'environmental': env_score, 'social': social_score,
+                    'governance': governance_score}
+            xai_out = self.xai.explain(cand, weights, [cand])
 
-            # Role assignments
-            role_assignments = None
-            if self.role_coordinator:
-                role_assignments = self.role_coordinator.assign_roles({
-                    'trust': 0.7, 'compute': 0.7,
-                    'energy': 1.0 - min(1.0, carbon_intensity),
-                    'performance': overall / 100.0})
+        # --- Roles ---
+        role_assignments = None
+        if self.role_coordinator:
+            role_assignments = self.role_coordinator.assign_roles({
+                'trust': 0.7, 'compute': 0.7,
+                'energy': 1.0 - min(1.0, carbon_intensity),
+                'performance': overall / 100.0})
 
-            # HITL escalation (only when confidence low)
-            hitl_outcome = None
-            confidence = overall / 100.0
-            if self.hitl and confidence < self.config.hitl_confidence_threshold:
-                try:
-                    hitl_outcome = await self.hitl.escalate(
-                        decision_context={'strategy': selected_strategy,
-                                          'carbon': carbon_intensity},
-                        options=['accept', 'retry', 'downgrade'],
-                        confidence=confidence,
-                        confidence_threshold=self.config.hitl_confidence_threshold)
-                except Exception:
-                    pass
+        # --- [P1] HITL — explicit confidence gate ---
+        hitl_outcome = None
+        confidence = overall / 100.0
+        if self.hitl and confidence < self.config.hitl_confidence_threshold:
+            try:
+                hitl_outcome = await self.hitl.escalate(
+                    decision_context={'strategy': selected_strategy,
+                                      'carbon': carbon_intensity},
+                    options=['accept', 'retry', 'downgrade'],
+                    confidence=confidence,
+                    confidence_threshold=self.config.hitl_confidence_threshold)
+            except Exception:
+                pass
 
-            # Carbon credit + REC
-            credit_value = 0.0
-            rec_value = 0.0
-            if self.carbon_market:
-                try:
-                    saved_kg = max(0.0, (400.0 - carbon_intensity * 1000) * 0.001)
+        # --- [P3] Baseline-aware carbon credit calculation ---
+        credit_value = 0.0
+        rec_value = 0.0
+        if self.carbon_market:
+            try:
+                baseline_g = self.config.carbon_baseline_g_per_kwh
+                energy_kwh = self.config.compute_energy_kwh_per_assessment
+                saved_kg = max(0.0, (baseline_g - carbon_intensity_g) * energy_kwh / 1000.0)
+                if saved_kg > 0:
                     credit_value = await self.carbon_market.get_carbon_credit_value(saved_kg)
                     rec_value = await self.carbon_market.get_rec_value(saved_kg * 0.5)
-                    self._carbon_saved_kg_total += saved_kg
-                except Exception:
-                    pass
+                    async with self._carbon_total_lock:
+                        self._carbon_saved_kg_total += saved_kg
+            except Exception as e:
+                logger.debug("carbon credit failed: %s", e)
 
-            # Federated submission
-            federated_round = None
-            if self.federated:
-                try:
-                    self.federated.submit_update(
-                        self.instance_id,
-                        [env_score / 100, social_score / 100, governance_score / 100],
-                        samples=1)
-                    if len(self.assessment_history) % 5 == 0:
-                        agg = self.federated.aggregate()
-                        federated_round = agg['round']
-                except Exception:
-                    pass
-
-            # Chaos smoke
-            chaos_passed = None
-            if self.chaos_tester and len(self.assessment_history) % 5 == 0:
-                try:
-                    cr = await self.chaos_tester.run_test(
-                        random.choice(ChaosTester.FAULT_TYPES), duration_s=0.02)
-                    chaos_passed = cr['passed']
-                except Exception:
-                    pass
-
-            # Peer comparison
-            sector = getattr(validated, 'sector', 'general').lower()
-            benchmark = self.industry_benchmarks.get(
-                sector, self.industry_benchmarks['technology'])
-            peer = {
-                'sector': sector,
-                'benchmark_score': benchmark['overall'],
-                'comparison': 'above' if overall > benchmark['overall'] else 'below',
-                'gap': overall - benchmark['overall'],
-            }
-
-            # Blockchain record
-            bc_hash = None
+        # --- Federated submission ---
+        federated_round = None
+        if self.federated:
             try:
-                key = await self.quantum_security.generate_keypair()
-                data_hash = hashlib.sha256(
-                    f"{validated.company_name}_{overall}".encode()).hexdigest()
-                bc = await self.blockchain.record_esg_data(
-                    f"esg_{uuid.uuid4().hex[:8]}", data_hash,
-                    {'esg_score': overall, 'sector': sector})
-                bc_hash = bc.get('tx_hash')
+                self.federated.submit_update(
+                    self.instance_id,
+                    [env_score / 100, social_score / 100, governance_score / 100],
+                    samples=1)
+                if len(self.assessment_history) % 5 == 0:
+                    agg = self.federated.aggregate()
+                    federated_round = agg['round']
             except Exception:
                 pass
 
-            cloud = await self.cloud_distributor.distribute_esg_data({'size_gb': 0.001})
-
-            result = SustainabilityAssessmentResult(
-                overall_sustainability_score=overall,
-                environmental_score=env_score,
-                social_score=social_score,
-                governance_score=governance_score,
-                data_quality_score=90.0,
-                assessment_time_ms=(time.time() - start) * 1000,
-                peer_comparison=peer,
-                blockchain_tx_hash=bc_hash,
-                cloud_distribution=cloud,
-                autonomous_optimization={
-                    'selected_strategy': selected_strategy, 'source': opt['source']},
-                company_name=getattr(validated, 'company_name', 'N/A'),
-                sector=sector,
-                # v17.0.0 fields
-                temporal_status=temporal_status,
-                xai_explanation=xai_out,
-                precision_used=precision.value,
-                carbon_credit_value_usd=credit_value,
-                rec_value_usd=rec_value,
-                role_assignments=role_assignments,
-                chaos_test_passed=chaos_passed,
-                hitl_outcome=hitl_outcome,
-                federated_round=federated_round,
-                causal_ates=self.causal_shaper.compute_ate() if self.causal_shaper else {},
-                limit_graph_summary=await self.limit_graph.get_graph_summary()
-                    if self.limit_graph else None,
-            )
-
-            # State update
-            if overall > 80:
-                await self.state.trigger_reflection('esg_improved')
-            else:
-                await self.state.trigger_reflection('esg_decreased')
-            if carbon_intensity > 0.4:
-                await self.state.trigger_reflection('high_carbon')
-
-            # Record + persist
-            async with self._history_lock:
-                self.assessment_history.append(result)
-            await self.storage.save_esg_assessment(result)
-
-            # WebSocket
+        # --- [P1] Chaos gated to ESG_ENV=chaos ---
+        chaos_passed = None
+        inline_chaos_ok = (
+            not self.config.chaos_env_gate or
+            os.getenv('ESG_ENV', 'production') == 'chaos'
+        )
+        if (self.chaos_tester and inline_chaos_ok
+                and len(self.assessment_history) % 5 == 0):
             try:
-                await self.websocket.broadcast({
-                    'type': 'esg_assessment',
-                    'company': result.company_name,
-                    'esg_score': overall,
-                    'strategy': selected_strategy,
-                    'timestamp': datetime.now().isoformat()}, topic='esg')
+                cr = await self.chaos_tester.run_test(
+                    random.choice(ChaosTester.FAULT_TYPES), duration_s=0.02)
+                chaos_passed = cr['passed']
             except Exception:
                 pass
 
-            # Metrics
-            SUSTAINABILITY_ASSESSMENTS.labels(status='success', sector=sector).inc()
-            ESG_SCORE.labels(sector=sector).set(overall)
+        # --- [P3] Supply chain / financial / scenarios ---
+        supply_chain = self._analyze_supply_chain(validated)
+        fin_impact = self._compute_financial_impact(
+            validated, financial_data, overall, carbon_intensity)
+        scenarios = {}
+        if run_scenarios:
+            scenarios = self._compute_scenarios(env_score, carbon_intensity, weights)
 
-            # Save metadata for get_last_metadata()
-            self._last_metadata = {
-                'precision_used': precision.value,
-                'temporal_status': temporal_status,
-                'xai_explanation': xai_out,
-                'role_assignments': role_assignments,
-                'hitl_outcome': hitl_outcome,
-                'carbon_credit_value_usd': credit_value,
-                'rec_value_usd': rec_value,
-                'federated_round': federated_round,
-                'chaos_test_passed': chaos_passed,
-                'causal_ates': result.causal_ates,
+        # --- Peer comparison ---
+        sector = str(getattr(validated, 'sector', 'general')).lower()
+        benchmark = self.industry_benchmarks.get(
+            sector, self.industry_benchmarks['technology'])
+        peer = {
+            'sector': sector,
+            'benchmark_score': benchmark['overall'],
+            'comparison': 'above' if overall > benchmark['overall'] else 'below',
+            'gap': round(overall - benchmark['overall'], 2),
+        }
+
+        # --- Blockchain record ---
+        bc_hash = None
+        try:
+            _ = await self.quantum_security.generate_keypair()
+            data_hash = hashlib.sha256(
+                f"{validated.company_name}_{overall}".encode()).hexdigest()
+            bc = await self.blockchain.record_esg_data(
+                f"esg_{uuid.uuid4().hex[:8]}", data_hash,
+                {'esg_score': overall, 'sector': sector})
+            bc_hash = bc.get('tx_hash')
+        except Exception:
+            pass
+
+        cloud = await self.cloud_distributor.distribute_esg_data({'size_gb': 0.001})
+
+        # --- Data quality [P1] ---
+        data_quality = self._compute_data_quality(validated)
+
+        result = SustainabilityAssessmentResult(
+            overall_sustainability_score=overall,
+            environmental_score=env_score,
+            social_score=social_score,
+            governance_score=governance_score,
+            data_quality_score=data_quality,
+            assessment_time_ms=(time.time() - start) * 1000,
+            supply_chain_analysis=supply_chain,
+            financial_impact=fin_impact,
+            scenario_analysis=scenarios,
+            peer_comparison=peer,
+            blockchain_tx_hash=bc_hash,
+            cloud_distribution=cloud,
+            autonomous_optimization={
+                'selected_strategy': selected_strategy, 'source': opt['source']},
+            company_name=getattr(validated, 'company_name', 'N/A'),
+            sector=sector,
+            temporal_status=temporal_status,
+            xai_explanation=xai_out,
+            precision_used=precision.value,
+            carbon_credit_value_usd=credit_value,
+            rec_value_usd=rec_value,
+            role_assignments=role_assignments,
+            chaos_test_passed=chaos_passed,
+            hitl_outcome=hitl_outcome,
+            federated_round=federated_round,
+            causal_ates=self.causal_shaper.compute_ate() if self.causal_shaper else {},
+            limit_graph_summary=await self.limit_graph.get_graph_summary()
+                if self.limit_graph else None,
+            carbon_forecast_g_per_kwh=forecast_g,
+            correlation_id=cid,
+        )
+
+        # --- State updates ---
+        if overall > 80:
+            await self.state.trigger_reflection('esg_improved')
+        else:
+            await self.state.trigger_reflection('esg_decreased')
+        if carbon_intensity > 0.4:
+            await self.state.trigger_reflection('high_carbon')
+
+        # --- [P1] Pareto front update ---
+        if self.autonomous_optimizer.pareto_optimizer:
+            try:
+                await self.autonomous_optimizer.pareto_optimizer.add_assessment(result)
+                await self.storage.save_pareto_front(
+                    self.autonomous_optimizer.pareto_optimizer.get_pareto_front())
+            except Exception as e:
+                logger.debug("pareto update failed: %s", e)
+
+        # --- Persist ---
+        async with self._history_lock:
+            self.assessment_history.append(result)
+        await self.storage.save_esg_assessment(result)
+
+        # --- WebSocket broadcast ---
+        try:
+            await self.websocket.broadcast({
+                'type': 'esg_assessment',
+                'company': result.company_name,
+                'esg_score': overall,
                 'strategy': selected_strategy,
-                'carbon_intensity': carbon_intensity,
-            }
+                'timestamp': datetime.now().isoformat()}, topic='esg')
+        except Exception:
+            pass
 
-            audit_logger.info("ESG Assessment: %s | Score=%.1f",
-                              result.company_name, overall)
-            return result
+        # --- Metrics ---
+        SUSTAINABILITY_ASSESSMENTS.labels(status='success', sector=sector).inc()
+        ESG_SCORE.labels(sector=sector).set(overall)
+        SC_ASSESSMENT_LATENCY.observe(time.time() - start)  # [P2]
 
-    # ----------------------------------------------------------------------
-    # v17.0.0 utilities
-    # ----------------------------------------------------------------------
-    def get_last_metadata(self) -> Optional[Dict]:
-        return self._last_metadata
+        # --- [P2] Metadata snapshot (bounded deque + lock) ---
+        snapshot = {
+            'correlation_id': cid,
+            'precision_used': precision.value,
+            'temporal_status': temporal_status,
+            'xai_explanation': xai_out,
+            'role_assignments': role_assignments,
+            'hitl_outcome': hitl_outcome,
+            'carbon_credit_value_usd': credit_value,
+            'rec_value_usd': rec_value,
+            'federated_round': federated_round,
+            'chaos_test_passed': chaos_passed,
+            'causal_ates': result.causal_ates,
+            'strategy': selected_strategy,
+            'carbon_intensity': carbon_intensity,
+            'carbon_forecast_g_per_kwh': forecast_g,
+            'supply_chain': supply_chain,
+            'financial_impact': fin_impact,
+            'data_quality_score': data_quality,
+        }
+        async with self._metadata_lock:
+            self._metadata_history.append(snapshot)
 
-    def select_precision(self, carbon_intensity: float = 0.4,
+        audit_logger.info(
+            "ESG Assessment: %s | Score=%.1f | cid=%s",
+            result.company_name, overall, cid)
+        return result
+
+    # ------------------------------------------------------------------
+    # Public utilities
+    # ------------------------------------------------------------------
+    def select_precision(self, carbon_intensity_kg: float = 0.4,
                          accuracy_required: float = 0.95) -> PrecisionLevel:
+        """Convenience wrapper — pass kg/kWh; converts to gCO2/kWh internally."""
         if self.precision_controller is None:
             return PrecisionLevel.FP32
-        return self.precision_controller.select(carbon_intensity, accuracy_required)
+        return self.precision_controller.select(
+            carbon_intensity_kg * 1000.0, accuracy_required)
 
     async def compute_carbon_credit(self, carbon_saved_kg: float) -> Dict:
         if self.carbon_market is None:
             return {'credit_usd': 0.0, 'rec_usd': 0.0}
         credit = await self.carbon_market.get_carbon_credit_value(carbon_saved_kg)
         rec = await self.carbon_market.get_rec_value(carbon_saved_kg * 0.5)
-        return {'credit_usd': credit, 'rec_usd': rec,
-                'cumulative_kg': self._carbon_saved_kg_total}
+        async with self._carbon_total_lock:
+            total = self._carbon_saved_kg_total
+        return {'credit_usd': credit, 'rec_usd': rec, 'cumulative_kg': total}
 
     def get_role_assignments(self, context: Optional[Dict] = None) -> Dict:
         if self.role_coordinator is None:
@@ -2191,7 +2637,8 @@ class EnhancedSustainabilitySystemV17:
             status['temporal_logic'] = self.temporal_monitor.get_status()
         if self.rlhf:
             status['rlhf'] = {'history_len': len(self.rlhf.history),
-                              'feedback_buffer': len(self.rlhf.feedback_buffer)}
+                              'feedback_buffer': len(self.rlhf.feedback_buffer),
+                              'preference_counts': dict(self.rlhf.preference_counts)}
         if self.distillation:
             status['distillation'] = {
                 'student_probs': self.distillation.get_student_probs(),
@@ -2208,6 +2655,9 @@ class EnhancedSustainabilitySystemV17:
                 'telemetry': self.precision_controller.telemetry}
         if self.causal_shaper:
             status['causal_ates'] = self.causal_shaper.compute_ate()
+        if self.autonomous_optimizer.pareto_optimizer:
+            status['pareto_size'] = len(
+                self.autonomous_optimizer.pareto_optimizer.get_pareto_front())
         return status
 
     async def shutdown(self):
@@ -2218,10 +2668,14 @@ class EnhancedSustainabilitySystemV17:
             t.cancel()
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        # [P3] persist RLHF + state
+        if self.rlhf:
+            try: await self.rlhf.save(self.config.rlhf_state_path)
+            except Exception: pass
+        await self.state.save()
         await self.carbon_client.close()
         await self.websocket.stop()
-        await self.state.save()
-        self.storage.dispose()
+        await self.storage.dispose()
         logger.info("Shutdown complete")
 
 
@@ -2243,7 +2697,11 @@ def handle_signal(signum, frame):
     if not _shutdown_requested:
         _shutdown_requested = True
         try:
-            asyncio.create_task(_signal_shutdown())
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_signal_shutdown())
+            else:
+                _shutdown_event_global.set()
         except Exception:
             pass
 
@@ -2270,110 +2728,143 @@ async def get_sustainability_system(config: Optional[ESGConfig] = None) -> Enhan
 
 
 async def _smoke_test():
-    logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s %(levelname)s %(name)s — %(message)s')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(name)s — %(message)s')
     print("=" * 78)
-    print("Sustainability Signals System v17.0.0 — smoke test")
+    print("Sustainability Signals System v17.1.0 — smoke test (Phase 1-3)")
     print("=" * 78)
 
-    system = await get_sustainability_system()
+    system: Optional[EnhancedSustainabilitySystemV17] = None
+    try:
+        system = await get_sustainability_system()
 
-    print("\n✅ v17.0.0 ENHANCEMENTS:")
-    print("   ✅ Temporal Logic Verification (G/F/U/->)")
-    print("   ✅ Explainable AI for ESG decisions")
-    print("   ✅ Adaptive Precision Switching")
-    print("   ✅ Carbon Markets + Renewable Energy Credits")
-    print("   ✅ Multi-Agent Role Specialization (emergent)")
-    print("   ✅ Chaos Testing as first-class citizen")
-    print("   ✅ Active RLHF with uncertainty-triggered human queries")
-    print("   ✅ Human-in-the-Loop Coordinator")
-    print("   ✅ Federated Green Learning (FedAvg)")
-    print("   ✅ Causal RL hooks (IPW / ATE)")
+        print("\n✅ v17.1.0 ENHANCEMENTS (Phase 1-3):")
+        print("   [P1] Precision-unit fix, RLHF-policy wiring, cache TTL")
+        print("   [P1] Signal registration, chaos-env gating, federated wiring")
+        print("   [P1] Drift detection, data-quality, score clamping")
+        print("   [P2] aiosqlite (async) storage + CircuitBreaker lock")
+        print("   [P2] Latency histogram + active gauge + drift counter")
+        print("   [P2] Correlation-ID propagation, bounded violations")
+        print("   [P3] Pluggable live carbon API (aiohttp)")
+        print("   [P3] Real ARIMA forecasting + EMA fallback")
+        print("   [P3] Supply-chain scoring, scenario analysis, financial impact")
+        print("   [P3] Baseline-aware carbon credits, RLHF/state persistence")
 
-    esg_data = {
-        'company_name': 'EcoTech Inc.',
-        'company_ticker': 'ECO',
-        'sector': 'technology',
-        'carbon_intensity': 150,
-        'renewable_energy_pct': 40,
-        'employee_satisfaction': 78,
-        'board_diversity_pct': 45,
-        'suppliers': [
-            {'id': 's1', 'name': 'Supplier A', 'esg_score': 70, 'risk_score': 30},
-            {'id': 's2', 'name': 'Supplier B', 'esg_score': 55, 'risk_score': 50},
-        ],
-        'documents': [
-            'We are committed to reducing carbon emissions by 50% by 2030.',
-            'Board diversity has improved.',
-        ],
-    }
-    financial_data = {'revenue': 1000, 'profit_margin': 0.15}
+        esg_data = {
+            'company_name': 'EcoTech Inc.',
+            'company_ticker': 'ECO',
+            'sector': 'technology',
+            'carbon_intensity': 150,
+            'renewable_energy_pct': 40,
+            'employee_satisfaction': 78,
+            'board_diversity_pct': 45,
+            'sustainability_report_available': True,
+            'audited_emissions': True,
+            'double_materiality_assessed': True,
+            'supplier_assessments_performed': True,
+            'suppliers': [
+                {'id': 's1', 'name': 'Supplier A', 'esg_score': 70,
+                 'risk_score': 30, 'tier': 1},
+                {'id': 's2', 'name': 'Supplier B', 'esg_score': 55,
+                 'risk_score': 50, 'tier': 2},
+            ],
+            'documents': [
+                'We are committed to reducing carbon emissions by 50% by 2030.',
+                'Board diversity has improved.',
+            ],
+        }
+        financial_data = {'revenue': 1000, 'profit_margin': 0.15}
 
-    print("\n🔬 Running sample ESG assessment...")
-    result = await system.comprehensive_sustainability_assessment(
-        esg_data, financial_data, user_id='user_123', run_scenarios=True)
+        print("\n🔬 Running sample ESG assessment…")
+        result = await system.comprehensive_sustainability_assessment(
+            esg_data, financial_data, user_id='user_123', run_scenarios=True)
 
-    print(f"   ESG Score: {result.overall_sustainability_score:.1f}/100")
-    print(f"   Environmental: {result.environmental_score:.1f}")
-    print(f"   Social: {result.social_score:.1f}")
-    print(f"   Governance: {result.governance_score:.1f}")
-    print(f"   Strategy: {result.autonomous_optimization['selected_strategy']} "
-          f"(source={result.autonomous_optimization['source']})")
-    print(f"   Precision: {result.precision_used}")
-    print(f"   Carbon credit: ${result.carbon_credit_value_usd or 0:.4f}")
-    print(f"   REC value: ${result.rec_value_usd or 0:.4f}")
-    if result.temporal_status:
-        print(f"   Temporal: {result.temporal_status}")
-    if result.role_assignments:
-        print(f"   Dominant role: {result.role_assignments.get('dominant_role')}")
-    if result.xai_explanation and result.xai_explanation.get('narrative'):
-        print(f"   XAI: {result.xai_explanation['narrative'][0]}")
-    if result.hitl_outcome:
-        print(f"   HITL: {result.hitl_outcome.get('source')} -> "
-              f"{result.hitl_outcome.get('chosen')}")
-    print(f"   Peer comparison: {result.peer_comparison}")
+        print(f"   ESG Score: {result.overall_sustainability_score:.1f}/100")
+        print(f"   Environmental: {result.environmental_score:.1f}")
+        print(f"   Social: {result.social_score:.1f}")
+        print(f"   Governance: {result.governance_score:.1f}")
+        print(f"   Data Quality: {result.data_quality_score:.1f}")
+        print(f"   Strategy: {result.autonomous_optimization['selected_strategy']} "
+              f"(source={result.autonomous_optimization['source']})")
+        print(f"   Precision: {result.precision_used}")
+        print(f"   Carbon credit: ${result.carbon_credit_value_usd or 0:.4f}")
+        print(f"   REC value: ${result.rec_value_usd or 0:.4f}")
+        if result.carbon_forecast_g_per_kwh is not None:
+            print(f"   Carbon forecast (24h): {result.carbon_forecast_g_per_kwh} gCO2/kWh")
+        if result.supply_chain_analysis:
+            sc = result.supply_chain_analysis
+            print(f"   Supply chain: {sc['supplier_count']} suppliers, "
+                  f"avg ESG={sc['avg_esg']:.1f}, high-risk={sc['high_risk_count']}")
+        if result.financial_impact:
+            fi = result.financial_impact
+            print(f"   Financial: compliance=${fi['compliance_exposure_usd']:.2f}, "
+                  f"capex=${fi['mitigation_capex_estimate_usd']:.2f}")
+        if result.scenario_analysis:
+            print(f"   Scenarios: {list(result.scenario_analysis.keys())}")
+        if result.temporal_status:
+            print(f"   Temporal: {result.temporal_status}")
+        if result.role_assignments:
+            print(f"   Dominant role: {result.role_assignments.get('dominant_role')}")
+        if result.xai_explanation and result.xai_explanation.get('narrative'):
+            print(f"   XAI: {result.xai_explanation['narrative'][0]}")
+        if result.hitl_outcome:
+            print(f"   HITL: {result.hitl_outcome.get('source')} -> "
+                  f"{result.hitl_outcome.get('chosen')}")
+        print(f"   Peer comparison: {result.peer_comparison}")
 
-    print("\n📝 Recording RLHF feedback...")
-    await system.rlhf.record_feedback(
-        state={'carbon_intensity': 0.15, 'esg_score': 0.85},
-        action='environmental_focused', reward=0.85)
-    print(f"   RLHF feedback recorded.")
+        print("\n📝 Recording RLHF feedback…")
+        if system.rlhf:
+            await system.rlhf.record_feedback(
+                state={'carbon_intensity': 0.15, 'esg_score': 0.85},
+                action='environmental_focused', reward=0.85)
+            probs = await system.rlhf.get_policy_probs({})
+            print(f"   RLHF policy after 1 update: {[round(p,3) for p in probs]}")
 
-    print("\n⚙️  Precision selector →",
-          system.select_precision(carbon_intensity=0.3).value)
-    cc = await system.compute_carbon_credit(250.0)
-    print(f"💱 Carbon credit: ${cc['credit_usd']:.4f}  REC: ${cc['rec_usd']:.4f}")
+        print("\n⚙️  Precision selector →",
+              system.select_precision(carbon_intensity=0.3).value)
+        cc = await system.compute_carbon_credit(250.0)
+        print(f"💱 Carbon credit: ${cc['credit_usd']:.4f}  REC: ${cc['rec_usd']:.4f}")
 
-    print(f"\n🎭 Roles: {system.get_role_assignments()}")
-    print(f"🧠 Causal ATEs: {system.get_causal_ates()}")
+        print(f"\n🎭 Roles: {system.get_role_assignments()}")
+        print(f"🧠 Causal ATEs: {system.get_causal_ates()}")
 
-    print("\n🧪 Chaos suite:")
-    chaos = await system.run_chaos_suite()
-    print(f"   Pass rate: {chaos['report']['pass_rate']:.2f}  "
-          f"tests: {chaos['report']['tests_run']}")
+        print("\n🧪 Chaos suite:")
+        chaos = await system.run_chaos_suite()
+        print(f"   Pass rate: {chaos['report']['pass_rate']:.2f}  "
+              f"tests: {chaos['report']['tests_run']}")
 
-    print("\n📊 Comprehensive status:")
-    status = system.get_comprehensive_status()
-    print(json.dumps({
-        'version': status['version'],
-        'assessment_count': status['assessment_count'],
-        'carbon_saved_kg': status['carbon_saved_kg_total'],
-        'features': status['features'],
-        'mopd_weights': status['mopd_weights'],
-        'rlhf': status.get('rlhf'),
-        'distillation': status.get('distillation'),
-        'federated': status.get('federated'),
-        'hitl_total': status.get('hitl', {}).get('total'),
-        'chaos_pass_rate': status.get('chaos', {}).get('pass_rate'),
-        'precision_last': status.get('precision', {}).get('last'),
-        'causal_ates': status.get('causal_ates'),
-    }, indent=2, default=str))
+        print("\n📊 Comprehensive status:")
+        status = system.get_comprehensive_status()
+        print(json.dumps({
+            'version': status['version'],
+            'assessment_count': status['assessment_count'],
+            'carbon_saved_kg': status['carbon_saved_kg_total'],
+            'features': status['features'],
+            'mopd_weights': status['mopd_weights'],
+            'rlhf_prefs': status.get('rlhf', {}).get('preference_counts'),
+            'distillation': status.get('distillation'),
+            'federated': status.get('federated'),
+            'hitl_total': status.get('hitl', {}).get('total'),
+            'chaos_pass_rate': status.get('chaos', {}).get('pass_rate'),
+            'precision_last': status.get('precision', {}).get('last'),
+            'causal_ates': status.get('causal_ates'),
+            'pareto_size': status.get('pareto_size'),
+        }, indent=2, default=str))
 
-    await system.shutdown()
-    print("\n" + "=" * 78)
-    print("✅ Sustainability Signals System v17.0.0 — smoke test complete")
-    print("=" * 78)
+    finally:
+        if system is not None:
+            await system.shutdown()
+        print("\n" + "=" * 78)
+        print("✅ Sustainability Signals System v17.1.0 — smoke test complete")
+        print("=" * 78)
 
 
 if __name__ == "__main__":
+    # [P1] Register signal handlers before event loop
+    try:
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
+    except (ValueError, RuntimeError):
+        pass
     asyncio.run(_smoke_test())
