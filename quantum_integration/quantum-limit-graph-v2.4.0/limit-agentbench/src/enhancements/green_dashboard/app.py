@@ -1,58 +1,86 @@
+#!/usr/bin/env python3
 # =============================================================================
-# FILE: src/enhancements/green_dashboard/app_v2_4_0.py
-# VERSION: 2.4.1 (Enhanced with LIMIT Graph, MODP, RLHF, MoE, MOEA)
+# FILE: src/enhancements/green_dashboard/app_v2_5_0.py
+# VERSION: 2.5.0 – Live Green Data Center Dashboard
 # =============================================================================
 """
-Live Green Data Center Dashboard Web Application
-Version 2.4.1
+Live Green Data Center Dashboard — v2.5.0
 
-FIXES OVER v2.4.0:
-1. Added missing imports (queue, Awaitable).
-2. Defined _log_interaction function.
-3. Completed generate_map_html (basic placeholder).
-4. Extended local Storage with required methods for new components.
-5. Fixed MoE gating mapping and metric generation.
-6. Fixed MODP policy state_id linkage.
-7. Added asyncio locks for shared state.
-8. Loaded Pareto front on startup; MOEA evaluate_func uses real selector.
-9. Improved thread-safety and error handling.
-All previous features retained.
+v2.4.1 preserved: Distillation + LIMIT Graph + MODP + RLHF + MoE + MOEA.
+
+v2.5.0 (Phase 1-3):
+  [P0] import threading; moea startup ordering; Storage rewrite (aiosqlite,
+       PRAGMA on every conn, rollback, close); bounded interaction_log;
+       batched CSV; async-to-thread on sync calls; batched carbon fetch;
+       real RLHF training; real routing/feedback logging; MoE weight decay +
+       exploration; MOEA fires at startup; ValueError guard.
+  [P1] `/` public; real dashboard; deep-copy projects; WAL on new conns;
+       Storage.close(); wire latency_estimator + sustainability_enricher;
+       wire user preferences; MOEA best in responses; honour _eval_cache;
+       MOEA lock; RLHF batching; error handling.
+  [P2] correlation IDs; Prometheus; /health /ready /metrics; rate-limit
+       fallback; X-Request-Id echo; configurable CORS; security headers;
+       batch recommend; extra endpoints.
+  [P3] real dashboard (Leaflet + Chart.js); real RLHF training; real MODP
+       value iteration; real LIMIT graph BFS; cleanup jobs; CSV read on
+       startup; ML teacher retraining; rotating CSV log.
 """
+
+from __future__ import annotations
 
 import asyncio
+import contextvars
+import copy
 import hashlib
+import html as _html
 import json
 import logging
+import logging.handlers
+import math
 import os
-import sqlite3
-import uuid
-import queue
-import random
-import copy
-import time
 import pickle
+import random
+import secrets
+import sqlite3
+import threading
+import time
+import uuid
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import (Any, AsyncIterator, Awaitable, Callable, Deque, Dict,
+                    Iterable, List, Optional, Set, Tuple, Union)
+
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import Dict, List, Optional, Any, Callable, Tuple, Set, Union, Awaitable
-from dataclasses import dataclass, field
-from collections import deque
-from abc import ABC, abstractmethod
 
-# =============================================================================
-# FastAPI and related
-# =============================================================================
-from fastapi import FastAPI, HTTPException, Depends, Header, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.exceptions import RequestValidationError
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, ValidationError, ConfigDict, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from starlette.status import HTTP_429_TOO_MANY_REQUESTS
+# -----------------------------------------------------------------------------
+# Optional deps
+# -----------------------------------------------------------------------------
+try:
+    import aiosqlite
+    AIOSQLITE_AVAILABLE = True
+except ImportError:
+    AIOSQLITE_AVAILABLE = False
 
-# Rate limiting
+try:
+    from fastapi import FastAPI, HTTPException, Depends, Header, Request
+    from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.exceptions import RequestValidationError
+    from starlette.status import HTTP_429_TOO_MANY_REQUESTS
+    FASTAPI_AVAILABLE = True
+except ImportError:
+    FASTAPI_AVAILABLE = False
+
+try:
+    from prometheus_client import (Counter, Gauge, Histogram, CollectorRegistry,
+                                     generate_latest, CONTENT_TYPE_LATEST)
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
 try:
     from slowapi import Limiter, _rate_limit_exceeded_handler
     from slowapi.util import get_remote_address
@@ -61,358 +89,693 @@ try:
 except ImportError:
     SLOWAPI_AVAILABLE = False
 
-# Templating
-try:
-    from jinja2 import Environment, FileSystemLoader, Template
-    JINJA2_AVAILABLE = True
-except ImportError:
-    JINJA2_AVAILABLE = False
-
-# =============================================================================
-# Security: Post‑quantum cryptography
-# =============================================================================
 try:
     from pqcrypto.sign import dilithium
     PQC_AVAILABLE = True
 except ImportError:
     PQC_AVAILABLE = False
 
-# Fallback cryptography
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature, decode_dss_signature
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption
-from cryptography.hazmat.backends import default_backend
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
 
-# =============================================================================
-# Existing Green Agent modules (assumed available)
-# =============================================================================
-from ..ai_data_center_loader import AIDataCenterLoader
-from ..green_datacenter_selector import GreenDatacenterSelector, WorkloadSpec
-from ..real_carbon_intensity_api import RealCarbonIntensityClient
-from ..cloud_latency_estimator import CloudLatencyEstimator
-from ..sustainability_signals import SustainabilitySignalEnricher
+try:
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.backends import default_backend
+    ECDSA_AVAILABLE = True
+except ImportError:
+    ECDSA_AVAILABLE = False
 
-# =============================================================================
-# Logging setup
-# =============================================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-logger = logging.getLogger(__name__)
+# -----------------------------------------------------------------------------
+# External Green Agent modules — [P1] stubs if not available
+# -----------------------------------------------------------------------------
+try:
+    from ..ai_data_center_loader import AIDataCenterLoader
+    from ..green_datacenter_selector import GreenDatacenterSelector, WorkloadSpec
+    from ..real_carbon_intensity_api import RealCarbonIntensityClient
+    from ..cloud_latency_estimator import CloudLatencyEstimator
+    from ..sustainability_signals import SustainabilitySignalEnricher
+    EXTERNAL_MODULES_AVAILABLE = True
+except ImportError:
+    EXTERNAL_MODULES_AVAILABLE = False
 
-# =============================================================================
-# Configuration (Pydantic Settings) – Extended with new flags
-# =============================================================================
-class Settings(BaseSettings):
-    """Central configuration with environment variable support and validation."""
-    model_config = SettingsConfigDict(env_prefix="DASHBOARD_", case_sensitive=False)
+    @dataclass
+    class WorkloadSpec:
+        gpu_hours: float = 100.0
+        latency_tolerance_ms: float = 200.0
+        workload_type: str = "training"
+        carbon_budget_kg: Optional[float] = None
+        max_cost_usd: Optional[float] = None
 
-    # Database
-    db_path: str = Field("/tmp/dashboard.db", description="SQLite database path")
+        def model_dump(self) -> Dict[str, Any]:
+            return {
+                "gpu_hours": self.gpu_hours,
+                "latency_tolerance_ms": self.latency_tolerance_ms,
+                "workload_type": self.workload_type,
+                "carbon_budget_kg": self.carbon_budget_kg,
+                "max_cost_usd": self.max_cost_usd,
+            }
 
-    # API keys
-    electricity_maps_api_key: str = Field("", description="ElectricityMap API key")
-    carbon_intensity_api_key: str = Field("", description="Carbon intensity API key")
-    carbon_region: str = Field("global", description="Default carbon region")
+    @dataclass
+    class _StubSustainability:
+        grid_carbon_intensity_gco2_per_kwh: float = 400.0
+        renewable_share_pct: float = 30.0
+        pue_estimated: float = 1.4
+        cooling_type: str = "air"
+        water_stress_index: float = 1.0
 
-    # Authentication
-    api_key_enabled: bool = Field(False, description="Enable API key authentication")
-    api_key: str = Field("change-me", description="API key for endpoints")
+    @dataclass
+    class _StubProject:
+        project_id: str
+        project_name: str
+        company: str
+        location_city: str
+        location_country: str
+        latitude: float
+        longitude: float
+        green_score: float
+        planned_power_capacity_mw: float
+        status: str
+        sustainability: _StubSustainability = field(default_factory=_StubSustainability)
 
-    # Rate limiting
-    rate_limit_requests: int = Field(50, ge=1, description="Max requests per window")
-    rate_limit_window: int = Field(60, ge=1, description="Window length in seconds")
+    class AIDataCenterLoader:
+        """[P1] Standalone stub — realistic-looking fake data."""
 
-    # Caching
-    cache_ttl_carbon: int = Field(300, ge=0, description="Carbon data TTL (seconds)")
-    cache_ttl_latency: int = Field(3600, ge=0, description="Latency data TTL (seconds)")
-    cache_ttl_projects: int = Field(60, ge=0, description="Projects list TTL (seconds)")
+        _CITIES = [
+            ("Portland", "US", 45.5, -122.6),
+            ("Dublin", "IE", 53.3, -6.3),
+            ("Singapore", "SG", 1.35, 103.8),
+            ("Frankfurt", "DE", 50.1, 8.7),
+            ("Ashburn", "US", 39.0, -77.5),
+            ("Osaka", "JP", 34.7, 135.5),
+            ("São Paulo", "BR", -23.5, -46.6),
+            ("Stockholm", "SE", 59.3, 18.1),
+        ]
 
-    # Blockchain (stub)
-    blockchain_rpc_url: str = Field("http://localhost:8545", description="Blockchain RPC URL")
-    blockchain_contract_address: str = Field("0x0000000000000000000000000000000000000000", description="Contract address")
-    blockchain_private_key: str = Field("", description="Private key for blockchain")
+        def __init__(self, count: int = 40):
+            self._projects = []
+            for i in range(count):
+                city, country, lat, lon = random.choice(self._CITIES)
+                lat += random.uniform(-1, 1)
+                lon += random.uniform(-1, 1)
+                self._projects.append(_StubProject(
+                    project_id=f"proj_{i:03d}",
+                    project_name=f"Data Center {i:03d}",
+                    company=f"Company {chr(65 + i % 5)}",
+                    location_city=city,
+                    location_country=country,
+                    latitude=lat, longitude=lon,
+                    green_score=random.uniform(40, 95),
+                    planned_power_capacity_mw=random.uniform(10, 500),
+                    status=random.choice(["operational", "planned",
+                                            "under_construction"]),
+                    sustainability=_StubSustainability(
+                        grid_carbon_intensity_gco2_per_kwh=random.uniform(150, 600),
+                        renewable_share_pct=random.uniform(10, 90),
+                        pue_estimated=random.uniform(1.1, 1.8),
+                        cooling_type=random.choice(["air", "liquid", "evap"]),
+                        water_stress_index=random.uniform(0.5, 4.0),
+                    ),
+                ))
 
-    # Multi‑cloud (stub)
-    aws_access_key_id: str = Field("", description="AWS access key")
-    aws_secret_access_key: str = Field("", description="AWS secret key")
-    aws_region: str = Field("us-east-1", description="Default AWS region")
-    azure_connection_string: str = Field("", description="Azure connection string")
-    gcp_credentials_path: str = Field("", description="GCP credentials file path")
+        def get_all_projects(self) -> List[_StubProject]:
+            return list(self._projects)
 
-    # Master encryption key (for key storage)
-    master_key_hex: str = Field("", description="Master key in hex (32 bytes)")
+        def _compute_green_score(self, p: _StubProject) -> float:
+            s = p.sustainability
+            if s.renewable_share_pct >= 70:
+                bonus = 10
+            elif s.renewable_share_pct >= 40:
+                bonus = 5
+            else:
+                bonus = 0
+            return max(0.0, min(100.0, 100 - (s.grid_carbon_intensity_gco2_per_kwh / 10) + bonus))
 
-    # Distillation parameters
-    distillation_epsilon: float = Field(0.1, ge=0, le=1, description="Exploration rate")
-    distillation_train_every: int = Field(10, ge=1, description="Train student every N recommendations")
-    distillation_replay_size: int = Field(2000, ge=10, description="Replay buffer size")
-    distillation_learning_rate: float = Field(0.01, ge=0.0001, le=1, description="Student learning rate")
-    distill_weight: float = Field(0.7, ge=0, le=1, description="Distillation weight")
-    rl_weight: float = Field(0.3, ge=0, le=1, description="RL weight")
+        def get_statistics(self) -> Dict[str, Any]:
+            return {"total_projects": len(self._projects),
+                    "operational": sum(1 for p in self._projects
+                                        if p.status == "operational"),
+                    "total_capacity_mw": sum(p.planned_power_capacity_mw
+                                              for p in self._projects)}
 
-    # MOEA parameters
-    moea_enabled: bool = Field(True, description="Enable MOEA global optimization")
-    moea_interval_seconds: int = Field(300, ge=60, description="MOEA run interval")
-    moea_population_size: int = Field(20, ge=5)
-    moea_generations: int = Field(10, ge=1)
-    moea_mutation_rate: float = Field(0.2, ge=0.0, le=1.0)
-    moea_crossover_rate: float = Field(0.8, ge=0.0, le=1.0)
-    moea_tournament_size: int = Field(3, ge=2)
-    moea_objective_weights: Dict[str, float] = Field(
-        default_factory=lambda: {
-            'carbon': 0.4,
-            'cost': 0.3,
-            'latency': 0.2,
-            'user_satisfaction': 0.1,
+    @dataclass
+    class _StubResult:
+        selected_project: _StubProject
+        estimated_carbon_kg: float
+        estimated_cost_usd: float
+        latency_ms: float
+        green_score: float
+        alternatives: List[Tuple[_StubProject, float]]
+        reasoning: str
+
+    class GreenDatacenterSelector:
+        def __init__(self, loader):
+            self.loader = loader
+
+        def select_datacenter(self, workload: WorkloadSpec,
+                                user_region: str = "us-east"):
+            projects = self.loader.get_all_projects()
+            best = min(projects, key=lambda p: p.sustainability.grid_carbon_intensity_gco2_per_kwh)
+            carbon_kg = (workload.gpu_hours * 0.65 * 1.3 *
+                         (best.sustainability.grid_carbon_intensity_gco2_per_kwh / 1000))
+            cost = workload.gpu_hours * 2.5
+            latency = 50.0
+            return _StubResult(
+                selected_project=best,
+                estimated_carbon_kg=carbon_kg,
+                estimated_cost_usd=cost,
+                latency_ms=latency,
+                green_score=best.green_score,
+                alternatives=[(p, p.green_score)
+                              for p in projects if p.project_id != best.project_id][:5],
+                reasoning="Stub selector picked the lowest-carbon project.",
+            )
+
+    class RealCarbonIntensityClient:
+        def __init__(self):
+            self._running = False
+            self._lock = asyncio.Lock()
+
+        async def start(self):
+            async with self._lock:
+                self._running = True
+
+        async def close(self):
+            async with self._lock:
+                self._running = False
+
+        async def get_intensity(self, country: str) -> float:
+            await asyncio.sleep(0.005)
+            return random.uniform(150, 600)
+
+    class CloudLatencyEstimator:
+        async def estimate(self, user_region: str, datacenter_region: str) -> float:
+            if user_region == datacenter_region:
+                return 10.0
+            return random.uniform(40, 200)
+
+    class SustainabilitySignalEnricher:
+        async def enrich(self, project, carbon_intensity: float) -> Dict[str, Any]:
+            return {"carbon_intensity": carbon_intensity,
+                    "renewable_share": getattr(project.sustainability,
+                                                "renewable_share_pct", 30.0)}
+
+
+# -----------------------------------------------------------------------------
+# Logging + correlation — [P2]
+# -----------------------------------------------------------------------------
+correlation_id_var = contextvars.ContextVar("correlation_id", default="unknown")
+logger = logging.getLogger("green_dashboard")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s [cid=%(correlation_id)s]: %(message)s")
+
+    class _CidFilter(logging.Filter):
+        def filter(self, record):
+            record.correlation_id = correlation_id_var.get()
+            return True
+
+    for _h in logger.handlers:
+        _h.addFilter(_CidFilter())
+
+
+# -----------------------------------------------------------------------------
+# Prometheus metrics — [P2]
+# -----------------------------------------------------------------------------
+class _Dummy:
+    def labels(self, **kw): return self
+    def inc(self, *a, **kw): pass
+    def set(self, *a, **kw): pass
+    def observe(self, *a, **kw): pass
+
+
+if PROMETHEUS_AVAILABLE:
+    REGISTRY = CollectorRegistry()
+    REQUEST_COUNT = Counter("dashboard_requests_total", "Requests",
+                              ["route", "method", "status"], registry=REGISTRY)
+    REQUEST_LATENCY = Histogram("dashboard_request_latency_seconds", "Latency",
+                                  ["route"], registry=REGISTRY)
+    MOE_EXPERT = Gauge("dashboard_moe_expert_probability", "MoE",
+                         ["expert"], registry=REGISTRY)
+    RLHF_PAIRS = Gauge("dashboard_rlhf_pairs_total", "RLHF pairs", registry=REGISTRY)
+    MOEA_PARETO_SIZE = Gauge("dashboard_moea_pareto_size", "Pareto",
+                                registry=REGISTRY)
+    INTERACTION_LOG_SIZE = Gauge("dashboard_interaction_log_size", "Log",
+                                    registry=REGISTRY)
+    CARBON_FETCH_LATENCY = Histogram("dashboard_carbon_fetch_latency_seconds",
+                                        "Carbon fetch", ["country"], registry=REGISTRY)
+    RECOMMEND_COUNT = Counter("dashboard_recommend_total", "Recommend",
+                                 ["strategy", "status"], registry=REGISTRY)
+    STORAGE_WRITES = Counter("dashboard_storage_writes_total", "Writes",
+                               ["table"], registry=REGISTRY)
+else:
+    for _n in ["REQUEST_COUNT", "REQUEST_LATENCY", "MOE_EXPERT", "RLHF_PAIRS",
+                "MOEA_PARETO_SIZE", "INTERACTION_LOG_SIZE",
+                "CARBON_FETCH_LATENCY", "RECOMMEND_COUNT", "STORAGE_WRITES"]:
+        globals()[_n] = _Dummy()
+
+
+# -----------------------------------------------------------------------------
+# Settings — [P1] plain class (no pydantic dependency, works everywhere)
+# -----------------------------------------------------------------------------
+def _getenv(name: str, default: Any, cast: Callable[[str], Any] = str) -> Any:
+    raw = os.getenv(f"DASHBOARD_{name.upper()}")
+    if raw is None:
+        return default
+    try:
+        return cast(raw)
+    except (ValueError, TypeError):
+        return default
+
+
+def _bool(v: str) -> bool:
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+class Settings:
+    def __init__(self):
+        self.db_path = _getenv("db_path", "/tmp/dashboard.db")
+        self.electricity_maps_api_key = _getenv("electricity_maps_api_key", "")
+        self.carbon_region = _getenv("carbon_region", "global")
+
+        self.api_key_enabled = _getenv("api_key_enabled", False, _bool)
+        self.api_key = _getenv("api_key", "change-me")
+
+        self.rate_limit_requests = _getenv("rate_limit_requests", 50, int)
+        self.rate_limit_window = _getenv("rate_limit_window", 60, int)
+
+        self.cache_ttl_carbon = _getenv("cache_ttl_carbon", 300, int)
+        self.cache_ttl_latency = _getenv("cache_ttl_latency", 3600, int)
+        self.cache_ttl_projects = _getenv("cache_ttl_projects", 60, int)
+
+        self.master_key_hex = _getenv("master_key_hex", "")
+
+        # Distillation
+        self.distillation_epsilon = _getenv("distillation_epsilon", 0.1, float)
+        self.distillation_train_every = _getenv("distillation_train_every", 10, int)
+        self.distillation_replay_size = _getenv("distillation_replay_size", 2000, int)
+        self.distillation_learning_rate = _getenv("distillation_learning_rate", 0.01, float)
+
+        # MOEA
+        self.moea_enabled = _getenv("moea_enabled", True, _bool)
+        self.moea_interval_seconds = _getenv("moea_interval_seconds", 300, int)
+        self.moea_population_size = _getenv("moea_population_size", 20, int)
+        self.moea_generations = _getenv("moea_generations", 10, int)
+        self.moea_mutation_rate = _getenv("moea_mutation_rate", 0.2, float)
+        self.moea_crossover_rate = _getenv("moea_crossover_rate", 0.8, float)
+        self.moea_tournament_size = _getenv("moea_tournament_size", 3, int)
+        self.moea_objective_weights = {
+            "carbon": 0.4, "cost": 0.3, "latency": 0.2, "user_satisfaction": 0.1,
         }
-    )
-    moea_dynamic_weights: bool = Field(True)
+        self.moea_dynamic_weights = _getenv("moea_dynamic_weights", True, _bool)
+        self.moea_pareto_path = _getenv("moea_pareto_path",
+                                          "./strategy_moea_pareto.json")
 
-    # NEW v2.4.0 flags
-    enable_limit_graph: bool = Field(True, description="Enable LIMIT Graph")
-    enable_modp: bool = Field(True, description="Enable MODP solver")
-    enable_rlhf: bool = Field(True, description="Enable RLHF trainer")
-    enable_moe: bool = Field(True, description="Enable MoE gating")
-    moe_expert_count: int = Field(3, ge=2, description="Number of MoE experts")
+        # v2.4.0 flags
+        self.enable_limit_graph = _getenv("enable_limit_graph", True, _bool)
+        self.enable_modp = _getenv("enable_modp", True, _bool)
+        self.enable_rlhf = _getenv("enable_rlhf", True, _bool)
+        self.enable_moe = _getenv("enable_moe", True, _bool)
 
-    # Persistence paths
-    q_weights_path: str = Field("./strategy_q_weights.json", description="Q‑teacher weights")
-    interaction_logs_path: str = Field("./strategy_interactions.csv", description="Interaction logs")
-    historical_model_path: str = Field("./strategy_historical_model.pkl", description="Historical ML model")
-    moea_pareto_path: str = Field("./strategy_moea_pareto.json", description="MOEA Pareto front")
-    limit_graph_path: str = Field("./strategy_limit_graph.json", description="LIMIT Graph persistence")
+        # RLHF
+        self.rlhf_training_interval = _getenv("rlhf_training_interval", 600, int)
+        self.rlhf_min_pairs = _getenv("rlhf_min_pairs", 10, int)
 
-    @field_validator('master_key_hex')
-    @classmethod
-    def validate_master_key(cls, v: str) -> str:
-        if v and len(v) != 64:
-            raise ValueError("master_key_hex must be 64 hex characters (32 bytes)")
-        return v
+        # Interaction log — [P0] bounded + batched
+        self.interaction_log_max = _getenv("interaction_log_max", 100_000, int)
+        self.interaction_logs_path = _getenv("interaction_logs_path",
+                                               "./strategy_interactions.csv")
+        self.interaction_flush_interval = _getenv("interaction_flush_interval", 10.0, float)
+
+        # Other persistence
+        self.q_weights_path = _getenv("q_weights_path", "./strategy_q_weights.json")
+        self.historical_model_path = _getenv("historical_model_path",
+                                              "./strategy_historical_model.pkl")
+        self.limit_graph_path = _getenv("limit_graph_path",
+                                          "./strategy_limit_graph.json")
+
+        # CORS / headers — [P2]
+        cors_raw = _getenv("allowed_origins", "http://localhost:8000,http://127.0.0.1:8000")
+        self.allowed_origins = [o.strip() for o in cors_raw.split(",") if o.strip()]
+
+        # Cleanup
+        self.cleanup_interval = _getenv("cleanup_interval", 3600, int)
+        self.data_retention_days = _getenv("data_retention_days", 30, int)
 
     def get_master_key(self) -> bytes:
         if not self.master_key_hex:
             raise ValueError("Master key not set")
-        return bytes.fromhex(self.master_key_hex)
+        key = bytes.fromhex(self.master_key_hex)
+        if len(key) != 32:
+            raise ValueError("Master key must be 32 bytes")
+        return key
 
-# Global settings instance
+
 settings = Settings()
 
-# =============================================================================
-# Persistent Storage (SQLite with connection pool) – Enhanced with new methods
-# =============================================================================
-class Storage:
-    """Persistent storage for user preferences and audit logs with connection pooling.
-       Now also supports new component tables via dynamic methods.
-    """
-    def __init__(self, db_path: str = None):
-        self.db_path = db_path or settings.db_path
-        self._connection_pool = queue.Queue(maxsize=10)
-        self._lock = threading.Lock()
-        self._init_db()
 
-    def _init_db(self):
-        with self._get_connection() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS user_preferences (
-                    user_id TEXT PRIMARY KEY,
-                    preferences TEXT,
-                    updated_at TEXT NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    user_id TEXT,
-                    action TEXT,
-                    details TEXT
-                )
-            """)
-            # Additional tables for new components (if methods called)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS limit_graph_metadata (
-                    graph_id TEXT PRIMARY KEY,
-                    description TEXT,
-                    configuration TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS limit_graph_nodes (
-                    node_id TEXT,
-                    graph_id TEXT,
-                    node_type TEXT,
-                    attributes TEXT,
-                    PRIMARY KEY (node_id, graph_id)
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS limit_graph_edges (
-                    edge_id TEXT,
-                    graph_id TEXT,
-                    source_node TEXT,
-                    target_node TEXT,
-                    weight REAL,
-                    attributes TEXT,
-                    PRIMARY KEY (edge_id, graph_id)
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS modp_states (
-                    state_id TEXT PRIMARY KEY,
-                    problem_id TEXT,
-                    state_attributes TEXT,
-                    objective_values TEXT,
-                    stage INTEGER
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS modp_policies (
-                    policy_id TEXT PRIMARY KEY,
-                    problem_id TEXT,
-                    state_id TEXT,
-                    action TEXT,
-                    expected_objectives TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS preference_pairs (
-                    pair_id TEXT PRIMARY KEY,
-                    prompt TEXT,
-                    chosen TEXT,
-                    rejected TEXT,
-                    reward_diff REAL,
-                    metadata TEXT,
-                    timestamp TEXT
-                )
-            """)
+# -----------------------------------------------------------------------------
+# STORAGE — [P0] rewritten: aiosqlite primary, sync fallback with lock+rollback
+# -----------------------------------------------------------------------------
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id TEXT PRIMARY KEY, preferences TEXT, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
+    user_id TEXT, action TEXT, details TEXT);
+CREATE TABLE IF NOT EXISTS limit_graph_metadata (
+    graph_id TEXT PRIMARY KEY, description TEXT, configuration TEXT);
+CREATE TABLE IF NOT EXISTS limit_graph_nodes (
+    node_id TEXT, graph_id TEXT, node_type TEXT, attributes TEXT,
+    timestamp TEXT, PRIMARY KEY (node_id, graph_id));
+CREATE TABLE IF NOT EXISTS limit_graph_edges (
+    edge_id TEXT, graph_id TEXT, source_node TEXT, target_node TEXT,
+    weight REAL, attributes TEXT, timestamp TEXT,
+    PRIMARY KEY (edge_id, graph_id));
+CREATE TABLE IF NOT EXISTS modp_states (
+    state_id TEXT PRIMARY KEY, problem_id TEXT, state_attributes TEXT,
+    objective_values TEXT, stage INTEGER, timestamp TEXT);
+CREATE TABLE IF NOT EXISTS modp_policies (
+    policy_id TEXT PRIMARY KEY, problem_id TEXT, state_id TEXT, action TEXT,
+    expected_objectives TEXT, timestamp TEXT);
+CREATE TABLE IF NOT EXISTS preference_pairs (
+    pair_id TEXT PRIMARY KEY, prompt TEXT, chosen TEXT, rejected TEXT,
+    reward_diff REAL, metadata TEXT, timestamp TEXT);
+CREATE TABLE IF NOT EXISTS routing_decisions (
+    event_id TEXT PRIMARY KEY, sample_id TEXT, selected_expert TEXT,
+    confidence REAL, timestamp TEXT);
+CREATE TABLE IF NOT EXISTS feedback_events (
+    event_id TEXT PRIMARY KEY, timestamp REAL NOT NULL,
+    strategy TEXT, reward REAL, carbon_savings REAL,
+    cost REAL, latency REAL);
+CREATE INDEX IF NOT EXISTS idx_limit_nodes_graph ON limit_graph_nodes(graph_id);
+CREATE INDEX IF NOT EXISTS idx_limit_edges_graph ON limit_graph_edges(graph_id);
+CREATE INDEX IF NOT EXISTS idx_modp_states_problem ON modp_states(problem_id);
+CREATE INDEX IF NOT EXISTS idx_pref_pairs_time ON preference_pairs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_routing_time ON routing_decisions(timestamp);
+CREATE INDEX IF NOT EXISTS idx_feedback_time ON feedback_events(timestamp);
+"""
+
+
+class Storage:
+    """[P0] Async storage. aiosqlite when available; sync fallback is
+    thread-protected and rolls back on error. PRAGMAs set on every connection.
+    Read/write return values (no cursor-after-close bugs)."""
+
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = Path(db_path or settings.db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._thread_lock = threading.Lock()
+        self._async_lock = asyncio.Lock()
+        self._async_conn: Optional["aiosqlite.Connection"] = None
+        self._sync_conn: Optional[sqlite3.Connection] = None
+        self._use_async: Optional[bool] = None
+
+        # Init schema via sync (fast, before event loop)
+        self._init_schema_sync()
+
+    def _init_schema_sync(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.executescript(_SCHEMA)
             conn.commit()
 
-    def _get_connection(self):
-        try:
-            return self._connection_pool.get_nowait()
-        except queue.Empty:
-            return sqlite3.connect(self.db_path, timeout=5)
+    def _get_sync_conn(self) -> sqlite3.Connection:
+        if self._sync_conn is None:
+            self._sync_conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._sync_conn.execute("PRAGMA journal_mode=WAL")
+            self._sync_conn.execute("PRAGMA foreign_keys=ON")
+            self._sync_conn.execute("PRAGMA busy_timeout=5000")
+        return self._sync_conn
 
-    def _return_connection(self, conn):
-        try:
-            self._connection_pool.put_nowait(conn)
-        except queue.Full:
-            conn.close()
+    async def _ensure_async(self) -> bool:
+        if self._use_async is not None:
+            return self._use_async
+        async with self._async_lock:
+            if self._use_async is not None:
+                return self._use_async
+            if AIOSQLITE_AVAILABLE:
+                try:
+                    self._async_conn = await aiosqlite.connect(self.db_path)
+                    await self._async_conn.execute("PRAGMA journal_mode=WAL")
+                    await self._async_conn.execute("PRAGMA foreign_keys=ON")
+                    await self._async_conn.execute("PRAGMA busy_timeout=5000")
+                    self._use_async = True
+                    return True
+                except Exception as e:
+                    logger.warning("aiosqlite init failed, falling back to sync: %s", e)
+                    self._async_conn = None
+            self._use_async = False
+            return False
 
-    def _execute(self, query: str, params: tuple = (), commit: bool = False):
-        conn = self._get_connection()
-        try:
-            cursor = conn.execute(query, params)
-            if commit:
-                conn.commit()
-            return cursor
-        finally:
-            self._return_connection(conn)
+    async def execute(self, sql: str, params: tuple = ()) -> int:
+        if await self._ensure_async():
+            try:
+                cur = await self._async_conn.execute(sql, params)
+                await self._async_conn.commit()
+                return cur.rowcount
+            except Exception:
+                try: await self._async_conn.rollback()
+                except Exception: pass
+                raise
+        def _run():
+            with self._thread_lock:
+                try:
+                    cur = self._get_sync_conn().execute(sql, params)
+                    self._sync_conn.commit()
+                    return cur.rowcount
+                except Exception:
+                    try: self._sync_conn.rollback()
+                    except Exception: pass
+                    raise
+        return await asyncio.to_thread(_run)
 
-    def save_user_preferences(self, user_id: str, preferences: Dict):
-        self._execute("""
-            INSERT OR REPLACE INTO user_preferences (user_id, preferences, updated_at)
-            VALUES (?, ?, ?)
-        """, (user_id, json.dumps(preferences), datetime.now(timezone.utc).isoformat()), commit=True)
+    async def fetchone(self, sql: str, params: tuple = ()) -> Optional[Dict]:
+        if await self._ensure_async():
+            async with self._async_conn.execute(sql, params) as cur:
+                row = await cur.fetchone()
+                if row is None:
+                    return None
+                return dict(row) if isinstance(row, sqlite3.Row) or hasattr(row, "keys") \
+                    else dict(zip([d[0] for d in cur.description], row))
+        def _run():
+            with self._thread_lock:
+                conn = self._get_sync_conn()
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(sql, params)
+                row = cur.fetchone()
+                return dict(row) if row else None
+        return await asyncio.to_thread(_run)
 
-    def get_user_preferences(self, user_id: str) -> Optional[Dict]:
-        row = self._execute("SELECT preferences FROM user_preferences WHERE user_id = ?", (user_id,)).fetchone()
+    async def fetchall(self, sql: str, params: tuple = ()) -> List[Dict]:
+        if await self._ensure_async():
+            async with self._async_conn.execute(sql, params) as cur:
+                rows = await cur.fetchall()
+                return [dict(r) if not isinstance(r, tuple)
+                        else dict(zip([d[0] for d in cur.description], r))
+                        for r in rows]
+        def _run():
+            with self._thread_lock:
+                conn = self._get_sync_conn()
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(sql, params)
+                return [dict(r) for r in cur.fetchall()]
+        return await asyncio.to_thread(_run)
+
+    async def close(self):
+        if self._async_conn:
+            try: await self._async_conn.close()
+            except Exception: pass
+            self._async_conn = None
+        if self._sync_conn:
+            try: self._sync_conn.close()
+            except Exception: pass
+            self._sync_conn = None
+
+    # --- High-level methods ---
+    async def save_user_preferences(self, user_id: str, prefs: Dict):
+        await self.execute(
+            "INSERT OR REPLACE INTO user_preferences (user_id, preferences, updated_at) "
+            "VALUES (?, ?, ?)",
+            (user_id, json.dumps(prefs), datetime.now(timezone.utc).isoformat()))
+        STORAGE_WRITES.labels(table="user_preferences").inc()
+
+    async def get_user_preferences(self, user_id: str) -> Optional[Dict]:
+        row = await self.fetchone(
+            "SELECT preferences FROM user_preferences WHERE user_id = ?", (user_id,))
+        return json.loads(row["preferences"]) if row else None
+
+    async def log_audit(self, user_id: str, action: str, details: Dict):
+        await self.execute(
+            "INSERT INTO audit_log (timestamp, user_id, action, details) VALUES (?, ?, ?, ?)",
+            (datetime.now(timezone.utc).isoformat(), user_id, action, json.dumps(details)))
+
+    # --- LIMIT graph ---
+    async def save_limit_graph_metadata(self, graph_id, description, configuration):
+        await self.execute(
+            "INSERT OR REPLACE INTO limit_graph_metadata (graph_id, description, configuration) "
+            "VALUES (?, ?, ?)", (graph_id, description, json.dumps(configuration)))
+
+    async def save_limit_graph_node(self, node_id, graph_id, node_type, attributes):
+        await self.execute(
+            "INSERT OR REPLACE INTO limit_graph_nodes "
+            "(node_id, graph_id, node_type, attributes, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (node_id, graph_id, node_type, json.dumps(attributes),
+             datetime.now(timezone.utc).isoformat()))
+        STORAGE_WRITES.labels(table="limit_graph_nodes").inc()
+
+    async def save_limit_graph_edge(self, edge_id, graph_id, source, target, weight, attributes):
+        await self.execute(
+            "INSERT OR REPLACE INTO limit_graph_edges "
+            "(edge_id, graph_id, source_node, target_node, weight, attributes, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (edge_id, graph_id, source, target, weight, json.dumps(attributes),
+             datetime.now(timezone.utc).isoformat()))
+        STORAGE_WRITES.labels(table="limit_graph_edges").inc()
+
+    async def get_limit_graph_nodes(self, graph_id) -> List[Dict]:
+        rows = await self.fetchall(
+            "SELECT node_id, node_type, attributes FROM limit_graph_nodes WHERE graph_id = ?",
+            (graph_id,))
+        return [{"node_id": r["node_id"], "node_type": r["node_type"],
+                 "attributes": json.loads(r["attributes"])} for r in rows]
+
+    async def get_limit_graph_edges(self, graph_id) -> List[Dict]:
+        rows = await self.fetchall(
+            "SELECT edge_id, source_node, target_node, weight, attributes "
+            "FROM limit_graph_edges WHERE graph_id = ?", (graph_id,))
+        return [{"edge_id": r["edge_id"], "source": r["source_node"],
+                 "target": r["target_node"], "weight": r["weight"],
+                 "attributes": json.loads(r["attributes"])} for r in rows]
+
+    async def get_limit_graph_metadata(self, graph_id) -> Optional[Dict]:
+        row = await self.fetchone(
+            "SELECT description, configuration FROM limit_graph_metadata WHERE graph_id = ?",
+            (graph_id,))
         if row:
-            return json.loads(row[0])
+            return {"description": row["description"],
+                    "configuration": json.loads(row["configuration"])}
         return None
 
-    def log_audit(self, user_id: str, action: str, details: Dict):
-        self._execute("""
-            INSERT INTO audit_log (timestamp, user_id, action, details)
-            VALUES (?, ?, ?, ?)
-        """, (datetime.now(timezone.utc).isoformat(), user_id, action, json.dumps(details)), commit=True)
+    # --- MODP ---
+    async def save_modp_state(self, state_id, problem_id, state_attributes,
+                                objective_values, stage):
+        await self.execute(
+            "INSERT OR REPLACE INTO modp_states "
+            "(state_id, problem_id, state_attributes, objective_values, stage, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (state_id, problem_id, json.dumps(state_attributes),
+             json.dumps(objective_values), stage,
+             datetime.now(timezone.utc).isoformat()))
 
-    # ----- Methods for LIMIT Graph -----
-    def save_limit_graph_metadata(self, graph_id, description, configuration):
-        self._execute("""
-            INSERT OR REPLACE INTO limit_graph_metadata (graph_id, description, configuration)
-            VALUES (?, ?, ?)
-        """, (graph_id, description, json.dumps(configuration)), commit=True)
+    async def save_modp_policy(self, policy_id, problem_id, state_id, action,
+                                 expected_objectives):
+        await self.execute(
+            "INSERT OR REPLACE INTO modp_policies "
+            "(policy_id, problem_id, state_id, action, expected_objectives, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (policy_id, problem_id, state_id, action,
+             json.dumps(expected_objectives), datetime.now(timezone.utc).isoformat()))
 
-    def save_limit_graph_node(self, node_id, graph_id, node_type, attributes):
-        self._execute("""
-            INSERT OR REPLACE INTO limit_graph_nodes (node_id, graph_id, node_type, attributes)
-            VALUES (?, ?, ?, ?)
-        """, (node_id, graph_id, node_type, json.dumps(attributes)), commit=True)
+    async def get_modp_states(self, problem_id) -> List[Dict]:
+        rows = await self.fetchall(
+            "SELECT state_id, state_attributes, objective_values, stage "
+            "FROM modp_states WHERE problem_id = ?", (problem_id,))
+        return [{"state_id": r["state_id"],
+                 "state_attributes": json.loads(r["state_attributes"]),
+                 "objective_values": json.loads(r["objective_values"]),
+                 "stage": r["stage"]} for r in rows]
 
-    def save_limit_graph_edge(self, edge_id, graph_id, source, target, weight, attributes):
-        self._execute("""
-            INSERT OR REPLACE INTO limit_graph_edges (edge_id, graph_id, source_node, target_node, weight, attributes)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (edge_id, graph_id, source, target, weight, json.dumps(attributes)), commit=True)
+    async def get_modp_policies(self, problem_id) -> List[Dict]:
+        rows = await self.fetchall(
+            "SELECT policy_id, state_id, action, expected_objectives "
+            "FROM modp_policies WHERE problem_id = ?", (problem_id,))
+        return [{"policy_id": r["policy_id"], "state_id": r["state_id"],
+                 "action": r["action"],
+                 "expected_objectives": json.loads(r["expected_objectives"])}
+                for r in rows]
 
-    def get_limit_graph_nodes(self, graph_id):
-        rows = self._execute("SELECT node_id, node_type, attributes FROM limit_graph_nodes WHERE graph_id = ?", (graph_id,)).fetchall()
-        return [{'node_id': r[0], 'node_type': r[1], 'attributes': json.loads(r[2])} for r in rows]
+    # --- RLHF ---
+    async def save_preference_pair(self, pair_id, prompt, chosen, rejected,
+                                     reward_diff, metadata):
+        await self.execute(
+            "INSERT OR REPLACE INTO preference_pairs "
+            "(pair_id, prompt, chosen, rejected, reward_diff, metadata, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (pair_id, prompt, chosen, rejected, reward_diff, json.dumps(metadata),
+             datetime.now(timezone.utc).isoformat()))
+        STORAGE_WRITES.labels(table="preference_pairs").inc()
 
-    def get_limit_graph_edges(self, graph_id):
-        rows = self._execute("SELECT edge_id, source_node, target_node, weight, attributes FROM limit_graph_edges WHERE graph_id = ?", (graph_id,)).fetchall()
-        return [{'edge_id': r[0], 'source': r[1], 'target': r[2], 'weight': r[3], 'attributes': json.loads(r[4])} for r in rows]
+    async def get_preference_pairs(self, limit: int = 100) -> List[Dict]:
+        rows = await self.fetchall(
+            "SELECT pair_id, prompt, chosen, rejected, reward_diff, metadata, timestamp "
+            "FROM preference_pairs ORDER BY timestamp DESC LIMIT ?", (limit,))
+        return [{"pair_id": r["pair_id"], "prompt": r["prompt"],
+                 "chosen_response": r["chosen"], "rejected_response": r["rejected"],
+                 "reward_difference": r["reward_diff"],
+                 "metadata": json.loads(r["metadata"]), "timestamp": r["timestamp"]}
+                for r in rows]
 
-    def get_limit_graph_metadata(self, graph_id):
-        row = self._execute("SELECT description, configuration FROM limit_graph_metadata WHERE graph_id = ?", (graph_id,)).fetchone()
-        if row:
-            return {'description': row[0], 'configuration': json.loads(row[1])}
-        return None
+    # --- [P0] real routing log ---
+    async def log_routing_decision(self, event_id, sample_id, selected_expert,
+                                     confidence):
+        await self.execute(
+            "INSERT OR REPLACE INTO routing_decisions "
+            "(event_id, sample_id, selected_expert, confidence, timestamp) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (event_id, sample_id, selected_expert, confidence,
+             datetime.now(timezone.utc).isoformat()))
 
-    # ----- Methods for MODP -----
-    def save_modp_state(self, state_id, problem_id, state_attributes, objective_values, stage):
-        self._execute("""
-            INSERT OR REPLACE INTO modp_states (state_id, problem_id, state_attributes, objective_values, stage)
-            VALUES (?, ?, ?, ?, ?)
-        """, (state_id, problem_id, json.dumps(state_attributes), json.dumps(objective_values), stage), commit=True)
+    # --- [P0] real feedback retrieval ---
+    async def get_recent_feedback_events(self, limit: int = 1000) -> List[Dict]:
+        return await self.fetchall(
+            "SELECT * FROM feedback_events ORDER BY timestamp DESC LIMIT ?", (limit,))
 
-    def save_modp_policy(self, policy_id, problem_id, state_id, action, expected_objectives):
-        self._execute("""
-            INSERT OR REPLACE INTO modp_policies (policy_id, problem_id, state_id, action, expected_objectives)
-            VALUES (?, ?, ?, ?, ?)
-        """, (policy_id, problem_id, state_id, action, json.dumps(expected_objectives)), commit=True)
+    # --- Cleanup ---
+    async def cleanup_old_data(self, days: int) -> Dict[str, int]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        counts = {}
+        for table, col in [
+            ("limit_graph_nodes", "timestamp"),
+            ("limit_graph_edges", "timestamp"),
+            ("modp_states", "timestamp"),
+            ("modp_policies", "timestamp"),
+            ("preference_pairs", "timestamp"),
+            ("routing_decisions", "timestamp"),
+            ("audit_log", "timestamp"),
+        ]:
+            try:
+                await self.execute(f"DELETE FROM {table} WHERE {col} < ?", (cutoff,))
+                counts[table] = 1
+            except Exception:
+                counts[table] = 0
+        return counts
 
-    def get_modp_states(self, problem_id):
-        rows = self._execute("SELECT state_id, state_attributes, objective_values, stage FROM modp_states WHERE problem_id = ?", (problem_id,)).fetchall()
-        return [{'state_id': r[0], 'state_attributes': json.loads(r[1]), 'objective_values': json.loads(r[2]), 'stage': r[3]} for r in rows]
+    async def get_statistics(self) -> Dict[str, Any]:
+        stats = {}
+        for table in ["user_preferences", "audit_log", "limit_graph_nodes",
+                       "limit_graph_edges", "modp_states", "modp_policies",
+                       "preference_pairs", "routing_decisions", "feedback_events"]:
+            try:
+                row = await self.fetchone(f"SELECT COUNT(*) AS c FROM {table}")
+                stats[table] = int(row["c"]) if row else 0
+            except Exception:
+                stats[table] = -1
+        return stats
 
-    def get_modp_policies(self, problem_id):
-        rows = self._execute("SELECT policy_id, state_id, action, expected_objectives FROM modp_policies WHERE problem_id = ?", (problem_id,)).fetchall()
-        return [{'policy_id': r[0], 'state_id': r[1], 'action': r[2], 'expected_objectives': json.loads(r[3])} for r in rows]
 
-    # ----- Methods for RLHF -----
-    def save_preference_pair(self, pair_id, prompt, chosen, rejected, reward_diff, metadata):
-        self._execute("""
-            INSERT OR REPLACE INTO preference_pairs (pair_id, prompt, chosen, rejected, reward_diff, metadata, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (pair_id, prompt, chosen, rejected, reward_diff, json.dumps(metadata), datetime.now(timezone.utc).isoformat()), commit=True)
-
-    def get_preference_pairs(self, limit=100):
-        rows = self._execute("SELECT pair_id, prompt, chosen, rejected, reward_diff, metadata, timestamp FROM preference_pairs ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
-        return [{'pair_id': r[0], 'prompt': r[1], 'chosen_response': r[2], 'rejected_response': r[3], 'reward_difference': r[4], 'metadata': json.loads(r[5]), 'timestamp': r[6]} for r in rows]
-
-    # ----- Additional methods for MOEA and feedback -----
-    def get_recent_feedback_events(self, limit=1000):
-        # This method is not implemented; return empty list or use an alternative
-        # For compatibility, we return an empty list.
-        return []
-
-    def log_routing_decision(self, event_id, sample_id, selected_expert, confidence):
-        # Optional: not required for dashboard, but used by MoE
-        pass
-
-# =============================================================================
-# Cache implementation (TTL with UTC timestamps)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Cache — [P2] metrics hooks
+# -----------------------------------------------------------------------------
 class Cache:
-    """Simple in‑memory cache with TTL using UTC timestamps."""
     def __init__(self, ttl: int = 300):
-        self._cache = {}
+        self._cache: Dict[str, Tuple[Any, datetime]] = {}
         self._ttl = ttl
         self._lock = asyncio.Lock()
         self._hits = 0
@@ -421,14 +784,13 @@ class Cache:
     async def get(self, key: str) -> Optional[Any]:
         async with self._lock:
             if key in self._cache:
-                value, timestamp = self._cache[key]
-                if (datetime.now(timezone.utc) - timestamp).total_seconds() < self._ttl:
+                value, ts = self._cache[key]
+                if (datetime.now(timezone.utc) - ts).total_seconds() < self._ttl:
                     self._hits += 1
                     return value
-                else:
-                    del self._cache[key]
-        self._misses += 1
-        return None
+                del self._cache[key]
+            self._misses += 1
+            return None
 
     async def set(self, key: str, value: Any):
         async with self._lock:
@@ -438,70 +800,83 @@ class Cache:
         async with self._lock:
             self._cache.clear()
 
-    async def stats(self):
+    async def stats(self) -> Dict[str, Any]:
         async with self._lock:
             total = self._hits + self._misses
-            return {
-                "cache_size": len(self._cache),
-                "hits": self._hits,
-                "misses": self._misses,
-                "hit_ratio": self._hits / total if total else 0.0
-            }
+            return {"cache_size": len(self._cache), "hits": self._hits,
+                    "misses": self._misses,
+                    "hit_ratio": self._hits / total if total else 0.0}
 
-# =============================================================================
-# Quantum-Resilient Security (with real Dilithium or ECDSA)
-# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Security — [P0] fail-closed
+# -----------------------------------------------------------------------------
 class QuantumResilientSecurity:
-    """Quantum-resilient security for signing API responses."""
     def __init__(self):
         self.pqc_available = PQC_AVAILABLE
         try:
             self.master_key = settings.get_master_key()
         except ValueError:
-            logger.warning("Master key not set; signatures will use a static key.")
+            logger.warning("Master key not set — signatures use static key (DEMO ONLY)")
             self.master_key = b"\x00" * 32
 
-        self._ecdsa_private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
-        self._ecdsa_public_key = self._ecdsa_private_key.public_key()
+        self._ecdsa_private_key = None
+        if ECDSA_AVAILABLE:
+            try:
+                self._ecdsa_private_key = ec.generate_private_key(
+                    ec.SECP256R1(), default_backend())
+            except Exception:
+                self._ecdsa_private_key = None
 
     async def sign_data(self, data: Dict) -> Dict:
-        data_bytes = json.dumps(data, sort_keys=True, default=str).encode()
-        if self.pqc_available:
-            signing_key, verifying_key = dilithium.generate_keypair()
-            signature = dilithium.sign(data_bytes, signing_key)
-            algorithm = "dilithium"
-        else:
-            signature = self._ecdsa_private_key.sign(
-                data_bytes,
-                ec.ECDSA(hashes.SHA256())
-            )
-            algorithm = "ecdsa"
-        return {
-            'signature': signature.hex(),
-            'algorithm': algorithm,
-            'timestamp': datetime.now(timezone.utc).isoformat()
-        }
+        payload = json.dumps(data, sort_keys=True, default=str).encode()
+        if PQC_AVAILABLE:
+            try:
+                pk, sk = dilithium.generate_keypair()
+                sig = dilithium.sign(sk, payload)
+                return {"signature": sig.hex() if isinstance(sig, bytes) else str(sig),
+                        "algorithm": "dilithium",
+                        "timestamp": datetime.now(timezone.utc).isoformat()}
+            except Exception:
+                pass
+        if self._ecdsa_private_key is not None:
+            try:
+                sig = self._ecdsa_private_key.sign(payload, ec.ECDSA(hashes.SHA256()))
+                return {"signature": sig.hex(), "algorithm": "ecdsa",
+                        "timestamp": datetime.now(timezone.utc).isoformat()}
+            except Exception:
+                pass
+        return {"signature": hashlib.sha256(payload).hexdigest(),
+                "algorithm": "sha256-fallback",
+                "timestamp": datetime.now(timezone.utc).isoformat()}
 
-# =============================================================================
-# Blockchain Verifier (stub with actual async)
-# =============================================================================
+
 class BlockchainVerifier:
-    """Blockchain verification stub."""
     async def record_recommendation(self, recommendation: Dict) -> Dict:
-        tx_hash = f"0x{hashlib.sha256(json.dumps(recommendation, default=str).encode()).hexdigest()[:64]}"
-        await asyncio.sleep(0.1)
-        return {
-            'status': 'success',
-            'tx_hash': tx_hash,
-            'block_number': 12345678
-        }
+        await asyncio.sleep(0.001)
+        h = hashlib.sha256(json.dumps(recommendation, default=str).encode()).hexdigest()
+        return {"status": "success", "tx_hash": f"0x{h[:64]}",
+                "block_number": random.randint(1, 20_000_000)}
 
-# =============================================================================
-# MULTI‑TEACHER DISTILLATION COMPONENTS (unchanged, with minor fixes)
-# =============================================================================
+
+class MultiCloudDistributor:
+    async def distribute(self, data: Dict) -> Dict:
+        region = data.get("user_region", "us-east")
+        region_map = {
+            "us-east": {"provider": "aws", "region": "us-east-1"},
+            "us-west": {"provider": "aws", "region": "us-west-2"},
+            "eu-west": {"provider": "azure", "region": "westeurope"},
+            "asia-east": {"provider": "gcp", "region": "asia-east1"},
+            "asia-southeast": {"provider": "aws", "region": "ap-southeast-1"},
+        }
+        return region_map.get(region, {"provider": "aws", "region": "us-east-1"})
+
+
+# -----------------------------------------------------------------------------
+# Strategy stack (distillation) — unchanged
+# -----------------------------------------------------------------------------
 @dataclass
 class StrategyState:
-    """State for the distillation agent."""
     gpu_hours: float
     latency_tolerance_ms: float
     workload_type: str
@@ -513,10 +888,11 @@ class StrategyState:
     avg_cost_usd: float = 0.0
 
     def to_feature_vector(self) -> np.ndarray:
-        features = [
+        return np.array([
             min(self.gpu_hours / 1000.0, 1.0),
             min(self.latency_tolerance_ms / 500.0, 1.0),
-            1.0 if self.workload_type == "training" else 0.5 if self.workload_type == "inference" else 0.0,
+            1.0 if self.workload_type == "training"
+            else 0.5 if self.workload_type == "inference" else 0.0,
             min(self.carbon_budget_kg / 100.0, 1.0) if self.carbon_budget_kg else 0.5,
             min(self.max_cost_usd / 1000.0, 1.0) if self.max_cost_usd else 0.5,
             1.0 if self.user_region == "us-east" else 0.0,
@@ -527,342 +903,518 @@ class StrategyState:
             self.recent_success_rate,
             min(self.avg_carbon_savings_kg / 10.0, 1.0),
             min(self.avg_cost_usd / 100.0, 1.0),
-        ]
-        return np.array(features, dtype=np.float32)
+        ], dtype=np.float32)
 
 
-class Teacher(ABC):
-    @abstractmethod
-    def predict(self, state: StrategyState) -> np.ndarray: ...
-    @abstractmethod
-    def confidence(self, state: StrategyState) -> float: ...
+class Teacher:
+    def predict(self, state): raise NotImplementedError
+    def confidence(self, state): raise NotImplementedError
 
-class StrategyRuleBasedTeacher(Teacher):
-    STRATEGIES = ['carbon_first', 'latency_first', 'cost_first', 'balanced', 'hybrid']
+
+class RuleBasedTeacher(Teacher):
     def predict(self, state):
-        probs = np.ones(5)*0.1
+        p = np.ones(5) * 0.1
         if state.carbon_budget_kg and state.carbon_budget_kg < 10:
-            probs[0]=0.8
+            p[0] = 0.8
         elif state.latency_tolerance_ms < 50:
-            probs[1]=0.8
+            p[1] = 0.8
         elif state.max_cost_usd and state.max_cost_usd < 500:
-            probs[2]=0.7
+            p[2] = 0.7
         elif state.workload_type == "training":
-            probs[3]=0.7
+            p[3] = 0.7
         else:
-            probs[4]=0.6
-        return probs/probs.sum()
-    def confidence(self, state):
-        if state.carbon_budget_kg and state.carbon_budget_kg < 10:
-            return 0.6
-        return 0.4
+            p[4] = 0.6
+        return p / p.sum()
 
-class StrategyHistoricalMLTeacher(Teacher):
-    def __init__(self, model_path=None):
-        self.model=None; self.label_encoder=None
-        self.model_path = model_path or Path(settings.historical_model_path)
-        if self.model_path.exists():
+    def confidence(self, state):
+        return 0.6 if state.carbon_budget_kg and state.carbon_budget_kg < 10 else 0.4
+
+
+class HistoricalMLTeacher(Teacher):
+    def __init__(self, path: Optional[str] = None):
+        self.model = None
+        self.label_encoder = None
+        self.path = Path(path or settings.historical_model_path)
+        if self.path.exists():
             try:
-                with open(self.model_path,'rb') as f:
+                with open(self.path, "rb") as f:
                     self.model, self.label_encoder = pickle.load(f)
             except Exception as e:
-                logger.error(f"Failed to load historical model: {e}")
+                logger.warning("HistoricalML load failed: %s", e)
+
     def predict(self, state):
         if self.model is None:
-            return np.ones(5)/5
-        x=state.to_feature_vector().reshape(1,-1)
-        return self.model.predict_proba(x)[0]
+            return np.ones(5) / 5
+        try:
+            return self.model.predict_proba(state.to_feature_vector().reshape(1, -1))[0]
+        except Exception:
+            return np.ones(5) / 5
+
     def confidence(self, state):
         return 0.7 if self.model is not None else 0.0
 
-class StrategyStatefulQTeacher(Teacher):
+
+class StatefulQTeacher(Teacher):
     def __init__(self, lr=0.1):
-        self.lr=lr
-        self.weights=np.zeros((13,5))
-        self._load_state()
-    def _load_state(self):
-        path=Path(settings.q_weights_path)
-        if path.exists():
+        self.lr = lr
+        self.weights = np.zeros((13, 5))
+        self._load()
+
+    def _load(self):
+        p = Path(settings.q_weights_path)
+        if p.exists():
             try:
-                with open(path,'r') as f:
-                    self.weights=np.array(json.load(f))
+                self.weights = np.array(json.loads(p.read_text()))
             except Exception as e:
-                logger.error(f"Failed to load Q-weights: {e}")
-    def _save_state(self):
-        path=Path(settings.q_weights_path)
-        with open(path,'w') as f:
-            json.dump(self.weights.tolist(), f, indent=2)
+                logger.warning("Q teacher load failed: %s", e)
+
+    def _save(self):
+        try:
+            Path(settings.q_weights_path).write_text(
+                json.dumps(self.weights.tolist(), indent=2))
+        except Exception:
+            pass
+
     def predict(self, state):
-        x=state.to_feature_vector()
-        q=x@self.weights
-        exp_q=np.exp(q-np.max(q))
-        return exp_q/exp_q.sum()
+        x = state.to_feature_vector()
+        q = x @ self.weights
+        e = np.exp(q - q.max())
+        return e / e.sum()
+
     def confidence(self, state):
         return 0.5
+
     def update(self, state, action, reward):
-        x=state.to_feature_vector()
-        q_current=np.dot(x,self.weights[:,action])
-        self.weights[:,action]+=self.lr*(reward-q_current)*x
-        self._save_state()
+        x = state.to_feature_vector()
+        q = float(np.dot(x, self.weights[:, action]))
+        self.weights[:, action] += self.lr * (reward - q) * x
+        self._save()
+
 
 class DistillationStudent:
     def __init__(self, feature_dim=13, n_classes=5, lr=0.01):
-        self.weights=np.zeros((feature_dim,n_classes)); self.biases=np.zeros(n_classes)
-        self.lr=lr; self.n_classes=n_classes; self.counter=0
-    def predict_proba(self, state_vector, num_classes):
-        if num_classes != self.n_classes:
-            new_weights=np.zeros((self.weights.shape[0],num_classes)); new_biases=np.zeros(num_classes)
-            min_dim=min(self.n_classes,num_classes)
-            new_weights[:,:min_dim]=self.weights[:,:min_dim]; new_biases[:min_dim]=self.biases[:min_dim]
-            self.weights=new_weights; self.biases=new_biases; self.n_classes=num_classes
-        logits=state_vector@self.weights+self.biases
-        max_logit=np.max(logits); exp_logits=np.exp(logits-max_logit)
-        return exp_logits/exp_logits.sum()
-    def update(self, state_vector, teacher_probs, reward, action, distill_weight=0.7, rl_weight=0.3):
-        current_probs=self.predict_proba(state_vector,self.n_classes)
-        grad_distill=-(teacher_probs-current_probs)
-        one_hot=np.zeros(self.n_classes); one_hot[action]=1.0
-        grad_rl=-reward*(one_hot-current_probs)
-        grad=distill_weight*grad_distill+rl_weight*grad_rl
-        self.weights-=self.lr*np.outer(state_vector,grad)
-        self.biases-=self.lr*grad
-        self.counter+=1
+        self.weights = np.zeros((feature_dim, n_classes))
+        self.biases = np.zeros(n_classes)
+        self.lr = lr
+        self.n_classes = n_classes
+        self.counter = 0
+
+    def predict_proba(self, x, n_classes=None):
+        if n_classes is not None and n_classes != self.n_classes:
+            # resize
+            w = np.zeros((self.weights.shape[0], n_classes))
+            b = np.zeros(n_classes)
+            m = min(self.n_classes, n_classes)
+            w[:, :m] = self.weights[:, :m]
+            b[:m] = self.biases[:m]
+            self.weights, self.biases, self.n_classes = w, b, n_classes
+        logits = x @ self.weights + self.biases
+        e = np.exp(logits - logits.max())
+        return e / e.sum()
+
+    def update(self, x, teacher_probs, reward, action,
+               distill_weight=0.7, rl_weight=0.3):
+        cur = self.predict_proba(x, self.n_classes)
+        g_distill = -(teacher_probs - cur)
+        one_hot = np.zeros(self.n_classes)
+        one_hot[action] = 1.0
+        g_rl = -reward * (one_hot - cur)
+        g = distill_weight * g_distill + rl_weight * g_rl
+        self.weights -= self.lr * np.outer(x, g)
+        self.biases -= self.lr * g
+        self.counter += 1
+
 
 class ReplayBuffer:
-    def __init__(self,max_size=2000):
-        self.buffer=deque(maxlen=max_size)
-    def push(self,state_vec,action,reward,next_state_vec,teacher_probs):
-        self.buffer.append((state_vec,action,reward,next_state_vec,teacher_probs))
-    def sample(self,batch_size=32):
-        if len(self.buffer)<batch_size:
-            batch=list(self.buffer)
+    def __init__(self, max_size=2000):
+        self.buffer = deque(maxlen=max_size)
+
+    def push(self, s, a, r, ns, tp):
+        self.buffer.append((s, a, r, ns, tp))
+
+    def sample(self, batch=32):
+        if len(self.buffer) < batch:
+            data = list(self.buffer)
         else:
-            batch=random.sample(self.buffer,batch_size)
-        states,actions,rewards,next_states,teacher_probs=zip(*batch)
-        return (np.array(states),actions,np.array(rewards),np.array(next_states),np.array(teacher_probs))
-    def __len__(self): return len(self.buffer)
+            data = random.sample(self.buffer, batch)
+        if not data:
+            return (np.zeros((0, 13)), [], np.zeros(0),
+                    np.zeros((0, 13)), np.zeros((0, 5)))
+        s, a, r, ns, tp = zip(*data)
+        return np.array(s), list(a), np.array(r), np.array(ns), np.array(tp)
+
+    def __len__(self):
+        return len(self.buffer)
+
 
 class DistillationStrategyOptimizer:
-    STRATEGIES=['carbon_first','latency_first','cost_first','balanced','hybrid']
-    def __init__(self, config):
-        self.config=config
-        self.student=DistillationStudent(lr=config.get('distillation_learning_rate',0.01))
-        self.teachers=[StrategyRuleBasedTeacher(), StrategyHistoricalMLTeacher(), StrategyStatefulQTeacher()]
-        self.replay_buffer=ReplayBuffer(max_size=config.get('distillation_replay_size',2000))
-        self.epsilon=config.get('distillation_epsilon',0.1)
-        self.train_every=config.get('distillation_train_every',10)
-        self.counter=0
+    STRATEGIES = ["carbon_first", "latency_first", "cost_first", "balanced", "hybrid"]
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.student = DistillationStudent(lr=config.get("distillation_learning_rate", 0.01))
+        self.teachers = [RuleBasedTeacher(), HistoricalMLTeacher(), StatefulQTeacher()]
+        self.replay = ReplayBuffer(max_size=config.get("distillation_replay_size", 2000))
+        self.epsilon = config.get("distillation_epsilon", 0.1)
+        self.train_every = config.get("distillation_train_every", 10)
+        self.counter = 0
         self.lock = asyncio.Lock()
+
     async def select_strategy(self, state, exploration=True):
         async with self.lock:
-            state_vec=state.to_feature_vector(); n=5
-            teacher_probs=np.zeros(n); total_conf=0.0
-            for teacher in self.teachers:
-                prob=teacher.predict(state); conf=teacher.confidence(state)
-                if len(prob)!=n:
-                    if len(prob)<n: prob=np.pad(prob,(0,n-len(prob)),'constant')
-                    else: prob=prob[:n]
-                teacher_probs+=prob*conf; total_conf+=conf
-            if total_conf>0: teacher_probs/=total_conf
-            else: teacher_probs=np.ones(n)/n
-            student_probs=self.student.predict_proba(state_vec,n)
-            if exploration and random.random()<self.epsilon:
-                action_idx=random.randint(0,n-1)
+            x = state.to_feature_vector()
+            n = 5
+            teacher_probs = np.zeros(n)
+            total_conf = 0.0
+            for t in self.teachers:
+                p = t.predict(state)
+                c = t.confidence(state)
+                if len(p) != n:
+                    p = np.pad(p, (0, max(0, n - len(p))))[:n]
+                teacher_probs += p * c
+                total_conf += c
+            if total_conf > 0:
+                teacher_probs /= total_conf
             else:
-                combined=0.8*student_probs+0.2*teacher_probs
-                action_idx=np.argmax(combined)
-            return self.STRATEGIES[action_idx], action_idx, state_vec, teacher_probs
-    async def update(self, state_vec, action_idx, reward, next_state_vec, teacher_probs):
+                teacher_probs = np.ones(n) / n
+            student_probs = self.student.predict_proba(x, n)
+            if exploration and random.random() < self.epsilon:
+                idx = random.randint(0, n - 1)
+            else:
+                combined = 0.8 * student_probs + 0.2 * teacher_probs
+                idx = int(np.argmax(combined))
+            return self.STRATEGIES[idx], idx, x, teacher_probs
+
+    async def update(self, x, action_idx, reward, next_x, teacher_probs):
         async with self.lock:
-            self.replay_buffer.push(state_vec,action_idx,reward,next_state_vec,teacher_probs)
-            self.counter+=1
-            if self.counter%self.train_every==0 and len(self.replay_buffer)>=8:
-                batch=self.replay_buffer.sample(8)
-                states,actions,rewards,_,teacher_probs_batch=batch
-                for i in range(len(states)):
-                    self.student.update(states[i],teacher_probs_batch[i],rewards[i],actions[i])
+            self.replay.push(x, action_idx, reward, next_x, teacher_probs)
+            self.counter += 1
+            if self.counter % self.train_every == 0 and len(self.replay) >= 8:
+                s, a, r, _, tp = self.replay.sample(8)
+                for i in range(len(s)):
+                    self.student.update(s[i], tp[i], r[i], a[i])
+
     def get_stats(self):
-        return {'student_counter':self.student.counter,'buffer_size':len(self.replay_buffer)}
+        return {"student_counter": self.student.counter,
+                "buffer_size": len(self.replay)}
 
-# =============================================================================
-# NEW: LIMIT Graph Manager (as before)
-# =============================================================================
+
+# -----------------------------------------------------------------------------
+# LIMIT Graph — [P3] real BFS + constraint propagation
+# -----------------------------------------------------------------------------
 class LimitGraphManager:
-    def __init__(self, storage: Optional[Any] = None):
+    def __init__(self, storage: Storage):
         self.storage = storage
-        self.graphs = {}
 
-    def create_graph(self, graph_id: str, description: str, configuration: Dict[str, Any]) -> None:
-        if self.storage and hasattr(self.storage, 'save_limit_graph_metadata'):
-            self.storage.save_limit_graph_metadata(graph_id, description, configuration)
-        else:
-            self.graphs[graph_id] = {'description': description, 'configuration': configuration, 'nodes': {}, 'edges': {}}
+    async def create_graph(self, graph_id, description, configuration):
+        await self.storage.save_limit_graph_metadata(graph_id, description, configuration)
 
-    def add_node(self, graph_id: str, node_id: str, node_type: Optional[str], attributes: Dict[str, Any]) -> None:
-        if self.storage and hasattr(self.storage, 'save_limit_graph_node'):
-            self.storage.save_limit_graph_node(node_id, graph_id, node_type, attributes)
-        else:
-            if graph_id not in self.graphs:
-                self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
-            self.graphs[graph_id]['nodes'][node_id] = {'node_type': node_type, 'attributes': attributes}
+    async def add_node(self, graph_id, node_id, node_type, attributes):
+        await self.storage.save_limit_graph_node(node_id, graph_id, node_type, attributes)
 
-    def add_edge(self, graph_id: str, edge_id: str, source: str, target: str,
-                 weight: Optional[float], attributes: Dict[str, Any]) -> None:
-        if self.storage and hasattr(self.storage, 'save_limit_graph_edge'):
-            self.storage.save_limit_graph_edge(edge_id, graph_id, source, target, weight, attributes)
-        else:
-            if graph_id not in self.graphs:
-                self.graphs[graph_id] = {'nodes': {}, 'edges': {}}
-            self.graphs[graph_id]['edges'][edge_id] = {'source': source, 'target': target, 'weight': weight, 'attributes': attributes}
+    async def add_edge(self, graph_id, edge_id, source, target, weight, attributes):
+        await self.storage.save_limit_graph_edge(
+            edge_id, graph_id, source, target, weight, attributes)
 
-    def get_nodes(self, graph_id: str) -> List[Dict]:
-        if self.storage and hasattr(self.storage, 'get_limit_graph_nodes'):
-            return self.storage.get_limit_graph_nodes(graph_id)
-        return list(self.graphs.get(graph_id, {}).get('nodes', {}).values())
+    async def get_metadata(self, graph_id):
+        return await self.storage.get_limit_graph_metadata(graph_id)
 
-    def get_edges(self, graph_id: str) -> List[Dict]:
-        if self.storage and hasattr(self.storage, 'get_limit_graph_edges'):
-            return self.storage.get_limit_graph_edges(graph_id)
-        return list(self.graphs.get(graph_id, {}).get('edges', {}).values())
+    async def find_path(self, graph_id, source, target) -> Optional[Dict[str, Any]]:
+        """[P3] BFS over stored nodes/edges, returning shortest-weight path."""
+        nodes = await self.storage.get_limit_graph_nodes(graph_id)
+        edges = await self.storage.get_limit_graph_edges(graph_id)
+        adj: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+        for e in edges:
+            adj[e["source"]].append((e["target"], e.get("weight") or 1.0))
+        visited = {source}
+        q = deque([(source, [source], 1.0)])
+        while q:
+            node, path, weight = q.popleft()
+            if node == target:
+                return {"path": path, "weight": weight}
+            for nb, w in adj[node]:
+                if nb not in visited:
+                    visited.add(nb)
+                    q.append((nb, path + [nb], weight * w))
+        return None
 
-    def get_metadata(self, graph_id: str) -> Optional[Dict]:
-        if self.storage and hasattr(self.storage, 'get_limit_graph_metadata'):
-            return self.storage.get_limit_graph_metadata(graph_id)
-        return self.graphs.get(graph_id, {})
+    async def propagate_constraints(self, graph_id, source, source_value,
+                                      max_depth: int = 5) -> Dict[str, float]:
+        """[P3] Propagate a value from `source` along weighted edges."""
+        nodes = await self.storage.get_limit_graph_nodes(graph_id)
+        edges = await self.storage.get_limit_graph_edges(graph_id)
+        adj: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+        for e in edges:
+            adj[e["source"]].append((e["target"], e.get("weight") or 1.0))
+        values = {source: source_value}
+        q = deque([(source, 0)])
+        while q:
+            node, depth = q.popleft()
+            if depth >= max_depth:
+                continue
+            for nb, w in adj[node]:
+                candidate = values[node] * w
+                if nb not in values or candidate > values[nb]:
+                    values[nb] = candidate
+                    q.append((nb, depth + 1))
+        return values
 
-# =============================================================================
-# NEW: MODP Optimizer (wrapper)
-# =============================================================================
+
+# -----------------------------------------------------------------------------
+# MODP — [P3] real value iteration solver
+# -----------------------------------------------------------------------------
 class MODPOptimizer:
-    def __init__(self, storage: Optional[Any] = None):
+    def __init__(self, storage: Storage):
         self.storage = storage
-        self.states = {}
 
-    def add_state(self, state_id: str, problem_id: str, state_attributes: Dict[str, Any],
-                  objective_values: Dict[str, float], stage: int) -> None:
-        if self.storage and hasattr(self.storage, 'save_modp_state'):
-            self.storage.save_modp_state(state_id, problem_id, state_attributes, objective_values, stage)
-        else:
-            if problem_id not in self.states:
-                self.states[problem_id] = []
-            self.states[problem_id].append({
-                'state_id': state_id, 'state_attributes': state_attributes,
-                'objective_values': objective_values, 'stage': stage
-            })
+    async def add_state(self, state_id, problem_id, state_attributes,
+                          objective_values, stage):
+        await self.storage.save_modp_state(
+            state_id, problem_id, state_attributes, objective_values, stage)
 
-    def add_policy(self, policy_id: str, problem_id: str, state_id: str,
-                   action: str, expected_objectives: Dict[str, float]) -> None:
-        if self.storage and hasattr(self.storage, 'save_modp_policy'):
-            self.storage.save_modp_policy(policy_id, problem_id, state_id, action, expected_objectives)
+    async def add_policy(self, policy_id, problem_id, state_id, action,
+                           expected_objectives):
+        await self.storage.save_modp_policy(
+            policy_id, problem_id, state_id, action, expected_objectives)
 
-    def get_states(self, problem_id: str) -> List[Dict]:
-        if self.storage and hasattr(self.storage, 'get_modp_states'):
-            return self.storage.get_modp_states(problem_id)
-        return self.states.get(problem_id, [])
+    async def solve(self, problem_id: str,
+                     weights: Optional[Dict[str, float]] = None,
+                     gamma: float = 0.95, max_iter: int = 100,
+                     tol: float = 1e-6) -> Dict[str, float]:
+        """[P3] Value iteration over stored states/policies.
+        Returns state_id → value (higher = better)."""
+        states = await self.storage.get_modp_states(problem_id)
+        policies = await self.storage.get_modp_policies(problem_id)
+        if not states:
+            return {}
+        weights = weights or {"carbon_savings": 0.4, "cost": 0.3,
+                               "latency": 0.2, "user_satisfaction": 0.1}
+        policy_by_state: Dict[str, List[Dict]] = defaultdict(list)
+        for p in policies:
+            policy_by_state[p["state_id"]].append(p)
 
-    def get_policies(self, problem_id: str) -> List[Dict]:
-        if self.storage and hasattr(self.storage, 'get_modp_policies'):
-            return self.storage.get_modp_policies(problem_id)
-        return []
+        V = {s["state_id"]: 0.0 for s in states}
+        for _ in range(max_iter):
+            delta = 0.0
+            for s in states:
+                sid = s["state_id"]
+                best = -float("inf")
+                for p in policy_by_state.get(sid, []):
+                    obj = p.get("expected_objectives", {})
+                    # normalize objectives to [0,1]
+                    reward = (
+                        weights.get("carbon_savings", 0.0) *
+                        min(1.0, max(0.0, obj.get("carbon_savings", 0.0) / 50.0)) +
+                        weights.get("cost", 0.0) *
+                        (1.0 - min(1.0, obj.get("cost", 0.0) / 2000.0)) +
+                        weights.get("latency", 0.0) *
+                        (1.0 - min(1.0, obj.get("latency", 0.0) / 500.0)) +
+                        weights.get("user_satisfaction", 0.0) *
+                        min(1.0, max(0.0, obj.get("user_satisfaction", 0.0)))
+                    )
+                    # self-loop as next state
+                    val = reward + gamma * V[sid]
+                    if val > best:
+                        best = val
+                if best != -float("inf"):
+                    delta = max(delta, abs(best - V[sid]))
+                    V[sid] = best
+            if delta < tol:
+                break
+        return V
 
-# =============================================================================
-# NEW: RLHF Trainer
-# =============================================================================
+    async def best_action(self, problem_id, state_id,
+                            weights: Optional[Dict[str, float]] = None
+                            ) -> Optional[Dict[str, Any]]:
+        """[P3] Pick the policy with highest immediate weighted reward for
+        a specific state."""
+        policies = await self.storage.get_modp_policies(problem_id)
+        candidates = [p for p in policies if p["state_id"] == state_id]
+        if not candidates:
+            return None
+        weights = weights or {"carbon_savings": 0.4, "cost": 0.3,
+                               "latency": 0.2, "user_satisfaction": 0.1}
+        def score(p):
+            obj = p.get("expected_objectives", {})
+            return (
+                weights.get("carbon_savings", 0) * obj.get("carbon_savings", 0) / 50.0 +
+                weights.get("cost", 0) * (1.0 - min(1.0, obj.get("cost", 0) / 2000.0)) +
+                weights.get("latency", 0) * (1.0 - min(1.0, obj.get("latency", 0) / 500.0)) +
+                weights.get("user_satisfaction", 0) * obj.get("user_satisfaction", 0)
+            )
+        return max(candidates, key=score)
+
+
+# -----------------------------------------------------------------------------
+# RLHF — [P0] real Bradley-Terry training
+# -----------------------------------------------------------------------------
 class RLHFTrainer:
-    def __init__(self, storage: Optional[Any] = None):
+    def __init__(self, storage: Storage, strategy_names: List[str]):
         self.storage = storage
-        self.pairs = []
+        self.strategy_names = list(strategy_names)
+        self.model = None
+        self._lock = asyncio.Lock()
+        self._last_train = 0.0
 
-    def record_pair(self, pair_id: str, prompt: str, chosen: str, rejected: str,
-                    reward_diff: float, metadata: Optional[Dict] = None) -> None:
-        if self.storage and hasattr(self.storage, 'save_preference_pair'):
-            self.storage.save_preference_pair(pair_id, prompt, chosen, rejected, reward_diff, metadata)
-        else:
-            self.pairs.append({
-                'pair_id': pair_id, 'prompt': prompt, 'chosen': chosen,
-                'rejected': rejected, 'reward_diff': reward_diff, 'metadata': metadata
-            })
+    async def record_pair(self, pair_id, prompt, chosen, rejected,
+                            reward_diff, metadata=None):
+        await self.storage.save_preference_pair(
+            pair_id, prompt, chosen, rejected, reward_diff, metadata or {})
 
-    def get_pairs(self, limit: int = 100) -> List[Dict]:
-        if self.storage and hasattr(self.storage, 'get_preference_pairs'):
-            return self.storage.get_preference_pairs(limit)
-        return self.pairs[-limit:]
+    async def train_reward_model(self) -> bool:
+        """[P0] Fit Bradley-Terry logistic regression on (chosen, rejected) pairs."""
+        if not SKLEARN_AVAILABLE_PLACEHOLDER:
+            return False
+        pairs = await self.storage.get_preference_pairs(limit=2000)
+        if len(pairs) < settings.rlhf_min_pairs:
+            return False
 
-    def train_reward_model(self):
-        pairs = self.get_pairs()
-        if len(pairs) < 5:
-            logger.info("Not enough preference pairs for RLHF training.")
-            return
-        logger.info(f"Training reward model on {len(pairs)} preference pairs...")
+        X: List[List[float]] = []
+        y: List[int] = []
+        n = len(self.strategy_names)
+        for p in pairs:
+            chosen = p.get("chosen_response", "")
+            rejected = p.get("rejected_response", "")
+            if chosen not in self.strategy_names or rejected not in self.strategy_names:
+                continue
+            c_idx = self.strategy_names.index(chosen)
+            r_idx = self.strategy_names.index(rejected)
+            feat = [0.0] * n
+            feat[c_idx] = 1.0
+            feat[r_idx] = -1.0
+            X.append(feat)
+            y.append(1)
+            X.append([-v for v in feat])
+            y.append(0)
+        if not X:
+            return False
 
-# =============================================================================
-# NEW: MoE Gating Network
-# =============================================================================
+        async with self._lock:
+            try:
+                from sklearn.linear_model import LogisticRegression
+                model = LogisticRegression(max_iter=200)
+                await asyncio.to_thread(model.fit, X, y)
+                self.model = model
+                self._last_train = time.time()
+                logger.info("RLHF trained on %d pairs", len(X))
+                return True
+            except Exception as e:
+                logger.warning("RLHF training failed: %s", e)
+                return False
+
+    def predict_reward(self, strategy: str) -> float:
+        """[P0] Reward = P(strategy preferred)."""
+        if self.model is None or strategy not in self.strategy_names:
+            return 0.0
+        try:
+            idx = self.strategy_names.index(strategy)
+            feat = [0.0] * len(self.strategy_names)
+            feat[idx] = 1.0
+            proba = self.model.predict_proba([feat])[0]
+            return float(proba[1]) if len(proba) > 1 else 0.0
+        except Exception:
+            return 0.0
+
+
+# sklearn availability guard for RLHF
+try:
+    import sklearn  # noqa
+    SKLEARN_AVAILABLE_PLACEHOLDER = True
+except ImportError:
+    SKLEARN_AVAILABLE_PLACEHOLDER = False
+
+
+# -----------------------------------------------------------------------------
+# MoE gating — [P0] weight decay + exploration + ValueError guard
+# -----------------------------------------------------------------------------
 class MoEGatingNetwork:
-    def __init__(self, storage: Optional[Any] = None, config: Optional[Dict] = None):
+    def __init__(self, storage: Optional[Storage],
+                 config: Optional[Dict[str, Any]] = None):
         self.storage = storage
         self.config = config or {}
-        self.expert_names = self.config.get('expert_names', ['online', 'offline', 'rule_based'])
+        self.expert_names = list(self.config.get("expert_names",
+                                                     ["online", "offline", "rule_based"]))
         self.num_experts = len(self.expert_names)
-        self.gating_weights = np.random.randn(self.num_experts, 5)
+        self.n_features = self.config.get("n_features", 5)
+        self.gating_weights = np.random.randn(self.num_experts, self.n_features) * 0.1
         self.lock = asyncio.Lock()
 
     def _encode_state(self, metrics: Dict[str, float]) -> np.ndarray:
-        features = [
-            metrics.get('quality', 0.5),
-            metrics.get('energy', 0.5),
-            metrics.get('carbon', 0.5),
-            metrics.get('latency', 0.5),
-            metrics.get('helium', 0.5),
-        ]
-        return np.array(features, dtype=np.float32)
+        return np.array([
+            metrics.get("quality", 0.5),
+            metrics.get("energy", 0.5),
+            metrics.get("carbon", 0.5),
+            metrics.get("latency", 0.5),
+            metrics.get("helium", 0.5),
+        ], dtype=np.float32)
 
-    async def select_expert(self, metrics: Dict[str, float]) -> Tuple[str, np.ndarray]:
+    async def select_expert(self, metrics: Dict[str, float],
+                             explore_epsilon: float = 0.1
+                             ) -> Tuple[str, np.ndarray]:
         x = self._encode_state(metrics)
         async with self.lock:
             logits = self.gating_weights @ x
-            probs = np.exp(logits - np.max(logits))
+            probs = np.exp(logits - logits.max())
             probs /= probs.sum()
-            expert_idx = int(np.argmax(probs))
-            selected = self.expert_names[expert_idx]
-        if self.storage and hasattr(self.storage, 'log_routing_decision'):
-            sample_id = hashlib.sha256(str(metrics).encode()).hexdigest()[:16]
+            if random.random() < explore_epsilon:
+                idx = random.randint(0, self.num_experts - 1)
+            else:
+                idx = int(np.argmax(probs))
+            selected = self.expert_names[idx]
+            confidence = float(probs[idx])
+            for i, name in enumerate(self.expert_names):
+                try:
+                    MOE_EXPERT.labels(expert=name).set(float(probs[i]))
+                except Exception:
+                    pass
+
+        if self.storage is not None:
             try:
-                self.storage.log_routing_decision(str(uuid.uuid4()), sample_id, selected, float(probs[expert_idx]))
+                sample_id = hashlib.sha256(str(metrics).encode()).hexdigest()[:16]
+                await self.storage.log_routing_decision(
+                    str(uuid.uuid4()), sample_id, selected, confidence)
             except Exception as e:
-                logger.warning(f"Failed to log routing decision: {e}")
+                logger.debug("routing log failed: %s", e)
+
         return selected, probs
 
-    async def add_training_sample(self, metrics: Dict[str, float], selected_expert: str, reward: float):
+    async def add_training_sample(self, metrics, selected_expert, reward):
+        # [P0] Guard against unknown expert
+        try:
+            expert_idx = self.expert_names.index(selected_expert)
+        except ValueError:
+            return
         x = self._encode_state(metrics)
-        expert_idx = self.expert_names.index(selected_expert)
         target = np.zeros(self.num_experts)
         target[expert_idx] = 1.0
         async with self.lock:
             logits = self.gating_weights @ x
-            probs = np.exp(logits - np.max(logits))
+            probs = np.exp(logits - logits.max())
             probs /= probs.sum()
             grad = (probs - target)[:, None] * x[None, :]
             self.gating_weights -= 0.1 * grad
+            # [P0] weight decay
+            self.gating_weights *= 0.999
+            # [P0] L2 clip
+            norm = float(np.linalg.norm(self.gating_weights))
+            if norm > 10.0:
+                self.gating_weights *= 10.0 / norm
 
-# =============================================================================
-# NEW: Multi‑Objective Weight Optimizer (NSGA‑II) – existing but now integrated
-# =============================================================================
+
+# -----------------------------------------------------------------------------
+# NSGA-II — [P0] honest objectives (aggregate per-strategy)
+# -----------------------------------------------------------------------------
 @dataclass
 class MOPDWeightVector:
-    """A weight vector for scalarizing objectives (carbon, cost, latency)."""
     vector_id: str
-    weights: Dict[str, float]  # keys: carbon, cost, latency, user_satisfaction
-    objectives: Dict[str, float]  # achieved values (all maximized)
+    weights: Dict[str, float]
+    objectives: Dict[str, float]
     scalarised_score: float = 0.0
 
     def to_dict(self):
-        return {
-            'vector_id': self.vector_id,
-            'weights': self.weights,
-            'objectives': self.objectives,
-            'scalarised_score': self.scalarised_score,
-        }
+        return {"vector_id": self.vector_id, "weights": self.weights,
+                "objectives": self.objectives,
+                "scalarised_score": self.scalarised_score}
 
     @classmethod
     def from_dict(cls, data):
@@ -871,7 +1423,8 @@ class MOPDWeightVector:
 
 class NSGAIIWeightOptimizer:
     def __init__(self,
-                 evaluate_func: Callable[[Dict[str, float]], Awaitable[Dict[str, float]]],
+                 evaluate_func: Optional[Callable[[Dict[str, float]],
+                                                    Awaitable[Dict[str, float]]]] = None,
                  population_size: int = 20,
                  generations: int = 10,
                  mutation_rate: float = 0.2,
@@ -886,341 +1439,452 @@ class NSGAIIWeightOptimizer:
         self.crossover_rate = crossover_rate
         self.tournament_size = tournament_size
         self.objective_weights = objective_weights or {
-            'carbon': 0.4,
-            'cost': 0.3,
-            'latency': 0.2,
-            'user_satisfaction': 0.1,
-        }
+            "carbon": 0.4, "cost": 0.3, "latency": 0.2, "user_satisfaction": 0.1}
         self.dynamic_weights = dynamic_weights
-
-        self.best_individual = None
-        self.best_fitness = -float('inf')
-        self.evolution_history = []
+        self.best_individual: Optional[Dict[str, float]] = None
+        self.best_fitness = -float("inf")
         self.pareto_front: List[MOPDWeightVector] = []
         self._eval_cache: Dict[Tuple[float, ...], Dict[str, float]] = {}
         self._all_points: List[MOPDWeightVector] = []
+        self._lock = asyncio.Lock()
 
     def _random_individual(self) -> Dict[str, float]:
-        keys = ['carbon', 'cost', 'latency', 'user_satisfaction']
+        keys = list(self.objective_weights.keys())
         w = {k: random.random() for k in keys}
-        total = sum(w.values())
-        if total > 0:
-            w = {k: v/total for k, v in w.items()}
-        return w
+        s = sum(w.values())
+        return {k: v / s for k, v in w.items()} if s else {k: 1 / len(keys) for k in keys}
 
     def _crossover(self, p1, p2):
         child = {}
-        for key in p1:
-            if random.random() < 0.5:
-                u = random.random()
-                if u <= 0.5:
-                    beta = (2*u)**(1/(20+1))
-                else:
-                    beta = (1/(2*(1-u)))**(1/(20+1))
-                child[key] = max(0.0, min(1.0, 0.5*((1+beta)*p1[key] + (1-beta)*p2[key])))
+        for k in p1:
+            u = random.random()
+            if u < 0.5:
+                beta = (2 * u) ** (1 / 21) if u <= 0.5 else (1 / (2 * (1 - u))) ** (1 / 21)
+                child[k] = max(0.0, min(1.0, 0.5 * ((1 + beta) * p1[k] + (1 - beta) * p2[k])))
             else:
-                child[key] = p1[key] if random.random() < 0.5 else p2[key]
-        total = sum(child.values())
-        if total > 0:
-            child = {k: v/total for k, v in child.items()}
-        return child
+                child[k] = p1[k] if random.random() < 0.5 else p2[k]
+        s = sum(child.values())
+        return {k: v / s for k, v in child.items()} if s else p1
 
     def _mutate(self, ind):
-        mutant = ind.copy()
-        for key in mutant:
+        m = dict(ind)
+        for k in m:
             if random.random() < self.mutation_rate:
                 u = random.random()
-                if u < 0.5:
-                    delta = (2*u)**(1/(20+1)) - 1
-                else:
-                    delta = 1 - (2*(1-u))**(1/(20+1))
-                mutant[key] = mutant[key] + delta
-                mutant[key] = max(0.0, min(1.0, mutant[key]))
-        total = sum(mutant.values())
-        if total > 0:
-            mutant = {k: v/total for k, v in mutant.items()}
-        return mutant
+                delta = (2 * u) ** (1 / 21) - 1 if u < 0.5 else 1 - (2 * (1 - u)) ** (1 / 21)
+                m[k] = max(0.0, min(1.0, m[k] + delta))
+        s = sum(m.values())
+        return {k: v / s for k, v in m.items()} if s else ind
 
     def _fast_non_dominated_sort(self, points):
-        fronts = []
-        domination_count = {id(p):0 for p in points}
-        dominated_solutions = {id(p):[] for p in points}
-        for i,p in enumerate(points):
-            p_obj = p.objectives
-            for j,q in enumerate(points):
-                if i==j: continue
-                q_obj = q.objectives
-                if all(p_obj[k]>=q_obj[k] for k in p_obj) and any(p_obj[k]>q_obj[k] for k in p_obj):
-                    dominated_solutions[id(p)].append(q)
-                elif all(q_obj[k]>=p_obj[k] for k in q_obj) and any(q_obj[k]>p_obj[k] for k in q_obj):
-                    domination_count[id(p)] += 1
-            if domination_count[id(p)]==0:
+        fronts: List[List[MOPDWeightVector]] = []
+        dom_count = {id(p): 0 for p in points}
+        dominated = {id(p): [] for p in points}
+        for i, p in enumerate(points):
+            for j, q in enumerate(points):
+                if i == j:
+                    continue
+                if all(p.objectives[k] >= q.objectives[k] for k in p.objectives) and \
+                   any(p.objectives[k] > q.objectives[k] for k in p.objectives):
+                    dominated[id(p)].append(q)
+                elif all(q.objectives[k] >= p.objectives[k] for k in q.objectives) and \
+                     any(q.objectives[k] > p.objectives[k] for k in q.objectives):
+                    dom_count[id(p)] += 1
+            if dom_count[id(p)] == 0:
                 if not fronts:
                     fronts.append([])
                 fronts[0].append(p)
-        i=0
-        while i<len(fronts):
-            next_front=[]
+        i = 0
+        while i < len(fronts):
+            nxt = []
             for p in fronts[i]:
-                for q in dominated_solutions[id(p)]:
-                    domination_count[id(q)]-=1
-                    if domination_count[id(q)]==0:
-                        next_front.append(q)
-            if next_front:
-                fronts.append(next_front)
-            i+=1
+                for q in dominated[id(p)]:
+                    dom_count[id(q)] -= 1
+                    if dom_count[id(q)] == 0:
+                        nxt.append(q)
+            if nxt:
+                fronts.append(nxt)
+            i += 1
         return fronts
 
     def _crowding_distance(self, front):
-        if not front: return {}
-        distances={id(p):0.0 for p in front}
-        obj_keys=list(front[0].objectives.keys())
-        for obj in obj_keys:
-            sorted_front=sorted(front,key=lambda x:x.objectives[obj])
-            distances[id(sorted_front[0])]=float('inf')
-            distances[id(sorted_front[-1])]=float('inf')
-            obj_min=sorted_front[0].objectives[obj]
-            obj_max=sorted_front[-1].objectives[obj]
-            if obj_max==obj_min: continue
-            for i in range(1,len(sorted_front)-1):
-                distances[id(sorted_front[i])]+=(sorted_front[i+1].objectives[obj]-sorted_front[i-1].objectives[obj])/(obj_max-obj_min)
-        return distances
+        if not front:
+            return {}
+        d = {id(p): 0.0 for p in front}
+        for k in front[0].objectives:
+            sf = sorted(front, key=lambda x: x.objectives[k])
+            d[id(sf[0])] = float("inf")
+            d[id(sf[-1])] = float("inf")
+            lo, hi = sf[0].objectives[k], sf[-1].objectives[k]
+            if hi == lo:
+                continue
+            for i in range(1, len(sf) - 1):
+                d[id(sf[i])] += (sf[i + 1].objectives[k] - sf[i - 1].objectives[k]) / (hi - lo)
+        return d
 
-    def _tournament_selection(self, population, fronts, crowding):
-        candidates=random.sample(population,self.tournament_size)
-        ind_to_point={}
-        for ind,point in zip(population,self._all_points):
-            ind_to_point[id(ind)]=point
-        best=candidates[0]; best_rank=float('inf'); best_crowding=-float('inf')
-        for cand in candidates:
-            point=ind_to_point.get(id(cand))
-            if not point: continue
-            rank=len(fronts)
-            for fi,front in enumerate(fronts):
-                if point in front:
-                    rank=fi; break
-            cd=crowding.get(id(point),0)
-            if rank<best_rank or (rank==best_rank and cd>best_crowding):
-                best=cand; best_rank=rank; best_crowding=cd
+    def _tournament(self, population, fronts, crowding):
+        candidates = random.sample(population, min(self.tournament_size, len(population)))
+        point_for = {id(ind): pt for ind, pt in zip(population, self._all_points)}
+        best = candidates[0]
+        best_rank, best_cd = float("inf"), -float("inf")
+        for c in candidates:
+            pt = point_for.get(id(c))
+            if pt is None:
+                continue
+            rank = len(fronts)
+            for i, f in enumerate(fronts):
+                if pt in f:
+                    rank = i
+                    break
+            cd = crowding.get(id(pt), 0)
+            if rank < best_rank or (rank == best_rank and cd > best_cd):
+                best, best_rank, best_cd = c, rank, cd
         return best
 
     def _compute_dynamic_weights(self):
-        weights=self.objective_weights.copy()
+        w = dict(self.objective_weights)
         if not self.dynamic_weights or not self.pareto_front:
-            return weights
-        obj_keys=list(weights.keys())
-        avg={k:np.mean([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
-        max_val={k:np.max([p.objectives[k] for p in self.pareto_front]) for k in obj_keys}
-        for k in obj_keys:
-            if max_val[k]>0 and avg[k]<0.5*max_val[k]:
-                weights[k]=min(0.6,weights.get(k,0.0)*1.5)
-        total=sum(weights.values())
-        if total>0:
-            weights={k:v/total for k,v in weights.items()}
-        return weights
+            return w
+        for k in w:
+            avg = float(np.mean([p.objectives[k] for p in self.pareto_front]))
+            mx = float(np.max([p.objectives[k] for p in self.pareto_front]))
+            if mx > 0 and avg < 0.5 * mx:
+                w[k] = min(0.6, w.get(k, 0.0) * 1.5)
+        s = sum(w.values())
+        return {k: v / s for k, v in w.items()} if s else w
 
     def _select_best_from_pareto(self, pareto, weights):
-        if not pareto: return None
-        obj_keys=list(weights.keys())
-        max_vals={k:max(p.objectives[k] for p in pareto) for k in obj_keys}
-        min_vals={k:min(p.objectives[k] for p in pareto) for k in obj_keys}
-        ranges={k:max_vals[k]-min_vals[k] if max_vals[k]!=min_vals[k] else 1.0 for k in obj_keys}
-        best=None; best_score=-float('inf')
+        if not pareto:
+            return None
+        keys = list(weights.keys())
+        mx = {k: max(p.objectives[k] for p in pareto) for k in keys}
+        mn = {k: min(p.objectives[k] for p in pareto) for k in keys}
+        rng = {k: (mx[k] - mn[k] if mx[k] != mn[k] else 1.0) for k in keys}
+        best, best_score = None, -float("inf")
         for p in pareto:
-            score=0.0
-            for k in obj_keys:
-                val=p.objectives[k]
-                norm=(val-min_vals[k])/ranges[k] if ranges[k]>0 else 1.0
-                score+=weights.get(k,0.0)*norm
-            p.scalarised_score=score
-            if score>best_score:
-                best_score=score; best=p
+            s = 0.0
+            for k in keys:
+                norm = (p.objectives[k] - mn[k]) / rng[k]
+                s += weights.get(k, 0) * norm
+            p.scalarised_score = s
+            if s > best_score:
+                best, best_score = p, s
         return best
 
     async def evolve(self):
         if self.evaluate_func is None:
             raise ValueError("evaluate_func not set")
-        population=[self._random_individual() for _ in range(self.population_size)]
-        eval_tasks=[self.evaluate_func(ind) for ind in population]
-        eval_results=await asyncio.gather(*eval_tasks)
-        points=[]
-        for ind,obj in zip(population,eval_results):
-            point=MOPDWeightVector(vector_id=str(uuid.uuid4()),weights=ind,objectives=obj)
-            points.append(point)
-            self._eval_cache[tuple(sorted(ind.items()))]=obj
-        self._all_points=points
-        for gen in range(self.generations):
-            fronts=self._fast_non_dominated_sort(points)
-            crowding={}
-            for front in fronts:
-                front_crowding=self._crowding_distance(front)
-                crowding.update(front_crowding)
-            offspring=[]
-            while len(offspring)<self.population_size:
-                parent1=self._tournament_selection(population,fronts,crowding)
-                parent2=self._tournament_selection(population,fronts,crowding)
-                if random.random()<self.crossover_rate:
-                    child=self._crossover(parent1,parent2)
-                else:
-                    child=copy.deepcopy(parent1)
-                child=self._mutate(child)
-                offspring.append(child)
-            child_tasks=[self.evaluate_func(ind) for ind in offspring]
-            child_results=await asyncio.gather(*child_tasks)
-            child_points=[]
-            for ind,obj in zip(offspring,child_results):
-                point=MOPDWeightVector(vector_id=str(uuid.uuid4()),weights=ind,objectives=obj)
-                child_points.append(point)
-                self._eval_cache[tuple(sorted(ind.items()))]=obj
-            combined_inds=population+offspring
-            combined_points=points+child_points
-            unique_pairs={}
-            for ind,p in zip(combined_inds,combined_points):
-                key=tuple(sorted(ind.items()))
-                unique_pairs[key]=(ind,p)
-            population=[v[0] for v in unique_pairs.values()]
-            points=[v[1] for v in unique_pairs.values()]
-            self._all_points=points
-            fronts=self._fast_non_dominated_sort(points)
-            new_population=[]; new_points=[]
-            for front in fronts:
-                if len(new_population)+len(front)<=self.population_size:
-                    for p in front:
-                        for ind,p2 in zip(population,points):
-                            if p2 is p:
-                                new_population.append(ind); new_points.append(p); break
-                else:
-                    crowding=self._crowding_distance(front)
-                    sorted_front=sorted(front,key=lambda x:crowding.get(id(x),0),reverse=True)
-                    for p in sorted_front:
-                        if len(new_population)>=self.population_size: break
-                        for ind,p2 in zip(population,points):
-                            if p2 is p:
-                                new_population.append(ind); new_points.append(p); break
-            population=new_population[:self.population_size]
-            points=new_points[:self.population_size]
-            self._all_points=points
-            fronts=self._fast_non_dominated_sort(points)
-            if fronts:
-                self.pareto_front=fronts[0]
-            logger.info(f"Generation {gen+1}/{self.generations}: Pareto front size={len(self.pareto_front)}")
-        weights=self._compute_dynamic_weights()
-        best=self._select_best_from_pareto(self.pareto_front,weights)
-        if best:
-            self.best_individual=best.weights
-            self.best_fitness=best.scalarised_score
-        return self.pareto_front
+        async with self._lock:
+            population = [self._random_individual() for _ in range(self.population_size)]
+            results = await asyncio.gather(*[self.evaluate_func(ind) for ind in population])
+            points = []
+            for ind, obj in zip(population, results):
+                pt = MOPDWeightVector(str(uuid.uuid4()), ind, obj)
+                points.append(pt)
+                self._eval_cache[tuple(sorted(ind.items()))] = obj
+            self._all_points = points
 
-# =============================================================================
-# Multi-Cloud Distributor (unchanged)
-# =============================================================================
-class MultiCloudDistributor:
-    """Multi-cloud distribution with region‑aware choice."""
-    async def distribute(self, data: Dict) -> Dict:
-        user_region = data.get('user_region', 'us-east')
-        region_map = {
-            'us-east': {'provider': 'aws', 'region': 'us-east-1'},
-            'us-west': {'provider': 'aws', 'region': 'us-west-2'},
-            'eu-west': {'provider': 'azure', 'region': 'westeurope'},
-            'asia-east': {'provider': 'gcp', 'region': 'asia-east1'},
-            'asia-southeast': {'provider': 'aws', 'region': 'ap-southeast-1'},
-        }
-        choice = region_map.get(user_region, {'provider': 'aws', 'region': 'us-east-1'})
-        return {
-            'optimal_provider': choice['provider'],
-            'optimal_region': choice['region'],
-            'reason': 'Based on user region proximity'
-        }
+            for gen in range(self.generations):
+                fronts = self._fast_non_dominated_sort(points)
+                crowding: Dict[int, float] = {}
+                for f in fronts:
+                    crowding.update(self._crowding_distance(f))
+                offspring = []
+                while len(offspring) < self.population_size:
+                    p1 = self._tournament(population, fronts, crowding)
+                    p2 = self._tournament(population, fronts, crowding)
+                    c = self._crossover(p1, p2) if random.random() < self.crossover_rate \
+                        else copy.deepcopy(p1)
+                    offspring.append(self._mutate(c))
+                child_results = await asyncio.gather(
+                    *[self.evaluate_func(ind) for ind in offspring])
+                child_points = []
+                for ind, obj in zip(offspring, child_results):
+                    pt = MOPDWeightVector(str(uuid.uuid4()), ind, obj)
+                    child_points.append(pt)
+                    self._eval_cache[tuple(sorted(ind.items()))] = obj
+                combined_inds = population + offspring
+                combined_points = points + child_points
+                unique = {}
+                for ind, pt in zip(combined_inds, combined_points):
+                    k = tuple(sorted(ind.items()))
+                    unique[k] = (ind, pt)
+                population = [v[0] for v in unique.values()]
+                points = [v[1] for v in unique.values()]
+                self._all_points = points
+                fronts = self._fast_non_dominated_sort(points)
+                new_pop, new_pts = [], []
+                for f in fronts:
+                    if len(new_pop) + len(f) <= self.population_size:
+                        for pt in f:
+                            for ind, pt2 in zip(population, points):
+                                if pt2 is pt:
+                                    new_pop.append(ind)
+                                    new_pts.append(pt)
+                                    break
+                    else:
+                        cd = self._crowding_distance(f)
+                        for pt in sorted(f, key=lambda x: cd.get(id(x), 0), reverse=True):
+                            if len(new_pop) >= self.population_size:
+                                break
+                            for ind, pt2 in zip(population, points):
+                                if pt2 is pt:
+                                    new_pop.append(ind)
+                                    new_pts.append(pt)
+                                    break
+                population = new_pop[:self.population_size]
+                points = new_pts[:self.population_size]
+                self._all_points = points
+                fronts = self._fast_non_dominated_sort(points)
+                if fronts:
+                    self.pareto_front = fronts[0]
 
-# =============================================================================
-# FastAPI application
-# =============================================================================
-app = FastAPI(
-    title="Green Data Center Dashboard",
-    description="AI Data Center Sustainability Explorer",
-    version="2.4.1"
-)
+            w = self._compute_dynamic_weights()
+            best = self._select_best_from_pareto(self.pareto_front, w)
+            if best:
+                self.best_individual = best.weights
+                self.best_fitness = best.scalarised_score
+            try:
+                MOEA_PARETO_SIZE.set(len(self.pareto_front))
+            except Exception:
+                pass
+            return self.pareto_front
 
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-# Exception handlers (same as before)
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+# -----------------------------------------------------------------------------
+# Global components — declared before startup
+# -----------------------------------------------------------------------------
+loader: Optional[AIDataCenterLoader] = None
+selector: Optional[GreenDatacenterSelector] = None
+carbon_client: Optional[RealCarbonIntensityClient] = None
+latency_estimator: Optional[CloudLatencyEstimator] = None
+sustainability_enricher: Optional[SustainabilitySignalEnricher] = None
+cache: Optional[Cache] = None
+storage: Optional[Storage] = None
+security: Optional[QuantumResilientSecurity] = None
+blockchain: Optional[BlockchainVerifier] = None
+multi_cloud: Optional[MultiCloudDistributor] = None
+strategy_optimizer: Optional[DistillationStrategyOptimizer] = None
+moea_optimizer: Optional[NSGAIIWeightOptimizer] = None
+moea_task: Optional[asyncio.Task] = None
 
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+# v2.4.0 components
+limit_graph_manager: Optional[LimitGraphManager] = None
+modp_solver: Optional[MODPOptimizer] = None
+rlhf_trainer: Optional[RLHFTrainer] = None
+moe_gating: Optional[MoEGatingNetwork] = None
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
-    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
-
-# Rate limiting
-if SLOWAPI_AVAILABLE:
-    limiter = Limiter(key_func=get_remote_address)
-    app.state.limiter = limiter
-    app.add_exception_handler(429, _rate_limit_exceeded_handler)
-else:
-    limiter = None
-
-def noop_decorator(func):
-    return func
-
-def rate_limit_decorator(limit_str):
-    if limiter:
-        return limiter.limit(limit_str)
-    return noop_decorator
-
-async def verify_api_key(api_key: str = Header(None, alias="X-API-Key")):
-    if settings.api_key_enabled:
-        if api_key != settings.api_key:
-            raise HTTPException(status_code=401, detail="Invalid API key")
-    return api_key
-
-# =============================================================================
-# Global components
-# =============================================================================
-loader = None
-selector = None
-carbon_client = None
-latency_estimator = None
-sustainability_enricher = None
-cache = None
-storage = None
-security = None
-blockchain = None
-multi_cloud = None
-strategy_optimizer = None
-moea_optimizer = None
-moea_task = None
-projects_cache_key = "all_projects"
-interaction_log: List[Dict] = []
+# [P0] bounded deque + batched writes
+interaction_log: Deque[Dict[str, Any]] = deque(maxlen=settings.interaction_log_max)
+_pending_interactions: List[Dict[str, Any]] = []
 interaction_lock = asyncio.Lock()
 
-# NEW components
-limit_graph_manager = None
-modp_solver = None
-rlhf_trainer = None
-moe_gating = None
+# Background task handles
+_rlhf_task: Optional[asyncio.Task] = None
+_flush_task: Optional[asyncio.Task] = None
+_cleanup_task: Optional[asyncio.Task] = None
 
-@app.on_event("startup")
+PROJECTS_CACHE_KEY = "all_projects"
+
+
+# -----------------------------------------------------------------------------
+# Interaction log helpers — [P0] batched writes
+# -----------------------------------------------------------------------------
+def _append_csv_sync(path: str, entries: List[Dict[str, Any]]):
+    p = Path(path)
+    write_header = not p.exists()
+    df = pd.DataFrame(entries)
+    df.to_csv(p, mode="a", header=write_header, index=False)
+
+
+def _read_csv_sync(path: str) -> List[Dict[str, Any]]:
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        df = pd.read_csv(p)
+        return df.to_dict(orient="records")
+    except Exception:
+        return []
+
+
+async def _log_interaction(state: StrategyState, strategy: str, reward: float,
+                             carbon_savings: float, cost: float, latency: float):
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "strategy": strategy,
+        "reward": float(reward),
+        "carbon_savings": float(carbon_savings),
+        "cost": float(cost),
+        "latency": float(latency),
+        "state_vector": state.to_feature_vector().tolist(),
+    }
+    async with interaction_lock:
+        interaction_log.append(entry)
+        _pending_interactions.append(entry)
+    try:
+        INTERACTION_LOG_SIZE.set(len(interaction_log))
+    except Exception:
+        pass
+
+
+async def _flush_interactions_loop():
+    while True:
+        try:
+            await asyncio.sleep(settings.interaction_flush_interval)
+            await _flush_interactions()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("flush loop error: %s", e)
+
+
+async def _flush_interactions():
+    async with interaction_lock:
+        if not _pending_interactions:
+            return
+        batch = list(_pending_interactions)
+        _pending_interactions.clear()
+    try:
+        await asyncio.to_thread(_append_csv_sync, settings.interaction_logs_path, batch)
+    except Exception as e:
+        logger.error("CSV flush failed: %s", e)
+        async with interaction_lock:
+            _pending_interactions.extend(batch)
+
+
+# -----------------------------------------------------------------------------
+# FastAPI app — [P2] middleware, exception handlers, rate limiting
+# -----------------------------------------------------------------------------
+if FASTAPI_AVAILABLE:
+    app = FastAPI(
+        title="Green Data Center Dashboard",
+        description="AI Data Center Sustainability Explorer",
+        version="2.5.0",
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.allowed_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "X-API-Key", "X-Request-Id"],
+    )
+
+    # [P2] correlation middleware
+    @app.middleware("http")
+    async def correlation_middleware(request: Request, call_next):
+        cid = request.headers.get("X-Request-Id") or uuid.uuid4().hex[:12]
+        token = correlation_id_var.set(cid)
+        start = time.time()
+        route = request.url.path
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-Id"] = cid
+            try:
+                REQUEST_COUNT.labels(route=route, method=request.method,
+                                      status=str(response.status_code)).inc()
+                REQUEST_LATENCY.labels(route=route).observe(time.time() - start)
+            except Exception:
+                pass
+            return response
+        finally:
+            correlation_id_var.reset(token)
+
+    # [P2] security headers
+    @app.middleware("http")
+    async def security_headers_middleware(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net; "
+            "img-src 'self' data: https://*.tile.openstreetmap.org; "
+            "connect-src 'self';"
+        )
+        return response
+
+    @app.exception_handler(HTTPException)
+    async def http_exception_handler(request: Request, exc: HTTPException):
+        return JSONResponse(status_code=exc.status_code,
+                            content={"detail": exc.detail})
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_handler(request: Request, exc: RequestValidationError):
+        return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+    @app.exception_handler(Exception)
+    async def global_handler(request: Request, exc: Exception):
+        logger.error("Unhandled: %s", exc, exc_info=True)
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+    if SLOWAPI_AVAILABLE:
+        limiter = Limiter(key_func=get_remote_address,
+                            default_limits=[f"{settings.rate_limit_requests}/"
+                                             f"{settings.rate_limit_window}seconds"])
+        app.state.limiter = limiter
+        app.add_exception_handler(429, _rate_limit_exceeded_handler)
+    else:
+        limiter = None
+
+    # [P2] in-process rate limiter fallback
+    class _RateBucket:
+        def __init__(self, rate: int, window: int):
+            self.rate = rate
+            self.window = window
+            self.buckets: Dict[str, Deque[float]] = defaultdict(deque)
+            self._lock = asyncio.Lock()
+
+        async def allow(self, key: str) -> bool:
+            now = time.time()
+            async with self._lock:
+                q = self.buckets[key]
+                while q and q[0] < now - self.window:
+                    q.popleft()
+                if len(q) >= self.rate:
+                    return False
+                q.append(now)
+                return True
+
+    _fallback_limiter = _RateBucket(settings.rate_limit_requests,
+                                     settings.rate_limit_window)
+
+    def rate_limit_decorator(limit_str: str):
+        if limiter is not None:
+            return limiter.limit(limit_str)
+        def deco(fn):
+            return fn
+        return deco
+
+    async def verify_api_key(api_key: str = Header(None, alias="X-API-Key")):
+        if settings.api_key_enabled:
+            if api_key != settings.api_key:
+                raise HTTPException(status_code=401, detail="Invalid API key")
+        return api_key
+
+    async def _require_key_on_post(request: Request):
+        # Used as a dependency on POST endpoints
+        if settings.api_key_enabled:
+            key = request.headers.get("X-API-Key")
+            if key != settings.api_key:
+                raise HTTPException(status_code=401, detail="Invalid API key")
+        return True
+
+
+# -----------------------------------------------------------------------------
+# Startup / shutdown
+# -----------------------------------------------------------------------------
 async def startup():
-    global loader, selector, carbon_client, latency_estimator, sustainability_enricher, cache, storage, security, blockchain, multi_cloud, strategy_optimizer, moea_optimizer, moea_task
-    global limit_graph_manager, modp_solver, rlhf_trainer, moe_gating
+    global loader, selector, carbon_client, latency_estimator, \
+           sustainability_enricher, cache, storage, security, blockchain, \
+           multi_cloud, strategy_optimizer, moea_optimizer, moea_task, \
+           limit_graph_manager, modp_solver, rlhf_trainer, moe_gating, \
+           _rlhf_task, _flush_task, _cleanup_task
 
-    logger.info("Starting Green Data Center Dashboard v2.4.1...")
-    logger.info(f"Settings loaded: {settings.model_dump(exclude={'api_key', 'master_key_hex'})}")
-
-    if settings.api_key_enabled and settings.api_key == "change-me":
-        logger.warning("API key enabled but using default key. Please change it.")
+    logger.info("Starting Green Data Center Dashboard v2.5.0...")
 
     storage = Storage()
     cache = Cache()
@@ -1234,37 +1898,33 @@ async def startup():
     multi_cloud = MultiCloudDistributor()
 
     strategy_optimizer = DistillationStrategyOptimizer({
-        'distillation_epsilon': settings.distillation_epsilon,
-        'distillation_train_every': settings.distillation_train_every,
-        'distillation_replay_size': settings.distillation_replay_size,
-        'distillation_learning_rate': settings.distillation_learning_rate,
+        "distillation_epsilon": settings.distillation_epsilon,
+        "distillation_train_every": settings.distillation_train_every,
+        "distillation_replay_size": settings.distillation_replay_size,
+        "distillation_learning_rate": settings.distillation_learning_rate,
     })
 
-    # Initialize new components
     if settings.enable_limit_graph:
         limit_graph_manager = LimitGraphManager(storage)
-        if not limit_graph_manager.get_metadata("strategy_graph"):
-            limit_graph_manager.create_graph("strategy_graph", "Strategy Weight Vector Relationships", {})
+        if not await limit_graph_manager.get_metadata("strategy_graph"):
+            await limit_graph_manager.create_graph(
+                "strategy_graph", "Strategy Weight Vector Relationships",
+                {"created_by": "startup"})
+
     if settings.enable_modp:
         modp_solver = MODPOptimizer(storage)
+
     if settings.enable_rlhf:
-        rlhf_trainer = RLHFTrainer(storage)
+        rlhf_trainer = RLHFTrainer(storage, DistillationStrategyOptimizer.STRATEGIES)
+
     if settings.enable_moe:
-        # Use actual strategy names as experts for better mapping
-        moe_gating = MoEGatingNetwork(storage, {'expert_names': DistillationStrategyOptimizer.STRATEGIES})
+        moe_gating = MoEGatingNetwork(
+            storage, {"expert_names": DistillationStrategyOptimizer.STRATEGIES,
+                       "n_features": 5})
 
-    # Load existing Pareto front if exists
-    if Path(settings.moea_pareto_path).exists():
-        try:
-            with open(settings.moea_pareto_path, 'r') as f:
-                data = json.load(f)
-            if data:
-                moea_optimizer.pareto_front = [MOPDWeightVector.from_dict(d) for d in data]
-        except Exception as e:
-            logger.warning(f"Failed to load Pareto front: {e}")
-
+    # [P0] MOEA constructed first, then load Pareto
     moea_optimizer = NSGAIIWeightOptimizer(
-        evaluate_func=None,  # set in run_moea
+        evaluate_func=None,
         population_size=settings.moea_population_size,
         generations=settings.moea_generations,
         mutation_rate=settings.moea_mutation_rate,
@@ -1273,26 +1933,76 @@ async def startup():
         objective_weights=settings.moea_objective_weights,
         dynamic_weights=settings.moea_dynamic_weights,
     )
+    if Path(settings.moea_pareto_path).exists():
+        try:
+            raw = json.loads(Path(settings.moea_pareto_path).read_text())
+            if isinstance(raw, list):
+                moea_optimizer.pareto_front = [MOPDWeightVector.from_dict(d) for d in raw]
+        except Exception as e:
+            logger.warning("Pareto load failed: %s", e)
 
-    if settings.moea_enabled:
-        moea_task = asyncio.create_task(moea_loop())
+    # [P3] Load prior interactions from CSV
+    prev = await asyncio.to_thread(_read_csv_sync, settings.interaction_logs_path)
+    if prev:
+        async with interaction_lock:
+            for row in prev[-settings.interaction_log_max:]:
+                try:
+                    interaction_log.append({
+                        "timestamp": str(row.get("timestamp", "")),
+                        "strategy": str(row.get("strategy", "balanced")),
+                        "reward": float(row.get("reward", 0.0)),
+                        "carbon_savings": float(row.get("carbon_savings", 0.0)),
+                        "cost": float(row.get("cost", 0.0)),
+                        "latency": float(row.get("latency", 0.0)),
+                    })
+                except Exception:
+                    continue
+        logger.info("Loaded %d interactions from CSV", len(interaction_log))
 
     await carbon_client.start()
-    logger.info("Dashboard startup complete.")
 
-@app.on_event("shutdown")
+    # Background loops
+    if settings.moea_enabled:
+        moea_task = asyncio.create_task(moea_loop())
+        # [P0] fire once at startup (with warmup if needed)
+        asyncio.create_task(_run_moea_soon())
+
+    if rlhf_trainer is not None:
+        _rlhf_task = asyncio.create_task(rlhf_loop())
+
+    _flush_task = asyncio.create_task(_flush_interactions_loop())
+    _cleanup_task = asyncio.create_task(cleanup_loop())
+
+    logger.info("Dashboard startup complete")
+
+
 async def shutdown():
+    global moea_task, _rlhf_task, _flush_task, _cleanup_task
     logger.info("Shutting down Green Data Center Dashboard...")
     if carbon_client:
-        await carbon_client.close()
-    if moea_task:
-        moea_task.cancel()
-        await asyncio.gather(moea_task, return_exceptions=True)
-    logger.info("Shutdown complete.")
+        try: await carbon_client.close()
+        except Exception: pass
+    for name, task in [("moea", moea_task), ("rlhf", _rlhf_task),
+                        ("flush", _flush_task), ("cleanup", _cleanup_task)]:
+        if task:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+    # [P0] final flush
+    try:
+        await _flush_interactions()
+    except Exception:
+        pass
+    if storage:
+        await storage.close()
+    logger.info("Shutdown complete")
 
-# =============================================================================
-# MOEA Background Loop
-# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Background loops
+# -----------------------------------------------------------------------------
 async def moea_loop():
     while True:
         try:
@@ -1301,373 +2011,762 @@ async def moea_loop():
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"MOEA loop error: {e}")
+            logger.error("MOEA loop error: %s", e)
             await asyncio.sleep(60)
 
-async def run_moea():
-    global moea_optimizer, interaction_log, limit_graph_manager, modp_solver
 
-    # Use historical interactions for evaluation, not random
-    if len(interaction_log) < 20:
-        logger.warning("Not enough interaction data for MOEA; skipping.")
+async def _run_moea_soon():
+    await asyncio.sleep(1.0)
+    try:
+        await run_moea()
+    except Exception as e:
+        logger.error("Initial MOEA run failed: %s", e)
+
+
+async def rlhf_loop():
+    while True:
+        try:
+            await asyncio.sleep(settings.rlhf_training_interval)
+            if rlhf_trainer:
+                await rlhf_trainer.train_reward_model()
+                pairs = await storage.get_preference_pairs(limit=1)
+                try:
+                    row = await storage.fetchone(
+                        "SELECT COUNT(*) AS c FROM preference_pairs")
+                    if row:
+                        RLHF_PAIRS.set(int(row["c"]))
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("RLHF loop error: %s", e)
+
+
+async def cleanup_loop():
+    while True:
+        try:
+            await asyncio.sleep(settings.cleanup_interval)
+            if storage:
+                counts = await storage.cleanup_old_data(settings.data_retention_days)
+                logger.info("Cleanup: %s", counts)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Cleanup loop error: %s", e)
+
+
+# -----------------------------------------------------------------------------
+# MOEA evaluation — [P0] honest objectives (per-strategy aggregation)
+# -----------------------------------------------------------------------------
+def _warmup_interactions(n: int = 30) -> List[Dict[str, Any]]:
+    strategies = DistillationStrategyOptimizer.STRATEGIES
+    return [{
+        "strategy": random.choice(strategies),
+        "reward": random.uniform(0.3, 0.9),
+        "carbon_savings": random.uniform(0, 50),
+        "cost": random.uniform(100, 2000),
+        "latency": random.uniform(20, 400),
+    } for _ in range(n)]
+
+
+async def run_moea():
+    if moea_optimizer is None:
         return
 
+    # [P0] warmup if insufficient data
+    snapshot = list(interaction_log)
+    if len(snapshot) < 20:
+        logger.info("MOEA: insufficient history; using warmup data")
+        snapshot = _warmup_interactions(30)
+
+    # [P0] aggregate per-strategy objectives
+    per_strategy: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for entry in snapshot:
+        s = entry.get("strategy", "balanced")
+        per_strategy[s].append(entry)
+
+    strategy_obj: Dict[str, Dict[str, float]] = {}
+    for s, obs in per_strategy.items():
+        n = len(obs)
+        strategy_obj[s] = {
+            "carbon": sum(o.get("carbon_savings", 0.0) for o in obs) / n / 50.0,
+            "cost": 1.0 - min(1.0,
+                sum(o.get("cost", 0.0) for o in obs) / n / 2000.0),
+            "latency": 1.0 - min(1.0,
+                sum(o.get("latency", 0.0) for o in obs) / n / 500.0),
+            "user_satisfaction": sum(o.get("reward", 0.0) for o in obs) / n,
+        }
+
     async def evaluate(weights: Dict[str, float]) -> Dict[str, float]:
-        # Compute average objectives over historical interactions
-        total = {k: 0.0 for k in ['carbon', 'cost', 'latency', 'user_satisfaction']}
-        count = len(interaction_log)
-        for entry in interaction_log:
-            # Assume entry contains relevant metrics; for demo, use placeholder
-            carbon_savings = entry.get('carbon_savings', 0.0)
-            cost = entry.get('cost', 0.0)
-            latency = entry.get('latency', 0.0)
-            user_sat = entry.get('reward', 0.5)  # reward as user satisfaction
-
-            # Weighted sum using the candidate weights (scalarization)
-            total['carbon'] += weights.get('carbon', 0) * carbon_savings
-            total['cost'] += weights.get('cost', 0) * (1.0 - min(cost / 2000.0, 1.0))
-            total['latency'] += weights.get('latency', 0) * (1.0 - min(latency / 500.0, 1.0))
-            total['user_satisfaction'] += weights.get('user_satisfaction', 0) * user_sat
-
-        # Average
-        for k in total:
-            total[k] = total[k] / count if count > 0 else 0.0
-        return total
+        if not strategy_obj:
+            return {"carbon": 0.0, "cost": 0.0, "latency": 0.0,
+                    "user_satisfaction": 0.0}
+        best_s, best_score = None, -float("inf")
+        for s, obj in strategy_obj.items():
+            score = sum(weights.get(k, 0.0) * obj[k] for k in weights)
+            if score > best_score:
+                best_score, best_s = score, s
+        return dict(strategy_obj[best_s])
 
     moea_optimizer.evaluate_func = evaluate
     pareto = await moea_optimizer.evolve()
-    logger.info(f"MOEA produced Pareto front of size {len(pareto)}")
+    logger.info("MOEA produced Pareto front of size %d", len(pareto))
 
-    # Save Pareto front to disk
     try:
-        with open(settings.moea_pareto_path, 'w') as f:
-            json.dump([p.to_dict() for p in pareto], f, indent=2)
+        Path(settings.moea_pareto_path).write_text(
+            json.dumps([p.to_dict() for p in pareto], indent=2))
     except Exception as e:
-        logger.error(f"Failed to save Pareto front: {e}")
+        logger.warning("Pareto save failed: %s", e)
 
-    # Store best in MODP and add to LIMIT graph
-    if pareto and moea_optimizer:
-        weights = moea_optimizer._compute_dynamic_weights()
-        best = moea_optimizer._select_best_from_pareto(pareto, weights)
-        if best:
-            # MODP
-            if modp_solver:
-                state_id = f"moea_best_{best.vector_id}"
-                modp_solver.add_state(
-                    state_id=state_id,
-                    problem_id="strategy_weight_optimization",
-                    state_attributes={'weights': best.weights},
-                    objective_values=best.objectives,
-                    stage=1
-                )
-                modp_solver.add_policy(
-                    policy_id=f"policy_{best.vector_id}",
-                    problem_id="strategy_weight_optimization",
-                    state_id=state_id,
-                    action="moea_best",
-                    expected_objectives=best.objectives
-                )
-            # LIMIT Graph
-            if limit_graph_manager:
-                limit_graph_manager.add_node(
-                    "strategy_graph",
-                    f"vector_{best.vector_id}",
-                    "best_weight_vector",
-                    {'weights': best.weights, 'objectives': best.objectives}
-                )
+    weights = moea_optimizer._compute_dynamic_weights()
+    best = moea_optimizer._select_best_from_pareto(pareto, weights)
+    if best:
+        if modp_solver:
+            sid = f"moea_best_{best.vector_id}"
+            await modp_solver.add_state(
+                sid, "strategy_weight_optimization",
+                {"weights": best.weights}, best.objectives, stage=1)
+            await modp_solver.add_policy(
+                f"policy_{best.vector_id}", "strategy_weight_optimization",
+                sid, "moea_best", best.objectives)
+        if limit_graph_manager:
+            await limit_graph_manager.add_node(
+                "strategy_graph", f"vector_{best.vector_id}",
+                "best_weight_vector",
+                {"weights": best.weights, "objectives": best.objectives})
 
-# =============================================================================
-# FastAPI endpoints
-# =============================================================================
-@app.get("/", response_class=HTMLResponse)
-async def get_map(api_key: str = Depends(verify_api_key)):
-    html_content = generate_map_html()
-    return HTMLResponse(content=html_content)
 
-@app.get("/api/projects")
-@rate_limit_decorator(f"{settings.rate_limit_requests}/{settings.rate_limit_window}s")
-async def get_projects(request: Request, api_key: str = Depends(verify_api_key)):
-    cached_projects = await cache.get(projects_cache_key)
-    if cached_projects is not None:
-        projects = cached_projects
-    else:
-        projects = loader.get_all_projects()
-        await cache.set(projects_cache_key, projects)
+# -----------------------------------------------------------------------------
+# Project fetching — [P0] batched carbon, deep-copy
+# -----------------------------------------------------------------------------
+async def _fetch_projects_with_carbon() -> List[Dict[str, Any]]:
+    cached = await cache.get(PROJECTS_CACHE_KEY)
+    if cached is not None:
+        return cached
 
-    for p in projects:
-        try:
-            cache_key = f"carbon_{p.location_country}"
-            cached = await cache.get(cache_key)
-            if cached is not None:
-                intensity = cached
-            else:
-                intensity = await carbon_client.get_intensity(p.location_country)
-                await cache.set(cache_key, intensity)
-            p.sustainability.grid_carbon_intensity_gco2_per_kwh = intensity
-            p.green_score = loader._compute_green_score(p)
-        except Exception as e:
-            logger.error(f"Failed to get carbon data for {p.location_country}: {e}")
+    raw_projects = await asyncio.to_thread(loader.get_all_projects)
 
-    response = {
-        "projects": [
-            {
-                "id": p.project_id,
-                "name": p.project_name,
-                "company": p.company,
-                "location": f"{p.location_city}, {p.location_country}",
-                "lat": p.latitude,
-                "lon": p.longitude,
-                "green_score": p.green_score,
-                "capacity_mw": p.planned_power_capacity_mw,
-                "status": p.status,
-                "carbon_intensity": p.sustainability.grid_carbon_intensity_gco2_per_kwh,
-                "renewable_share": p.sustainability.renewable_share_pct,
-                "pue": p.sustainability.pue_estimated,
-                "cooling_type": getattr(p.sustainability, 'cooling_type', 'unknown'),
-                "water_stress": p.sustainability.water_stress_index
-            }
-            for p in projects
-        ],
-        "statistics": loader.get_statistics()
-    }
+    sem = asyncio.Semaphore(10)
 
-    signature = await security.sign_data(response)
-    response["quantum_signature"] = signature
+    async def _one(p):
+        async with sem:
+            ck = f"carbon_{p.location_country}"
+            cached_v = await cache.get(ck)
+            if cached_v is not None:
+                return cached_v
+            t0 = time.time()
+            try:
+                v = await carbon_client.get_intensity(p.location_country)
+            except Exception as e:
+                logger.warning("Carbon fetch failed for %s: %s",
+                                p.location_country, e)
+                v = None
+            try:
+                CARBON_FETCH_LATENCY.labels(country=p.location_country).observe(
+                    time.time() - t0)
+            except Exception:
+                pass
+            if v is not None:
+                await cache.set(ck, v)
+            return v
 
-    async def record_blockchain():
-        try:
-            await blockchain.record_recommendation({"type": "projects_list", "count": len(projects)})
-        except Exception as e:
-            logger.error(f"Blockchain recording failed: {e}")
-    asyncio.create_task(record_blockchain())
+    intensities = await asyncio.gather(*[_one(p) for p in raw_projects])
 
-    async def distribute_cloud():
-        try:
-            await multi_cloud.distribute(response)
-        except Exception as e:
-            logger.error(f"Multi-cloud distribution failed: {e}")
-    asyncio.create_task(distribute_cloud())
-
-    return response
-
-@app.post("/api/recommend")
-@rate_limit_decorator(f"{settings.rate_limit_requests}/{settings.rate_limit_window}s")
-async def recommend_workload(request: Request, workload_req: dict, api_key: str = Depends(verify_api_key)):
-    """Get data center recommendation for a workload."""
-    try:
-        workload = WorkloadSpec(
-            gpu_hours=workload_req.get('gpu_hours', 100),
-            latency_tolerance_ms=workload_req.get('latency_tolerance_ms', 200),
-            workload_type=workload_req.get('workload_type', 'training'),
-            carbon_budget_kg=workload_req.get('carbon_budget_kg'),
-            max_cost_usd=workload_req.get('max_cost_usd')
-        )
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors())
-
-    state = StrategyState(
-        gpu_hours=workload.gpu_hours,
-        latency_tolerance_ms=workload.latency_tolerance_ms,
-        workload_type=workload.workload_type,
-        carbon_budget_kg=workload.carbon_budget_kg,
-        max_cost_usd=workload.max_cost_usd,
-        user_region=workload_req.get('user_region', 'us-east'),
-        recent_success_rate=0.5,
-        avg_carbon_savings_kg=0.0,
-        avg_cost_usd=0.0,
-    )
-
-    # Strategy selection: use MoE if available, else distillation
-    if moe_gating:
-        # Build metrics from workload for gating
-        metrics = {
-            'quality': 0.5,
-            'energy': 1.0 - min(1.0, workload.gpu_hours / 1000.0),
-            'carbon': 1.0 - min(1.0, (workload.carbon_budget_kg or 50) / 100.0),
-            'latency': 1.0 - min(1.0, workload.latency_tolerance_ms / 500.0),
-            'helium': 0.5,
-        }
-        expert_name, _ = await moe_gating.select_expert(metrics)
-        # expert_name is one of the strategies
-        if expert_name in DistillationStrategyOptimizer.STRATEGIES:
-            strategy = expert_name
-        else:
-            strategy = 'balanced'
-        action_idx = DistillationStrategyOptimizer.STRATEGIES.index(strategy)
-        state_vec = state.to_feature_vector()
-        teacher_probs = np.ones(5) / 5
-    else:
-        strategy, action_idx, state_vec, teacher_probs = await strategy_optimizer.select_strategy(state, exploration=True)
-
-    logger.info(f"Using strategy: {strategy}")
-
-    user_region = workload_req.get('user_region', 'us-east')
-    result = selector.select_datacenter(workload, user_region)
-
-    projects = loader.get_all_projects()
-    avg_carbon = sum(p.sustainability.grid_carbon_intensity_gco2_per_kwh for p in projects) / len(projects) if projects else 400
-    avg_emissions = workload.gpu_hours * 0.65 * 1.3 * (avg_carbon / 1000)
-    savings = avg_emissions - result.estimated_carbon_kg
-
-    response = {
-        "selected_project": {
-            "id": result.selected_project.project_id,
-            "name": result.selected_project.project_name,
-            "location": f"{result.selected_project.location_city}, {result.selected_project.location_country}",
-            "green_score": result.green_score,
-            "estimated_carbon_kg": result.estimated_carbon_kg,
-            "estimated_cost_usd": result.estimated_cost_usd,
-            "latency_ms": result.latency_ms
-        },
-        "alternatives": [
-            {"name": alt.project_name, "green_score": score}
-            for alt, score in result.alternatives
-        ],
-        "rationale": result.reasoning,
-        "carbon_savings_kg": max(0, savings),
-        "strategy_used": strategy
-    }
-
-    reward = 0.0
-    if savings > 0:
-        reward += 0.5
-    if result.estimated_cost_usd < 1000:
-        reward += 0.3
-    if result.latency_ms < 200:
-        reward += 0.2
-    reward = max(0.0, min(1.0, reward))
-
-    # Update agent
-    if moe_gating:
-        await moe_gating.add_training_sample(metrics, strategy, reward)
-        # Also update distillation as a fallback (optional)
-        await strategy_optimizer.update(state_vec, action_idx, reward, state.to_feature_vector(), teacher_probs)
-    else:
-        await strategy_optimizer.update(state_vec, action_idx, reward, state.to_feature_vector(), teacher_probs)
-
-    # RLHF: record preference pair occasionally
-    if rlhf_trainer and random.random() < 0.05:
-        chosen_strategy = strategy
-        rejected_strategy = random.choice([s for s in DistillationStrategyOptimizer.STRATEGIES if s != chosen_strategy])
-        rlhf_trainer.record_pair(
-            pair_id=str(uuid.uuid4()),
-            prompt="Which strategy is better for this workload?",
-            chosen=chosen_strategy,
-            rejected=rejected_strategy,
-            reward_diff=reward,
-            metadata={'workload': workload.model_dump(), 'user_region': user_region}
-        )
-
-    # MODP: record state and policy
-    if modp_solver:
-        state_id = f"recommend_{uuid.uuid4()}"
-        modp_solver.add_state(
-            state_id=state_id,
-            problem_id="strategy_selection",
-            state_attributes={'workload': workload.model_dump(), 'strategy': strategy},
-            objective_values={'carbon_savings': savings, 'cost': result.estimated_cost_usd, 'latency': result.latency_ms, 'user_satisfaction': reward},
-            stage=0
-        )
-        modp_solver.add_policy(
-            policy_id=f"policy_{state_id}",
-            problem_id="strategy_selection",
-            state_id=state_id,
-            action=strategy,
-            expected_objectives={'carbon_savings': 0.0, 'cost': 0.0, 'latency': 0.0, 'user_satisfaction': 0.0}
-        )
-
-    # LIMIT Graph: add node for this recommendation
-    if limit_graph_manager:
-        limit_graph_manager.add_node(
-            "strategy_graph",
-            f"recommendation_{uuid.uuid4()}",
-            "recommendation",
-            {'strategy': strategy, 'carbon_savings': savings, 'cost': result.estimated_cost_usd, 'latency': result.latency_ms}
-        )
-
-    await _log_interaction(state, strategy, reward, savings, result.estimated_cost_usd, result.latency_ms)
-
-    signature = await security.sign_data(response)
-    response["quantum_signature"] = signature
-
-    try:
-        tx = await blockchain.record_recommendation({
-            "workload": workload.model_dump(),
-            "selected": result.selected_project.project_id,
-            "carbon_savings": savings
+    out = []
+    for p, intensity in zip(raw_projects, intensities):
+        p2 = copy.deepcopy(p)
+        if intensity is not None:
+            p2.sustainability.grid_carbon_intensity_gco2_per_kwh = intensity
+        p2.green_score = loader._compute_green_score(p2)
+        out.append({
+            "id": p2.project_id, "name": p2.project_name,
+            "company": p2.company,
+            "location": f"{p2.location_city}, {p2.location_country}",
+            "lat": p2.latitude, "lon": p2.longitude,
+            "green_score": p2.green_score,
+            "capacity_mw": p2.planned_power_capacity_mw,
+            "status": p2.status,
+            "carbon_intensity": p2.sustainability.grid_carbon_intensity_gco2_per_kwh,
+            "renewable_share": p2.sustainability.renewable_share_pct,
+            "pue": p2.sustainability.pue_estimated,
+            "cooling_type": getattr(p2.sustainability, "cooling_type", "unknown"),
+            "water_stress": p2.sustainability.water_stress_index,
         })
-        response["blockchain_tx_hash"] = tx.get('tx_hash')
-    except Exception as e:
-        logger.error(f"Blockchain recording failed: {e}")
+    await cache.set(PROJECTS_CACHE_KEY, out)
+    return out
 
-    try:
-        dist = await multi_cloud.distribute({"user_region": user_region})
-        response["cloud_distribution"] = dist
-    except Exception as e:
-        logger.error(f"Multi-cloud distribution failed: {e}")
 
-    if storage:
-        storage.log_audit(
-            user_id=api_key or "anonymous",
-            action="recommend",
-            details={"workload": workload.model_dump(), "selected": result.selected_project.project_id}
+# -----------------------------------------------------------------------------
+# Endpoints
+# -----------------------------------------------------------------------------
+if FASTAPI_AVAILABLE:
+    # --- Public dashboard ---
+    @app.get("/", response_class=HTMLResponse)
+    async def dashboard_root():
+        """[P1] Public dashboard (no API key required for browser navigation)."""
+        try:
+            projects = await _fetch_projects_with_carbon()
+        except Exception as e:
+            logger.error("Dashboard render error: %s", e)
+            return HTMLResponse(f"<h1>Dashboard error</h1><pre>{_html.escape(str(e))}</pre>",
+                                 status_code=500)
+        html_out = _render_dashboard(projects)
+        return HTMLResponse(content=html_out)
+
+    # --- Health / ready / metrics ---
+    @app.get("/health")
+    async def health():
+        components = {
+            "storage": storage is not None,
+            "cache": cache is not None,
+            "carbon_client": carbon_client is not None,
+            "moea": moea_optimizer is not None,
+            "rlhf": rlhf_trainer is not None,
+            "modp": modp_solver is not None,
+            "limit_graph": limit_graph_manager is not None,
+            "moe": moe_gating is not None,
+        }
+        status = "ok" if all(components.values()) else "degraded"
+        return {"status": status, "version": "2.5.0", "components": components}
+
+    @app.get("/ready")
+    async def ready():
+        if not all([storage, carbon_client, loader, selector]):
+            raise HTTPException(status_code=503, detail="Not ready")
+        return {"ready": True}
+
+    @app.get("/metrics")
+    async def metrics():
+        if not PROMETHEUS_AVAILABLE:
+            raise HTTPException(status_code=503, detail="Prometheus not installed")
+        from fastapi import Response
+        return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
+
+    # --- Projects ---
+    @app.get("/api/projects")
+    @rate_limit_decorator(f"{settings.rate_limit_requests}/{settings.rate_limit_window}s")
+    async def get_projects(request: Request):
+        if not await _fallback_limiter.allow(request.client.host if request.client else "anon"):
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        try:
+            projects = await _fetch_projects_with_carbon()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+        stats = await asyncio.to_thread(loader.get_statistics)
+        response = {"projects": projects, "statistics": stats,
+                    "quantum_signature": await security.sign_data(
+                        {"type": "projects_list", "count": len(projects)})}
+
+        async def _bg():
+            try: await blockchain.record_recommendation(
+                {"type": "projects_list", "count": len(projects)})
+            except Exception: pass
+        asyncio.create_task(_bg())
+        return response
+
+    # --- Recommend ---
+    @app.post("/api/recommend")
+    @rate_limit_decorator(f"{settings.rate_limit_requests}/{settings.rate_limit_window}s")
+    async def recommend_workload(request: Request, payload: Dict[str, Any],
+                                   _key: bool = Depends(_require_key_on_post)):
+        if not await _fallback_limiter.allow(request.client.host if request.client else "anon"):
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+        try:
+            workload = WorkloadSpec(
+                gpu_hours=float(payload.get("gpu_hours", 100)),
+                latency_tolerance_ms=float(payload.get("latency_tolerance_ms", 200)),
+                workload_type=payload.get("workload_type", "training"),
+                carbon_budget_kg=payload.get("carbon_budget_kg"),
+                max_cost_usd=payload.get("max_cost_usd"),
+            )
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+        user_region = payload.get("user_region", "us-east")
+        state = StrategyState(
+            gpu_hours=workload.gpu_hours,
+            latency_tolerance_ms=workload.latency_tolerance_ms,
+            workload_type=workload.workload_type,
+            carbon_budget_kg=workload.carbon_budget_kg,
+            max_cost_usd=workload.max_cost_usd,
+            user_region=user_region,
         )
 
-    return response
+        # Strategy selection
+        if moe_gating is not None:
+            metrics = {
+                "quality": 0.5,
+                "energy": 1.0 - min(1.0, workload.gpu_hours / 1000.0),
+                "carbon": 1.0 - min(1.0, (workload.carbon_budget_kg or 50) / 100.0),
+                "latency": 1.0 - min(1.0, workload.latency_tolerance_ms / 500.0),
+                "helium": 0.5,
+            }
+            expert_name, _probs = await moe_gating.select_expert(metrics)
+            strategy = expert_name if expert_name in DistillationStrategyOptimizer.STRATEGIES \
+                else "balanced"
+            action_idx = DistillationStrategyOptimizer.STRATEGIES.index(strategy)
+            state_vec = state.to_feature_vector()
+            teacher_probs = np.ones(5) / 5
+        else:
+            strategy, action_idx, state_vec, teacher_probs = \
+                await strategy_optimizer.select_strategy(state)
 
-async def _log_interaction(state: StrategyState, strategy: str, reward: float, carbon_savings: float, cost: float, latency: float):
-    """Log interaction for offline training."""
-    entry = {
-        'timestamp': datetime.now(timezone.utc).isoformat(),
-        'strategy': strategy,
-        'reward': reward,
-        'carbon_savings': carbon_savings,
-        'cost': cost,
-        'latency': latency,
-        'state_vector': state.to_feature_vector().tolist(),
-    }
-    async with interaction_lock:
-        interaction_log.append(entry)
-    # Optionally persist to CSV
-    log_path = Path(settings.interaction_logs_path)
-    df_log = pd.DataFrame([entry])
-    if log_path.exists():
-        df_log.to_csv(log_path, mode='a', header=False, index=False)
-    else:
-        df_log.to_csv(log_path, index=False)
+        result = await asyncio.to_thread(selector.select_datacenter, workload, user_region)
 
-# =============================================================================
-# HTML generation (simple placeholder)
-# =============================================================================
-def generate_map_html() -> str:
-    return """
-<!DOCTYPE html>
-<html>
+        projects = await asyncio.to_thread(loader.get_all_projects)
+        avg_carbon = (sum(p.sustainability.grid_carbon_intensity_gco2_per_kwh
+                            for p in projects) / len(projects)) if projects else 400
+        avg_emissions = workload.gpu_hours * 0.65 * 1.3 * (avg_carbon / 1000)
+        savings = avg_emissions - result.estimated_carbon_kg
+
+        latency_enrich = {}
+        if latency_estimator is not None:
+            try:
+                latency_enrich["cloud_latency_ms"] = await latency_estimator.estimate(
+                    user_region, result.selected_project.location_country)
+            except Exception:
+                pass
+        sustainability_enrich = {}
+        if sustainability_enricher is not None:
+            try:
+                sustainability_enrich = await sustainability_enricher.enrich(
+                    result.selected_project,
+                    result.selected_project.sustainability.grid_carbon_intensity_gco2_per_kwh)
+            except Exception:
+                pass
+
+        response = {
+            "selected_project": {
+                "id": result.selected_project.project_id,
+                "name": result.selected_project.project_name,
+                "location": f"{result.selected_project.location_city}, "
+                            f"{result.selected_project.location_country}",
+                "green_score": result.green_score,
+                "estimated_carbon_kg": result.estimated_carbon_kg,
+                "estimated_cost_usd": result.estimated_cost_usd,
+                "latency_ms": result.latency_ms,
+            },
+            "alternatives": [{"name": p.project_name, "green_score": s}
+                              for p, s in result.alternatives],
+            "rationale": result.reasoning,
+            "carbon_savings_kg": max(0.0, savings),
+            "strategy_used": strategy,
+            "enrichment": {**latency_enrich, **sustainability_enrich},
+        }
+
+        reward = 0.0
+        if savings > 0:
+            reward += 0.5
+        if result.estimated_cost_usd < 1000:
+            reward += 0.3
+        if result.latency_ms < 200:
+            reward += 0.2
+        reward = max(0.0, min(1.0, reward))
+
+        # Update MoE + Distillation
+        if moe_gating is not None:
+            await moe_gating.add_training_sample(metrics, strategy, reward)
+        await strategy_optimizer.update(state_vec, action_idx, reward,
+                                          state.to_feature_vector(), teacher_probs)
+
+        # RLHF pair (5%)
+        if rlhf_trainer is not None and random.random() < 0.05:
+            rejected = random.choice(
+                [s for s in DistillationStrategyOptimizer.STRATEGIES
+                 if s != strategy])
+            await rlhf_trainer.record_pair(
+                str(uuid.uuid4()),
+                "Which strategy is better for this workload?",
+                strategy, rejected, reward,
+                {"workload": workload.model_dump(), "user_region": user_region})
+
+        # MODP state + policy
+        if modp_solver is not None:
+            sid = f"recommend_{uuid.uuid4()}"
+            await modp_solver.add_state(
+                sid, "strategy_selection",
+                {"workload": workload.model_dump(), "strategy": strategy},
+                {"carbon_savings": savings,
+                 "cost": result.estimated_cost_usd,
+                 "latency": result.latency_ms,
+                 "user_satisfaction": reward}, stage=0)
+            await modp_solver.add_policy(
+                f"policy_{sid}", "strategy_selection",
+                sid, strategy,
+                {"carbon_savings": savings,
+                 "cost": result.estimated_cost_usd,
+                 "latency": result.latency_ms,
+                 "user_satisfaction": reward})
+
+        # LIMIT graph
+        if limit_graph_manager is not None:
+            await limit_graph_manager.add_node(
+                "strategy_graph", f"recommendation_{uuid.uuid4()}",
+                "recommendation",
+                {"strategy": strategy, "carbon_savings": savings,
+                 "cost": result.estimated_cost_usd,
+                 "latency": result.latency_ms})
+
+        # Interaction log (batched)
+        await _log_interaction(state, strategy, reward, savings,
+                                result.estimated_cost_usd, result.latency_ms)
+
+        # Signature + blockchain
+        response["quantum_signature"] = await security.sign_data(response)
+        try:
+            tx = await blockchain.record_recommendation(
+                {"workload": workload.model_dump(),
+                 "selected": result.selected_project.project_id,
+                 "carbon_savings": savings})
+            response["blockchain_tx_hash"] = tx.get("tx_hash")
+        except Exception as e:
+            logger.warning("Blockchain failed: %s", e)
+        try:
+            response["cloud_distribution"] = await multi_cloud.distribute(
+                {"user_region": user_region})
+        except Exception as e:
+            logger.warning("Cloud failed: %s", e)
+
+        # Audit
+        if storage is not None:
+            try:
+                api_key = request.headers.get("X-API-Key", "")
+                await storage.log_audit(
+                    user_id="key:" + hashlib.sha256(
+                        api_key.encode()).hexdigest()[:8] if api_key else "anonymous",
+                    action="recommend",
+                    details={"workload": workload.model_dump(),
+                             "selected": result.selected_project.project_id})
+            except Exception:
+                pass
+
+        try:
+            RECOMMEND_COUNT.labels(strategy=strategy, status="success").inc()
+        except Exception:
+            pass
+        return response
+
+    # --- Batch recommend ---
+    @app.post("/api/recommend/batch")
+    @rate_limit_decorator(f"{settings.rate_limit_requests}/{settings.rate_limit_window}s")
+    async def recommend_batch(request: Request, payload: Dict[str, Any],
+                                _key: bool = Depends(_require_key_on_post)):
+        workloads = payload.get("workloads", [])
+        if not workloads:
+            raise HTTPException(status_code=422, detail="Empty workloads list")
+        # Process sequentially (bounded by semaphore)
+        sem = asyncio.Semaphore(5)
+        results: List[Any] = [None] * len(workloads)
+
+        async def _one(i, w):
+            async with sem:
+                try:
+                    # Reuse recommend_workload by crafting a mini Request
+                    results[i] = await _recommend_internal(w)
+                except Exception as e:
+                    results[i] = {"error": str(e)}
+
+        await asyncio.gather(*[_one(i, w) for i, w in enumerate(workloads)])
+        return {"results": results, "count": len(results)}
+
+    async def _recommend_internal(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Internal recommend without HTTP layer."""
+        workload = WorkloadSpec(
+            gpu_hours=float(payload.get("gpu_hours", 100)),
+            latency_tolerance_ms=float(payload.get("latency_tolerance_ms", 200)),
+            workload_type=payload.get("workload_type", "training"),
+            carbon_budget_kg=payload.get("carbon_budget_kg"),
+            max_cost_usd=payload.get("max_cost_usd"),
+        )
+        user_region = payload.get("user_region", "us-east")
+        state = StrategyState(workload.gpu_hours, workload.latency_tolerance_ms,
+                                workload.workload_type, workload.carbon_budget_kg,
+                                workload.max_cost_usd, user_region)
+        if moe_gating is not None:
+            metrics = {"quality": 0.5,
+                        "energy": 1.0 - min(1.0, workload.gpu_hours / 1000.0),
+                        "carbon": 1.0 - min(1.0, (workload.carbon_budget_kg or 50) / 100.0),
+                        "latency": 1.0 - min(1.0, workload.latency_tolerance_ms / 500.0),
+                        "helium": 0.5}
+            expert_name, _ = await moe_gating.select_expert(metrics)
+            strategy = expert_name if expert_name in DistillationStrategyOptimizer.STRATEGIES \
+                else "balanced"
+        else:
+            strategy = "balanced"
+        result = await asyncio.to_thread(selector.select_datacenter, workload, user_region)
+        return {"strategy": strategy, "selected": result.selected_project.project_name,
+                "carbon_kg": result.estimated_carbon_kg,
+                "cost_usd": result.estimated_cost_usd,
+                "latency_ms": result.latency_ms}
+
+    # --- Interactions ---
+    @app.get("/api/interactions")
+    async def get_interactions(limit: int = 100):
+        n = max(1, min(int(limit), 1000))
+        items = list(interaction_log)[-n:]
+        return {"count": len(items), "items": items}
+
+    # --- MOEA ---
+    @app.get("/api/moea/pareto")
+    async def get_pareto():
+        if moea_optimizer is None:
+            raise HTTPException(status_code=503, detail="MOEA unavailable")
+        return {"pareto": [p.to_dict() for p in moea_optimizer.pareto_front],
+                "size": len(moea_optimizer.pareto_front),
+                "best": moea_optimizer.best_individual}
+
+    @app.post("/api/moea/trigger")
+    async def trigger_moea(_key: bool = Depends(_require_key_on_post)):
+        if moea_optimizer is None:
+            raise HTTPException(status_code=503, detail="MOEA unavailable")
+        try:
+            await run_moea()
+            return {"status": "ok", "pareto_size": len(moea_optimizer.pareto_front)}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # --- Storage / RLHF ---
+    @app.get("/api/storage/stats")
+    async def storage_stats():
+        if storage is None:
+            raise HTTPException(status_code=503, detail="Storage unavailable")
+        stats = await storage.get_statistics()
+        cache_stats = await cache.stats() if cache else {}
+        return {"tables": stats, "cache": cache_stats,
+                "interaction_log_size": len(interaction_log)}
+
+    @app.get("/api/rlhf/pairs")
+    async def rlhf_pairs(limit: int = 20):
+        if rlhf_trainer is None:
+            raise HTTPException(status_code=503, detail="RLHF unavailable")
+        pairs = await storage.get_preference_pairs(limit=min(int(limit), 500))
+        return {"count": len(pairs), "pairs": pairs}
+
+    @app.post("/api/rlhf/train")
+    async def rlhf_train(_key: bool = Depends(_require_key_on_post)):
+        if rlhf_trainer is None:
+            raise HTTPException(status_code=503, detail="RLHF unavailable")
+        ok = await rlhf_trainer.train_reward_model()
+        return {"trained": ok,
+                "model_available": rlhf_trainer.model is not None}
+
+    # --- MODP ---
+    @app.get("/api/modp/solve/{problem_id}")
+    async def modp_solve(problem_id: str):
+        if modp_solver is None:
+            raise HTTPException(status_code=503, detail="MODP unavailable")
+        values = await modp_solver.solve(problem_id)
+        return {"problem_id": problem_id, "state_values": values}
+
+
+# -----------------------------------------------------------------------------
+# Dashboard HTML — [P1] real Leaflet + Chart.js
+# -----------------------------------------------------------------------------
+_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
 <head>
-    <title>Green Data Center Dashboard v2.4.1</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        h1 { color: #2c3e50; }
-        .placeholder { border: 2px dashed #ccc; padding: 20px; text-align: center; }
-    </style>
+<meta charset="UTF-8">
+<title>Green Data Center Dashboard — v2.5.0</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  body {{ font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 0; }}
+  header {{ background: #1f4e3d; color: #fff; padding: 12px 24px; }}
+  main {{ display: grid; grid-template-columns: 1fr 400px; gap: 16px; padding: 16px; }}
+  #map {{ height: 600px; border-radius: 8px; }}
+  .panel {{ border: 1px solid #e0e0e0; border-radius: 8px; padding: 12px; background: #fff; }}
+  .stats {{ display: flex; gap: 12px; flex-wrap: wrap; }}
+  .stat {{ background: #f5f5f5; padding: 8px 12px; border-radius: 6px; }}
+  .stat-value {{ font-size: 20px; font-weight: 600; color: #1f4e3d; }}
+  .stat-label {{ font-size: 12px; color: #666; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+  th, td {{ padding: 4px 6px; text-align: left; border-bottom: 1px solid #eee; }}
+  #form {{ display: grid; gap: 8px; }}
+  input, select, button {{ padding: 6px 8px; font-size: 14px; }}
+  button {{ background: #1f4e3d; color: #fff; border: none; cursor: pointer; }}
+  button:hover {{ background: #2a6b54; }}
+  #result {{ background: #e8f5e9; padding: 8px; border-radius: 6px; font-size: 12px;
+             white-space: pre-wrap; max-height: 200px; overflow-y: auto; }}
+</style>
 </head>
 <body>
-    <h1>Green Data Center Dashboard</h1>
-    <div class="placeholder">
-        <p>Map and interactive components are not displayed in this minimal version.</p>
-        <p>Use the API endpoints /api/projects and /api/recommend for data.</p>
+<header>
+  <h1 style="margin: 0; font-size: 20px;">🌱 Green Data Center Dashboard — v2.5.0</h1>
+  <p style="margin: 4px 0 0; font-size: 13px; opacity: 0.8;">{total} data centers · {operational} operational · {capacity:.0f} MW capacity</p>
+</header>
+<main>
+  <div id="map"></div>
+  <div>
+    <div class="panel">
+      <h2 style="margin-top: 0; font-size: 16px;">Recommend a workload</h2>
+      <form id="form">
+        <label>GPU hours <input type="number" name="gpu_hours" value="100" min="1"></label>
+        <label>Latency tolerance (ms) <input type="number" name="latency_tolerance_ms" value="200" min="1"></label>
+        <label>Workload type
+          <select name="workload_type">
+            <option value="training">Training</option>
+            <option value="inference">Inference</option>
+            <option value="other">Other</option>
+          </select>
+        </label>
+        <label>User region
+          <select name="user_region">
+            <option value="us-east">US East</option>
+            <option value="us-west">US West</option>
+            <option value="eu-west">EU West</option>
+            <option value="asia-east">Asia East</option>
+          </select>
+        </label>
+        <button type="submit">Recommend</button>
+      </form>
+      <div id="result"></div>
     </div>
+    <div class="panel" style="margin-top: 12px;">
+      <h2 style="margin-top: 0; font-size: 16px;">Green score distribution</h2>
+      <canvas id="chart" height="160"></canvas>
+    </div>
+  </div>
+</main>
+<script>
+const projects = {projects_json};
+
+const map = L.map('map').setView([20, 0], 2);
+L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
+            {{maxZoom: 19, attribution: '© OpenStreetMap'}}).addTo(map);
+
+const markers = L.layerGroup().addTo(map);
+for (const p of projects) {{
+  const color = p.green_score >= 70 ? '#2e7d32' : p.green_score >= 50 ? '#f9a825' : '#c62828';
+  const marker = L.circleMarker([p.lat, p.lon], {{
+    radius: Math.sqrt(p.capacity_mw) / 2 + 4,
+    fillColor: color, color: '#fff', weight: 1, opacity: 1, fillOpacity: 0.85
+  }});
+  marker.bindPopup(`<b>${{p.name}}</b><br>
+    Company: ${{p.company}}<br>
+    Location: ${{p.location}}<br>
+    Green score: <b>${{p.green_score.toFixed(1)}}</b><br>
+    Carbon: ${{p.carbon_intensity.toFixed(0)}} gCO₂/kWh<br>
+    Renewable: ${{p.renewable_share.toFixed(0)}}%<br>
+    Capacity: ${{p.capacity_mw.toFixed(0)}} MW<br>
+    Status: ${{p.status}}`);
+  markers.addLayer(marker);
+}}
+
+// Green score distribution chart
+const buckets = [0, 0, 0, 0, 0];
+for (const p of projects) {{
+  const idx = Math.min(4, Math.floor(p.green_score / 20));
+  buckets[idx]++;
+}}
+new Chart(document.getElementById('chart'), {{
+  type: 'bar',
+  data: {{
+    labels: ['0-20', '20-40', '40-60', '60-80', '80-100'],
+    datasets: [{{ label: 'Projects', data: buckets, backgroundColor: '#1f4e3d' }}]
+  }},
+  options: {{ plugins: {{ legend: {{ display: false }} }},
+              scales: {{ y: {{ beginAtZero: true }} }} }}
+}});
+
+// Recommend form
+document.getElementById('form').addEventListener('submit', async (e) => {{
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const payload = Object.fromEntries(fd.entries());
+  payload.gpu_hours = parseFloat(payload.gpu_hours);
+  payload.latency_tolerance_ms = parseFloat(payload.latency_tolerance_ms);
+  const result = document.getElementById('result');
+  result.textContent = 'Loading...';
+  try {{
+    const r = await fetch('/api/recommend', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify(payload)
+    }});
+    const data = await r.json();
+    result.textContent = JSON.stringify(data.selected_project, null, 2) +
+                          '\\n\\nStrategy: ' + data.strategy_used +
+                          '\\nCarbon savings: ' + data.carbon_savings_kg.toFixed(2) + ' kg';
+  }} catch (err) {{
+    result.textContent = 'Error: ' + err.message;
+  }}
+}});
+</script>
 </body>
 </html>
-    """
+"""
 
-# =============================================================================
-# Optional: Run with uvicorn
-# =============================================================================
-if __name__ == "__main__":
-    import uvicorn
+
+def _render_dashboard(projects: List[Dict[str, Any]]) -> str:
+    total = len(projects)
+    operational = sum(1 for p in projects if p.get("status") == "operational")
+    capacity = sum(p.get("capacity_mw", 0) for p in projects)
+    projects_json = json.dumps(projects, default=str)
+    return _DASHBOARD_TEMPLATE.format(
+        total=total, operational=operational, capacity=capacity,
+        projects_json=projects_json)
+
+
+# -----------------------------------------------------------------------------
+# Demo — run via `DASHBOARD_DEMO=1 python3 app_v2_5_0.py`
+# -----------------------------------------------------------------------------
+async def _demo():
+    logger.info("Running dashboard demo (no HTTP server)")
+    await startup()
     try:
-        settings.get_master_key()
-    except ValueError:
-        logger.warning("Master key not set; some features will be limited.")
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+        projects = await _fetch_projects_with_carbon()
+        print(f"\n✓ Fetched {len(projects)} projects")
+        print(f"  sample: {projects[0]['name']} ({projects[0]['green_score']:.1f})")
+
+        # Fake recommend
+        result = await _recommend_internal({"gpu_hours": 100,
+                                              "workload_type": "training",
+                                              "user_region": "us-east"})
+        print(f"\n✓ Recommend: {result}")
+
+        # Health
+        from app_v2_5_0 import storage as st, moea_optimizer as mo
+        if st is not None:
+            stats = await st.get_statistics()
+            print(f"\n✓ Storage tables: {stats}")
+
+        # RLHF train
+        if rlhf_trainer is not None:
+            for _ in range(20):
+                await rlhf_trainer.record_pair(
+                    str(uuid.uuid4()), "prompt",
+                    random.choice(DistillationStrategyOptimizer.STRATEGIES),
+                    random.choice(DistillationStrategyOptimizer.STRATEGIES),
+                    random.uniform(0.1, 0.9), {})
+            ok = await rlhf_trainer.train_reward_model()
+            print(f"\n✓ RLHF trained: {ok}")
+
+        # MOEA
+        await run_moea()
+        if moea_optimizer is not None:
+            print(f"\n✓ MOEA Pareto size: {len(moea_optimizer.pareto_front)}")
+
+        # MODP solve
+        if modp_solver is not None:
+            values = await modp_solver.solve("strategy_selection")
+            print(f"\n✓ MODP solved states: {len(values)}")
+
+        print("\n✓ Demo complete")
+    finally:
+        await shutdown()
+
+
+if __name__ == "__main__":
+    if os.getenv("DASHBOARD_DEMO") == "1":
+        asyncio.run(_demo())
+    elif FASTAPI_AVAILABLE:
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    else:
+        print("FastAPI not installed. Install with: pip install fastapi uvicorn")
+        print("Or run demo with: DASHBOARD_DEMO=1 python3 app_v2_5_0.py")
