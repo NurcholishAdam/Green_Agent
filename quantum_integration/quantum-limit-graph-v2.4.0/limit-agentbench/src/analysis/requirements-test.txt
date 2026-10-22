@@ -1,0 +1,167 @@
+# Test requirements for the Green Agent analysis module (v2.0.0)
+# ==============================================================
+#
+# Install with:
+#     pip install -r requirements_analysis.txt -r requirements-test.txt
+# or (via pyproject.toml extras):
+#     pip install "green-agent-analysis[test]"
+#
+# Python 3.10+ required (inherited from requirements_analysis.txt).
+# --------------------------------------------------------------------
+
+
+# ====================================================================
+# pytest family — the test harness
+# ====================================================================
+# pytest is pinned to a specific major: pytest 8.0 (2024-02) removed
+# several deprecated features (py.path.local, pytest.warns(None),
+# autouse fixture changes). Tests written for 7.4 can fail on 8.x
+# without a warning.
+# --------------------------------------------------------------------
+
+pytest>=8.0.0,<9.0.0
+
+# pytest-asyncio is pinned to a specific minor: 0.21 → 0.25 covered
+# five breaking deprecation waves (event_loop fixture, asyncio_mode
+# defaults, loop scope). 0.24 is the version the enhanced
+# AsyncAgentRuntime tests were validated against.
+# --------------------------------------------------------------------
+
+pytest-asyncio>=0.24.0,<0.25.0
+# Without pytest-asyncio, modern pytest does NOT silently skip async
+# tests — it fails during collection with `async def functions are
+# not natively supported`. (The v1 comment said "silently skipped"
+# which was true only for pytest-asyncio <0.21.)
+
+# pytest-cov bumped from 4.1 → 5.5 (paired with coverage[toml] 7.6).
+# --------------------------------------------------------------------
+
+pytest-cov>=5.5.0,<7.0.0
+
+# coverage[toml] with the TOML extra: configure coverage via
+# pyproject.toml's [tool.coverage.*] sections, not .coveragerc.
+# --------------------------------------------------------------------
+
+coverage[toml]>=7.6.0,<8.0.0
+
+
+# ====================================================================
+# test-quality — property-based + concurrency + isolation
+# ====================================================================
+# hypothesis — property-based testing of the numeric edge cases that
+# the 18 enhanced modules explicitly guard against (NaN, Inf,
+# negative values, zero divisors, tolerance bands). The single most
+# useful tool for this layer's correctness surface.
+# --------------------------------------------------------------------
+
+hypothesis>=6.100.0,<7.0.0
+
+# pytest-timeout — catches the deadlock regressions that have
+# actually shipped in this repo (streaming.py queue-sink deadlock,
+# langchain_runtime concurrent-callback races).
+# --------------------------------------------------------------------
+
+pytest-timeout>=2.3.0,<3.0.0
+
+# pytest-mock — `mocker.patch("psutil.Process")` for the fallback
+# paths in self_monitor / metrics_collector. Cleaner than
+# monkeypatch for one-off mocks with automatic cleanup.
+# --------------------------------------------------------------------
+
+pytest-mock>=3.14.0,<4.0.0
+
+# pytest-xdist — parallel test runs; the 18 modules include
+# threading.Barrier concurrency tests that take 3-5x longer
+# serially.
+# --------------------------------------------------------------------
+
+pytest-xdist>=3.6.0,<4.0.0
+
+# pytest-randomly — test-order independence; critical for the
+# modules that mutate module-level counters (_STATS in complexity_analyzer,
+# _GLOBAL_STATS elsewhere). A passing suite must not depend on
+# alphabetical test order.
+# --------------------------------------------------------------------
+
+pytest-randomly>=3.16.0,<4.0.0
+
+# freezegun — for tests that exercise the default clock (not the
+# injectable time_source= clock added in streaming v2 / self_monitor v2 /
+# policy_loader v2). Frozen time makes datetime-based assertions
+# deterministic.
+# --------------------------------------------------------------------
+
+freezegun>=1.5.0,<2.0.0
+
+
+# ====================================================================
+# exporter tests — for a DIFFERENT module
+# ====================================================================
+# These two are required only by:
+#     tests/test_graph_metrics_exporter.py
+#     tests/test_graph_metrics_exporter_helium.py
+# They belong to the metrics-exporter module, not the analysis layer.
+# Install only if you're testing the exporter:
+# --------------------------------------------------------------------
+
+requests>=2.31.0,<3.0.0
+prometheus_client>=0.19.0,<1.0.0
+
+# responses — HTTP mocking for outbound-call assertions in the
+# exporter tests. `requests` alone doesn't let you assert the outbound
+# call shape (URL, headers, body) — responses does.
+# --------------------------------------------------------------------
+
+responses>=0.25.0,<1.0.0
+
+
+# ====================================================================
+# What's NOT here and why
+# ====================================================================
+# pytest>=7.4 was the v1 floor. Bumped to >=8.0.0 — the deprecation
+# path through 7.4 → 8.0 was validated during the 2.0.0 cycle.
+#
+# pytest-asyncio>=0.21 was the v1 floor. Bumped to >=0.24.0 — 0.21 →
+# 0.23 changed the event_loop fixture semantics; 0.24 → 0.25 changed
+# the asyncio_mode defaults. Pinning to 0.24 avoids both.
+#
+# pytest-cov>=4.1 was the v1 floor. Bumped to >=5.5.0 to pair with
+# coverage[toml]>=7.6.
+# --------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------
+# Demo — verify the test suite collects and runs
+# --------------------------------------------------------------------
+#
+# 1. Install:
+#
+#     python -m pip install -r requirements_analysis.txt -r requirements-test.txt
+#
+# 2. Verify all plugins are active:
+#
+#     pytest --version
+#     # → pytest 8.x.y
+#     # → plugins: asyncio-0.24.x, cov-5.x.x, mock-3.x.x, timeout-2.x.x,
+#     #            xdist-3.x.x, randomly-3.x.x
+#
+# 3. Collect only (fast — proves nothing is skipped silently):
+#
+#     pytest --collect-only -q
+#
+# 4. Run with timeouts and parallelism:
+#
+#     pytest -p no:cacheprovider --timeout=30 -n auto -q
+#
+# 5. Coverage gate (configured in pyproject.toml [tool.coverage.*]):
+#
+#     pytest --cov=analysis --cov-report=term-missing --cov-fail-under=80
+#
+# 6. Reproducible CI:
+#
+#     python -m pip install --only-binary=:all: \
+#         -r requirements_analysis.txt \
+#         -r requirements-test.txt \
+#         -c constraints.txt
+#
+# --------------------------------------------------------------------
