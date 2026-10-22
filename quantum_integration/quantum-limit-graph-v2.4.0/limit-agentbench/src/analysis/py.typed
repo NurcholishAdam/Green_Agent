@@ -1,0 +1,21 @@
+# PEP 561 marker — the presence of this file tells type checkers
+# (mypy, pyright, pyre) that the `analysis` package ships inline type
+# hints that should be used instead of `Any`.
+#
+# The file is intentionally empty (or comment-only). PEP 561 says:
+#   - An empty py.typed means "fully typed — trust the inline hints."
+#   - A py.typed containing `partial` on the first line means "partial
+#     stubs — some symbols may be Any."
+#
+# The enhanced analysis layer is fully typed: every public function,
+# dataclass, and Protocol has a complete type signature. Keep this
+# file empty so downstream users get the full type surface.
+#
+# Location: src/analysis/py.typed
+#
+# Verify it's shipped:
+#   python -m build && unzip -l dist/*.whl | grep py.typed
+#
+# Verify mypy sees the package as typed:
+#   mypy --strict -c "from analysis.optimization.complexity_analyzer import ComplexityAnalyzer; reveal_type(ComplexityAnalyzer())"
+#   # → analysis.optimization.complexity_analyzer.ComplexityAnalyzer  (not Any)
