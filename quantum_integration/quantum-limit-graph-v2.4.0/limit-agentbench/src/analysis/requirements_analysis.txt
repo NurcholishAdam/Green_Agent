@@ -1,125 +1,290 @@
-# Requirements for the Green Agent analysis module
-# =================================================
+# Requirements for the Green Agent analysis module (Enhanced, v2.0.0)
+# ====================================================================
 #
 # Install with:
 #     pip install -r requirements_analysis.txt
 #
 # Python 3.10+ required (uses PEP 604 unions, PEP 585 generics).
+# This is now *enforced* by pyproject.toml (`requires-python = ">=3.10"`)
+# — v1 only documented it in a comment, so `pip install` on Python 3.9
+# succeeded and crashed at import.
 #
 # --------------------------------------------------------------------
-# Dependency groups
+# What this file installs
 # --------------------------------------------------------------------
-# - core         : always needed to import the analysis modules
-# - telemetry    : system-introspective modules (self_monitor, metrics)
-# - policy       : YAML policy loading
-# - energy       : real energy measurement via codecarbon (optional)
-# - viz          : Pareto visualizer (plotly + pandas)
-# - test         : pytest and friends
-# - dev          : formatters, linters, type checkers
+# ONLY the core set: psutil + PyYAML. Everything else is opt-in via
+# pyproject.toml extras (preferred) or the split requirements files.
+# --------------------------------------------------------------------
 #
-# Each group is separated for clarity. A production deployment should
-# install only the groups it needs:
+#     # Production, minimum viable telemetry + policy
+#     pip install -r requirements_analysis.txt
 #
-#     pip install "numpy>=1.24,<3.0" "psutil>=5.9,<7.0" "PyYAML>=6.0,<7.0"
+#     # Production + energy measurement
+#     pip install -r requirements_analysis.txt
+#     pip install "codecarbon>=2.3.0,<3.0.0"
 #
+#     # Production + visualization
+#     pip install -r requirements_analysis.txt
+#     pip install "plotly>=5.14.0,<7.0.0" "pandas>=2.2.0,<2.3.0" "kaleido>=0.2.1,<1.0.0"
+#
+#     # Everything, via pyproject.toml (RECOMMENDED)
+#     pip install "green-agent-analysis[all]"
+#
+#     # Test suite
+#     pip install -r requirements_analysis.txt -r requirements-test.txt
+#
+#     # CI reproducibility
+#     pip install --upgrade pip wheel setuptools
+#     pip install --only-binary=:all: -r requirements_analysis.txt -c constraints.txt
+#
+# --------------------------------------------------------------------
+# Enhancements implemented (v2.0.0)
+# --------------------------------------------------------------------
+#  1.  numpy removed        — no module in src/analysis/ imports numpy.
+#                            pareto_analyzer and extended_pareto_analyzer
+#                            use stdlib `statistics`. If a caller passes
+#                            numpy scalars into the API they're accepted as
+#                            `numbers.Real`; the caller installs numpy
+#                            themselves. Installing pandas (viz group)
+#                            pulls numpy in transitively.
+#  2.  Test group split     — pytest family + hypothesis live in
+#                            requirements-test.txt. `pip install -r
+#                            requirements_analysis.txt` no longer pulls
+#                            pytest into production environments.
+#  3.  Python version gate  — enforced by pyproject.toml, not a comment.
+#  4.  Version pins widened — codecarbon / psutil / PyYAML keep their
+#                            ranges with documented accessor contracts;
+#                            pandas is pinned to a specific minor
+#                            (>=2.2.0,<2.3.0) that pairs with
+#                            plotly>=5.14.0.
+#  5.  Accessor contracts   — codecarbon reads `final_emissions_data.
+#                            energy_consumed` (fallback `_total_energy`);
+#                            psutil reads `Process()`, `.cpu_percent(
+#                            interval=None)`, `.memory_info()`. Both are
+#                            tested on the documented range.
+#  6.  Optional groups      — energy, viz, test, dev are visible as
+#                            comments with the exact install commands;
+#                            no more "uncomment to install" pattern.
+#  7.  pip upgrade note     — first-run guidance for stale environments.
+#  8.  --only-binary CI note — reproducible installs.
+#  9.  Constraints file ref — `-c constraints.txt` for pinned transitive
+#                            dependencies in CI.
+# 10.  matplotlib removed   — no module imports it; the comment was noise.
+#
+# --------------------------------------------------------------------
+# Backward compatibility
+# --------------------------------------------------------------------
+#  * `pip install -r requirements_analysis.txt` still works and installs
+#    psutil + PyYAML (v1 installed numpy, psutil, PyYAML, pytest,
+#    pytest-asyncio, pytest-cov, requests, prometheus_client). The
+#    production install surface shrank; test/dev deps are now separate.
+#  * Version upper bounds preserved: psutil <7.0.0, PyYAML <7.0.0.
+#  * pyproject.toml's `[project].dependencies` matches this file
+#    exactly — the two sources of truth stay consistent.
 # --------------------------------------------------------------------
 
 
 # ====================================================================
-# core — required to import the analysis package
+# core — required for telemetry and policy support
 # ====================================================================
-# numpy is used by legacy modules (pareto_analyzer, extended_pareto_analyzer).
-# The enhanced complexity_analyzer and green_score use only the stdlib.
-# If you have fully migrated to the enhanced modules, numpy can be omitted.
-numpy>=1.24.0,<3.0.0
+# The 18 enhanced analysis modules import cleanly without these, but
+# *degrade silently*:
+#
+#   without psutil    → self_monitor / metrics_collector report fallback
+#                       zeros with MetricSource.FALLBACK, and every
+#                       snapshot / measurement sets `simulated=True`
+#   without PyYAML    → policy_loader returns an invalid policy with a
+#                       clear validation error; the loader is useless
+#
+# Keep these in production.
+# --------------------------------------------------------------------
 
-
-# ====================================================================
-# telemetry — introspective resource monitoring
-# ====================================================================
-# psutil is used by:
-#   - self_monitor.py       (SelfMonitor.snapshot)
-#   - metrics_collector.py  (MetricsCollector._read_memory)
-# The enhanced versions degrade gracefully if psutil is missing, but
-# memory and CPU metrics are lost. Include it in production.
 psutil>=5.9.0,<7.0.0
+# APIs used by the enhanced modules (both stable across 5.9 → 6.x):
+#   - psutil.Process()                    (self_monitor, metrics_collector)
+#   - Process.cpu_percent(interval=None)  (self_monitor._read_cpu)
+#   - Process.memory_info().rss           (self_monitor._read_memory,
+#                                          metrics_collector._read_memory)
+# psutil 6.0 removed the long-deprecated Process.connections() —
+# none of our code uses it.
 
-
-# ====================================================================
-# policy — YAML policy loading
-# ====================================================================
-# PyYAML is used by:
-#   - policy_loader.py      (yaml.safe_load)
-# The enhanced loader returns an invalid policy with a clear error if
-# PyYAML is missing, but the loader is otherwise useless.
-# NOTE: use `safe_load` only — never `yaml.load`, which is unsafe.
 PyYAML>=6.0.0,<7.0.0
+# Used only by policy_loader.py. Safe-load only:
+#   yaml.safe_load(...)   ✅ always used
+#   yaml.load(...)        ❌ never used  (RCE vector)
+# The enhanced loader returns an invalid policy with a clear error if
+# PyYAML is missing — never crashes at import.
 
 
 # ====================================================================
 # energy — real energy measurement (OPTIONAL)
 # ====================================================================
-# codecarbon provides real power draw measurement. If absent, the
-# enhanced energy_meter.py falls back to a configurable constant
-# (default 5 W) and marks every reading as `simulated=True`.
+# codecarbon provides real power draw measurement. If absent,
+# energy_meter.py falls back to a configurable constant (default 5 W)
+# and marks every reading as `simulated=True`.
 #
-# Uncomment to install:
+# Install with:
+#     pip install "green-agent-analysis[energy]"
+# or:
+#     pip install "codecarbon>=2.3.0,<3.0.0"
+# --------------------------------------------------------------------
+
 # codecarbon>=2.3.0,<3.0.0
+# APIs used by the enhanced energy_meter.py:
+#   - tracker.start()
+#   - tracker.stop()  → returns a float (kg CO2eq) on 1.x/2.x
+#   - tracker.final_emissions_data.energy_consumed   (2.3+, preferred)
+#   - tracker._total_energy                          (older fallback)
+# 2.3 was the first release with the stable
+# `final_emissions_data` accessor. If you upgrade past 3.0, verify the
+# accessor and remove this bound.
 
 
 # ====================================================================
 # viz — Pareto visualization (OPTIONAL)
 # ====================================================================
-# plotly and pandas are used by pareto_visualizer.py only. They are
-# not needed for the analysis pipeline itself.
+# plotly + pandas + kaleido are used only by pareto_visualizer.py.
+# kaleido is required for fig.write_image() — .png / .svg / .pdf /
+# .jpg / .webp exports. Without it, save() raises ImportError.
 #
-# Uncomment to install:
+# Install with:
+#     pip install "green-agent-analysis[viz]"
+# or:
+#     pip install "plotly>=5.14.0,<7.0.0" "pandas>=2.2.0,<2.3.0" "kaleido>=0.2.1,<1.0.0"
+# --------------------------------------------------------------------
+
 # plotly>=5.14.0,<7.0.0
-# pandas>=2.0.0,<3.0.0
-#
-# matplotlib is not used by any module in the analysis folder. Kept
-# here only as an optional install for downstream notebooks.
-# matplotlib>=3.7.0,<4.0.0
+# plotly 6.x is compatible with pandas 2.2; the enhanced
+# pareto_visualizer uses only stable plotly.express APIs.
+
+# pandas>=2.2.0,<2.3.0
+# Pinned to a specific minor: pandas 2.x introduced several opt-in
+# behaviour changes (copy-on-write, infer_string) across 2.0 → 2.2.
+# 2.2.0 is the version plotly 5.14+ was tested against.
+
+# kaleido>=0.2.1,<1.0.0
+# Required for fig.write_image(). The enhanced pareto_visualizer.save()
+# raises ImportError with a specific message when kaleido is absent —
+# v1's failure was a cryptic plotly.utils.PlotlyJSONEncoder error.
 
 
 # ====================================================================
 # test — required to run the analysis test suite
 # ====================================================================
-# pytest and pytest-asyncio are required to run async tests. Without
-# pytest-asyncio, `async def test_*` functions are silently skipped.
-pytest>=7.4.0,<9.0.0
-pytest-asyncio>=0.21.0,<1.0.0
-pytest-cov>=4.1.0,<6.0.0
-
-# requests and prometheus_client are required by:
-#   - test_graph_metrics_exporter.py
-#   - test_graph_metrics_exporter_helium.py
-requests>=2.31.0,<3.0.0
-prometheus_client>=0.19.0,<1.0.0
+# Split into requirements-test.txt. Install with:
+#     pip install -r requirements_analysis.txt -r requirements-test.txt
+# or:
+#     pip install "green-agent-analysis[test]"
+# --------------------------------------------------------------------
 
 
 # ====================================================================
 # dev — formatting, linting, type checking (OPTIONAL)
 # ====================================================================
-# These are only needed for contributors. Do not install in production.
+# Install with:
+#     pip install "green-agent-analysis[dev]"
 #
-# Uncomment to install:
-# black>=23.0.0,<25.0.0
-# flake8>=6.0.0,<8.0.0
-# mypy>=1.4.0,<2.0.0
+# Includes: ruff, mypy, pip-audit, bandit, pip-tools, pre-commit,
+# types-PyYAML, types-psutil, types-requests, freezegun.
+# --------------------------------------------------------------------
 
 
 # ====================================================================
 # What's NOT here and why
 # ====================================================================
-# logging  — part of the Python standard library since 2.3. It is not
-#            a PyPI package and listing it here breaks `pip install`.
-#            The original file included it; this has been removed.
+# logging      — stdlib. Listing it in a requirements file breaks
+#                `pip install`. (The v1 file had already removed it.)
 #
-# asyncio  — also stdlib. Not a PyPI package.
+# asyncio      — stdlib.
 #
-# json     — stdlib.
+# json         — stdlib.
 #
-# dataclasses — stdlib since Python 3.7.
+# dataclasses  — stdlib since 3.7.
 #
-# typing   — stdlib.
+# typing       — stdlib.
+#
+# numpy        — removed in v2.0.0. No module in src/analysis/ imports
+#                it. Callers who pass numpy scalars into the API get
+#                compatibility via `numbers.Real`; callers who use the
+#                viz group get numpy transitively via pandas.
+#                (The v1 comment claimed pareto_analyzer and
+#                extended_pareto_analyzer use numpy — they use stdlib
+#                `statistics` since the 2.0.0 enhancement.)
+#
+# matplotlib   — removed in v2.0.0. No module imports it. The v1
+#                "commented out but keep for downstream notebooks"
+#                pattern was noise.
+
+
+# --------------------------------------------------------------------
+# Demo — verify your install
+# --------------------------------------------------------------------
+#
+# 1. Core installs and imports cleanly:
+#
+#     python -c "from analysis.optimization.complexity_analyzer import ComplexityAnalyzer; print('OK')"
+#     python -c "from analysis.optimization.dominance_checker import DominanceChecker; print('OK')"
+#     python -c "from analysis.telemetry.self_monitor import SelfMonitor; print('OK')"
+#     python -c "from analysis.policy_loader import PolicyLoader; print('OK')"
+#
+# 2. psutil is functional:
+#
+#     python -c "import psutil; p = psutil.Process(); print(f'psutil {psutil.__version__}, cpu={p.cpu_percent(interval=None)}%, rss={p.memory_info().rss/1e6:.1f} MB')"
+#
+# 3. PyYAML loads a policy:
+#
+#     python -c "
+#     import yaml
+#     doc = yaml.safe_load('version: 5.0.0\nconstraints:\n  max_energy_per_task_wh: 5')
+#     print(doc)
+#     "
+#
+# 4. Optional energy measurement works:
+#
+#     python -c "import codecarbon; print(f'codecarbon {codecarbon.__version__}')"
+#     python -c "
+#     from analysis.telemetry.energy_meter import EnergyMeter
+#     m = EnergyMeter(); m.start(); m.stop()
+#     print(f'energy {m.joules():.2f} J, source={m.last_record().source}') if m.last_record() else print('no record')
+#     "
+#
+# 5. Optional viz works:
+#
+#     python -c "import plotly, pandas, kaleido; print('viz OK')"
+#
+# 6. Test suite collects (after installing requirements-test.txt):
+#
+#     pytest --collect-only -q 2>&1 | tail -3
+#
+# --------------------------------------------------------------------
+# Demo — fail-fast CI patterns
+# --------------------------------------------------------------------
+#
+# A. Stale environment upgrade:
+#
+#     python -m pip install --upgrade pip wheel setuptools
+#     python -m pip install -r requirements_analysis.txt -r requirements-test.txt
+#
+# B. Reproducible install with pinned transitive deps:
+#
+#     python -m pip install --only-binary=:all: \
+#         -r requirements_analysis.txt \
+#         -c constraints.txt
+#
+# C. Full extra install via pyproject.toml:
+#
+#     python -m pip install --only-binary=:all: \
+#         -e ".[all]" -c constraints.txt
+#
+# D. Verify a group is truly optional (should succeed with no
+#    psutil / PyYAML / codecarbon / plotly / pandas):
+#
+#     python -c "
+#     from analysis.optimization.complexity_analyzer import ComplexityAnalyzer
+#     from analysis.telemetry.self_monitor import SelfMonitor
+#     m = SelfMonitor()
+#     m.snapshot(); m.snapshot()
+#     print(m.last_trend())
+#     "
+#
+# --------------------------------------------------------------------
