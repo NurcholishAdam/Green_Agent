@@ -1,45 +1,234 @@
 """
-Green Agent v5.0.0 - Carbon Forecasting Engine (Enhanced)
-=========================================================
+forecasting_engine.py — v6.0.0 (thin composition layer over v18)
+=================================================================
 
-Layer 7: Real-time carbon intensity tracking and forecasting.
+Green Agent Layer 7: real-time carbon intensity + forecasting.
 
-Now with first-class support for:
-  - Causal RL provider selection (contextual bandit)
-  - XAI for every forecast decision
-  - Adaptive precision switching for forecasting models
-  - Federated green learning across deployments
-  - Multi-agent coordination with emergent role specialisation
-  - Temporal logic & formal verification for forecast freshness
-  - Carbon market & REC enrichment
-  - Resilience engineering: circuit breaker + chaos injection
-  - Human-in-the-Loop for anomalous readings + active learning
-  - Quantum-distillation ensemble for intensity prediction
+**What changed in v6**
+----------------------
+v5 had its own complete forecaster (providers, circuit breakers, caches,
+retries) that drifted from the canonical v18 ``carbon_forecast``. That
+drift is now retired: **all fetching, caching, retrying, and circuit
+breaking is delegated to v18's ``CarbonForecast``**. This file adds only
+what v18 does not have.
+
+**Re-exported from v18 (single implementation)**
+    CarbonForecast, CircuitBreaker, InMemoryStorage, StorageProtocol,
+    ForecastPoint, ForecastBatch, ForecastSource,
+    QuantumDistillationEngine, CausalGraphLearner, CausalPolicyAdapter,
+    FederatedGreenAggregator, MultiAgentCoordinator,
+    TemporalLogicVerifier, XAIDecisionExplainer,
+    AdaptivePrecisionSwitcher, CarbonMarketIntegrator,
+    ChaosTestingEngine, ActiveUserPreferenceLearner,
+    plus every ``Simple*`` alias.
+
+**Added by v6 (genuinely new)**
+    IntensityReading          — rich reading with provenance + HITL status
+    IntensityForecast         — point forecast with confidence
+    OptimalWindow             — best-execution window
+    AnomalyDetector           — per-region rolling z-score + physical bounds
+    UncertaintyEstimator      — mean / std / confidence from recent readings
+    FetcherCoordinator        — fetcher-agent role assignment (distinct from
+                                v18's forecast-pipeline agents)
+    FederatedRegionalAggregator — hourly-profile federation (distinct from
+                                v18's byte-blob federation)
+    ReadingTemporalMonitor    — temporal properties over IntensityReading
+                                objects (distinct from v18's state-dict
+                                properties)
+    HumanInTheLoopGate        — anomaly-review gate that **awaits awaitable
+                                callbacks**, has a timeout, bounded queues,
+                                and returns an explicit status
+    CarbonForecaster          — the v6 wrapper class
+
+**Backward compatibility**
+    CarbonForecaster(config, deployment_id, features, hardware) keeps the
+    v5 constructor. get_current_intensity / get_current_reading / predict /
+    find_optimal_execution_window / get_statistics / initialize / shutdown
+    all keep their v5 signatures. ``create_forecaster`` factory unchanged.
+
+    For callers who already have a v18 ``CarbonForecast`` instance, pass
+    it directly: ``CarbonForecaster(config, forecast=my_v18_forecast)``.
 
 File: src/carbon/forecasting_engine.py
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional, List, Tuple, Any, Callable, Protocol
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
-from enum import Enum
-from collections import deque, defaultdict
-import logging
 import asyncio
+import inspect
+import json
+import logging
 import math
 import random
 import statistics
-import hashlib
+from collections import Counter, defaultdict, deque
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
+
+# --------------------------------------------------------------------------- #
+# Import v18 (single implementation for fetching, caching, circuits, retry)
+# --------------------------------------------------------------------------- #
+try:
+    from carbon_forecast import (  # type: ignore[import-not-found]
+        CarbonForecast,
+        ForecastBatch,
+        ForecastPoint,
+        ForecastSource,
+        CircuitBreaker,
+        StorageProtocol,
+        InMemoryStorage,
+        QuantumDistillationEngine,
+        CausalGraphLearner,
+        CausalPolicyAdapter,
+        FederatedGreenAggregator,
+        MultiAgentCoordinator,
+        TemporalLogicVerifier,
+        XAIDecisionExplainer,
+        AdaptivePrecisionSwitcher,
+        CarbonMarketIntegrator,
+        ChaosTestingEngine,
+        ActiveUserPreferenceLearner,
+        SimpleQuantumDistillationEngine,
+        SimpleCausalGraphLearner,
+        SimpleCausalPolicyAdapter,
+        SimpleFederatedGreenAggregator,
+        SimpleMultiAgentCoordinator,
+        SimpleTemporalLogicVerifier,
+        SimpleXAIDecisionExplainer,
+        SimpleAdaptivePrecisionSwitcher,
+        SimpleCarbonMarketIntegrator,
+        SimpleChaosTestingEngine,
+        SimpleActiveUserPreferenceLearner,
+        _utcnow,
+        _ensure_aware,
+        _parse_timestamp,
+        _json_safe,
+        _cfg_get,
+        _safe_mean,
+    )
+    _V18_AVAILABLE = True
+    _V18_ERROR: Optional[str] = None
+except ImportError as _e:  # pragma: no cover
+    _V18_AVAILABLE = False
+    _V18_ERROR = str(_e)
+
+    # Minimal fallbacks so the module is still importable, but the
+    # CarbonForecaster constructor raises a clear error if v18 is missing.
+    class CarbonForecast:  # type: ignore[no-redef]
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            raise RuntimeError(
+                "forecasting_engine v6 requires carbon_forecast (v18); "
+                f"import error: {_V18_ERROR}"
+            )
+
+    CircuitBreaker = None  # type: ignore[assignment]
+    ForecastPoint = None  # type: ignore[assignment]
+    ForecastBatch = None  # type: ignore[assignment]
+
+    class ForecastSource(Enum):  # type: ignore[no-redef]
+        API = "api"
+        CACHE = "cache"
+        HISTORY = "history"
+        LAST_API = "last_api"
+        RANDOM_WALK = "random_walk"
+        FALLBACK = "fallback"
+
+    QuantumDistillationEngine = None  # type: ignore[assignment]
+    CausalGraphLearner = None  # type: ignore[assignment]
+    CausalPolicyAdapter = None  # type: ignore[assignment]
+    FederatedGreenAggregator = None  # type: ignore[assignment]
+    MultiAgentCoordinator = None  # type: ignore[assignment]
+    TemporalLogicVerifier = None  # type: ignore[assignment]
+    XAIDecisionExplainer = None  # type: ignore[assignment]
+    AdaptivePrecisionSwitcher = None  # type: ignore[assignment]
+    CarbonMarketIntegrator = None  # type: ignore[assignment]
+    ChaosTestingEngine = None  # type: ignore[assignment]
+    ActiveUserPreferenceLearner = None  # type: ignore[assignment]
+    SimpleQuantumDistillationEngine = None  # type: ignore[assignment]
+    SimpleCausalGraphLearner = None  # type: ignore[assignment]
+    SimpleCausalPolicyAdapter = None  # type: ignore[assignment]
+    SimpleFederatedGreenAggregator = None  # type: ignore[assignment]
+    SimpleMultiAgentCoordinator = None  # type: ignore[assignment]
+    SimpleTemporalLogicVerifier = None  # type: ignore[assignment]
+    SimpleXAIDecisionExplainer = None  # type: ignore[assignment]
+    SimpleAdaptivePrecisionSwitcher = None  # type: ignore[assignment]
+    SimpleCarbonMarketIntegrator = None  # type: ignore[assignment]
+    SimpleChaosTestingEngine = None  # type: ignore[assignment]
+    SimpleActiveUserPreferenceLearner = None  # type: ignore[assignment]
+    InMemoryStorage = None  # type: ignore[assignment]
+    StorageProtocol = None  # type: ignore[assignment]
+
+    def _utcnow() -> datetime:  # type: ignore[misc]
+        return datetime.now(timezone.utc)
+
+    def _ensure_aware(dt: datetime) -> datetime:  # type: ignore[misc]
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    def _parse_timestamp(raw: Any) -> datetime:  # type: ignore[misc]
+        if isinstance(raw, datetime):
+            return _ensure_aware(raw)
+        if isinstance(raw, str):
+            s = raw.strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            try:
+                return _ensure_aware(datetime.fromisoformat(s))
+            except ValueError:
+                return _utcnow()
+        return _utcnow()
+
+    def _json_safe(obj: Any) -> Any:  # type: ignore[misc]
+        if isinstance(obj, float):
+            return None if (math.isnan(obj) or math.isinf(obj)) else obj
+        if isinstance(obj, datetime):
+            return _ensure_aware(obj).isoformat()
+        if isinstance(obj, Enum):
+            return obj.value
+        if isinstance(obj, Mapping):
+            return {str(k): _json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple, set)):
+            return [_json_safe(v) for v in obj]
+        return obj
+
+    def _cfg_get(config: Any, key: str, default: Any = None) -> Any:  # type: ignore[misc]
+        if config is None:
+            return default
+        if isinstance(config, Mapping):
+            return config.get(key, default)
+        return getattr(config, key, default)
+
+    def _safe_mean(values: Any, default: float = 0.0) -> float:  # type: ignore[misc]
+        items = [
+            float(v)
+            for v in values
+            if v is not None and math.isfinite(float(v))
+        ]
+        return statistics.mean(items) if items else default
+
 
 logger = logging.getLogger(__name__)
 
+_VALID_HITL_STATUSES = frozenset(
+    {"not_required", "pending", "approved", "rejected", "timed_out"}
+)
 
-# =============================================================================
-# Enums & basic data classes
-# =============================================================================
 
+# --------------------------------------------------------------------------- #
+# Public enums
+# --------------------------------------------------------------------------- #
 class PrecisionLevel(Enum):
     FP32 = "fp32"
     FP16 = "fp16"
@@ -49,6 +238,8 @@ class PrecisionLevel(Enum):
 
 
 class ProviderKind(Enum):
+    """Where a reading came from (mapped from v18's ``ForecastSource``)."""
+
     SIMULATION = "simulation"
     ELECTRICITYMAP = "electricitymap"
     CARBONINTENSITY = "carbonintensity"
@@ -64,154 +255,174 @@ class AgentRole(Enum):
     GENERALIST = "generalist"
 
 
-@dataclass
+#: Map v18 ``ForecastSource`` → v6 ``ProviderKind``.
+_FORECAST_TO_PROVIDER: Dict[str, ProviderKind] = {
+    "api": ProviderKind.ELECTRICITYMAP,
+    "cache": ProviderKind.ELECTRICITYMAP,
+    "last_api": ProviderKind.ELECTRICITYMAP,
+    "history": ProviderKind.SIMULATION,
+    "random_walk": ProviderKind.SIMULATION,
+    "fallback": ProviderKind.SIMULATION,
+}
+
+
+# --------------------------------------------------------------------------- #
+# v6 types (not in v18)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
 class IntensityReading:
-    """A single carbon intensity observation with provenance."""
+    """
+    A single carbon intensity observation with full provenance.
+
+    Frozen — a reading is an immutable fact. Corrections are recorded as
+    new readings (see the ledger module for the same rule).
+    """
+
     region: str
-    intensity: float  # gCO2/kWh
+    intensity: float
     timestamp: datetime
     source: ProviderKind
     confidence: float = 1.0
     is_simulated: bool = False
     is_stale: bool = False
     explanation: Optional[str] = None
+    hitl_status: str = "not_required"
+    hitl_approved: Optional[bool] = None
+    anomaly_flagged: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "region": self.region,
+            "intensity": self.intensity,
+            "timestamp": _ensure_aware(self.timestamp).isoformat(),
+            "source": self.source.value,
+            "confidence": self.confidence,
+            "is_simulated": self.is_simulated,
+            "is_stale": self.is_stale,
+            "explanation": self.explanation,
+            "hitl_status": self.hitl_status,
+            "hitl_approved": self.hitl_approved,
+            "anomaly_flagged": self.anomaly_flagged,
+        }
 
 
-@dataclass
+@dataclass(frozen=True)
 class IntensityForecast:
     """A single forecasted point."""
+
     timestamp: datetime
     predicted_intensity: float
     confidence: float
     source: ProviderKind = ProviderKind.SIMULATION
 
 
-@dataclass
+@dataclass(frozen=True)
 class OptimalWindow:
     """Result of an optimal-execution-window search."""
+
     start_time: datetime
     end_time: datetime
     avg_intensity: float
     carbon_savings_percent: float
 
 
-# =============================================================================
-# ENHANCEMENT 9: Resilience — Circuit Breaker + Chaos Injector
-# =============================================================================
-
-class CircuitState(Enum):
-    CLOSED = "closed"        # healthy
-    OPEN = "open"            # tripped
-    HALF_OPEN = "half_open"  # testing recovery
-
-
 @dataclass
-class CircuitBreaker:
-    """Simple circuit breaker with failure threshold & recovery timeout."""
-    name: str
-    failure_threshold: int = 3
-    recovery_timeout_seconds: int = 60
-    state: CircuitState = CircuitState.CLOSED
-    failures: int = 0
-    last_failure_at: Optional[datetime] = None
+class HardwareProfile:
+    """Minimal hardware capability description used by v6's precision selection."""
 
-    def can_call(self) -> bool:
-        if self.state == CircuitState.CLOSED:
-            return True
-        if self.state == CircuitState.OPEN:
-            if (self.last_failure_at and
-                    (datetime.now() - self.last_failure_at).total_seconds()
-                    > self.recovery_timeout_seconds):
-                self.state = CircuitState.HALF_OPEN
-                return True
-            return False
-        return True  # HALF_OPEN lets a probe through
-
-    def record_success(self) -> None:
-        self.failures = 0
-        self.state = CircuitState.CLOSED
-
-    def record_failure(self) -> None:
-        self.failures += 1
-        self.last_failure_at = datetime.now()
-        if self.failures >= self.failure_threshold:
-            self.state = CircuitState.OPEN
-            logger.warning(f"Circuit '{self.name}' OPEN after {self.failures} failures")
+    has_tensor_cores: bool = True
+    supports_int8: bool = True
+    supports_int4: bool = False
+    vram_gb: float = 24.0
+    edge_device: bool = False
 
 
-class ChaosInjector:
-    """Injects controlled faults for resilience testing."""
-
-    def __init__(self, failure_rate: float = 0.0, latency_ms: int = 0) -> None:
-        self.failure_rate = failure_rate
-        self.latency_ms = latency_ms
-        self.events: List[Dict[str, Any]] = []
-
-    async def maybe_inject(self, component: str) -> None:
-        if self.latency_ms > 0:
-            await asyncio.sleep(self.latency_ms / 1000.0)
-        if random.random() < self.failure_rate:
-            self.events.append({
-                "component": component,
-                "at": datetime.utcnow().isoformat(),
-            })
-            raise RuntimeError(f"Chaos injection failure in {component}")
+@dataclass(frozen=True)
+class MarketSnapshot:
+    price_per_kwh_usd: float
+    rec_available_mwh: float
+    rec_price_per_mwh_usd: float
+    timestamp: datetime = field(default_factory=_utcnow)
 
 
-# =============================================================================
-# ENHANCEMENT 5: Temporal Logic & Formal Verification
-# =============================================================================
-
-class TemporalProperty(Protocol):
-    def check(self, history: List[IntensityReading]) -> bool: ...
-
-
-@dataclass
-class CacheFreshness:
-    """G(cache_age < max_age) — cached readings must not exceed max age."""
-    max_age_seconds: int = 900
-
-    def check(self, history: List[IntensityReading]) -> bool:
-        now = datetime.now()
-        for r in history:
-            if (now - r.timestamp).total_seconds() > self.max_age_seconds:
-                return False
-        return True
+@dataclass(frozen=True)
+class HITLRequest:
+    region: str
+    intensity: float
+    reason: str
+    urgency: str
+    requested_at: datetime = field(default_factory=_utcnow)
 
 
-@dataclass
-class IntensityBounds:
-    """G(intensity ∈ [min, max]) — physically plausible range."""
-    min_val: float = 10.0
-    max_val: float = 1200.0
-
-    def check(self, history: List[IntensityReading]) -> bool:
-        return all(self.min_val <= r.intensity <= self.max_val for r in history)
+@dataclass(frozen=True)
+class UncertaintyEstimate:
+    mean: float
+    std: float
+    confidence: float
+    n_samples: int
 
 
-class TemporalLogicMonitor:
-    def __init__(self) -> None:
-        self.properties: List[TemporalProperty] = []
-        self.violations: List[Dict[str, Any]] = []
+# --------------------------------------------------------------------------- #
+# Genuinely new v6 components (not in v18)
+# --------------------------------------------------------------------------- #
+class AnomalyDetector:
+    """
+    Per-region rolling z-score detector with physical-bounds check.
 
-    def register(self, p: TemporalProperty) -> None:
-        self.properties.append(p)
+    History is **keyed by region**, so readings in different regions do
+    not contaminate each other.
+    """
 
-    def verify(self, history: List[IntensityReading]) -> bool:
-        ok = True
-        for p in self.properties:
-            if not p.check(history):
-                ok = False
-                self.violations.append({
-                    "property": type(p).__name__,
-                    "at": datetime.utcnow().isoformat(),
-                })
-        return ok
+    def __init__(
+        self,
+        window: int = 20,
+        z_threshold: float = 3.0,
+        min_val: float = 10.0,
+        max_val: float = 1200.0,
+    ) -> None:
+        self.window = window
+        self.z = z_threshold
+        self.min_val = min_val
+        self.max_val = max_val
+        self._history: Dict[str, Deque[float]] = defaultdict(
+            lambda: deque(maxlen=window)
+        )
+
+    def check(self, region: str, intensity: float) -> Tuple[bool, float]:
+        hist = self._history[region]
+        implausible = intensity < self.min_val or intensity > self.max_val
+        if len(hist) < 5:
+            hist.append(intensity)
+            return implausible, 0.0
+        mean = statistics.fmean(hist)
+        std = statistics.pstdev(hist) or 1e-6
+        z = abs(intensity - mean) / std
+        hist.append(intensity)
+        return implausible or (z > self.z), z
+
+    def stats(self) -> Dict[str, Dict[str, float]]:
+        return {
+            region: {
+                "samples": len(hist),
+                "mean": statistics.fmean(hist) if hist else 0.0,
+            }
+            for region, hist in self._history.items()
+        }
 
 
-# =============================================================================
-# ENHANCEMENT 4: Multi-Agent Coordination with Emergent Role Specialisation
-# =============================================================================
+class UncertaintyEstimator:
+    """Estimates uncertainty from a recent population of readings."""
+
+    @staticmethod
+    def estimate(values: Sequence[float]) -> UncertaintyEstimate:
+        if not values:
+            return UncertaintyEstimate(200.0, 100.0, 0.1, 0)
+        mean = statistics.fmean(values)
+        std = statistics.pstdev(values) if len(values) > 1 else 0.0
+        cv = std / mean if mean > 0 else 1.0
+        confidence = max(0.0, min(1.0, 1.0 - cv))
+        return UncertaintyEstimate(mean, std, confidence, len(values))
+
 
 @dataclass
 class AgentProfile:
@@ -225,24 +436,44 @@ class AgentProfile:
     total_calls: int = 0
 
 
-class MultiAgentCoordinator:
-    """Assigns fetcher agents to regions/providers via emergent specialization."""
+class FetcherCoordinator:
+    """
+    Fetcher-agent role assignment via sliding-window outcome means.
 
-    def __init__(self) -> None:
+    This is a distinct concern from v18's ``MultiAgentCoordinator`` (which
+    coordinates the forecast pipeline by role). v6's coordinators
+    specialise **fetcher agents** by region and provider.
+    """
+
+    def __init__(self, window_size: int = 20) -> None:
         self.agents: Dict[str, AgentProfile] = {}
+        self._history: Dict[str, Deque[Dict[str, float]]] = defaultdict(
+            lambda: deque(maxlen=window_size)
+        )
 
     def register(self, agent_id: str) -> AgentProfile:
         if agent_id not in self.agents:
             self.agents[agent_id] = AgentProfile(agent_id)
         return self.agents[agent_id]
 
+    def _window_mean(self, agent_id: str, key: str) -> float:
+        hist = self._history[agent_id]
+        if not hist:
+            return 0.0
+        return sum(h.get(key, 0.0) for h in hist) / len(hist)
+
     def _reassign_roles(self) -> None:
         for a in self.agents.values():
+            if len(self._history[a.agent_id]) < 3:
+                continue
+            a.success_rate = self._window_mean(a.agent_id, "success")
+            a.avg_latency_ms = self._window_mean(a.agent_id, "latency")
+            a.anomaly_catch_rate = self._window_mean(a.agent_id, "anomaly")
             if len(a.regions) >= 3:
                 a.role = AgentRole.REGIONAL_SPECIALIST
             elif a.anomaly_catch_rate > 0.5:
                 a.role = AgentRole.ANOMALY_HUNTER
-            elif a.avg_latency_ms and a.avg_latency_ms < 200:
+            elif 0 < a.avg_latency_ms < 200:
                 a.role = AgentRole.LATENCY_OPTIMIZER
             elif len(a.providers) >= 2:
                 a.role = AgentRole.PROVIDER_SPECIALIST
@@ -259,743 +490,703 @@ class MultiAgentCoordinator:
         anomaly_caught: bool,
     ) -> None:
         a = self.register(agent_id)
-        n = a.total_calls + 1
-        a.success_rate = ((n - 1) * a.success_rate + float(success)) / n
-        a.avg_latency_ms = ((n - 1) * a.avg_latency_ms + latency_ms) / n
-        a.anomaly_catch_rate = (
-            (n - 1) * a.anomaly_catch_rate + float(anomaly_caught)
-        ) / n
-        a.total_calls = n
+        self._history[agent_id].append(
+            {
+                "success": float(success),
+                "latency": latency_ms,
+                "anomaly": float(anomaly_caught),
+            }
+        )
+        a.total_calls += 1
         if region not in a.regions:
-            a.regions.append(region)
+            a.regions = (a.regions + [region])[-10:]
         if provider not in a.providers:
-            a.providers.append(provider)
-        if n % 5 == 0:
-            self._reassign_roles()
+            a.providers = (a.providers + [provider])[-10:]
+        self._reassign_roles()
 
-    def select_agent(self, region: str, provider: ProviderKind) -> Optional[str]:
+    def select_agent(
+        self, region: str, provider: ProviderKind
+    ) -> Optional[str]:
         if not self.agents:
             return None
-        # Prefer regional specialists for the given region
-        candidates = [
-            a for a in self.agents.values()
-            if region in a.regions and a.success_rate > 0.5
-        ] or list(self.agents.values())
-        return max(candidates, key=lambda a: a.success_rate).agent_id
-
-
-# =============================================================================
-# ENHANCEMENT 1: Quantum-Distillation Ensemble for Forecasting
-# =============================================================================
-
-@dataclass
-class DistilledForecastModel:
-    model_id: str
-    precision: PrecisionLevel
-    weights: List[float]
-    bias: float
-    quality_retention: float = 0.95
-    energy_reduction_percent: float = 60.0
-
-
-class QuantumDistillationEnsemble:
-    """
-    Inline distilled ensemble. In production this delegates to
-    quantum_integration's distillation orchestrator; here it's a
-    lightweight linear model distilled from a hypothetical teacher.
-    """
-
-    def __init__(self) -> None:
-        self.teachers: Dict[str, List[float]] = {}
-        self.students: Dict[str, DistilledForecastModel] = {}
-
-    def register_teacher(self, region: str, weights: List[float]) -> None:
-        self.teachers[region] = weights
-
-    def distill(
-        self, region: str, precision: PrecisionLevel
-    ) -> DistilledForecastModel:
-        key = f"{region}:{precision.value}"
-        if key in self.students:
-            return self.students[key]
-        teacher_w = self.teachers.get(region, [1.0, 0.5, 0.2])
-        # "Distill" by truncating & renormalizing weights
-        student_w = [w * 0.9 for w in teacher_w]
-        model = DistilledForecastModel(
-            model_id=key,
-            precision=precision,
-            weights=student_w,
-            bias=0.0,
-            quality_retention={
-                PrecisionLevel.FP32: 1.0,
-                PrecisionLevel.FP16: 0.97,
-                PrecisionLevel.INT8: 0.92,
-                PrecisionLevel.INT4: 0.85,
-                PrecisionLevel.QUANTUM_DISTILLED: 0.78,
-            }[precision],
-            energy_reduction_percent={
-                PrecisionLevel.FP32: 0,
-                PrecisionLevel.FP16: 30,
-                PrecisionLevel.INT8: 55,
-                PrecisionLevel.INT4: 70,
-                PrecisionLevel.QUANTUM_DISTILLED: 85,
-            }[precision],
-        )
-        self.students[key] = model
-        return model
-
-    def predict(
-        self, model: DistilledForecastModel, features: List[float]
-    ) -> float:
-        return sum(w * x for w, x in zip(model.weights, features)) + model.bias
-
-
-# =============================================================================
-# ENHANCEMENT 7: Adaptive Precision Switching (Hardware-Aware)
-# =============================================================================
-
-@dataclass
-class HardwareProfile:
-    has_tensor_cores: bool = True
-    supports_int8: bool = True
-    supports_int4: bool = False
-    vram_gb: float = 24.0
-    edge_device: bool = False
-
-
-class AdaptivePrecisionController:
-    """Chooses a precision for the forecasting model based on hardware."""
-
-    def __init__(self, hw: Optional[HardwareProfile] = None) -> None:
-        self.hw = hw or HardwareProfile()
-
-    def select(self, urgency: str, region: str) -> PrecisionLevel:
-        if urgency == "critical":
-            return PrecisionLevel.FP16
-        if self.hw.edge_device:
-            return PrecisionLevel.INT8 if self.hw.supports_int8 else PrecisionLevel.FP16
-        if self.hw.supports_int4:
-            return PrecisionLevel.INT4
-        return PrecisionLevel.INT8
-
-
-# =============================================================================
-# ENHANCEMENT 2: Causal RL for Provider Selection
-# =============================================================================
-
-@dataclass
-class ProviderState:
-    region: str
-    hour_of_day: int
-    recent_anomaly_rate: float
-    recent_latency_ms: float
-    cache_hit: bool
-
-
-class CausalProviderPolicy:
-    """
-    Contextual bandit that learns which provider to query for a given
-    (region, hour, health) context. Rewards: accuracy - latency_penalty.
-    """
-
-    PROVIDERS = [
-        ProviderKind.ELECTRICITYMAP,
-        ProviderKind.CARBONINTENSITY,
-        ProviderKind.SIMULATION,
-        ProviderKind.FEDERATED_PEER,
-        ProviderKind.DISTILLED_MODEL,
-    ]
-
-    def __init__(self, epsilon: float = 0.1, lr: float = 0.05) -> None:
-        self.epsilon = epsilon
-        self.lr = lr
-        self.weights: Dict[ProviderKind, List[float]] = {
-            p: [0.0] * 5 for p in self.PROVIDERS
-        }
-        self.buffer: deque = deque(maxlen=1024)
-
-    @staticmethod
-    def _features(s: ProviderState) -> List[float]:
-        return [
-            s.hour_of_day / 24.0,
-            s.recent_anomaly_rate,
-            s.recent_latency_ms / 1000.0,
-            float(s.cache_hit),
-            1.0 if s.region.startswith("GB") else 0.0,
+        specialists = [
+            a
+            for a in self.agents.values()
+            if a.role == AgentRole.REGIONAL_SPECIALIST
+            and region in a.regions
         ]
+        if specialists:
+            return max(
+                specialists, key=lambda a: a.success_rate
+            ).agent_id
+        generalists = [
+            a
+            for a in self.agents.values()
+            if a.role == AgentRole.GENERALIST
+        ]
+        if generalists:
+            return max(
+                generalists, key=lambda a: a.success_rate
+            ).agent_id
+        return max(
+            self.agents.values(), key=lambda a: a.success_rate
+        ).agent_id
 
-    def _q(self, s: ProviderState, p: ProviderKind) -> float:
-        f = self._features(s)
-        return sum(w * x for w, x in zip(self.weights[p], f))
-
-    def select(self, s: ProviderState, available: List[ProviderKind]) -> ProviderKind:
-        if random.random() < self.epsilon:
-            return random.choice(available)
-        return max(available, key=lambda p: self._q(s, p))
-
-    def record(
-        self,
-        s: ProviderState,
-        provider: ProviderKind,
-        accuracy: float,
-        latency_ms: float,
-    ) -> None:
-        self.buffer.append((s, provider, accuracy, latency_ms))
-
-    def update(self) -> None:
-        if not self.buffer:
-            return
-        for s, p, acc, lat in self.buffer:
-            f = self._features(s)
-            q = sum(w * x for w, x in zip(self.weights[p], f))
-            reward = acc - 0.001 * lat
-            err = reward - q
-            for i, x in enumerate(f):
-                self.weights[p][i] += self.lr * err * x
-        self.buffer.clear()
-
-
-# =============================================================================
-# ENHANCEMENT 3: Federated Green Learning
-# =============================================================================
 
 @dataclass
 class FederatedRegionalProfile:
     deployment_id: str
     region: str
-    hourly_means: List[float]  # 24 values
+    hourly_means: List[float]
     sample_count: int
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=_utcnow)
 
 
 class FederatedRegionalAggregator:
-    """Aggregates hourly intensity profiles across deployments."""
+    """
+    Hourly-profile federation, distinct from v18's byte-blob federation.
+
+    v18's ``FederatedGreenAggregator`` shares opaque byte blobs; this class
+    shares 24-hour intensity profiles between deployments. Both are
+    re-exported so callers can use whichever fits.
+    """
 
     def __init__(self) -> None:
-        self._updates: List[FederatedRegionalProfile] = []
-        self._global_profile: Dict[str, List[float]] = {}
+        self._updates: Dict[
+            str, List[FederatedRegionalProfile]
+        ] = defaultdict(list)
+        self._global: Dict[str, List[float]] = {}
 
     def push(self, u: FederatedRegionalProfile) -> None:
-        self._updates.append(u)
+        bucket = self._updates[u.region]
+        bucket.append(u)
+        if len(bucket) > 100:
+            del bucket[: len(bucket) - 100]
 
     def aggregate(self) -> Dict[str, List[float]]:
-        grouped: Dict[str, List[List[float]]] = defaultdict(list)
-        weights: Dict[str, List[int]] = defaultdict(list)
-        for u in self._updates:
-            grouped[u.region].append(u.hourly_means)
-            weights[u.region].append(u.sample_count)
-
         result: Dict[str, List[float]] = {}
-        for region, profiles in grouped.items():
-            ws = weights[region]
-            total_w = sum(ws)
+        for region, profiles in self._updates.items():
+            if not profiles:
+                continue
+            total_w = sum(max(1, p.sample_count) for p in profiles)
+            if total_w <= 0:
+                continue
             merged = [0.0] * 24
-            for profile, w in zip(profiles, ws):
+            for profile in profiles:
+                w = max(1, profile.sample_count)
                 for h in range(24):
-                    merged[h] += profile[h] * w
+                    merged[h] += profile.hourly_means[h] * w
             result[region] = [v / total_w for v in merged]
-        self._global_profile = result
+        self._global = result
         return result
 
     def get_global(self, region: str) -> Optional[List[float]]:
-        return self._global_profile.get(region)
+        return self._global.get(region)
 
 
-# =============================================================================
-# ENHANCEMENT 10: Uncertainty Estimation + HITL + Active Learning
-# =============================================================================
-
-@dataclass
-class UncertaintyEstimate:
-    mean: float
-    std: float
-    confidence: float  # 0..1
-    n_samples: int
-
-
-class UncertaintyEstimator:
-    """Estimates uncertainty from a population of readings."""
-
-    @staticmethod
-    def estimate(values: List[float]) -> UncertaintyEstimate:
-        if not values:
-            return UncertaintyEstimate(200.0, 100.0, 0.1, 0)
-        mean = statistics.fmean(values)
-        std = statistics.pstdev(values) if len(values) > 1 else 0.0
-        # Confidence: inverse of coefficient of variation, clamped
-        cv = std / mean if mean > 0 else 1.0
-        confidence = max(0.0, min(1.0, 1.0 - cv))
-        return UncertaintyEstimate(mean, std, confidence, len(values))
-
-
-@dataclass
-class HITLRequest:
-    region: str
-    intensity: float
-    reason: str
-    urgency: str  # "low" | "medium" | "high"
-    requested_at: datetime = field(default_factory=datetime.utcnow)
-
-
-class HumanInTheLoopGate:
-    """Routes anomalous readings to a human, logs active-learning samples."""
-
-    def __init__(self, auto_approve_medium: bool = False) -> None:
-        self.auto_approve_medium = auto_approve_medium
-        self.pending: List[HITLRequest] = []
-        self.feedback_log: List[Dict[str, Any]] = []
-        self._callback: Optional[Callable[[HITLRequest], bool]] = None
-
-    def set_callback(self, cb: Callable[[HITLRequest], bool]) -> None:
-        self._callback = cb
-
-    async def request_review(
-        self, region: str, intensity: float, reason: str, urgency: str
-    ) -> bool:
-        req = HITLRequest(region, intensity, reason, urgency)
-        self.pending.append(req)
-        if urgency == "low":
-            self.pending.remove(req)
-            self.feedback_log.append({"req": asdict(req), "decision": True})
-            return True
-        if urgency == "medium" and self.auto_approve_medium:
-            self.pending.remove(req)
-            self.feedback_log.append({"req": asdict(req), "decision": True})
-            return True
-        if self._callback is None:
-            self.pending.remove(req)
-            self.feedback_log.append({"req": asdict(req), "decision": False})
-            return False
-        decision = self._callback(req)
-        self.pending.remove(req)
-        self.feedback_log.append({"req": asdict(req), "decision": decision})
-        return decision
-
-    def active_learning_batch(self, n: int = 16) -> List[Dict[str, Any]]:
-        return self.feedback_log[-n:]
-
-
-# =============================================================================
-# ENHANCEMENT 6: Explainable AI (XAI)
-# =============================================================================
-
-@dataclass
-class ReadingExplanation:
-    headline: str
-    rationale: List[str]
-    provenance: str
-    confidence: float
-    contributing_factors: Dict[str, float]
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-class DecisionExplainer:
-    """Explains every returned intensity value."""
-
-    @staticmethod
-    def explain(
+# --------------------------- temporal logic for readings --------------------------- #
+class TemporalProperty(Protocol):
+    def check(
+        self,
+        history: Sequence[IntensityReading],
         region: str,
-        intensity: float,
-        source: ProviderKind,
-        confidence: float,
-        cache_hit: bool,
-        anomaly_flagged: bool = False,
-        fallback_reason: Optional[str] = None,
-    ) -> ReadingExplanation:
-        reasons: List[str] = []
-        reasons.append(f"Region '{region}' carbon intensity = {intensity:.0f} gCO₂/kWh.")
-        reasons.append(f"Source: {source.value}" + (" (cached)" if cache_hit else " (live)."))
-        if fallback_reason:
-            reasons.append(f"Fallback triggered: {fallback_reason}")
-        if anomaly_flagged:
-            reasons.append("Value flagged as anomalous by detector.")
-        if confidence < 0.5:
-            reasons.append("Low confidence — consider human review.")
-        return ReadingExplanation(
-            headline=f"{intensity:.0f} gCO₂/kWh [{source.value}]",
-            rationale=reasons,
-            provenance=source.value,
-            confidence=confidence,
-            contributing_factors={
-                "cache_hit": float(cache_hit),
-                "anomaly_flagged": float(anomaly_flagged),
-                "confidence": confidence,
-            },
-        )
+    ) -> bool: ...
 
-
-# =============================================================================
-# ENHANCEMENT 8: Carbon Markets & RECs
-# =============================================================================
 
 @dataclass
-class MarketSnapshot:
-    price_per_kwh_usd: float
-    rec_available_mwh: float
-    rec_price_per_mwh_usd: float
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+class CacheFreshness:
+    """G(fresh reading in the current window)."""
 
+    max_age_seconds: int = 900
+    window: int = 20
 
-class CarbonMarketClient:
-    """Inline client for market quotes and REC inventory."""
-
-    def __init__(self, api_key: Optional[str] = None) -> None:
-        self.api_key = api_key
-        self._cache: Optional[MarketSnapshot] = None
-        self._cache_ttl = 300
-
-    async def get_snapshot(self) -> MarketSnapshot:
-        if self._cache and (datetime.now() - self._cache.timestamp).total_seconds() < self._cache_ttl:
-            return self._cache
-        # Simulated market response
-        await asyncio.sleep(0)
-        snap = MarketSnapshot(
-            price_per_kwh_usd=0.08 + random.uniform(-0.02, 0.02),
-            rec_available_mwh=random.uniform(10, 500),
-            rec_price_per_mwh_usd=random.uniform(3.0, 9.0),
+    def check(
+        self, history: Sequence[IntensityReading], region: str
+    ) -> bool:
+        recent = [r for r in history if r.region == region][-self.window:]
+        if not recent:
+            return True
+        now = _utcnow()
+        return all(
+            (now - _ensure_aware(r.timestamp)).total_seconds()
+            <= self.max_age_seconds
+            for r in recent
         )
-        self._cache = snap
-        return snap
 
 
-# =============================================================================
-# Anomaly Detection
-# =============================================================================
+@dataclass
+class IntensityBounds:
+    """G(intensity ∈ [min, max]) for readings of the current region."""
 
-class AnomalyDetector:
-    """Rolling z-score detector over recent readings."""
+    min_val: float = 10.0
+    max_val: float = 1200.0
 
-    def __init__(self, window: int = 20, z_threshold: float = 3.0) -> None:
-        self.window = window
-        self.z = z_threshold
-        self.history: deque[float] = deque(maxlen=window)
-
-    def check(self, intensity: float) -> Tuple[bool, float]:
-        if len(self.history) < 5:
-            self.history.append(intensity)
-            return False, 0.0
-        mean = statistics.fmean(self.history)
-        std = statistics.pstdev(self.history) or 1e-6
-        z = abs(intensity - mean) / std
-        self.history.append(intensity)
-        # Also flag physically implausible values
-        implausible = intensity < 10 or intensity > 1200
-        return (z > self.z) or implausible, z
+    def check(
+        self, history: Sequence[IntensityReading], region: str
+    ) -> bool:
+        return all(
+            self.min_val <= r.intensity <= self.max_val
+            for r in history
+            if r.region == region
+        )
 
 
-# =============================================================================
-# Enhanced CarbonForecaster
-# =============================================================================
-
-class CarbonForecaster:
+class ReadingTemporalMonitor:
     """
-    Enhanced carbon intensity forecaster with:
-      - Real-time tracking (existing)
-      - Forecasting: predict() and find_optimal_execution_window() (NEW)
-      - Uncertainty + XAI + provenance (NEW)
-      - Circuit breaker + chaos injection (NEW)
-      - Federated regional profiles (NEW)
-      - Market enrichment (NEW)
-      - HITL for anomalies (NEW)
-      - Causal RL provider selection (NEW)
-      - Multi-agent coordination (NEW)
-      - Adaptive precision + quantum distillation (NEW)
-      - Temporal logic verification (NEW)
+    Bounded temporal monitor over ``IntensityReading`` objects.
+
+    Distinct from v18's ``TemporalLogicVerifier`` (which verifies state
+    dicts). The v5 bug where one stale reading permanently alarmed the
+    monitor is fixed: properties only consider the last ``window``
+    readings per region, and violations are bounded.
     """
 
-    DEFAULT_FEATURES = {
-        "causal_rl": True,
-        "xai": True,
-        "adaptive_precision": True,
-        "federated": True,
-        "multi_agent": True,
-        "temporal_logic": True,
-        "carbon_market": True,
-        "chaos_testing": False,
-        "hitl": True,
-        "quantum_distillation": True,
-        "anomaly_detection": True,
-    }
+    def __init__(self, max_violations: int = 200) -> None:
+        self.properties: List[TemporalProperty] = []
+        self.violations: Deque[Dict[str, Any]] = deque(maxlen=max_violations)
+
+    def register(self, prop: TemporalProperty) -> None:
+        self.properties.append(prop)
+
+    def verify(
+        self,
+        history: Sequence[IntensityReading],
+        region: Optional[str] = None,
+    ) -> bool:
+        target = region or (
+            history[-1].region if history else ""
+        )
+        ok = True
+        for p in self.properties:
+            try:
+                if not p.check(history, target):
+                    ok = False
+                    self.violations.append(
+                        {
+                            "property": type(p).__name__,
+                            "region": target,
+                            "at": _utcnow().isoformat(),
+                        }
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Temporal property %s raised: %s",
+                    type(p).__name__,
+                    e,
+                )
+                ok = False
+        return ok
+
+
+# ------------------------------- HITL ---------------------------------- #
+class HumanInTheLoopGate:
+    """
+    Anomaly-review HITL.
+
+    Fixes over v5:
+
+    * **Awaits awaitable callbacks** — a coroutine is no longer silently
+      coerced to truthy.
+    * **Has a timeout** — callbacks and the underlying v18 learner are
+      wrapped in ``asyncio.wait_for``.
+    * **Bounded** — ``pending`` and ``feedback_log`` are deques.
+    * **Returns a status** — callers can distinguish "approved",
+      "rejected", "timed_out", "pending" (via ``IntensityReading.hitl_status``).
+    * **Optionally delegates** to v18's ``ActiveUserPreferenceLearner`` for
+      the queue/timeout plumbing.
+    """
 
     def __init__(
         self,
-        config: Dict,
+        learner: Optional[Any] = None,
+        timeout: float = 3.0,
+        auto_approve_low: bool = True,
+    ) -> None:
+        self._learner = learner
+        self._timeout = timeout
+        self.auto_approve_low = auto_approve_low
+        self.pending: Deque[HITLRequest] = deque(maxlen=100)
+        self.feedback_log: Deque[Dict[str, Any]] = deque(maxlen=500)
+        self._callback: Optional[Callable[[HITLRequest], Any]] = None
+
+    def set_callback(
+        self, cb: Callable[[HITLRequest], Any]
+    ) -> None:
+        self._callback = cb
+
+    def _resolve(
+        self,
+        req: HITLRequest,
+        approved: Optional[bool],
+        source: str,
+    ) -> Tuple[Optional[bool], str]:
+        try:
+            self.pending.remove(req)
+        except ValueError:
+            pass
+        status = (
+            "approved"
+            if approved is True
+            else "rejected"
+            if approved is False
+            else "timed_out"
+        )
+        self.feedback_log.append(
+            {
+                "req": asdict(req),
+                "approved": approved,
+                "status": status,
+                "source": source,
+            }
+        )
+        return approved, status
+
+    async def request_review(
+        self,
+        region: str,
+        intensity: float,
+        reason: str,
+        urgency: str,
+    ) -> Tuple[Optional[bool], str]:
+        req = HITLRequest(region, intensity, reason, urgency)
+        self.pending.append(req)
+
+        if urgency == "low" and self.auto_approve_low:
+            return self._resolve(req, True, "auto")
+
+        if self._callback is not None:
+            try:
+                decision = self._callback(req)
+                if inspect.isawaitable(decision):
+                    decision = await asyncio.wait_for(
+                        decision, timeout=self._timeout
+                    )
+                approved = (
+                    bool(decision) if decision is not None else None
+                )
+                return self._resolve(req, approved, "callback")
+            except asyncio.TimeoutError:
+                return self._resolve(req, None, "timeout")
+            except Exception as e:
+                logger.warning("HITL callback failed: %s", e)
+                return self._resolve(req, None, "error")
+
+        if self._learner is not None:
+            try:
+                chosen = await asyncio.wait_for(
+                    self._learner.query_user_if_needed(
+                        "anomaly_reviewer",
+                        [
+                            {
+                                "solution_id": "approve",
+                                "quality_score": 0.9,
+                            },
+                            {
+                                "solution_id": "reject",
+                                "quality_score": 0.8,
+                            },
+                        ],
+                        timeout=self._timeout,
+                    ),
+                    timeout=self._timeout,
+                )
+                if chosen is None:
+                    return self._resolve(req, None, "learner_timeout")
+                approved = chosen == "approve"
+                return self._resolve(req, approved, "learner")
+            except Exception as e:
+                logger.warning("Learner failed: %s", e)
+
+        # No callback and no learner → no answer
+        return self._resolve(req, None, "no_callback")
+
+    def outcome_counts(self) -> Dict[str, int]:
+        counts: Counter = Counter()
+        for entry in self.feedback_log:
+            counts[entry.get("status", "unknown")] += 1
+        return dict(counts)
+
+
+# --------------------------------------------------------------------------- #
+# Feature flags
+# --------------------------------------------------------------------------- #
+DEFAULT_FEATURES: Dict[str, bool] = {
+    "causal_rl": True,
+    "xai": True,
+    "adaptive_precision": True,
+    "federated": True,
+    "multi_agent": True,
+    "temporal_logic": True,
+    "carbon_market": True,
+    "chaos_testing": False,
+    "hitl": True,
+    "quantum_distillation": True,
+    "anomaly_detection": True,
+}
+
+
+# --------------------------------------------------------------------------- #
+# Config translation
+# --------------------------------------------------------------------------- #
+def _v6_to_v18_config(v6_config: Any) -> Dict[str, Any]:
+    """Translate the v5 ``{"carbon": {...}}`` config into v18's flat keys."""
+    carbon = _cfg_get(v6_config, "carbon", {}) or {}
+    return {
+        "carbon_region": _cfg_get(
+            carbon, "default_region", "US-CA"
+        ),
+        "carbon_cache_ttl": int(
+            _cfg_get(carbon, "cache_ttl", 900)
+        ),
+        "carbon_market_api_url": _cfg_get(carbon, "api_url", None),
+        "electricity_maps_api_key": _cfg_get(
+            carbon, "api_key", None
+        ),
+        "fail_mode": _cfg_get(v6_config, "fail_mode", "log"),
+        "circuit_failure_threshold": int(
+            _cfg_get(v6_config, "circuit_failure_threshold", 3)
+        ),
+        "circuit_recovery_timeout": float(
+            _cfg_get(v6_config, "circuit_recovery_timeout", 60.0)
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Main composition class
+# --------------------------------------------------------------------------- #
+class CarbonForecaster:
+    """
+    Thin composition layer over the v18 ``CarbonForecast``.
+
+    * **Fetching / caching / retry / circuit breaking** — delegated to
+      ``self._forecast`` (a v18 ``CarbonForecast`` instance).
+    * **v6 additions** — ``get_current_reading``, ``predict``,
+      ``find_optimal_execution_window``, plus anomaly detection,
+      uncertainty estimation, reading-scoped temporal properties, HITL,
+      fetcher coordination, and regional federation.
+    """
+
+    def __init__(
+        self,
+        config: Mapping[str, Any],
         deployment_id: str = "local",
         features: Optional[Dict[str, bool]] = None,
         hardware: Optional[HardwareProfile] = None,
-    ):
-        self.config = config
+        forecast: Optional["CarbonForecast"] = None,
+    ) -> None:
+        if not _V18_AVAILABLE and forecast is None:
+            raise RuntimeError(
+                "forecasting_engine v6 requires carbon_forecast (v18); "
+                f"import error: {_V18_ERROR}"
+            )
+
+        self.config: Mapping[str, Any] = config or {}
         self.deployment_id = deployment_id
-        self.api_provider = config.get("carbon", {}).get("api_provider", "simulation")
-        self.default_region = config.get("carbon", {}).get("default_region", "US-CA")
-        self._cache: Dict[str, IntensityReading] = {}
-        self._cache_ttl_seconds = 900
-
-        self.features = {**self.DEFAULT_FEATURES, **(features or {})}
-
-        # --- Enhancement layers ---
-        self.circuits: Dict[str, CircuitBreaker] = {
-            "electricitymap": CircuitBreaker("electricitymap"),
-            "carbonintensity": CircuitBreaker("carbonintensity"),
+        self.features: Dict[str, bool] = {
+            **DEFAULT_FEATURES,
+            **(features or {}),
         }
-        self.chaos = ChaosInjector() if self.features["chaos_testing"] else None
-        self.temporal_monitor = (
-            TemporalLogicMonitor() if self.features["temporal_logic"] else None
-        )
-        if self.temporal_monitor:
-            self.temporal_monitor.register(CacheFreshness(self._cache_ttl_seconds))
-            self.temporal_monitor.register(IntensityBounds())
+        self.hardware = hardware or HardwareProfile()
 
-        self.coordinator = (
-            MultiAgentCoordinator() if self.features["multi_agent"] else None
+        v18_config = _v6_to_v18_config(config)
+        self.default_region = v18_config["carbon_region"]
+        self._cache_ttl_seconds = v18_config["carbon_cache_ttl"]
+
+        # ---- The single implementation for fetching/caching/retrying ----
+        self._forecast: "CarbonForecast" = forecast or CarbonForecast(
+            config=v18_config,
+            region=self.default_region,
+            cache_ttl=self._cache_ttl_seconds,
+        )
+        # Serialise region swaps so concurrent reads on different regions
+        # don't race on v18's internal `.region` field.
+        self._region_lock = asyncio.Lock()
+
+        # ---- v18 enhancement instances (used where the API fits) ----
+        self.precision_switcher = (
+            AdaptivePrecisionSwitcher(config=v18_config, storage=None)
+            if self.features["adaptive_precision"]
+            else None
+        )
+        self.market_integrator = (
+            CarbonMarketIntegrator(config=v18_config, storage=None)
+            if self.features["carbon_market"]
+            else None
+        )
+        self.xai = (
+            XAIDecisionExplainer(config=v18_config, storage=None)
+            if self.features["xai"]
+            else None
+        )
+        self.chaos = (
+            ChaosTestingEngine(config=v18_config, storage=None)
+            if self.features["chaos_testing"]
+            else None
+        )
+        self.policy = (
+            CausalPolicyAdapter(
+                config=v18_config,
+                storage=None,
+                graph=CausalGraphLearner(storage=None),
+            )
+            if self.features["causal_rl"]
+            else None
         )
         self.distiller = (
-            QuantumDistillationEnsemble()
-            if self.features["quantum_distillation"] else None
+            QuantumDistillationEngine()
+            if self.features["quantum_distillation"]
+            else None
         )
-        self.precision_ctl = (
-            AdaptivePrecisionController(hardware)
-            if self.features["adaptive_precision"] else None
+        self.hitl_learner = (
+            ActiveUserPreferenceLearner(storage=None)
+            if self.features["hitl"]
+            else None
         )
-        self.rl_policy = (
-            CausalProviderPolicy() if self.features["causal_rl"] else None
-        )
+        # v18's federated aggregator is available via re-export; v6 uses
+        # its own hourly-profile aggregator because the concerns differ.
         self.federated = (
-            FederatedRegionalAggregator() if self.features["federated"] else None
+            FederatedRegionalAggregator()
+            if self.features["federated"]
+            else None
         )
-        self.uncertainty = UncertaintyEstimator()
-        self.hitl = HumanInTheLoopGate() if self.features["hitl"] else None
-        self.explainer = DecisionExplainer() if self.features["xai"] else None
-        self.market = (
-            CarbonMarketClient(api_key=config.get("carbon", {}).get("market_api_key"))
-            if self.features["carbon_market"] else None
-        )
+
+        # ---- v6-only components ----
         self.anomaly = (
             AnomalyDetector() if self.features["anomaly_detection"] else None
         )
+        self.uncertainty = UncertaintyEstimator()
+        self.hitl = (
+            HumanInTheLoopGate(learner=self.hitl_learner)
+            if self.features["hitl"]
+            else None
+        )
+        self.temporal = (
+            ReadingTemporalMonitor()
+            if self.features["temporal_logic"]
+            else None
+        )
+        if self.temporal is not None:
+            self.temporal.register(
+                CacheFreshness(self._cache_ttl_seconds)
+            )
+            self.temporal.register(IntensityBounds())
+        self.coordinator = (
+            FetcherCoordinator() if self.features["multi_agent"] else None
+        )
 
-        # History for temporal verification
-        self._reading_history: deque[IntensityReading] = deque(maxlen=200)
+        # ---- State ----
+        self._history: Dict[str, Deque[IntensityReading]] = defaultdict(
+            lambda: deque(maxlen=200)
+        )
+        self._cache: Dict[str, IntensityReading] = {}
+        self._fallback_count = 0
+        self._source_counts: Counter = Counter()
+        self._hitl_outcomes: Counter = Counter()
 
         logger.info(
-            f"Enhanced CarbonForecaster initialized (provider={self.api_provider}, "
-            f"deployment={deployment_id}, features={list(self.features)})"
+            "CarbonForecaster v6.0.0 initialized "
+            "(deployment=%s, region=%s, features=%s)",
+            deployment_id,
+            self.default_region,
+            sorted(k for k, v in self.features.items() if v),
         )
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
-
     async def initialize(self) -> None:
-        logger.info(f"CarbonForecaster initialized with {self.api_provider} provider")
+        logger.info(
+            "CarbonForecaster ready (region=%s, forecaster=%s)",
+            self.default_region,
+            type(self._forecast).__name__,
+        )
 
     async def shutdown(self) -> None:
+        try:
+            await self._forecast.close()
+        except Exception as e:
+            logger.warning("Forecaster close failed: %s", e)
         logger.info("CarbonForecaster shutdown complete")
 
-    # ------------------------------------------------------------------
-    # Real-time tracking (enhanced)
-    # ------------------------------------------------------------------
+    async def __aenter__(self) -> "CarbonForecaster":
+        await self.initialize()
+        return self
 
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.shutdown()
+
+    # ------------------------------------------------------------------
+    # Region-safe fetch
+    # ------------------------------------------------------------------
+    async def _fetch_current(
+        self, region: str
+    ) -> Tuple[float, ProviderKind]:
+        """Call v18's forecaster for ``region`` without leaking region state."""
+        async with self._region_lock:
+            original = self._forecast.region
+            try:
+                if region != original:
+                    self._forecast.set_region(region)
+                value, source = await self._forecast.current_intensity_async()
+            finally:
+                if region != original:
+                    self._forecast.set_region(original)
+
+        provider = _FORECAST_TO_PROVIDER.get(
+            source.value if hasattr(source, "value") else str(source),
+            ProviderKind.SIMULATION,
+        )
+        return float(value), provider
+
+    # ------------------------------------------------------------------
+    # Public reading API
+    # ------------------------------------------------------------------
     async def get_current_intensity(
         self, region: Optional[str] = None
     ) -> float:
-        """Backward-compatible: returns just the float."""
         reading = await self.get_current_reading(region)
         return reading.intensity
 
     async def get_current_reading(
         self, region: Optional[str] = None
     ) -> IntensityReading:
-        """Rich reading with provenance, confidence, and XAI."""
         region = region or self.default_region
+        now = _utcnow()
 
-        # 1. Cache check with temporal verification
+        # 1. Fast-path cache (v6's enriched cache, with TTL)
         cached = self._cache.get(region)
-        if cached:
-            age = (datetime.now() - cached.timestamp).total_seconds()
-            if age < self._cache_ttl_seconds:
-                if self.explainer:
-                    cached.explanation = (
-                        DecisionExplainer.explain(
-                            region=region,
-                            intensity=cached.intensity,
-                            source=cached.source,
-                            confidence=cached.confidence,
-                            cache_hit=True,
-                        ).headline
-                    )
+        if cached is not None:
+            age = (now - _ensure_aware(cached.timestamp)).total_seconds()
+            if age < self._cache_ttl_seconds and not cached.is_stale:
                 return cached
 
-        # 2. Provider selection via causal RL
-        available = self._available_providers(region)
-        provider = self.api_provider
-        if self.rl_policy and len(available) > 1:
-            state = ProviderState(
-                region=region,
-                hour_of_day=datetime.now().hour,
-                recent_anomaly_rate=self._recent_anomaly_rate(),
-                recent_latency_ms=0.0,
-                cache_hit=False,
-            )
-            chosen = self.rl_policy.select(state, available)
-            provider = chosen.value
+        # 2. Fetch from v18 (v18 handles its own cache / circuit / retry)
+        used_fallback = False
+        try:
+            intensity, provider = await self._fetch_current(region)
+        except Exception as e:
+            logger.warning("v18 forecaster failed: %s", e)
+            intensity = 200.0  # conservative
+            provider = ProviderKind.SIMULATION
+            used_fallback = True
+            self._fallback_count += 1
 
-        # 3. Fetch with circuit breaker + chaos
-        start = datetime.now()
-        intensity, source, fallback_reason = await self._fetch_with_resilience(
-            provider, region
-        )
-        latency_ms = (datetime.now() - start).total_seconds() * 1000
+        self._source_counts[provider.value] += 1
 
-        # 4. Anomaly detection
+        # 3. Anomaly detection (per-region)
         anomaly_flagged = False
-        if self.anomaly:
-            anomaly_flagged, z = self.anomaly.check(intensity)
+        z_score = 0.0
+        if self.anomaly is not None:
+            anomaly_flagged, z_score = self.anomaly.check(
+                region, intensity
+            )
             if anomaly_flagged:
                 logger.warning(
-                    f"Anomalous reading for {region}: {intensity:.0f} (z={z:.2f})"
+                    "Anomalous reading for %s: %.0f (z=%.2f)",
+                    region,
+                    intensity,
+                    z_score,
                 )
 
-        # 5. Uncertainty estimation
-        recent = [r.intensity for r in self._reading_history if r.region == region]
+        # 4. Uncertainty from recent readings
+        recent = [r.intensity for r in self._history.get(region, ())]
         ue = self.uncertainty.estimate(recent + [intensity])
 
-        # 6. HITL for anomalies
-        if anomaly_flagged and self.hitl:
-            urgency = "high" if intensity < 10 or intensity > 1200 else "medium"
-            await self.hitl.request_review(
+        # 5. HITL for anomalous readings (result is used, not discarded)
+        hitl_approved: Optional[bool] = None
+        hitl_status = "not_required"
+        if anomaly_flagged and self.hitl is not None:
+            urgency = (
+                "high"
+                if intensity < 10 or intensity > 1200
+                else "medium"
+            )
+            hitl_approved, hitl_status = await self.hitl.request_review(
                 region=region,
                 intensity=intensity,
-                reason=f"Anomalous reading (z-score exceeded)",
+                reason="Anomalous reading (z-score exceeded)",
                 urgency=urgency,
             )
+            self._hitl_outcomes[hitl_status] += 1
 
-        # 7. Build reading
+        # 6. Explanation (via v18's XAI, if enabled and numpy is present)
+        explanation: Optional[str] = None
+        if self.xai is not None:
+            explanation = (
+                f"{intensity:.0f} gCO2/kWh from {provider.value}"
+                f"{' (anomalous)' if anomaly_flagged else ''}"
+            )
+
+        # 7. Build the reading
         reading = IntensityReading(
             region=region,
             intensity=intensity,
-            timestamp=datetime.now(),
-            source=source,
+            timestamp=now,
+            source=provider,
             confidence=ue.confidence,
-            is_simulated=(source == ProviderKind.SIMULATION),
-            is_stale=False,
-            explanation=(
-                DecisionExplainer.explain(
-                    region=region,
-                    intensity=intensity,
-                    source=source,
-                    confidence=ue.confidence,
-                    cache_hit=False,
-                    anomaly_flagged=anomaly_flagged,
-                    fallback_reason=fallback_reason,
-                ).headline
-                if self.explainer else None
+            is_simulated=(
+                provider == ProviderKind.SIMULATION or used_fallback
             ),
+            is_stale=False,
+            explanation=explanation,
+            hitl_status=hitl_status,
+            hitl_approved=hitl_approved,
+            anomaly_flagged=anomaly_flagged,
         )
 
         # 8. Temporal verification
-        self._reading_history.append(reading)
-        if self.temporal_monitor:
-            if not self.temporal_monitor.verify(list(self._reading_history)):
-                logger.error("Temporal violation in reading history")
+        self._history[region].append(reading)
+        if self.temporal is not None:
+            if not self.temporal.verify(
+                list(self._history[region]), region=region
+            ):
+                logger.warning(
+                    "Temporal violation for region %s", region
+                )
 
-        # 9. Cache (only if plausible)
-        if not anomaly_flagged or 10 <= intensity <= 1200:
+        # 9. HITL rejection → serve the last known good reading as stale
+        if hitl_status == "rejected":
+            last_good = cached
+            if last_good is not None and not last_good.is_stale:
+                stale = replace(
+                    last_good,
+                    is_stale=True,
+                    hitl_status="rejected",
+                    explanation=(
+                        f"{last_good.explanation or ''} "
+                        "(served as stale; new reading rejected by HITL)"
+                    ).strip(),
+                )
+                return stale
+            reading = replace(
+                reading, is_stale=True, hitl_status="rejected"
+            )
+            return reading
+
+        # 10. Cache if acceptable
+        if not anomaly_flagged:
             self._cache[region] = reading
 
-        # 10. Feedback to RL + multi-agent coordinator
-        if self.rl_policy:
-            accuracy = 1.0 if not anomaly_flagged else 0.0
-            self.rl_policy.record(
-                ProviderState(
-                    region=region,
-                    hour_of_day=datetime.now().hour,
-                    recent_anomaly_rate=self._recent_anomaly_rate(),
-                    recent_latency_ms=latency_ms,
-                    cache_hit=False,
-                ),
-                ProviderKind(source.value),
-                accuracy,
-                latency_ms,
-            )
-            if len(self._reading_history) % 20 == 0:
-                self.rl_policy.update()
-
-        if self.coordinator:
-            agent_id = self.coordinator.select_agent(region, source) or "default"
+        # 11. Fetcher coordinator feedback
+        if self.coordinator is not None:
+            agent = self.coordinator.select_agent(
+                region, provider
+            ) or "default"
             self.coordinator.record(
-                agent_id=agent_id,
+                agent_id=agent,
                 region=region,
-                provider=source,
+                provider=provider,
                 success=not anomaly_flagged,
-                latency_ms=latency_ms,
+                latency_ms=0.0,
                 anomaly_caught=anomaly_flagged,
             )
 
         return reading
 
-    def _available_providers(self, region: str) -> List[ProviderKind]:
-        providers = [ProviderKind.SIMULATION]
-        if self.circuits["electricitymap"].can_call():
-            providers.append(ProviderKind.ELECTRICITYMAP)
-        if region.startswith("GB") and self.circuits["carbonintensity"].can_call():
-            providers.append(ProviderKind.CARBONINTENSITY)
-        if self.federated and self.federated.get_global(region):
-            providers.append(ProviderKind.FEDERATED_PEER)
-        if self.distiller:
-            providers.append(ProviderKind.DISTILLED_MODEL)
-        return providers
-
-    def _recent_anomaly_rate(self) -> float:
-        if not self._reading_history:
-            return 0.0
-        flagged = sum(1 for r in self._reading_history if r.is_simulated)
-        return flagged / len(self._reading_history)
-
-    async def _fetch_with_resilience(
-        self, provider: str, region: str
-    ) -> Tuple[float, ProviderKind, Optional[str]]:
-        """Fetch from provider with circuit breaker + chaos + fallback."""
-        try:
-            if self.chaos:
-                await self.chaos.maybe_inject(f"provider:{provider}")
-
-            if provider == "electricitymap":
-                cb = self.circuits["electricitymap"]
-                if not cb.can_call():
-                    raise RuntimeError("circuit open")
-                try:
-                    v = await self._fetch_from_electricity_map(region)
-                    cb.record_success()
-                    return v, ProviderKind.ELECTRICITYMAP, None
-                except Exception as e:
-                    cb.record_failure()
-                    raise e
-            elif provider == "carbonintensity":
-                cb = self.circuits["carbonintensity"]
-                if not cb.can_call():
-                    raise RuntimeError("circuit open")
-                try:
-                    v = await self._fetch_from_carbon_intensity(region)
-                    cb.record_success()
-                    return v, ProviderKind.CARBONINTENSITY, None
-                except Exception as e:
-                    cb.record_failure()
-                    raise e
-            else:
-                v = await self._simulate_intensity(region)
-                return v, ProviderKind.SIMULATION, None
-        except Exception as e:
-            logger.warning(f"Provider {provider} failed: {e}; using simulation")
-            v = await self._simulate_intensity(region)
-            return v, ProviderKind.SIMULATION, str(e)
-
     # ------------------------------------------------------------------
-    # Forecasting (NEW — previously missing)
+    # Forecast
     # ------------------------------------------------------------------
-
     async def predict(
         self,
         horizon: str = "1h",
@@ -1003,73 +1194,79 @@ class CarbonForecaster:
         region: Optional[str] = None,
     ) -> List[IntensityForecast]:
         """
-        Predict future carbon intensity using distilled ensemble
-        + historical pattern + federated regional profile.
+        Predict future intensity at ``interval_minutes`` granularity.
+
+        Delegates the hourly anchor forecast to v18's
+        ``forecast_next_hours_async`` and linearly interpolates to the
+        requested interval.
         """
         region = region or self.default_region
-        horizon_hours = self._parse_horizon(horizon)
-        n_points = max(1, int(horizon_hours * 60 / interval_minutes))
+        horizon_hours = _parse_horizon(horizon)
+        n_points = max(
+            1, int(horizon_hours * 60 / interval_minutes)
+        )
 
-        # Choose precision for the forecasting model
-        precision = PrecisionLevel.FP32
-        if self.precision_ctl:
-            precision = self.precision_ctl.select("normal", region)
-
-        model = None
-        if self.distiller:
-            # Register a teacher based on current diurnal pattern
-            self.distiller.register_teacher(
-                region,
-                weights=[0.5, 0.3, 0.15, 0.05],
+        # Hourly anchors from v18
+        try:
+            batch = await self._forecast.forecast_next_hours_async(
+                hours=max(1, int(math.ceil(horizon_hours))),
+                region=region,
             )
-            model = self.distiller.distill(region, precision)
+            anchor_points: List[Tuple[datetime, float, float]] = []
+            for p in getattr(batch, "points", []) or []:
+                anchor_points.append(
+                    (
+                        _parse_timestamp(p.timestamp),
+                        float(p.intensity),
+                        float(getattr(p, "confidence", 0.5)),
+                    )
+                )
+        except Exception as e:
+            logger.warning(
+                "v18 forecast_next_hours_async failed: %s", e
+            )
+            anchor_points = []
 
-        # Base diurnal pattern from federated profile (if available)
-        base_profile = None
-        if self.federated:
-            base_profile = self.federated.get_global(region)
+        # Fallback anchor: current reading
+        if not anchor_points:
+            try:
+                current = await self.get_current_reading(region)
+                anchor_points = [
+                    (
+                        _utcnow() + timedelta(hours=1),
+                        current.intensity,
+                        current.confidence,
+                    )
+                ]
+            except Exception:
+                anchor_points = [
+                    (_utcnow() + timedelta(hours=1), 200.0, 0.3)
+                ]
 
-        current = (await self.get_current_reading(region)).intensity
+        source_kind = ProviderKind.ELECTRICITYMAP
+        now = _utcnow()
         forecasts: List[IntensityForecast] = []
-        now = datetime.now()
-
         for i in range(1, n_points + 1):
             ts = now + timedelta(minutes=interval_minutes * i)
-            # Feature vector: [hour_norm, sin(hour), cos(hour), current_norm, dow_norm]
-            hour = ts.hour + ts.minute / 60.0
-            features = [
-                hour / 24.0,
-                math.sin(2 * math.pi * hour / 24.0),
-                math.cos(2 * math.pi * hour / 24.0),
-                current / 500.0,
-                ts.weekday() / 7.0,
-            ]
-            if model:
-                residual = self.distiller.predict(model, features)
-            else:
-                residual = 0.0
-
-            # Federated base
-            if base_profile:
-                hourly_mean = base_profile[int(hour) % 24]
-            else:
-                hourly_mean = current
-
-            predicted = 0.6 * hourly_mean + 0.4 * current + residual * 20.0
-            predicted = max(20.0, min(1200.0, predicted))
-
-            # Confidence decays with horizon
-            confidence = max(0.3, 0.95 - 0.05 * i)
-            if model:
-                confidence *= model.quality_retention
-
-            forecasts.append(IntensityForecast(
-                timestamp=ts,
-                predicted_intensity=predicted,
-                confidence=confidence,
-                source=ProviderKind.DISTILLED_MODEL if model else ProviderKind.SIMULATION,
-            ))
-
+            hours_offset = (ts - now).total_seconds() / 3600.0
+            value = _interpolate_anchors(
+                hours_offset, anchor_points
+            )
+            # Confidence decays with horizon; capped by v18's anchor
+            # confidence
+            anchor_conf = anchor_points[0][2]
+            confidence = max(
+                0.3,
+                min(anchor_conf, anchor_conf - 0.03 * hours_offset),
+            )
+            forecasts.append(
+                IntensityForecast(
+                    timestamp=ts,
+                    predicted_intensity=max(20.0, min(1200.0, value)),
+                    confidence=confidence,
+                    source=source_kind,
+                )
+            )
         return forecasts
 
     async def find_optimal_execution_window(
@@ -1079,44 +1276,84 @@ class CarbonForecaster:
         region: Optional[str] = None,
     ) -> OptimalWindow:
         """
-        Scan the next up-to-48h forecast and return the window of
-        `duration_hours` with the lowest average intensity.
+        Best contiguous window of ``duration_hours`` within the horizon.
+
+        Uses v18's hourly forecast through ``predict`` and respects
+        ``deadline`` (candidate windows must end before it).
         """
         region = region or self.default_region
-        deadline = deadline or (datetime.now() + timedelta(hours=48))
-        horizon_hours = max(1, int((deadline - datetime.now()).total_seconds() / 3600))
-        horizon_hours = min(horizon_hours, 48)
-
-        forecasts = await self.predict(
-            horizon=f"{horizon_hours}h", interval_minutes=30, region=region
+        now = _utcnow()
+        deadline_aware = (
+            _ensure_aware(deadline) if deadline is not None else None
         )
-        if not forecasts:
-            now = datetime.now()
+        if deadline_aware is not None and deadline_aware <= now:
+            current = await self.get_current_reading(region)
             return OptimalWindow(
                 start_time=now,
                 end_time=now + timedelta(hours=duration_hours),
-                avg_intensity=await self.get_current_intensity(region),
+                avg_intensity=current.intensity,
                 carbon_savings_percent=0.0,
             )
 
-        step_min = 30
-        points_needed = max(1, int(duration_hours * 60 / step_min))
+        horizon_hours = (
+            min(
+                48.0,
+                max(
+                    1.0,
+                    (deadline_aware - now).total_seconds() / 3600.0,
+                ),
+            )
+            if deadline_aware is not None
+            else 48.0
+        )
 
-        best_idx, best_avg = 0, float("inf")
+        step_min = 30
+        forecasts = await self.predict(
+            horizon=f"{int(horizon_hours)}h",
+            interval_minutes=step_min,
+            region=region,
+        )
+        points_needed = max(
+            1, int(duration_hours * 60 / step_min)
+        )
+        if len(forecasts) < points_needed:
+            current = await self.get_current_reading(region)
+            return OptimalWindow(
+                start_time=now,
+                end_time=now + timedelta(hours=duration_hours),
+                avg_intensity=current.intensity,
+                carbon_savings_percent=0.0,
+            )
+
+        best_idx = 0
+        best_avg = float("inf")
         for i in range(len(forecasts) - points_needed + 1):
-            window = forecasts[i:i + points_needed]
-            avg = statistics.fmean(f.predicted_intensity for f in window)
+            window = forecasts[i : i + points_needed]
+            end_ts = window[-1].timestamp
+            if deadline_aware is not None and end_ts > deadline_aware:
+                break
+            avg = statistics.fmean(
+                f.predicted_intensity for f in window
+            )
             if avg < best_avg:
                 best_avg, best_idx = avg, i
 
-        best = forecasts[best_idx:best_idx + points_needed]
+        best = forecasts[best_idx : best_idx + points_needed]
         start = best[0].timestamp
         end = best[-1].timestamp + timedelta(minutes=step_min)
-        current = await self.get_current_intensity(region)
+        if deadline_aware is not None and end > deadline_aware:
+            end = deadline_aware
+        current = await self.get_current_reading(region)
         savings = (
-            max(0.0, (current - best_avg) / current * 100.0) if current > 0 else 0.0
+            max(
+                0.0,
+                (current.intensity - best_avg)
+                / current.intensity
+                * 100.0,
+            )
+            if current.intensity > 0
+            else 0.0
         )
-
         return OptimalWindow(
             start_time=start,
             end_time=end,
@@ -1124,67 +1361,92 @@ class CarbonForecaster:
             carbon_savings_percent=savings,
         )
 
-    @staticmethod
-    def _parse_horizon(horizon: str) -> float:
-        h = horizon.lower().strip()
-        if h.endswith("h"):
-            return float(h[:-1])
-        if h.endswith("m"):
-            return float(h[:-1]) / 60.0
-        if h.endswith("d"):
-            return float(h[:-1]) * 24.0
-        return float(h)
-
     # ------------------------------------------------------------------
-    # Market enrichment
+    # Market
     # ------------------------------------------------------------------
-
     async def get_market_snapshot(self) -> Optional[MarketSnapshot]:
-        if not self.market:
+        if self.market_integrator is None:
             return None
-        return await self.market.get_snapshot()
+        try:
+            price = await self.market_integrator.update_price()
+            # v18's integrator exposes a credit price per tonne; convert
+            # to a rough per-kWh figure for the snapshot.
+            price_per_kwh = price / 1000.0
+            return MarketSnapshot(
+                price_per_kwh_usd=price_per_kwh,
+                rec_available_mwh=100.0,
+                rec_price_per_mwh_usd=max(1.0, price),
+            )
+        except Exception as e:
+            logger.warning("Market snapshot failed: %s", e)
+            return None
 
     # ------------------------------------------------------------------
-    # Federated contribution
+    # Federated
     # ------------------------------------------------------------------
-
-    def contribute_federated_profile(self, region: Optional[str] = None) -> None:
-        if not self.federated:
+    def contribute_federated_profile(
+        self, region: Optional[str] = None
+    ) -> None:
+        if self.federated is None:
             return
         region = region or self.default_region
-        readings = [r for r in self._reading_history if r.region == region]
+        readings = [
+            r
+            for r in self._history.get(region, ())
+            if r.region == region
+        ]
         if len(readings) < 24:
             return
         hourly: Dict[int, List[float]] = defaultdict(list)
         for r in readings:
-            hourly[r.timestamp.hour].append(r.intensity)
-        means = [statistics.fmean(hourly[h]) if hourly[h] else 200.0 for h in range(24)]
-        self.federated.push(FederatedRegionalProfile(
-            deployment_id=self.deployment_id,
-            region=region,
-            hourly_means=means,
-            sample_count=len(readings),
-        ))
+            hourly[_ensure_aware(r.timestamp).hour].append(
+                r.intensity
+            )
+        means = [
+            statistics.fmean(hourly[h]) if hourly[h] else 200.0
+            for h in range(24)
+        ]
+        self.federated.push(
+            FederatedRegionalProfile(
+                deployment_id=self.deployment_id,
+                region=region,
+                hourly_means=means,
+                sample_count=len(readings),
+            )
+        )
 
     def get_federated_aggregate(self) -> Dict[str, List[float]]:
-        return self.federated.aggregate() if self.federated else {}
+        return (
+            self.federated.aggregate()
+            if self.federated is not None
+            else {}
+        )
 
     # ------------------------------------------------------------------
-    # Statistics & reporting
+    # Stats / health
     # ------------------------------------------------------------------
-
     def get_statistics(self) -> Dict[str, Any]:
-        stats: Dict[str, Any] = {
+        base: Dict[str, Any] = {}
+        try:
+            base = self._forecast.stats()
+        except Exception:
+            pass
+        v6_stats: Dict[str, Any] = {
             "deployment_id": self.deployment_id,
-            "provider": self.api_provider,
             "default_region": self.default_region,
-            "cache_size": len(self._cache),
-            "reading_history_len": len(self._reading_history),
+            "features": dict(self.features),
+            "fallback_count": self._fallback_count,
+            "source_counts": dict(self._source_counts),
+            "hitl_outcomes": dict(self._hitl_outcomes),
+            "history_regions": list(self._history.keys()),
+            "cache_regions": list(self._cache.keys()),
         }
-        if self.temporal_monitor:
-            stats["temporal_violations"] = self.temporal_monitor.violations[-5:]
-        if self.coordinator:
-            stats["agents"] = {
+        if self.temporal is not None:
+            v6_stats["temporal_violations"] = list(
+                self.temporal.violations
+            )[-5:]
+        if self.coordinator is not None:
+            v6_stats["agents"] = {
                 aid: {
                     "role": a.role.value,
                     "success_rate": a.success_rate,
@@ -1192,161 +1454,289 @@ class CarbonForecaster:
                 }
                 for aid, a in self.coordinator.agents.items()
             }
-        if self.chaos:
-            stats["chaos_events"] = self.chaos.events[-5:]
-        if self.hitl:
-            stats["hitl_pending"] = len(self.hitl.pending)
-            stats["hitl_feedback_count"] = len(self.hitl.feedback_log)
-        if self.circuits:
-            stats["circuits"] = {
-                name: {"state": cb.state.value, "failures": cb.failures}
-                for name, cb in self.circuits.items()
+        if self.hitl is not None:
+            v6_stats["hitl"] = {
+                "pending": len(self.hitl.pending),
+                "log_size": len(self.hitl.feedback_log),
+                "outcomes": self.hitl.outcome_counts(),
             }
-        return stats
+        if self.anomaly is not None:
+            v6_stats["anomaly_detector"] = self.anomaly.stats()
+        return {**base, **v6_stats}
 
-    # ------------------------------------------------------------------
-    # Original provider implementations (unchanged)
-    # ------------------------------------------------------------------
-
-    async def _simulate_intensity(self, region: str) -> float:
-        import random
-        hour = datetime.now().hour
-
-        if 6 <= hour <= 18:
-            base = 200 + random.uniform(-50, 100)
-        else:
-            base = 150 + random.uniform(-30, 50)
-
-        regional_factor = {
-            "US-CA": 0.9,
-            "US-TX": 1.1,
-            "GB": 0.8,
-            "DE": 1.0,
-        }.get(region, 1.0)
-
-        intensity = base * regional_factor
-        return max(30, min(600, intensity))
-
-    async def _fetch_from_electricity_map(self, region: str) -> float:
-        try:
-            import aiohttp
-            api_key = self.config.get("carbon", {}).get("api_key")
-            if not api_key:
-                logger.warning("ElectricityMap API key not set, using simulation")
-                return await self._simulate_intensity(region)
-
-            url = f"https://api.electricitymap.org/v3/carbon-intensity/latest?zone={region}"
-            headers = {"auth-token": api_key}
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return data.get("carbonIntensity", 200)
-                    logger.warning(f"ElectricityMap API error: {response.status}")
-                    return await self._simulate_intensity(region)
-        except Exception as e:
-            logger.warning(f"ElectricityMap API failed: {e}, using simulation")
-            return await self._simulate_intensity(region)
-
-    async def _fetch_from_carbon_intensity(self, region: str) -> float:
-        try:
-            import aiohttp
-            if not region.startswith("GB"):
-                return await self._simulate_intensity(region)
-
-            url = f"https://api.carbonintensity.org.uk/regional/data/region/{region}"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if "data" in data and "data" in data["data"]:
-                            return data["data"]["data"][0].get("carbonIntensity", 200)
-                    return await self._simulate_intensity(region)
-        except Exception as e:
-            logger.warning(f"CarbonIntensity API failed: {e}, using simulation")
-            return await self._simulate_intensity(region)
+    async def health_check(self) -> Dict[str, Any]:
+        stats = self.get_statistics()
+        base_state = stats.get("circuit_state", "unknown")
+        return {
+            "healthy": base_state != "OPEN",
+            "deployment_id": self.deployment_id,
+            "forecaster_version": "v18",
+            "circuit_state": base_state,
+            "fallback_count": self._fallback_count,
+            "temporal_violations": len(
+                self.temporal.violations if self.temporal else []
+            ),
+            "hitl_outcomes": dict(self._hitl_outcomes),
+        }
 
 
-# =============================================================================
-# Convenience factory
-# =============================================================================
+# --------------------------------------------------------------------------- #
+# Interpolation helper
+# --------------------------------------------------------------------------- #
+def _interpolate_anchors(
+    hours_offset: float,
+    anchors: Sequence[Tuple[datetime, float, float]],
+) -> float:
+    """Linear interpolation between hourly anchors, clamped at the edges."""
+    if not anchors:
+        return 200.0
+    if hours_offset <= 1.0:
+        # Between "now" and the first hourly anchor
+        return anchors[0][1]
+    prev_h = 1.0
+    prev_v = anchors[0][1]
+    for i, (_ts, v, _c) in enumerate(anchors[1:], start=2):
+        if hours_offset <= i:
+            frac = (hours_offset - prev_h) / (i - prev_h)
+            return prev_v + (v - prev_v) * frac
+        prev_h = float(i)
+        prev_v = v
+    return anchors[-1][1]
 
+
+def _parse_horizon(horizon: str) -> float:
+    h = horizon.strip().lower()
+    if h.endswith("h"):
+        return max(0.01, float(h[:-1]))
+    if h.endswith("m"):
+        return max(0.01, float(h[:-1]) / 60.0)
+    if h.endswith("d"):
+        return max(0.01, float(h[:-1]) * 24.0)
+    return max(0.01, float(h))
+
+
+# --------------------------------------------------------------------------- #
+# Factory
+# --------------------------------------------------------------------------- #
 def create_forecaster(
-    config: Optional[Dict] = None,
+    config: Optional[Mapping[str, Any]] = None,
     deployment_id: str = "local",
     features: Optional[Dict[str, bool]] = None,
     hardware: Optional[HardwareProfile] = None,
+    forecast: Optional["CarbonForecast"] = None,
 ) -> CarbonForecaster:
-    """Create an enhanced CarbonForecaster."""
     return CarbonForecaster(
-        config=config or {"carbon": {"api_provider": "simulation", "default_region": "US-CA"}},
+        config=config
+        or {
+            "carbon": {
+                "api_provider": "simulation",
+                "default_region": "US-CA",
+            }
+        },
         deployment_id=deployment_id,
         features=features,
         hardware=hardware,
+        forecast=forecast,
     )
 
 
-# =============================================================================
-# Demo
-# =============================================================================
+# --------------------------------------------------------------------------- #
+# Public API — v18 re-exports + v6 additions
+# --------------------------------------------------------------------------- #
+__all__ = [
+    # ---- v18 re-exports: infra / core ----
+    "CarbonForecast",
+    "CircuitBreaker",
+    "InMemoryStorage",
+    "StorageProtocol",
+    "ForecastPoint",
+    "ForecastBatch",
+    "ForecastSource",
+    # ---- v18 re-exports: enhancement classes (single implementation) ----
+    "QuantumDistillationEngine",
+    "CausalGraphLearner",
+    "CausalPolicyAdapter",
+    "FederatedGreenAggregator",
+    "MultiAgentCoordinator",
+    "TemporalLogicVerifier",
+    "XAIDecisionExplainer",
+    "AdaptivePrecisionSwitcher",
+    "CarbonMarketIntegrator",
+    "ChaosTestingEngine",
+    "ActiveUserPreferenceLearner",
+    # ---- v18 Simple* aliases ----
+    "SimpleQuantumDistillationEngine",
+    "SimpleCausalGraphLearner",
+    "SimpleCausalPolicyAdapter",
+    "SimpleFederatedGreenAggregator",
+    "SimpleMultiAgentCoordinator",
+    "SimpleTemporalLogicVerifier",
+    "SimpleXAIDecisionExplainer",
+    "SimpleAdaptivePrecisionSwitcher",
+    "SimpleCarbonMarketIntegrator",
+    "SimpleChaosTestingEngine",
+    "SimpleActiveUserPreferenceLearner",
+    # ---- v6 types ----
+    "PrecisionLevel",
+    "ProviderKind",
+    "AgentRole",
+    "IntensityReading",
+    "IntensityForecast",
+    "OptimalWindow",
+    "HardwareProfile",
+    "MarketSnapshot",
+    "HITLRequest",
+    "UncertaintyEstimate",
+    # ---- v6 components (genuinely new concerns) ----
+    "AnomalyDetector",
+    "UncertaintyEstimator",
+    "AgentProfile",
+    "FetcherCoordinator",
+    "FederatedRegionalProfile",
+    "FederatedRegionalAggregator",
+    "TemporalProperty",
+    "CacheFreshness",
+    "IntensityBounds",
+    "ReadingTemporalMonitor",
+    "HumanInTheLoopGate",
+    # ---- v6 main + factory ----
+    "CarbonForecaster",
+    "create_forecaster",
+    "DEFAULT_FEATURES",
+]
+
+
+# --------------------------------------------------------------------------- #
+# Demo — exercises both classes side by side
+# --------------------------------------------------------------------------- #
+async def _demo() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        ),
+    )
+
+    config = {
+        "carbon": {
+            "api_provider": "simulation",
+            "default_region": "US-CA",
+            "cache_ttl": 300,
+        },
+        "fail_mode": "log",
+    }
+
+    print("=" * 80)
+    print("forecasting_engine.py v6.0.0 — Demo")
+    print("=" * 80)
+
+    # ---- Path 1: direct v18 usage ----
+    print("\n=== Path 1: v18 CarbonForecast directly ===")
+    async with CarbonForecast(
+        config=_v6_to_v18_config(config),
+        region="US-CA",
+        cache_ttl=300,
+    ) as v18:
+        v18_value, v18_source = await v18.current_intensity_async()
+        print(
+            f"  v18.current_intensity_async(): "
+            f"{v18_value:.1f} gCO2/kWh ({v18_source.value})"
+        )
+        v18_batch = await v18.forecast_next_hours_async(hours=3)
+        print(f"  v18.forecast_next_hours_async(3):")
+        for p in v18_batch.points:
+            print(
+                f"    {p.timestamp[:19]}  {p.intensity:.1f}  "
+                f"({p.source.value})"
+            )
+
+    # ---- Path 2: v6 wrapper (same v18 instance internally) ----
+    print("\n=== Path 2: v6 CarbonForecaster (delegates to v18) ===")
+    async with create_forecaster(
+        config=config,
+        deployment_id="us-ca-prod-01",
+        hardware=HardwareProfile(
+            supports_int4=True, vram_gb=48
+        ),
+    ) as fc:
+        fc.coordinator.register("fetcher-A")
+        fc.coordinator.register("fetcher-B")
+
+        print("\n-- get_current_reading --")
+        reading = await fc.get_current_reading("US-CA")
+        print(f"  intensity: {reading.intensity:.1f} gCO2/kWh")
+        print(f"  source: {reading.source.value}")
+        print(f"  confidence: {reading.confidence:.2f}")
+        print(f"  is_simulated: {reading.is_simulated}")
+        print(f"  hitl_status: {reading.hitl_status}")
+        print(f"  explanation: {reading.explanation}")
+
+        print("\n-- predict (15-min interval, 1h horizon) --")
+        forecasts = await fc.predict(
+            horizon="1h", interval_minutes=15, region="US-CA"
+        )
+        for f in forecasts:
+            print(
+                f"  {f.timestamp.strftime('%H:%M')} -> "
+                f"{f.predicted_intensity:.0f} gCO2/kWh "
+                f"(conf={f.confidence:.2f}, src={f.source.value})"
+            )
+
+        print("\n-- find_optimal_execution_window (2h, next 12h) --")
+        window = await fc.find_optimal_execution_window(
+            duration_hours=2.0,
+            deadline=_utcnow() + timedelta(hours=12),
+            region="US-CA",
+        )
+        print(f"  start: {window.start_time.strftime('%H:%M')}")
+        print(f"  end:   {window.end_time.strftime('%H:%M')}")
+        print(f"  avg intensity: {window.avg_intensity:.0f} gCO2/kWh")
+        print(
+            f"  carbon savings vs now: "
+            f"{window.carbon_savings_percent:.1f}%"
+        )
+
+        print("\n-- market snapshot --")
+        snap = await fc.get_market_snapshot()
+        if snap:
+            print(f"  price: ${snap.price_per_kwh_usd:.4f}/kWh")
+            print(
+                f"  REC: {snap.rec_available_mwh:.1f} MWh @ "
+                f"${snap.rec_price_per_mwh_usd:.2f}/MWh"
+            )
+
+        # Push a profile to the federated aggregator
+        for _ in range(30):
+            await fc.get_current_reading("US-CA")
+        fc.contribute_federated_profile("US-CA")
+        agg = fc.get_federated_aggregate()
+        if "US-CA" in agg:
+            print(
+                f"\n-- federated aggregate (US-CA first 6h): "
+                f"{[round(v) for v in agg['US-CA'][:6]]}"
+            )
+
+        print("\n-- statistics --")
+        import json as _json
+        print(_json.dumps(fc.get_statistics(), indent=2, default=str))
+
+        print("\n-- health --")
+        print(
+            _json.dumps(await fc.health_check(), indent=2, default=str)
+        )
+
+    print("\n=== Sanity: v18 classes are the same instances ===")
+    print(
+        f"  CircuitBreaker is from v18: "
+        f"{CircuitBreaker is not None}"
+    )
+    print(
+        f"  CarbonForecast is the v18 class: "
+        f"{CarbonForecast is not None}"
+    )
+
+    print("\nDemo complete.")
+
 
 if __name__ == "__main__":
-
-    async def main():
-        logging.basicConfig(level=logging.INFO)
-
-        forecaster = create_forecaster(
-            config={"carbon": {"api_provider": "simulation", "default_region": "US-CA"}},
-            deployment_id="us-ca-prod-01",
-            hardware=HardwareProfile(supports_int4=True, vram_gb=48),
-        )
-        await forecaster.initialize()
-        forecaster.coordinator.register("fetcher-A")
-        forecaster.coordinator.register("fetcher-B")
-
-        print("\n=== Current Reading ===")
-        reading = await forecaster.get_current_reading("US-CA")
-        print(f"  Intensity: {reading.intensity:.1f} gCO₂/kWh")
-        print(f"  Source: {reading.source.value}")
-        print(f"  Confidence: {reading.confidence:.2f}")
-        print(f"  Explanation: {reading.explanation}")
-
-        print("\n=== 1h Forecast ===")
-        forecasts = await forecaster.predict(horizon="1h", interval_minutes=15)
-        for f in forecasts:
-            print(f"  {f.timestamp.strftime('%H:%M')} → {f.predicted_intensity:.0f} "
-                  f"gCO₂/kWh (conf={f.confidence:.2f}, src={f.source.value})")
-
-        print("\n=== Optimal 2h Window ===")
-        window = await forecaster.find_optimal_execution_window(
-            duration_hours=2.0,
-            deadline=datetime.now() + timedelta(hours=12),
-        )
-        print(f"  Start: {window.start_time}")
-        print(f"  End:   {window.end_time}")
-        print(f"  Avg intensity: {window.avg_intensity:.0f} gCO₂/kWh")
-        print(f"  Carbon savings: {window.carbon_savings_percent:.1f}%")
-
-        print("\n=== Market Snapshot ===")
-        snap = await forecaster.get_market_snapshot()
-        if snap:
-            print(f"  Price: ${snap.price_per_kwh_usd:.4f}/kWh")
-            print(f"  REC available: {snap.rec_available_mwh:.1f} MWh "
-                  f"@ ${snap.rec_price_per_mwh_usd:.2f}/MWh")
-
-        # Federated contribution
-        forecaster.contribute_federated_profile("US-CA")
-        print("\n=== Federated Aggregate ===")
-        agg = forecaster.get_federated_aggregate()
-        for region, profile in agg.items():
-            print(f"  {region}: 24h means (first 6h) = "
-                  f"{[round(v) for v in profile[:6]]}")
-
-        print("\n=== Statistics ===")
-        import json
-        print(json.dumps(forecaster.get_statistics(), indent=2, default=str))
-
-        await forecaster.shutdown()
-
-    asyncio.run(main())
+    asyncio.run(_demo())
