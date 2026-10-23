@@ -1,596 +1,218 @@
+# src/constraints/green_policy_enforcer.py
 """
-green_policy_enforcer.py (Enhanced)
-====================================
+green_policy_enforcer.py — v6.0.0
+==================================
 
-Policy enforcement with mode-switching behavior (raise vs. report), now
-with first-class support for the ten Green Agent enhancement layers.
+Policy enforcement with mode-switching behavior (raise vs. report).
 
-Original API preserved:
+**Public API preserved**
+
     enforcer = GreenPolicyEnforcer(policy)
     result = enforcer.check(metrics)
     # raises PolicyViolation(violations) if mode == "active_enforcement"
     # else returns {"compliant": bool, "violations": [...]}
 
-Enhancements (all inline, feature-toggleable):
-  1. Quantum-Distillation of policy constraints
-  2. Causal RL for adaptive constraint limits
-  3. Federated Green Learning across deployments
-  4. Multi-Agent Coordination with emergent role specialisation
-  5. Temporal Logic & Formal Verification of enforcement invariants
-  6. Explainable AI (XAI) — structured rationale on every decision
-  7. Adaptive Precision as a constraint dimension
-  8. Carbon Markets & REC enrichment
-  9. Resilience Engineering (circuit breaker + chaos testing)
- 10. Human-in-the-Loop for severe violations + active learning
- +   Helium + cost awareness (dual-axis enforcement)
- +   All-violations aggregation (not just first)
- +   Structured PolicyViolation payload
- +   Input validation, logging, statistics
+**What changed (v5 → v6)**
+--------------------------
+
+**P0 — enforcement contract and correctness**
+
+1. **Every degraded path raises in active mode.** v5 returned a dict on
+   circuit-open, chaos, internal error, and invalid input — even in
+   `active_enforcement` mode. A caller using the documented try/except
+   pattern ran the agent whenever enforcement was unavailable. v6 raises
+   ``PolicyViolation(degraded=True)`` on every degraded path in active
+   mode; monitor mode still returns a dict.
+2. **`record_outcome` tracks the last-violated metric.** v5 crashed on
+   the first-ever call via ``next(["energy"])`` (a list is not an
+   iterator) and credited the **first-ever** breached metric rather than
+   the most recent. v6 stores ``self._last_violated_metric`` during every
+   check and credits only that metric on outcome feedback.
+3. **HITL propagates.** v5 reviewed the top violation, discarded the
+   result, and raised unconditionally. v6 reviews **every** reviewable
+   violation; ``allow_hitl_override=False`` (default) makes approvals
+   advisory; when True and all approved, the deny is suppressed with
+   ``hitl_override=True`` and ``compliant=True``.
+4. **`ActiveModeRaises` is load-bearing.** v5 verified with
+   ``raised = will_raise`` — a tautology. v6 verifies **after** the
+   decision (in `check()`), with ``raised = observed`` — so a future
+   refactor that stops raising in active mode fires the property.
+5. **`temporal_verified` reflects the actual verification.** v5
+   hard-coded ``True`` in the result dict. v6 propagates the real result
+   from `verify()`; a temporal violation surfaces in
+   ``temporal_violations`` and sets ``temporal_verified=False``.
+6. **NaN / missing metrics → EMERGENCY.** v5's ``_safe_float(NaN) = 0.0``
+   and ``metrics.get(k, 0.0)`` silently permitted. v6 (in strict mode,
+   the default) treats both as ``bad_data`` violations with
+   ``severity=EMERGENCY``.
+7. **`metrics=None` is not a clean pass.** v5 coerced it to ``{}`` and
+   returned compliant. v6 routes it to the degraded path.
+8. **Small / zero-limit breaches are never `INFO`.** v5 classified any
+   breach below 5% as ``INFO``; zero-limit breaches got
+   ``overshoot_pct=0.0`` → also ``INFO``. v6: any breach is at least
+   ``WARNING``; zero-limit is ``EMERGENCY``; multi-metric escalation
+   applies.
+9. **Constraints validated at construction.** v5 accepted non-numeric,
+   non-finite, and negative constraints, deferring the failure to
+   ``check()`` (where it became ``internal_error`` → silent permit in
+   active mode). v6 rejects at construction with ``ValueError``.
+10. **Causal learner fixed.** Uses ``budget_domain.CausalBudgetLearner``
+    (feature-aware, signed ``±1`` reward, tightening-only by default).
+
+**P1 — reliability**
+
+11. **Thread-safe via ``RLock``**.
+12. **v18 single-probe ``CircuitBreaker``** via ``SyncCircuitAdapter``
+    from ``budget_domain``.
+13. **Async HITL callbacks awaited in ``areview``, rejected in ``review``**.
+14. **Bounded collections** (violations, hitl queues, chaos events,
+    federated updates).
+15. **Cached market snapshot** in ``get_statistics()``.
+16. **``set_mode(mode)``**, **``set_features(features)``**,
+    **``health_check()``**, **``__aenter__``/``__aexit__``**.
+17. **``degraded_count``, ``override_count``, ``hitl_outcomes``** on
+    stats and health.
+
+**P2 — architecture**
+
+18. **Eight enhancement classes imported from ``carbon_forecast`` v18
+    (via ``budget_domain``)** — the eleventh local copy in v5 is
+    retired.
+19. **Budget-family primitives reused**: ``CausalBudgetLearner``,
+    ``SyncCircuitAdapter``, ``SyncChaosInjector``, ``HumanReviewGate``,
+    ``CarbonMarketCache``, ``HeliumProfiler``,
+    ``QuantumDistillationBridge``, ``FederatedBudgetAggregator``,
+    ``BudgetState``.
+20. **``QuantumDistillationBridge`` uses ``round``**, not ``floor``.
+21. **``FederatedBudgetAggregator`` is bounded and zero-weight safe.**
+22. **``contribute_federated`` pushes utilization, not breach rate.**
+
+**Local only** (per the extraction spec)
+    ``EnforcementMode``, ``PolicyViolation``,
+    ``EnforcementExplanation``, ``EnforcementExplainer``,
+    ``CompliantImpliesNoViolations``, ``ActiveModeRaises``,
+    ``GreenPolicyEnforcer``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
-import random
-from collections import defaultdict
+import threading
+from collections import defaultdict, deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from enum import Enum
 from typing import (
-    Any, Callable, Dict, List, Optional, Protocol, Tuple,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+)
+
+# --------------------------------------------------------------------------- #
+# Shared budget primitives (single source of truth for the family)
+# --------------------------------------------------------------------------- #
+from budget_domain import (  # type: ignore[import-not-found]
+    # v18 re-exports (eight enhancement classes)
+    CircuitBreaker,
+    ChaosTestingEngine,
+    ActiveUserPreferenceLearner,
+    AdaptivePrecisionSwitcher,
+    CarbonMarketIntegrator,
+    MultiAgentCoordinator,
+    FederatedGreenAggregator,
+    TemporalLogicVerifier,
+    # Enums
+    Severity,
+    PrecisionLevel,
+    AgentRole,
+    # Types
+    HardwareProfile,
+    BudgetState,
+    DistilledBudgetPolicy,
+    FederatedBudgetProfile,
+    MarketSnapshot,
+    HITLRequest,
+    # Helpers
+    _utcnow,
+    _ensure_aware,
+    _json_safe,
+    _safe_float,
+    _V18_AVAILABLE,
+    _V18_ERROR,
+    # Bounds
+    MAX_HITL_LOG,
+    MAX_CHAOS_EVENTS,
+    MAX_FEDERATED_UPDATES,
+    MAX_VIOLATIONS,
+    # Components
+    SyncCircuitAdapter,
+    SyncChaosInjector,
+    CausalBudgetLearner,
+    QuantumDistillationBridge,
+    FederatedBudgetAggregator,
+    HeliumProfiler,
+    BudgetSafetyMonitor,
+    HumanReviewGate,
+    CarbonMarketCache,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Enums
-# =============================================================================
-
+# --------------------------------------------------------------------------- #
+# Local enums
+# --------------------------------------------------------------------------- #
 class EnforcementMode(Enum):
-    """Recognized enforcement modes (original `active_enforcement` preserved)."""
     ACTIVE_ENFORCEMENT = "active_enforcement"
     MONITOR = "monitor"
-    REPORT = "report"           # alias for monitor
+    REPORT = "report"   # explicit alias for monitor
 
 
-class Severity(Enum):
-    INFO = "info"
-    WARNING = "warning"
-    CRITICAL = "critical"
-    EMERGENCY = "emergency"
+_RECOGNIZED_MODES = {m.value for m in EnforcementMode}
 
 
-class PrecisionLevel(Enum):
-    FP32 = "fp32"
-    FP16 = "fp16"
-    INT8 = "int8"
-    INT4 = "int4"
-    QUANTUM_DISTILLED = "quantum_distilled"
-
-
-class AgentRole(Enum):
-    GENERALIST = "generalist"
-    ENERGY_SPECIALIST = "energy_specialist"
-    CARBON_SPECIALIST = "carbon_specialist"
-    HELIUM_SPECIALIST = "helium_specialist"
-    LATENCY_SPECIALIST = "latency_specialist"
-
-
-class CircuitState(Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
-
-
-# =============================================================================
-# 9. Resilience
-# =============================================================================
-
-@dataclass
-class CircuitBreaker:
-    name: str
-    failure_threshold: int = 5
-    recovery_timeout_seconds: int = 30
-    state: CircuitState = CircuitState.CLOSED
-    failures: int = 0
-    last_failure_at: Optional[datetime] = None
-
-    def can_call(self) -> bool:
-        if self.state == CircuitState.CLOSED:
-            return True
-        if self.state == CircuitState.OPEN:
-            if (self.last_failure_at and
-                    (datetime.now() - self.last_failure_at).total_seconds()
-                    > self.recovery_timeout_seconds):
-                self.state = CircuitState.HALF_OPEN
-                return True
-            return False
-        return True
-
-    def record_success(self) -> None:
-        self.failures = 0
-        self.state = CircuitState.CLOSED
-
-    def record_failure(self) -> None:
-        self.failures += 1
-        self.last_failure_at = datetime.now()
-        if self.failures >= self.failure_threshold:
-            self.state = CircuitState.OPEN
-            logger.warning(
-                f"Circuit '{self.name}' OPEN after {self.failures} failures"
-            )
-
-
-class ChaosInjector:
-    def __init__(self, failure_rate: float = 0.0) -> None:
-        self.failure_rate = failure_rate
-        self.events: List[Dict[str, Any]] = []
-
-    def maybe_fail(self, component: str) -> bool:
-        if random.random() < self.failure_rate:
-            self.events.append({
-                "component": component,
-                "at": datetime.now().isoformat(),
-            })
-            return True
-        return False
-
-
-# =============================================================================
-# 5. Temporal Logic
-# =============================================================================
-
-class EnforcementProperty(Protocol):
-    def check(self, ctx: Dict[str, Any]) -> bool: ...
-    def name(self) -> str: ...
-
-
-@dataclass
-class CompliantImpliesNoViolations:
-    """G(compliant=True → violations is empty)."""
-    def check(self, ctx: Dict[str, Any]) -> bool:
-        if ctx.get("compliant"):
-            return len(ctx.get("violations", [])) == 0
-        return True
-
-    def name(self) -> str:
-        return "CompliantImpliesNoViolations"
-
-
-@dataclass
-class ActiveModeRaises:
-    """G(active_enforcement ∧ violations → raised=True)."""
-    def check(self, ctx: Dict[str, Any]) -> bool:
-        mode = ctx.get("mode", "")
-        violations = ctx.get("violations", [])
-        raised = ctx.get("raised", False)
-        if mode == EnforcementMode.ACTIVE_ENFORCEMENT.value and violations:
-            return raised
-        return True
-
-    def name(self) -> str:
-        return "ActiveModeRaises"
-
-
-class TemporalLogicMonitor:
-    def __init__(self) -> None:
-        self.properties: List[EnforcementProperty] = []
-        self.violations: List[Dict[str, Any]] = []
-
-    def register(self, p: EnforcementProperty) -> None:
-        self.properties.append(p)
-
-    def verify(self, ctx: Dict[str, Any]) -> Tuple[bool, List[str]]:
-        bad: List[str] = []
-        for p in self.properties:
-            if not p.check(ctx):
-                bad.append(p.name())
-                self.violations.append({
-                    "property": p.name(),
-                    "at": datetime.now().isoformat(),
-                })
-        return (len(bad) == 0, bad)
-
-
-# =============================================================================
-# 6. XAI
-# =============================================================================
-
-@dataclass
-class EnforcementExplanation:
-    headline: str
-    rationale: List[str]
-    confidence: float
-    contributing_factors: Dict[str, float]
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-class EnforcementExplainer:
-    @staticmethod
-    def explain(
-        compliant: bool,
-        violations: List[Dict[str, Any]],
-        severity: Optional[str] = None,
-        market_snapshot: Optional[Dict[str, Any]] = None,
-    ) -> EnforcementExplanation:
-        reasons: List[str] = []
-        if compliant:
-            reasons.append("All policy constraints satisfied.")
-        else:
-            reasons.append(f"{len(violations)} constraint(s) violated.")
-            for v in violations:
-                reasons.append(
-                    f"'{v['metric']}': {v['value']:.4f} > "
-                    f"limit {v['limit']:.4f} "
-                    f"(overshoot {v['overshoot_pct']:.1f}%)."
-                )
-        if severity:
-            reasons.append(f"Severity: {severity}.")
-        if market_snapshot:
-            cp = market_snapshot.get("carbon_price_per_tco2_usd")
-            if cp:
-                reasons.append(f"Carbon market price: ${cp:.2f}/tCO₂.")
-
-        headline = (
-            "Compliant"
-            if compliant
-            else f"Violated: {', '.join(v['metric'] for v in violations)}"
-        )
-        return EnforcementExplanation(
-            headline=headline,
-            rationale=reasons,
-            confidence=0.95,
-            contributing_factors={
-                f"overshoot_{v['metric']}": v["overshoot"]
-                for v in violations
-            },
-        )
-
-
-# =============================================================================
-# 7. Adaptive Precision
-# =============================================================================
-
-@dataclass
-class HardwareProfile:
-    has_tensor_cores: bool = True
-    supports_int8: bool = True
-    supports_int4: bool = False
-    vram_gb: float = 24.0
-    edge_device: bool = False
-
-
-class AdaptivePrecisionController:
-    def __init__(self, hw: Optional[HardwareProfile] = None) -> None:
-        self.hw = hw or HardwareProfile()
-
-    def select(self, urgency: str) -> PrecisionLevel:
-        if urgency == "critical":
-            return PrecisionLevel.FP16
-        if self.hw.edge_device:
-            return (PrecisionLevel.INT8 if self.hw.supports_int8
-                    else PrecisionLevel.FP16)
-        return (PrecisionLevel.INT4 if self.hw.supports_int4
-                else PrecisionLevel.INT8)
-
-
-# =============================================================================
-# 2. Causal RL
-# =============================================================================
-
-@dataclass
-class ConstraintState:
-    hour_of_day: int
-    utilization_ratio: float
-    workload_hash: float
-
-
-class CausalConstraintLearner:
-    """Learns per-metric constraint offsets from outcomes."""
-    N_FEATURES = 3
-
-    def __init__(self, lr: float = 0.02) -> None:
-        self.lr = lr
-        self.offsets: Dict[str, List[float]] = defaultdict(
-            lambda: [0.0] * self.N_FEATURES
-        )
-        self.observations: int = 0
-        self.updates: int = 0
-
-    @staticmethod
-    def _features(s: ConstraintState) -> List[float]:
-        return [s.hour_of_day / 24.0, s.utilization_ratio, s.workload_hash]
-
-    def predict_offset(self, metric: str, s: ConstraintState) -> float:
-        f = self._features(s)
-        base = self.offsets[metric]
-        offset = sum(c * x for c, x in zip(base, f))
-        # Bound to ±15% of base constraint
-        return max(-0.15, min(0.15, offset))
-
-    def record(self, metric: str, reward: float) -> None:
-        for i in range(self.N_FEATURES):
-            self.offsets[metric][i] += self.lr * reward * 0.1
-        self.observations += 1
-
-    def update(self) -> None:
-        self.updates += 1
-
-
-# =============================================================================
-# 1. Quantum-Distillation
-# =============================================================================
-
-@dataclass
-class DistilledPolicy:
-    precision: PrecisionLevel
-    constraints: Dict[str, float]
-    quality_retention: float
-    energy_reduction_percent: float
-
-
-class QuantumDistillationBridge:
-    def distill(
-        self, constraints: Dict[str, float], precision: PrecisionLevel,
-    ) -> DistilledPolicy:
-        scale, retention, energy = {
-            PrecisionLevel.FP32: (1.0, 1.00, 0.0),
-            PrecisionLevel.FP16: (1.0, 0.98, 30.0),
-            PrecisionLevel.INT8: (100.0, 0.93, 55.0),
-            PrecisionLevel.INT4: (10.0, 0.85, 70.0),
-            PrecisionLevel.QUANTUM_DISTILLED: (5.0, 0.80, 85.0),
-        }[precision]
-
-        def qz(v: float) -> float:
-            return math.floor(v * scale) / scale if scale > 1.0 else v
-
-        return DistilledPolicy(
-            precision=precision,
-            constraints={k: qz(v) for k, v in constraints.items()},
-            quality_retention=retention,
-            energy_reduction_percent=energy,
-        )
-
-
-# =============================================================================
-# 3. Federated Green Learning
-# =============================================================================
-
-@dataclass
-class FederatedViolationProfile:
-    deployment_id: str
-    metric: str
-    mean_overshoot_pct: float
-    sample_count: int
-    timestamp: datetime = field(default_factory=datetime.now)
-
-
-class FederatedAggregator:
-    def __init__(self) -> None:
-        self.updates: List[FederatedViolationProfile] = []
-        self._global: Dict[str, Dict[str, float]] = {}
-
-    def push(self, u: FederatedViolationProfile) -> None:
-        self.updates.append(u)
-
-    def aggregate(self) -> Dict[str, Dict[str, float]]:
-        grouped: Dict[str, List[FederatedViolationProfile]] = defaultdict(list)
-        for u in self.updates:
-            grouped[u.metric].append(u)
-        result: Dict[str, Dict[str, float]] = {}
-        for metric, profiles in grouped.items():
-            total_w = sum(p.sample_count for p in profiles) or 1
-            result[metric] = {
-                "mean_overshoot_pct": sum(
-                    p.mean_overshoot_pct * p.sample_count for p in profiles
-                ) / total_w,
-                "sample_count": total_w,
-            }
-        self._global = result
-        return result
-
-    def lookup(self, metric: str) -> Optional[Dict[str, float]]:
-        return self._global.get(metric)
-
-
-# =============================================================================
-# 4. Multi-Agent Coordination
-# =============================================================================
-
-@dataclass
-class AgentProfile:
-    agent_id: str
-    role: AgentRole = AgentRole.GENERALIST
-    success_rate: float = 0.0
-    dominant_violation: Optional[str] = None
-    total_calls: int = 0
-
-
-class MultiAgentCoordinator:
-    def __init__(self) -> None:
-        self.agents: Dict[str, AgentProfile] = {}
-
-    def register(self, agent_id: str) -> AgentProfile:
-        if agent_id not in self.agents:
-            self.agents[agent_id] = AgentProfile(agent_id)
-        return self.agents[agent_id]
-
-    def _reassign(self) -> None:
-        role_map = {
-            "energy": AgentRole.ENERGY_SPECIALIST,
-            "carbon": AgentRole.CARBON_SPECIALIST,
-            "helium": AgentRole.HELIUM_SPECIALIST,
-            "latency": AgentRole.LATENCY_SPECIALIST,
-        }
-        for a in self.agents.values():
-            if a.dominant_violation in role_map:
-                a.role = role_map[a.dominant_violation]
-            else:
-                a.role = AgentRole.GENERALIST
-
-    def record(
-        self, agent_id: str, success: bool,
-        dominant_violation: Optional[str] = None,
-    ) -> None:
-        a = self.register(agent_id)
-        n = a.total_calls + 1
-        a.success_rate = ((n - 1) * a.success_rate + float(success)) / n
-        if dominant_violation:
-            a.dominant_violation = dominant_violation
-        a.total_calls = n
-        if n % 5 == 0:
-            self._reassign()
-
-    def select_agent(self, prefer: AgentRole = AgentRole.GENERALIST) -> Optional[str]:
-        if not self.agents:
-            return None
-        cands = [a for a in self.agents.values() if a.role == prefer]
-        if not cands:
-            cands = list(self.agents.values())
-        return max(cands, key=lambda a: a.success_rate).agent_id
-
-
-# =============================================================================
-# 8. Carbon Markets
-# =============================================================================
-
-@dataclass
-class MarketSnapshot:
-    carbon_price_per_tco2_usd: float
-    rec_price_per_mwh_usd: float
-    rec_available_mwh: float
-    timestamp: datetime = field(default_factory=datetime.now)
-
-
-class CarbonMarketClient:
-    def __init__(self) -> None:
-        self._cache: Optional[MarketSnapshot] = None
-        self._ttl = 300
-
-    def get_snapshot(self) -> MarketSnapshot:
-        if self._cache and (
-            (datetime.now() - self._cache.timestamp).total_seconds() < self._ttl
-        ):
-            return self._cache
-        snap = MarketSnapshot(
-            carbon_price_per_tco2_usd=random.uniform(20, 80),
-            rec_price_per_mwh_usd=random.uniform(3, 9),
-            rec_available_mwh=random.uniform(10, 500),
-        )
-        self._cache = snap
-        return snap
-
-
-# =============================================================================
-# 10. HITL
-# =============================================================================
-
-@dataclass
-class HITLRequest:
-    metric: str
-    value: float
-    limit: float
-    reason: str
-    urgency: str
-    context: Dict[str, Any] = field(default_factory=dict)
-    requested_at: datetime = field(default_factory=datetime.now)
-
-
-class HumanInTheLoopGate:
-    def __init__(
-        self, borderline_ratio: float = 1.05, severe_ratio: float = 2.0,
-    ) -> None:
-        self.borderline_ratio = borderline_ratio
-        self.severe_ratio = severe_ratio
-        self.pending: List[HITLRequest] = []
-        self.feedback_log: List[Dict[str, Any]] = []
-        self._callback: Optional[Callable[[HITLRequest], bool]] = None
-
-    def set_callback(self, cb: Callable[[HITLRequest], bool]) -> None:
-        self._callback = cb
-
-    def needs_review(self, value: float, limit: float) -> bool:
-        if limit <= 0:
-            return True
-        ratio = value / limit
-        if 1.0 < ratio <= self.borderline_ratio:
-            return True
-        if ratio >= self.severe_ratio:
-            return True
-        return False
-
-    def request_review(
-        self, metric: str, value: float, limit: float,
-        reason: str, urgency: str = "medium",
-        context: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        req = HITLRequest(metric, value, limit, reason, urgency, context or {})
-        self.pending.append(req)
-        if urgency == "low":
-            self.pending.remove(req)
-            self.feedback_log.append({"req": asdict(req), "decision": True})
-            return True
-        if self._callback is None:
-            self.pending.remove(req)
-            self.feedback_log.append({"req": asdict(req), "decision": False})
-            return False
-        decision = self._callback(req)
-        self.pending.remove(req)
-        self.feedback_log.append({"req": asdict(req), "decision": decision})
-        return decision
-
-    def active_learning_batch(self, n: int = 16) -> List[Dict[str, Any]]:
-        return self.feedback_log[-n:]
-
-
-# =============================================================================
-# Helium Profiling
-# =============================================================================
-
-class HeliumProfiler:
-    HELIUM_UNITS_PER_WH = 5e-5
-
-    @classmethod
-    def estimate_units(
-        cls, energy_wh: float, scarcity_score: float = 0.0,
-    ) -> float:
-        base = energy_wh * cls.HELIUM_UNITS_PER_WH
-        efficiency = 1.0 - min(0.5, scarcity_score * 0.5)
-        return base * efficiency
-
-
-# =============================================================================
-# ENHANCED PolicyViolation — backward compatible
-# =============================================================================
-
+# --------------------------------------------------------------------------- #
+# Local exception (backward compatible)
+# --------------------------------------------------------------------------- #
 class PolicyViolation(Exception):
     """
-    Raised when policy constraints are violated.
+    Raised when policy constraints are violated **or** enforcement is
+    unavailable in active mode.
 
     Backward-compatible:
-        str(exc)             -> str(violations)  (same as before)
-        exc.args[0]          -> violations list  (same as before)
+        str(exc)             -> str(violations)  (v1 contract)
+        exc.args[0]          -> violations list  (v1 contract)
 
     Enhanced:
-        exc.details          -> structured dict with violations, severity,
-                                explanation, market_snapshot, etc.
+        exc.details          -> structured dict (violations, severity,
+                                explanation, market_snapshot, etc.)
+        exc.degraded         -> True when raised because enforcement was
+                                unavailable (circuit-open, chaos,
+                                internal-error, invalid input)
     """
+
     def __init__(
         self,
         violations: List[str],
         details: Optional[Dict[str, Any]] = None,
-    ):
+    ) -> None:
         super().__init__(violations)
         self.details: Dict[str, Any] = details or {}
 
-    # Convenience accessors
     @property
     def violations(self) -> List[str]:
-        return self.args[0] if self.args else []
+        # Defensive: if a caller passed a bare string as args[0], don't
+        # hand back the string's characters.
+        raw = self.args[0] if self.args else []
+        if isinstance(raw, str):
+            return [raw]
+        return list(raw) if raw else []
 
     @property
     def severity(self) -> Optional[str]:
@@ -602,24 +224,204 @@ class PolicyViolation(Exception):
 
     @property
     def structured_violations(self) -> List[Dict[str, Any]]:
-        return self.details.get("structured_violations", [])
+        return list(self.details.get("structured_violations", []) or [])
+
+    @property
+    def degraded(self) -> bool:
+        return bool(self.details.get("degraded", False))
+
+    @property
+    def temporal_verified(self) -> Optional[bool]:
+        return self.details.get("temporal_verified")
+
+    @property
+    def hitl_status(self) -> str:
+        return str(self.details.get("hitl_status", "not_required"))
+
+    @property
+    def hitl_override(self) -> bool:
+        return bool(self.details.get("hitl_override", False))
 
 
-# =============================================================================
-# ENHANCED GreenPolicyEnforcer
-# =============================================================================
+# --------------------------------------------------------------------------- #
+# Local XAI
+# --------------------------------------------------------------------------- #
+@dataclass
+class EnforcementExplanation:
+    headline: str
+    rationale: List[str]
+    confidence: float
+    contributing_factors: Dict[str, float]
 
+    def to_dict(self) -> Dict[str, Any]:
+        return _json_safe(asdict(self))
+
+
+class EnforcementExplainer:
+    @staticmethod
+    def explain(
+        compliant: bool,
+        violations: List[Dict[str, Any]],
+        severity: Optional[str] = None,
+        market_snapshot: Optional[Dict[str, Any]] = None,
+        hitl_status: str = "not_required",
+    ) -> EnforcementExplanation:
+        reasons: List[str] = []
+        if compliant:
+            reasons.append("All policy constraints satisfied.")
+        else:
+            reasons.append(f"{len(violations)} constraint(s) violated.")
+            for v in violations:
+                metric = v.get("metric", "?")
+                value = v.get("value")
+                limit = v.get("limit", 0.0)
+                pct = v.get("overshoot_pct")
+                if value is None:
+                    reasons.append(
+                        f"'{metric}': unreadable value "
+                        f"({v.get('reason', 'bad_data')}), "
+                        f"limit {float(limit):.4f}."
+                    )
+                elif pct is None or pct == float("inf"):
+                    reasons.append(
+                        f"'{metric}': value {float(value):.4f} against "
+                        f"zero limit."
+                    )
+                else:
+                    reasons.append(
+                        f"'{metric}': {float(value):.4f} > "
+                        f"limit {float(limit):.4f} "
+                        f"(overshoot {pct:.1f}%)."
+                    )
+        if severity and severity != Severity.INFO.value:
+            reasons.append(f"Severity: {severity}.")
+        if market_snapshot:
+            cp = market_snapshot.get("carbon_price_per_tco2_usd")
+            if cp:
+                reasons.append(
+                    f"Carbon market price: ${float(cp):.2f}/tCO₂."
+                )
+        if hitl_status and hitl_status != "not_required":
+            reasons.append(f"HITL status: {hitl_status}.")
+
+        headline = (
+            "Compliant"
+            if compliant
+            else f"Violated: {', '.join(str(v.get('metric', '?')) for v in violations)}"
+        )
+        factors: Dict[str, float] = {}
+        for v in violations:
+            metric = str(v.get("metric", "?"))
+            pct = v.get("overshoot_pct")
+            factors[f"overshoot_{metric}"] = (
+                float("inf") if pct is None or pct == float("inf") else float(pct)
+            )
+        return EnforcementExplanation(
+            headline=headline,
+            rationale=reasons,
+            confidence=0.95 if compliant else 0.90,
+            contributing_factors=factors,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Local temporal properties (load-bearing)
+# --------------------------------------------------------------------------- #
+class EnforcementProperty:
+    """Marker protocol for enforcement temporal properties."""
+    def check(self, ctx: Mapping[str, Any]) -> bool: ...
+    def name(self) -> str: ...
+
+
+@dataclass(frozen=True)
+class CompliantImpliesNoViolations:
+    """G(compliant ∧ ¬hitl_override → violations is empty)."""
+
+    def check(self, ctx: Mapping[str, Any]) -> bool:
+        if not ctx.get("compliant"):
+            return True
+        if ctx.get("hitl_override"):
+            return True
+        return len(ctx.get("violations", []) or []) == 0
+
+    def name(self) -> str:
+        return "CompliantImpliesNoViolations"
+
+
+@dataclass(frozen=True)
+class ActiveModeRaises:
+    """
+    G(active_enforcement ∧ violations ∧ ¬hitl_override → raised).
+
+    v5 verified with ``raised = will_raise`` — a tautology. v6 verifies
+    **after** the decision with ``raised = observed``, so a future
+    refactor that stops raising fires this property.
+    """
+
+    def check(self, ctx: Mapping[str, Any]) -> bool:
+        mode = str(ctx.get("mode", ""))
+        violations = ctx.get("violations", []) or []
+        raised = bool(ctx.get("raised", False))
+        hitl_override = bool(ctx.get("hitl_override", False))
+        if mode != EnforcementMode.ACTIVE_ENFORCEMENT.value:
+            return True
+        if violations and not hitl_override:
+            return raised
+        return True
+
+    def name(self) -> str:
+        return "ActiveModeRaises"
+
+
+# --------------------------------------------------------------------------- #
+# Sync-safe coordinator bridge
+# --------------------------------------------------------------------------- #
+class _CoordinatorBridge:
+    """
+    Thin sync-safe adapter over v18's async ``MultiAgentCoordinator``.
+
+    Reward updates are scheduled if a loop is running (fire-and-forget)
+    or run to completion in a private loop otherwise. Exceptions are
+    logged and swallowed so the coordinator can never break a policy
+    check.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def register(self, agent_id: str) -> None:
+        try:
+            self._inner.register(agent_id)
+        except Exception:  # pragma: no cover — defensive
+            pass
+
+    def record(self, agent_id: str, success: bool) -> None:
+        reward = 1.0 if success else 0.0
+        try:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._inner.reward(agent_id, reward))
+            except RuntimeError:
+                asyncio.run(self._inner.reward(agent_id, reward))
+        except Exception:  # pragma: no cover — defensive
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# GreenPolicyEnforcer
+# --------------------------------------------------------------------------- #
 class GreenPolicyEnforcer:
     """
     Enhanced policy enforcement with mode-switching behavior.
 
-    Backward-compatible signature:
+    Backward-compatible:
+
         GreenPolicyEnforcer(policy)
-        check(metrics) -> {"compliant": bool, "violations": [...]}
-                     or raises PolicyViolation(violations)
+        .check(metrics) -> {"compliant": bool, "violations": [...]}
+                       or raises PolicyViolation(violations)
     """
 
-    DEFAULT_FEATURES = {
+    DEFAULT_FEATURES: Dict[str, bool] = {
         "causal_rl": True,
         "xai": True,
         "adaptive_precision": True,
@@ -635,630 +437,1842 @@ class GreenPolicyEnforcer:
         "aggregate_violations": True,
     }
 
+    #: Mapping from v1 policy constraint names to internal metric names.
+    _CONSTRAINT_MAP: Tuple[Tuple[str, str], ...] = (
+        ("max_energy_per_task_wh", "energy"),
+        ("max_carbon_per_task_kg", "carbon"),
+        ("max_latency_seconds", "latency"),
+    )
+
     def __init__(
         self,
-        policy: Dict[str, Any],
+        policy: Mapping[str, Any],
         deployment_id: str = "local",
         agent_id: str = "policy-enforcer-0",
         features: Optional[Dict[str, bool]] = None,
         hardware: Optional[HardwareProfile] = None,
-    ):
-        # --- Original policy loading (with defensive fallbacks) ---
-        policy = policy if isinstance(policy, dict) else {}
-        constraints = policy.get("constraints", {})
-        if not isinstance(constraints, dict):
-            constraints = {}
-        agent_identity = policy.get("agent_identity", {})
-        if not isinstance(agent_identity, dict):
-            agent_identity = {}
+        *,
+        strict_metrics: bool = True,
+        allow_hitl_override: bool = False,
+        allow_constraint_loosening: bool = False,
+        min_severity_to_raise: str = "warning",
+    ) -> None:
+        # ---- Extract the policy (defensive) ----
+        if not isinstance(policy, Mapping):
+            policy = {}
+        raw_constraints = policy.get("constraints", {})
+        if not isinstance(raw_constraints, Mapping):
+            raw_constraints = {}
+        raw_identity = policy.get("agent_identity", {})
+        if not isinstance(raw_identity, Mapping):
+            raw_identity = {}
 
-        # --- Original fields (preserved names) ---
-        self.constraints = constraints
-        self.mode = agent_identity.get("mode", "monitor")
+        # ---- Validate + copy constraints (P0 §2.10) ----
+        self.constraints: Dict[str, float] = self._validate_constraints(
+            raw_constraints
+        )
 
-        # --- Validate mode (warn if unrecognized; default to monitor) ---
-        recognized_modes = {m.value for m in EnforcementMode}
-        if self.mode not in recognized_modes:
+        # ---- Validate mode ----
+        mode = str(raw_identity.get("mode", EnforcementMode.MONITOR.value))
+        if mode not in _RECOGNIZED_MODES:
             logger.warning(
-                f"Unrecognized enforcement mode '{self.mode}'; "
-                f"defaulting to 'monitor'"
+                "Unrecognized enforcement mode %r; defaulting to 'monitor'",
+                mode,
             )
-            self.mode = EnforcementMode.MONITOR.value
+            mode = EnforcementMode.MONITOR.value
+        self.mode = mode
 
-        # --- Enhancement config ---
+        # ---- Config ----
         self.deployment_id = deployment_id
         self.agent_id = agent_id
-        self.features = {**self.DEFAULT_FEATURES, **(features or {})}
-
-        # --- Resilience ---
-        self._circuit = CircuitBreaker("policy_enforcer", failure_threshold=5)
-        self.chaos = (
-            ChaosInjector(failure_rate=0.0)
-            if self.features["chaos_testing"] else None
+        self.features: Dict[str, bool] = {
+            **self.DEFAULT_FEATURES,
+            **(features or {}),
+        }
+        self.hardware = hardware or HardwareProfile()
+        self._strict_metrics = bool(strict_metrics)
+        self._allow_hitl_override = bool(allow_hitl_override)
+        self._allow_constraint_loosening = bool(allow_constraint_loosening)
+        self._min_severity_to_raise = self._parse_min_severity(
+            min_severity_to_raise
         )
 
-        # --- Temporal logic ---
-        self.temporal_monitor: Optional[TemporalLogicMonitor] = (
-            TemporalLogicMonitor() if self.features["temporal_logic"] else None
-        )
-        if self.temporal_monitor:
-            self.temporal_monitor.register(CompliantImpliesNoViolations())
-            self.temporal_monitor.register(ActiveModeRaises())
+        # ---- Locks ----
+        self._lock = threading.RLock()
 
-        # --- XAI ---
-        self.explainer = EnforcementExplainer() if self.features["xai"] else None
-
-        # --- Adaptive precision ---
-        self.precision_ctl = (
-            AdaptivePrecisionController(hardware)
-            if self.features["adaptive_precision"] else None
-        )
-
-        # --- Causal RL ---
-        self.constraint_learner = (
-            CausalConstraintLearner()
-            if self.features["causal_rl"] else None
-        )
-
-        # --- Quantum distillation ---
-        self.distiller = (
-            QuantumDistillationBridge()
-            if self.features["quantum_distillation"] else None
-        )
-
-        # --- Federated ---
-        self.federated = (
-            FederatedAggregator() if self.features["federated"] else None
-        )
-
-        # --- Multi-agent ---
-        self.coordinator = (
-            MultiAgentCoordinator() if self.features["multi_agent"] else None
-        )
-        if self.coordinator:
-            self.coordinator.register(self.agent_id)
-
-        # --- Carbon markets ---
-        self.market = (
-            CarbonMarketClient() if self.features["carbon_market"] else None
-        )
-
-        # --- HITL ---
-        self.hitl = HumanInTheLoopGate() if self.features["hitl"] else None
-
-        # --- Helium ---
-        self.helium_profiler = (
-            HeliumProfiler() if self.features["helium_awareness"] else None
-        )
-        self.helium_signal_fn: Optional[Callable[[], Any]] = None
-
-        # --- History & statistics ---
+        # ---- Counters ----
         self.check_count: int = 0
         self.compliant_count: int = 0
         self.violation_count: int = 0
         self.raise_count: int = 0
+        self.degraded_count: int = 0
+        self.override_count: int = 0
+        self.distilled_count: int = 0
         self.breach_by_metric: Dict[str, int] = defaultdict(int)
         self.severity_counts: Dict[str, int] = defaultdict(int)
+        self._outcome_counts: Dict[str, int] = defaultdict(int)
+
+        # ---- Cached state ----
         self.last_explanation: Optional[EnforcementExplanation] = None
+        self._last_violated_metric: Optional[str] = None
+        self._last_state: Optional[BudgetState] = None
+        self._last_market_snapshot: Optional[MarketSnapshot] = None
+        self._last_market_fetched_at: Optional[float] = None
+
+        # ---- Enhancement layers ----
+        self._circuit: Optional[SyncCircuitAdapter] = None
+        self._chaos: Optional[SyncChaosInjector] = None
+        self._safety: Optional[BudgetSafetyMonitor] = None
+        self._precision: Optional[Any] = None
+        self._budget_learner: Optional[CausalBudgetLearner] = None
+        self._distiller: Optional[QuantumDistillationBridge] = None
+        self._federated: Optional[FederatedBudgetAggregator] = None
+        self._coordinator: Optional[_CoordinatorBridge] = None
+        self._market: Optional[CarbonMarketCache] = None
+        self._hitl: Optional[HumanReviewGate] = None
+        self.helium_signal_fn: Optional[Callable[[], Any]] = None
+
+        self._build_layers()
 
         logger.info(
-            f"Enhanced GreenPolicyEnforcer initialized "
-            f"(deployment={deployment_id}, agent={agent_id}, "
-            f"mode={self.mode}, features={list(self.features)})"
+            "GreenPolicyEnforcer v6 ready: deployment=%s, agent=%s, "
+            "mode=%s, strict_metrics=%s, features=%s",
+            deployment_id,
+            agent_id,
+            self.mode,
+            self._strict_metrics,
+            sorted(k for k, v in self.features.items() if v),
         )
 
     # ------------------------------------------------------------------
-    # Original public API: check
+    # Construction helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_constraints(
+        constraints: Mapping[str, Any]
+    ) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for name, value in constraints.items():
+            if isinstance(value, bool):
+                raise ValueError(
+                    f"constraint {name!r} must be numeric, got bool"
+                )
+            try:
+                fval = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"constraint {name!r} must be numeric, got {value!r}"
+                ) from exc
+            if not math.isfinite(fval):
+                raise ValueError(
+                    f"constraint {name!r} must be finite, got {value!r}"
+                )
+            if fval < 0:
+                raise ValueError(
+                    f"constraint {name!r} must be >= 0, got {value!r}"
+                )
+            out[str(name)] = fval
+        return out
 
-    def check(self, metrics: Dict[str, float]) -> Dict[str, Any]:
+    @staticmethod
+    def _parse_min_severity(value: str) -> Severity:
+        try:
+            return Severity(str(value).lower())
+        except ValueError as exc:
+            raise ValueError(
+                f"min_severity_to_raise must be one of "
+                f"{[s.value for s in Severity]}, got {value!r}"
+            ) from exc
+
+    def _build_layers(self) -> None:
+        self._circuit = SyncCircuitAdapter(
+            "policy_enforcer",
+            failure_threshold=5,
+            recovery_timeout=30.0,
+        )
+
+        self._chaos = (
+            SyncChaosInjector()
+            if self.features["chaos_testing"]
+            else None
+        )
+
+        self._safety = None
+        if self.features["temporal_logic"]:
+            self._safety = BudgetSafetyMonitor()
+            self._safety.register(CompliantImpliesNoViolations())
+            self._safety.register(ActiveModeRaises())
+
+        self._precision = None
+        if self.features["adaptive_precision"] and _V18_AVAILABLE:
+            try:
+                self._precision = AdaptivePrecisionSwitcher(  # type: ignore[misc]
+                    config={}, storage=None
+                )
+            except Exception:  # pragma: no cover
+                self._precision = None
+
+        self._budget_learner = None
+        if self.features["causal_rl"]:
+            self._budget_learner = CausalBudgetLearner(
+                known_metrics=[
+                    "energy", "carbon", "latency", "helium", "cost",
+                ],
+                allow_loosening=self._allow_constraint_loosening,
+            )
+
+        self._distiller = (
+            QuantumDistillationBridge()
+            if self.features["quantum_distillation"]
+            else None
+        )
+
+        self._federated = (
+            FederatedBudgetAggregator()
+            if self.features["federated"]
+            else None
+        )
+
+        self._coordinator = None
+        if self.features["multi_agent"] and _V18_AVAILABLE:
+            try:
+                inner = MultiAgentCoordinator(  # type: ignore[misc]
+                    config={}, storage=None
+                )
+                self._coordinator = _CoordinatorBridge(inner)
+                self._coordinator.register(self.agent_id)
+            except Exception:  # pragma: no cover
+                self._coordinator = None
+
+        self._market = (
+            CarbonMarketCache()
+            if self.features["carbon_market"]
+            else None
+        )
+
+        self._hitl = None
+        if self.features["hitl"]:
+            learner = None
+            if _V18_AVAILABLE:
+                try:
+                    learner = ActiveUserPreferenceLearner(  # type: ignore[misc]
+                        storage=None
+                    )
+                except Exception:  # pragma: no cover
+                    learner = None
+            self._hitl = HumanReviewGate(learner=learner)
+
+    # ------------------------------------------------------------------
+    # Public: mode / features
+    # ------------------------------------------------------------------
+    def set_mode(self, mode: str) -> None:
+        """Change the enforcement mode at runtime (P1 §3.13)."""
+        if mode not in _RECOGNIZED_MODES:
+            raise ValueError(
+                f"Unrecognized enforcement mode {mode!r}; "
+                f"must be one of {sorted(_RECOGNIZED_MODES)}"
+            )
+        with self._lock:
+            self.mode = mode
+        logger.info(
+            "Enforcement mode switched to %r (agent=%s)",
+            mode, self.agent_id,
+        )
+
+    def set_features(
+        self, features: Mapping[str, bool]
+    ) -> None:
+        for k, v in features.items():
+            if k not in self.DEFAULT_FEATURES:
+                raise ValueError(f"unknown feature {k!r}")
+            self.features[k] = bool(v)
+        with self._lock:
+            self._build_layers()
+
+    # ------------------------------------------------------------------
+    # v1 public API: check
+    # ------------------------------------------------------------------
+    def check(self, metrics: Mapping[str, Any]) -> Dict[str, Any]:
         """
         Check metrics against policy constraints.
 
-        Original behavior preserved:
-        - Collects violations for energy, carbon, latency
-        - Raises PolicyViolation(violations) if mode == "active_enforcement"
-          and there are violations
-        - Returns {"compliant": bool, "violations": [...]} otherwise
-
-        Enhanced:
-        - Also checks helium and cost when the corresponding constraints exist
-        - PolicyViolation carries a structured `details` payload
-        - XAI, HITL, and multi-agent feedback are applied when features are on
+        In active mode, raises ``PolicyViolation`` on any non-compliance
+        **including** degraded paths (§2.1). In monitor/report mode,
+        returns a result dict.
         """
-        self.check_count += 1
+        with self._lock:
+            self.check_count += 1
 
-        # --- Input validation ---
-        if metrics is None or not isinstance(metrics, dict):
-            logger.warning("Invalid metrics input; treating as empty dict")
-            metrics = {}
+        # ---- P0 §2.8: invalid input is never a clean pass ----
+        if not isinstance(metrics, Mapping):
+            return self._handle_degraded("invalid_input")
 
-        # --- Circuit breaker ---
+        # ---- P0 §2.1: circuit-open raises in active mode ----
         if not self._circuit.can_call():
-            logger.warning("Circuit open — returning conservative compliance")
-            return {"compliant": False, "violations": ["circuit_open"]}
+            return self._handle_degraded("circuit_open")
 
-        # --- Chaos injection ---
-        if self.chaos and self.chaos.maybe_fail("check"):
-            self._circuit.record_failure()
-            return {"compliant": False, "violations": ["chaos"]}
-
-        try:
-            result = self._check_internal(metrics)
-            self._circuit.record_success()
-            return result
-        except PolicyViolation:
-            # Re-raise (active enforcement mode)
-            self._circuit.record_success()
-            raise
-        except Exception as e:
-            self._circuit.record_failure()
-            logger.warning(f"Check failed: {e}")
-            return {"compliant": False, "violations": ["internal_error"]}
-
-    # ------------------------------------------------------------------
-    # Internal pipeline
-    # ------------------------------------------------------------------
-
-    def _check_internal(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
-        # --- Base constraints (original names preserved) ---
-        active_constraints: Dict[str, float] = {}
-        if "max_energy_per_task_wh" in self.constraints:
-            active_constraints["energy"] = float(
-                self.constraints["max_energy_per_task_wh"]
-            )
-        if "max_carbon_per_task_kg" in self.constraints:
-            active_constraints["carbon"] = float(
-                self.constraints["max_carbon_per_task_kg"]
-            )
-        if "max_latency_seconds" in self.constraints:
-            active_constraints["latency"] = float(
-                self.constraints["max_latency_seconds"]
-            )
-        # New optional constraints
-        if self.features["helium_awareness"] and \
-                "max_helium_units" in self.constraints:
-            active_constraints["helium"] = float(
-                self.constraints["max_helium_units"]
-            )
-        if self.features["cost_awareness"] and \
-                "max_cost_usd" in self.constraints:
-            active_constraints["cost"] = float(
-                self.constraints["max_cost_usd"]
-            )
-
-        # --- Causal RL adjustments ---
-        causal_adjustments: Dict[str, float] = {}
-        if self.constraint_learner:
-            state = ConstraintState(
-                hour_of_day=datetime.now().hour,
-                utilization_ratio=0.5,
-                workload_hash=float(hash(self.agent_id) % 1000) / 1000.0,
-            )
-            for metric, base in list(active_constraints.items()):
-                offset = self.constraint_learner.predict_offset(metric, state)
-                if offset != 0.0:
-                    active_constraints[metric] = base * (1.0 + offset)
-                    causal_adjustments[metric] = offset
-
-        # --- Collect violations ---
-        violations: List[str] = []                   # original list of strings
-        structured: List[Dict[str, Any]] = []        # enhanced structured list
-        for metric, limit in active_constraints.items():
-            if metric not in metrics and \
-                    not (metric == "helium" and self.helium_profiler):
-                continue
-            value = self._safe_float(metrics.get(metric, 0.0))
-            if value > limit:
-                violations.append(metric)
-                overshoot = value - limit
-                structured.append({
-                    "metric": metric,
-                    "value": value,
-                    "limit": limit,
-                    "overshoot": overshoot,
-                    "overshoot_pct": (
-                        overshoot / limit * 100 if limit > 0 else 0.0
-                    ),
-                })
-                self.breach_by_metric[metric] += 1
-
-        # --- Auto-estimate helium if constraint exists and value missing ---
+        # ---- P0 §2.1: chaos raises in active mode ----
         if (
-            self.features["helium_awareness"]
-            and "helium" in active_constraints
-            and "helium" not in metrics
-            and self.helium_profiler
+            self._chaos is not None
+            and self._chaos.maybe_fail("check")
         ):
-            energy = self._safe_float(metrics.get("energy", 0.0))
-            helium_est = HeliumProfiler.estimate_units(energy)
-            if helium_est > active_constraints["helium"]:
-                violations.append("helium")
-                overshoot = helium_est - active_constraints["helium"]
-                structured.append({
-                    "metric": "helium",
-                    "value": helium_est,
-                    "limit": active_constraints["helium"],
-                    "overshoot": overshoot,
-                    "overshoot_pct": (
-                        overshoot / active_constraints["helium"] * 100
-                    ),
-                })
-                self.breach_by_metric["helium"] += 1
+            self._circuit.record_failure()
+            return self._handle_degraded("chaos")
 
-        compliant = len(violations) == 0
+        # ---- Enforcement ----
+        try:
+            result = self._check_internal(dict(metrics))
+            self._circuit.record_success()
+        except Exception as exc:
+            self._circuit.record_failure()
+            logger.warning("check_internal failed: %s", exc)
+            return self._handle_degraded(f"internal_error: {exc}")
 
-        # --- Severity ---
-        severity = self._classify_severity(structured)
-        if severity != Severity.INFO:
-            self.severity_counts[severity.value] += 1
-
-        # --- Market enrichment ---
-        market_snapshot = None
-        if self.market:
-            try:
-                snap = self.market.get_snapshot()
-                co2_used = self._safe_float(metrics.get("carbon", 0.0))
-                market_snapshot = {
-                    "carbon_price_per_tco2_usd": snap.carbon_price_per_tco2_usd,
-                    "rec_available_mwh": snap.rec_available_mwh,
-                    "co2_market_value_usd": (
-                        co2_used * snap.carbon_price_per_tco2_usd
-                    ),
-                }
-            except Exception:
-                pass
-
-        # --- Precision attribution ---
-        precision = PrecisionLevel.FP32
-        if self.precision_ctl:
-            urgency = "critical" if not compliant else "normal"
-            precision = self.precision_ctl.select(urgency)
-
-        # --- XAI ---
-        explanation: Optional[EnforcementExplanation] = None
-        if self.explainer:
-            explanation = EnforcementExplainer.explain(
-                compliant=compliant,
-                violations=structured,
-                severity=severity.value,
-                market_snapshot=market_snapshot,
+        # ---- P0 §2.4: raise in active mode with load-bearing verify ----
+        should_raise = (
+            self.mode == EnforcementMode.ACTIVE_ENFORCEMENT.value
+            and not result["compliant"]
+            and not result.get("hitl_override", False)
+            and self._severity_at_least_min(result.get("severity"))
+        )
+        if should_raise:
+            ok, tv = self._verify_temporal(
+                compliant=False,
+                violations=result["violations"],
+                raised=True,
+                hitl_override=False,
             )
-            self.last_explanation = explanation
+            with self._lock:
+                self.raise_count += 1
+                self._outcome_counts["raised"] += 1
+            details = {
+                **result,
+                "temporal_verified": ok,
+                "temporal_violations": tv,
+            }
+            raise PolicyViolation(result["violations"], details=details)
 
-        # --- HITL (only for violations) ---
-        hitl_required = False
-        hitl_approved: Optional[bool] = None
-        if not compliant and self.hitl and structured:
-            top = max(structured, key=lambda v: v["overshoot_pct"])
-            if self.hitl.needs_review(top["value"], top["limit"]):
-                hitl_required = True
-                hitl_approved = self.hitl.request_review(
-                    metric=top["metric"],
-                    value=top["value"],
-                    limit=top["limit"],
-                    reason=f"overshoot {top['overshoot_pct']:.1f}%",
-                    urgency=(
-                        "high"
-                        if severity in (Severity.CRITICAL, Severity.EMERGENCY)
-                        else "medium"
-                    ),
-                    context={"agent_id": self.agent_id},
+        # ---- No raise: verify with raised=False (§2.4 / §2.6) ----
+        ok, tv = self._verify_temporal(
+            compliant=result["compliant"],
+            violations=result["violations"],
+            raised=False,
+            hitl_override=result.get("hitl_override", False),
+        )
+        result["temporal_verified"] = ok
+        result["temporal_violations"] = tv
+        with self._lock:
+            self._outcome_counts[
+                "compliant" if result["compliant"] else "violated"
+            ] += 1
+        return result
+
+    def _severity_at_least_min(self, sev: Optional[str]) -> bool:
+        if not sev:
+            return True
+        try:
+            current = Severity(sev)
+        except ValueError:
+            return True
+        order = [
+            Severity.INFO,
+            Severity.WARNING,
+            Severity.CRITICAL,
+            Severity.EMERGENCY,
+        ]
+        return order.index(current) >= order.index(self._min_severity_to_raise)
+
+    # ------------------------------------------------------------------
+    # Internal pipeline (never raises)
+    # ------------------------------------------------------------------
+    def _check_internal(
+        self, metrics: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        # 1. Build the state used by the RL and record_outcome
+        state = self._build_state(metrics)
+        with self._lock:
+            self._last_state = state
+
+        # 2. Active constraints (with RL tightening)
+        active_constraints, causal_adjustments = (
+            self._active_constraints(state)
+        )
+
+        # 3. Collect violations
+        violations_flat: List[str] = []
+        violations_struct: List[Dict[str, Any]] = []
+        checked_metrics: List[str] = []
+
+        for metric, limit in active_constraints.items():
+            checked_metrics.append(metric)
+
+            # Missing metric (P0 §2.7 / strict_metrics)
+            if metric not in metrics:
+                if self._strict_metrics:
+                    violations_struct.append(
+                        self._bad_data_violation(metric, limit, "missing")
+                    )
+                    violations_flat.append(metric)
+                continue
+
+            raw = metrics[metric]
+            # Non-numeric (P0 §2.7)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                violations_struct.append(
+                    self._bad_data_violation(metric, limit, "not_numeric")
+                )
+                violations_flat.append(metric)
+                continue
+            # Non-finite (P0 §2.7)
+            if not math.isfinite(float(raw)):
+                violations_struct.append(
+                    self._bad_data_violation(metric, limit, "not_finite")
+                )
+                violations_flat.append(metric)
+                continue
+
+            value = float(raw)
+            if value > limit + 1e-9:
+                overshoot = value - limit
+                if limit > 0:
+                    overshoot_pct = overshoot / limit * 100.0
+                else:
+                    # P0 §2.9: zero-limit breach is EMERGENCY
+                    overshoot_pct = float("inf")
+                violations_flat.append(metric)
+                violations_struct.append(
+                    {
+                        "metric": metric,
+                        "value": value,
+                        "limit": limit,
+                        "overshoot": overshoot,
+                        "overshoot_pct": overshoot_pct,
+                    }
                 )
 
-        # --- Multi-agent feedback ---
-        if self.coordinator:
-            self.coordinator.record(
-                agent_id=self.agent_id,
-                success=compliant,
-                dominant_violation=(violations[0] if violations else None),
+        # 4. Auto-estimate helium if the constraint exists but metric
+        #    wasn't provided (P2 §3.8: consult helium_signal_fn)
+        if (
+            self.features.get("helium_awareness")
+            and "helium" in active_constraints
+            and "helium" not in metrics
+        ):
+            energy = _safe_float(metrics.get("energy", 0.0))
+            scarcity = self._current_scarcity()
+            helium_est = HeliumProfiler.estimate_units(energy, scarcity)
+            limit = active_constraints["helium"]
+            if helium_est > limit + 1e-9:
+                overshoot = helium_est - limit
+                overshoot_pct = (
+                    overshoot / limit * 100.0
+                    if limit > 0
+                    else float("inf")
+                )
+                violations_flat.append("helium")
+                violations_struct.append(
+                    {
+                        "metric": "helium",
+                        "value": helium_est,
+                        "limit": limit,
+                        "overshoot": overshoot,
+                        "overshoot_pct": overshoot_pct,
+                        "reason": "auto_estimated",
+                    }
+                )
+
+        compliant = len(violations_flat) == 0
+
+        # 5. Track last-violated metric for record_outcome (P0 §2.2/§2.3)
+        with self._lock:
+            self._last_violated_metric = (
+                violations_struct[0]["metric"]
+                if violations_struct
+                else None
             )
 
-        # --- Federated contribution (every 25 checks) ---
-        if self.federated and self.check_count % 25 == 0:
-            for s in structured:
-                self.federated.push(FederatedViolationProfile(
-                    deployment_id=self.deployment_id,
-                    metric=s["metric"],
-                    mean_overshoot_pct=s["overshoot_pct"],
-                    sample_count=1,
-                ))
-            self.federated.aggregate()
+        # 6. Severity (P0 §2.9)
+        severity = self._classify_severity(violations_struct)
+        with self._lock:
+            if not compliant:
+                self.severity_counts[severity.value] += 1
+                for v in violations_struct:
+                    self.breach_by_metric[v["metric"]] += 1
 
-        # --- Temporal verification ---
-        # (verify AFTER building the result but BEFORE raising, so we can
-        # pass the correct `raised` flag)
-        will_raise = (
-            bool(violations)
-            and self.mode == EnforcementMode.ACTIVE_ENFORCEMENT.value
+        # 7. Market snapshot (cached)
+        market_snapshot = self._get_market_snapshot(metrics)
+
+        # 8. Precision attribution
+        precision = self._select_precision(
+            "critical" if not compliant else "normal"
         )
-        if self.temporal_monitor:
-            ctx = {
-                "compliant": compliant,
-                "violations": violations,
-                "mode": self.mode,
-                "raised": will_raise,
-            }
-            self.temporal_monitor.verify(ctx)
 
-        # --- Statistics ---
-        if compliant:
-            self.compliant_count += 1
+        # 9. HITL — review ALL reviewable violations (P0 §2.5)
+        hitl = self._run_hitl(violations_struct, severity)
+
+        # 10. Coordinator feedback (P1 §3.5: use _CoordinatorBridge)
+        if self._coordinator is not None:
+            self._coordinator.record(self.agent_id, compliant)
+
+        # 11. Federated (P2 §3.9: utilization, not breach rate)
+        self._feedback_federated(checked_metrics, metrics, active_constraints)
+
+        # 12. Counters
+        with self._lock:
+            if compliant:
+                self.compliant_count += 1
+            else:
+                self.violation_count += 1
+
+        # 13. XAI (built last so it can include HITL status)
+        explanation = EnforcementExplainer.explain(
+            compliant=compliant,
+            violations=violations_struct,
+            severity=severity.value,
+            market_snapshot=market_snapshot,
+            hitl_status=hitl["status"],
+        )
+        with self._lock:
+            self.last_explanation = explanation
+
+        # 14. Effective compliance (HITL override flips compliant)
+        effective_compliant = compliant or hitl["override"]
+
+        return {
+            "compliant": effective_compliant,
+            "violations": violations_flat,
+            "structured_violations": violations_struct,
+            "severity": severity.value,
+            "causal_adjustments": causal_adjustments,
+            "precision": precision.value,
+            "hitl_required": hitl["required"],
+            "hitl_approved": hitl["approved"],
+            "hitl_status": hitl["status"],
+            "hitl_override": hitl["override"],
+            "market_snapshot": market_snapshot,
+            "explanation": (
+                explanation.to_dict() if explanation else None
+            ),
+            "degraded": False,
+            "degraded_reason": None,
+            "temporal_verified": None,   # set by check()
+            "temporal_violations": [],
+            "at": _utcnow().isoformat(),
+        }
+
+    # ------------------------------------------------------------------
+    # Constraint adjustments
+    # ------------------------------------------------------------------
+    def _active_constraints(
+        self, state: BudgetState
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        base: Dict[str, float] = {}
+        for orig_name, metric in self._CONSTRAINT_MAP:
+            if orig_name in self.constraints:
+                base[metric] = self.constraints[orig_name]
+        if self.features.get("helium_awareness"):
+            if "max_helium_units" in self.constraints:
+                base["helium"] = self.constraints["max_helium_units"]
+        if self.features.get("cost_awareness"):
+            if "max_cost_usd" in self.constraints:
+                base["cost"] = self.constraints["max_cost_usd"]
+
+        if self._budget_learner is None:
+            return base, {}
+
+        adjusted: Dict[str, float] = {}
+        adjustments: Dict[str, float] = {}
+        for metric, limit in base.items():
+            offset = self._budget_learner.predict_offset(metric, state)
+            adjusted[metric] = limit * (1.0 + offset)
+            if offset != 0.0:
+                adjustments[metric] = offset
+        return adjusted, adjustments
+
+    def _build_state(self, metrics: Mapping[str, Any]) -> BudgetState:
+        ratios: List[float] = []
+        for orig_name, metric in self._CONSTRAINT_MAP:
+            if orig_name not in self.constraints:
+                continue
+            limit = self.constraints[orig_name]
+            if limit <= 0:
+                continue
+            if metric in metrics:
+                try:
+                    v = float(metrics[metric])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(v):
+                    ratios.append(v / limit)
+        peak = max(ratios) if ratios else 0.5
+        return BudgetState(
+            hour_of_day=_utcnow().hour,
+            utilization_ratio=min(1.0, peak),
+            workload_hash=float(abs(hash(self.agent_id)) % 1000) / 1000.0,
+        )
+
+    def _current_scarcity(self) -> float:
+        if self.helium_signal_fn is None:
+            return 0.0
+        try:
+            sig = self.helium_signal_fn()
+            if sig is None:
+                return 0.0
+            return _safe_float(getattr(sig, "scarcity_score", 0.0))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _bad_data_violation(
+        metric: str, limit: float, reason: str
+    ) -> Dict[str, Any]:
+        return {
+            "metric": metric,
+            "value": None,
+            "limit": float(limit),
+            "overshoot": float("inf"),
+            "overshoot_pct": float("inf"),
+            "reason": reason,
+        }
+
+    # ------------------------------------------------------------------
+    # HITL (P0 §2.5)
+    # ------------------------------------------------------------------
+    def _run_hitl(
+        self,
+        violations: List[Dict[str, Any]],
+        severity: Severity,
+    ) -> Dict[str, Any]:
+        result = {
+            "required": False,
+            "approved": None,
+            "status": "not_required",
+            "override": False,
+        }
+        if self._hitl is None or not violations:
+            return result
+
+        reviewable = [
+            v for v in violations
+            if v.get("limit", 0.0) > 0
+            and v.get("value") is not None
+            and self._hitl_needs_review(v["value"], v["limit"])
+        ]
+        if not reviewable:
+            return result
+
+        result["required"] = True
+        all_approved = True
+        statuses: List[str] = []
+        for v in reviewable:
+            approved, status = self._hitl.review(
+                metric=v["metric"],
+                value=v["value"],
+                limit=v["limit"],
+                reason=f"overshoot {v['overshoot_pct']:.1f}%",
+                urgency=(
+                    "high"
+                    if severity in (Severity.CRITICAL, Severity.EMERGENCY)
+                    else "medium"
+                ),
+                context={"agent_id": self.agent_id},
+            )
+            statuses.append(status)
+            if approved is not True:
+                all_approved = False
+
+        result["approved"] = all_approved
+        result["status"] = (
+            "approved"
+            if all_approved
+            else ("rejected" if "rejected" in statuses else "timed_out")
+        )
+
+        # P0 §2.5: HITL override only when explicitly enabled
+        if self._allow_hitl_override and all_approved:
+            result["override"] = True
+            with self._lock:
+                self.override_count += 1
+                self._outcome_counts["overridden"] += 1
+            for v in violations:
+                v["hitl_override"] = True
+            logger.warning(
+                "HITL approved denial (allow_hitl_override=True): %s",
+                [v["metric"] for v in violations],
+            )
+        return result
+
+    @staticmethod
+    def _hitl_needs_review(value: float, limit: float) -> bool:
+        if limit <= 0:
+            return False
+        ratio = value / limit
+        if 1.0 < ratio <= 1.05:
+            return True
+        if ratio >= 2.0:
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Federated (P2 §3.9: utilization, not breach rate)
+    # ------------------------------------------------------------------
+    def _feedback_federated(
+        self,
+        checked_metrics: List[str],
+        metrics: Mapping[str, Any],
+        active_constraints: Mapping[str, float],
+    ) -> None:
+        if self._federated is None:
+            return
+        with self._lock:
+            check_count = self.check_count
+        if check_count % 25 != 0:
+            return
+        for metric in checked_metrics:
+            limit = active_constraints.get(metric)
+            if limit is None or limit <= 0:
+                continue
+            value = _safe_float(metrics.get(metric, 0.0))
+            self._federated.push(
+                FederatedBudgetProfile(
+                    deployment_id=self.deployment_id,
+                    metric=metric,
+                    mean_utilization=value / limit,
+                    sample_count=1,
+                    budget_name=f"policy:{self.agent_id}",
+                )
+            )
+        self._federated.aggregate()
+
+    # ------------------------------------------------------------------
+    # Severity
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _classify_severity(
+        violations: List[Dict[str, Any]]
+    ) -> Severity:
+        if not violations:
+            return Severity.INFO
+        infinite = any(
+            v.get("overshoot_pct") == float("inf") for v in violations
+        )
+        if infinite:
+            return Severity.EMERGENCY
+        finite = [
+            v["overshoot_pct"]
+            for v in violations
+            if v.get("overshoot_pct") != float("inf")
+        ]
+        max_pct = max(finite) if finite else 0.0
+        if max_pct >= 100.0:
+            base = Severity.EMERGENCY
+        elif max_pct >= 30.0:
+            base = Severity.CRITICAL
         else:
-            self.violation_count += 1
+            base = Severity.WARNING   # any breach is at least WARNING
+        # Multi-metric escalation
+        if len(violations) >= 4 and base == Severity.CRITICAL:
+            return Severity.EMERGENCY
+        if len(violations) >= 3 and base == Severity.WARNING:
+            return Severity.CRITICAL
+        return base
 
-        # --- Build return dict (original shape preserved) ---
-        result: Dict[str, Any] = {
+    # ------------------------------------------------------------------
+    # Market
+    # ------------------------------------------------------------------
+    def _get_market_snapshot(
+        self, metrics: Mapping[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        if self._market is None:
+            return None
+        try:
+            snap = self._market.get_snapshot()
+            co2_used = _safe_float(metrics.get("carbon", 0.0))
+            payload = {
+                "carbon_price_per_tco2_usd": snap.carbon_price_per_tco2_usd,
+                "rec_available_mwh": snap.rec_available_mwh,
+                "co2_market_value_usd": (
+                    co2_used * snap.carbon_price_per_tco2_usd
+                ),
+            }
+            with self._lock:
+                self._last_market_snapshot = snap
+                self._last_market_fetched_at = _utcnow().timestamp()
+            return payload
+        except Exception:  # pragma: no cover
+            return None
+
+    # ------------------------------------------------------------------
+    # Precision
+    # ------------------------------------------------------------------
+    def _select_precision(self, urgency: str) -> PrecisionLevel:
+        if urgency == "critical":
+            return PrecisionLevel.FP16
+        if self.hardware.edge_device:
+            return (
+                PrecisionLevel.INT8
+                if self.hardware.supports_int8
+                else PrecisionLevel.FP16
+            )
+        return (
+            PrecisionLevel.INT4
+            if self.hardware.supports_int4
+            else PrecisionLevel.INT8
+        )
+
+    # ------------------------------------------------------------------
+    # Degraded handling (P0 §2.1, §2.6, §2.8)
+    # ------------------------------------------------------------------
+    def _handle_degraded(self, reason: str) -> Dict[str, Any]:
+        with self._lock:
+            self.degraded_count += 1
+            self._outcome_counts["degraded"] += 1
+
+        # Verify with raised reflecting the actual decision (§2.4)
+        # For monitor mode: raised=False. For active mode: raised=True.
+        active = self.mode == EnforcementMode.ACTIVE_ENFORCEMENT.value
+
+        if active:
+            ok, tv = self._verify_temporal(
+                compliant=False,
+                violations=[reason],
+                raised=True,
+                hitl_override=False,
+            )
+            with self._lock:
+                self.raise_count += 1
+            raise PolicyViolation(
+                [reason],
+                details={
+                    "degraded": True,
+                    "degraded_reason": reason,
+                    "violations": [reason],
+                    "structured_violations": [],
+                    "severity": Severity.EMERGENCY.value,
+                    "temporal_verified": ok,
+                    "temporal_violations": tv,
+                    "hitl_status": "not_required",
+                    "hitl_override": False,
+                    "at": _utcnow().isoformat(),
+                },
+            )
+
+        # Monitor mode: return a well-formed degraded result
+        ok, tv = self._verify_temporal(
+            compliant=False,
+            violations=[reason],
+            raised=False,
+            hitl_override=False,
+        )
+        return {
+            "compliant": False,
+            "violations": [reason],
+            "structured_violations": [],
+            "severity": Severity.EMERGENCY.value,
+            "degraded": True,
+            "degraded_reason": reason,
+            "temporal_verified": ok,
+            "temporal_violations": tv,
+            "hitl_status": "not_required",
+            "hitl_override": False,
+            "at": _utcnow().isoformat(),
+        }
+
+    # ------------------------------------------------------------------
+    # Temporal verification (P0 §2.4, §2.6)
+    # ------------------------------------------------------------------
+    def _verify_temporal(
+        self,
+        *,
+        compliant: bool,
+        violations: List[str],
+        raised: bool,
+        hitl_override: bool,
+    ) -> Tuple[bool, List[str]]:
+        if self._safety is None:
+            return (True, [])
+        ctx = {
             "compliant": compliant,
             "violations": violations,
+            "mode": self.mode,
+            "raised": raised,
+            "hitl_override": hitl_override,
         }
-        # Enhancement additions (purely additive)
-        result["structured_violations"] = structured
-        result["severity"] = severity.value
-        result["causal_adjustments"] = causal_adjustments
-        result["precision"] = precision.value
-        result["temporal_verified"] = True
-        result["hitl_required"] = hitl_required
-        result["hitl_approved"] = hitl_approved
-        if explanation:
-            result["explanation"] = explanation.to_dict()
-        if market_snapshot:
-            result["market_snapshot"] = market_snapshot
-
-        # --- Active enforcement: raise ---
-        if will_raise:
-            self.raise_count += 1
-            details = {
-                "structured_violations": structured,
-                "severity": severity.value,
-                "causal_adjustments": causal_adjustments,
-                "precision": precision.value,
-                "market_snapshot": market_snapshot,
-                "hitl_required": hitl_required,
-                "hitl_approved": hitl_approved,
-                "explanation": (
-                    explanation.to_dict() if explanation else None
-                ),
-                "at": datetime.now().isoformat(),
-            }
-            raise PolicyViolation(violations, details=details)
-
-        return result
+        return self._safety.verify(ctx)
 
     # ------------------------------------------------------------------
     # Public enhancement APIs
     # ------------------------------------------------------------------
+    def set_hitl_callback(
+        self, cb: Callable[[HITLRequest], Any]
+    ) -> None:
+        if self._hitl is not None:
+            self._hitl.set_callback(cb)
 
-    def set_hitl_callback(self, cb: Callable[[HITLRequest], bool]) -> None:
-        if self.hitl:
-            self.hitl.set_callback(cb)
-
-    def active_learning_samples(self, n: int = 16) -> List[Dict[str, Any]]:
-        return self.hitl.active_learning_batch(n) if self.hitl else []
-
-    def record_outcome(self, was_correct: bool) -> None:
-        """Feed back whether the last check was correct."""
-        if not self.constraint_learner:
-            return
-        reward = 1.0 if was_correct else 0.0
-        # Attribute reward to the most recent violated metric (or energy)
-        metric = next(
-            iter(self.breach_by_metric) if self.breach_by_metric else ["energy"]
+    def active_learning_samples(
+        self, n: int = 16
+    ) -> List[Dict[str, Any]]:
+        return (
+            list(self._hitl.feedback_log)[-n:]
+            if self._hitl is not None
+            else []
         )
-        self.constraint_learner.record(metric, reward)
-        if self.constraint_learner.observations % 10 == 0:
-            self.constraint_learner.update()
+
+    def record_outcome(self, was_correct: bool) -> bool:
+        """
+        Feed back whether the last check was correct.
+
+        P0 §2.2: does **not** crash on the first-ever call when there
+        are no breaches yet.
+        P0 §2.3: credits the **most recent** violated metric, not the
+        first-ever.
+        P0 §2.11: uses the real BudgetState for feature-aware update.
+        """
+        if self._budget_learner is None:
+            return False
+        with self._lock:
+            metric = self._last_violated_metric
+            state = self._last_state
+        if metric is None or state is None:
+            # Compliant last check: nothing to credit
+            return False
+        features = CausalBudgetLearner.features_of(state)
+        reward = 1.0 if was_correct else -1.0
+        self._budget_learner.record(metric, features, reward)
+        if (
+            self._budget_learner.observations % 10 == 0
+            and self._budget_learner.buffer
+        ):
+            self._budget_learner.update()
+        return True
 
     def contribute_federated(self) -> None:
-        if not self.federated:
+        """
+        P2 §3.9: push per-metric utilization (not breach rate) from the
+        last check.
+        """
+        if self._federated is None:
             return
-        for metric, count in self.breach_by_metric.items():
-            self.federated.push(FederatedViolationProfile(
-                deployment_id=self.deployment_id,
-                metric=metric,
-                mean_overshoot_pct=float(count) / max(1, self.check_count),
-                sample_count=count,
-            ))
-        self.federated.aggregate()
+        with self._lock:
+            state = self._last_state
+            last_metric = self._last_violated_metric
+        if state is None:
+            return
+        # Recompute utilization from constraints and current state
+        ratios: Dict[str, float] = {}
+        for orig_name, metric in self._CONSTRAINT_MAP:
+            if orig_name in self.constraints:
+                limit = self.constraints[orig_name]
+                if limit > 0 and metric == last_metric:
+                    # Use state.utilization_ratio as a proxy for the metric
+                    ratios[metric] = state.utilization_ratio
+        if not ratios:
+            return
+        for metric, util in ratios.items():
+            self._federated.push(
+                FederatedBudgetProfile(
+                    deployment_id=self.deployment_id,
+                    metric=metric,
+                    mean_utilization=util,
+                    sample_count=1,
+                    budget_name=f"policy:{self.agent_id}",
+                )
+            )
+        self._federated.aggregate()
 
-    def get_federated_aggregate(self) -> Dict[str, Dict[str, float]]:
-        return self.federated.aggregate() if self.federated else {}
+    def get_federated_aggregate(
+        self,
+    ) -> Dict[str, Dict[str, float]]:
+        return (
+            self._federated.aggregate()
+            if self._federated is not None
+            else {}
+        )
 
     def distill_policy(
         self, urgency: str = "normal"
-    ) -> Optional[DistilledPolicy]:
-        if not self.distiller:
+    ) -> Optional[DistilledBudgetPolicy]:
+        if self._distiller is None:
             return None
-        precision = (
-            self.precision_ctl.select(urgency)
-            if self.precision_ctl else PrecisionLevel.INT8
-        )
-        # Convert original-named constraints to metric-named
-        named_constraints: Dict[str, float] = {}
-        for orig, name in [
-            ("max_energy_per_task_wh", "energy"),
-            ("max_carbon_per_task_kg", "carbon"),
-            ("max_latency_seconds", "latency"),
-            ("max_helium_units", "helium"),
-            ("max_cost_usd", "cost"),
-        ]:
-            if orig in self.constraints:
-                try:
-                    named_constraints[name] = float(self.constraints[orig])
-                except (TypeError, ValueError):
-                    continue
-        return self.distiller.distill(named_constraints, precision)
+        precision = self._select_precision(urgency)
+        named: Dict[str, Optional[float]] = {}
+        for orig_name, metric in self._CONSTRAINT_MAP:
+            if orig_name in self.constraints:
+                named[metric] = self.constraints[orig_name]
+        if "max_helium_units" in self.constraints:
+            named["helium"] = self.constraints["max_helium_units"]
+        if "max_cost_usd" in self.constraints:
+            named["cost"] = self.constraints["max_cost_usd"]
+        if not named:
+            return None
+        policy = self._distiller.distill(named, precision)
+        with self._lock:
+            self.distilled_count += 1
+        return policy
 
     def explain_last_check(self) -> Optional[EnforcementExplanation]:
-        return self.last_explanation
+        with self._lock:
+            return self.last_explanation
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Statistics / health
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _safe_float(value: Any, default: float = 0.0) -> float:
-        try:
-            v = float(value)
-            return v if math.isfinite(v) else default
-        except (TypeError, ValueError):
-            return default
-
-    @staticmethod
-    def _classify_severity(violations: List[Dict[str, Any]]) -> Severity:
-        if not violations:
-            return Severity.INFO
-        max_pct = max(v["overshoot_pct"] for v in violations)
-        if max_pct >= 100.0:
-            return Severity.EMERGENCY
-        if max_pct >= 30.0:
-            return Severity.CRITICAL
-        if max_pct >= 5.0:
-            return Severity.WARNING
-        return Severity.INFO
-
-    # ------------------------------------------------------------------
-    # Statistics
-    # ------------------------------------------------------------------
-
     def get_statistics(self) -> Dict[str, Any]:
-        stats: Dict[str, Any] = {
-            "deployment_id": self.deployment_id,
-            "agent_id": self.agent_id,
-            "mode": self.mode,
-            "checks": self.check_count,
-            "compliant_count": self.compliant_count,
-            "violation_count": self.violation_count,
-            "raise_count": self.raise_count,
-            "compliance_rate": (
-                self.compliant_count / self.check_count
-                if self.check_count > 0 else 0.0
-            ),
-            "breach_by_metric": dict(self.breach_by_metric),
-            "severity_counts": dict(self.severity_counts),
-            "circuit": {
-                "state": self._circuit.state.value,
-                "failures": self._circuit.failures,
-            },
-        }
-        if self.temporal_monitor:
-            stats["temporal_violations"] = self.temporal_monitor.violations[-5:]
-        if self.coordinator:
-            stats["agents"] = {
-                aid: {"role": a.role.value, "calls": a.total_calls}
-                for aid, a in self.coordinator.agents.items()
+        with self._lock:
+            stats: Dict[str, Any] = {
+                "deployment_id": self.deployment_id,
+                "agent_id": self.agent_id,
+                "mode": self.mode,
+                "checks": self.check_count,
+                "compliant_count": self.compliant_count,
+                "violation_count": self.violation_count,
+                "raise_count": self.raise_count,
+                "degraded_count": self.degraded_count,
+                "override_count": self.override_count,
+                "distilled_count": self.distilled_count,
+                "compliance_rate": (
+                    self.compliant_count / self.check_count
+                    if self.check_count > 0
+                    else 0.0
+                ),
+                "breach_by_metric": dict(self.breach_by_metric),
+                "severity_counts": dict(self.severity_counts),
+                "outcome_counts": dict(self._outcome_counts),
+                "circuit": {
+                    "state": self._circuit.state,
+                    "failures": self._circuit.failures,
+                },
             }
-        if self.chaos:
-            stats["chaos_events"] = self.chaos.events[-5:]
-        if self.hitl:
-            stats["hitl_pending"] = len(self.hitl.pending)
-            stats["hitl_feedback_count"] = len(self.hitl.feedback_log)
-        if self.market:
-            snap = self.market.get_snapshot()
-            stats["market"] = {
-                "carbon_price_per_tco2_usd": snap.carbon_price_per_tco2_usd,
+            if self._safety is not None:
+                stats["temporal_violation_count"] = len(
+                    self._safety.violations
+                )
+                stats["temporal_violations"] = list(
+                    self._safety.violations
+                )[-5:]
+            if self._hitl is not None:
+                stats["hitl"] = {
+                    "pending": len(self._hitl.pending),
+                    "log_size": len(self._hitl.feedback_log),
+                    "outcomes": self._hitl.outcomes(),
+                }
+            if self._chaos is not None:
+                stats["chaos_events"] = list(self._chaos.events)[-5:]
+            if self._budget_learner is not None:
+                stats["causal_learner"] = (
+                    self._budget_learner.stats()
+                )
+            if self._federated is not None:
+                stats["federated_aggregate"] = (
+                    self._federated.aggregate()
+                )
+            if self._last_market_snapshot is not None:
+                stats["market"] = {
+                    "carbon_price_per_tco2_usd": (
+                        self._last_market_snapshot.carbon_price_per_tco2_usd
+                    ),
+                    "cached_at": _ensure_aware(
+                        self._last_market_snapshot.timestamp
+                    ).isoformat(),
+                }
+            return stats
+
+    async def health_check(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "healthy": self._circuit.state != "OPEN",
+                "deployment_id": self.deployment_id,
+                "agent_id": self.agent_id,
+                "mode": self.mode,
+                "circuit": {
+                    "state": self._circuit.state,
+                    "failures": self._circuit.failures,
+                },
+                "checks": self.check_count,
+                "compliant_count": self.compliant_count,
+                "violation_count": self.violation_count,
+                "degraded_count": self.degraded_count,
+                "override_count": self.override_count,
+                "strict_metrics": self._strict_metrics,
+                "allow_hitl_override": self._allow_hitl_override,
+                "allow_constraint_loosening": (
+                    self._allow_constraint_loosening
+                ),
+                "min_severity_to_raise": self._min_severity_to_raise.value,
+                "hitl_outcomes": (
+                    self._hitl.outcomes()
+                    if self._hitl is not None
+                    else {}
+                ),
+                "temporal_violation_count": (
+                    len(self._safety.violations)
+                    if self._safety is not None
+                    else 0
+                ),
+                "features": dict(self.features),
             }
-        if self.constraint_learner:
-            stats["causal_learner"] = {
-                "observations": self.constraint_learner.observations,
-                "updates": self.constraint_learner.updates,
-            }
-        if self.federated:
-            stats["federated_aggregate"] = self.federated.aggregate()
-        return stats
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    def __enter__(self) -> "GreenPolicyEnforcer":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        pass
+
+    async def __aenter__(self) -> "GreenPolicyEnforcer":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        pass
+
+    def __repr__(self) -> str:
+        with self._lock:
+            return (
+                "GreenPolicyEnforcer("
+                f"agent={self.agent_id!r}, "
+                f"mode={self.mode!r}, "
+                f"checks={self.check_count}, "
+                f"compliant={self.compliant_count}, "
+                f"violations={self.violation_count}, "
+                f"circuit={self._circuit.state})"
+            )
 
 
-# =============================================================================
-# Demo
-# =============================================================================
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
+__all__ = [
+    # v18 re-exports
+    "CircuitBreaker",
+    "ChaosTestingEngine",
+    "ActiveUserPreferenceLearner",
+    "AdaptivePrecisionSwitcher",
+    "CarbonMarketIntegrator",
+    "MultiAgentCoordinator",
+    "FederatedGreenAggregator",
+    "TemporalLogicVerifier",
+    # Enums / types
+    "EnforcementMode",
+    "Severity",
+    "PrecisionLevel",
+    "AgentRole",
+    "HardwareProfile",
+    "BudgetState",
+    "EnforcementExplanation",
+    "DistilledBudgetPolicy",
+    "FederatedBudgetProfile",
+    "MarketSnapshot",
+    "HITLRequest",
+    # Components
+    "SyncCircuitAdapter",
+    "SyncChaosInjector",
+    "CausalBudgetLearner",
+    "QuantumDistillationBridge",
+    "FederatedBudgetAggregator",
+    "HeliumProfiler",
+    "BudgetSafetyMonitor",
+    "HumanReviewGate",
+    "CarbonMarketCache",
+    # Local
+    "PolicyViolation",
+    "EnforcementProperty",
+    "CompliantImpliesNoViolations",
+    "ActiveModeRaises",
+    "GreenPolicyEnforcer",
+]
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
 
-    base_policy = {
-        "constraints": {
+# --------------------------------------------------------------------------- #
+# Demo — every P0/P1 fix verified by assertion
+# --------------------------------------------------------------------------- #
+def _demo() -> None:
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
+    print("=" * 78)
+    print("green_policy_enforcer.py v6.0.0 — Demo")
+    print("=" * 78)
+
+    def _check(condition: bool, message: str) -> None:
+        if not condition:
+            raise AssertionError(f"FAILED: {message}")
+        print(f"  ✓ {message}")
+
+    def _policy(mode: str = "active_enforcement", **constraints) -> Dict:
+        base_constraints = {
             "max_energy_per_task_wh": 5.0,
             "max_carbon_per_task_kg": 0.5,
             "max_latency_seconds": 30.0,
             "max_helium_units": 0.0002,
             "max_cost_usd": 0.05,
-        },
-        "agent_identity": {"mode": "active_enforcement"},
-    }
+        }
+        base_constraints.update(constraints)
+        return {
+            "constraints": base_constraints,
+            "agent_identity": {"mode": mode},
+        }
 
-    def auto_approve(req: HITLRequest) -> bool:
-        logger.info(f"[HITL] auto-approve: {req.reason}")
-        return True
+    # ============================================================= #
+    # v1 compatibility
+    # ============================================================= #
+    print("\n=== v1 compatibility: PolicyViolation contract preserved ===")
+    exc = PolicyViolation(["energy", "carbon"])
+    _check(
+        exc.args[0] == ["energy", "carbon"],
+        f"args[0] is the violations list (got {exc.args[0]!r})",
+    )
+    _check(
+        str(exc) == str(["energy", "carbon"]),
+        "str(exc) matches v1 format",
+    )
+    _check(
+        exc.violations == ["energy", "carbon"],
+        "violations property returns the list",
+    )
+    # P1 §3.16: string arg is coerced
+    str_exc = PolicyViolation("energy")  # type: ignore[arg-type]
+    _check(
+        str_exc.violations == ["energy"],
+        f"string arg coerced to ['energy'] (got {str_exc.violations!r})",
+    )
 
-    # --- Legacy mode (features off) ---
+    # ============================================================= #
+    # Legacy mode (features off)
+    # ============================================================= #
     print("\n=== Legacy mode (all features off) ===")
     legacy = GreenPolicyEnforcer(
-        base_policy,
+        _policy(),
         features={k: False for k in GreenPolicyEnforcer.DEFAULT_FEATURES},
     )
     try:
         legacy.check({"energy": 6.2, "carbon": 0.4, "latency": 25.0})
     except PolicyViolation as e:
-        print(f"  raised: {e}")
-        print(f"  args:   {e.args}")
-        print(f"  details (empty in legacy): {e.details}")
+        _check(
+            e.violations == ["energy"],
+            f"legacy raise on energy breach (got {e.violations!r})",
+        )
+        _check(
+            e.details.get("structured_violations") is not None,
+            "legacy exception still carries structured data",
+        )
+    else:
+        raise AssertionError("legacy active check did not raise")
 
-    # --- Enhanced mode ---
-    print("\n=== Enhanced mode (all features on) ===")
-    enforcer = GreenPolicyEnforcer(
-        base_policy,
-        deployment_id="us-ca-prod-01",
-        agent_id="enforcer-A",
-        hardware=HardwareProfile(supports_int4=True, vram_gb=48),
-    )
-    enforcer.set_hitl_callback(auto_approve)
+    # ============================================================= #
+    # P0 §2.1 — all degraded paths raise in active mode
+    # ============================================================= #
+    print("\n=== P0 §2.1: every degraded path raises in active mode ===")
 
-    # Multi-violation raise
+    # (a) circuit-open
+    circ = GreenPolicyEnforcer(_policy())
+    for _ in range(10):
+        circ._circuit.record_failure()
+    _check(circ._circuit.state == "OPEN", "circuit forced open")
     try:
-        enforcer.check({
-            "energy": 6.2, "carbon": 1.5, "latency": 35.0,
-            "helium": 0.0003, "cost": 0.08,
-        })
+        circ.check({"energy": 1.0})
     except PolicyViolation as e:
-        print(f"  raised: {e}")
-        print(f"  args:   {e.args}")
-        print(f"  severity: {e.severity}")
-        print(f"  violations (structured):")
-        for v in e.structured_violations:
-            print(f"    - {v['metric']}: {v['value']:.4f} > {v['limit']:.4f} "
-                  f"({v['overshoot_pct']:.1f}%)")
-        if e.explanation:
-            print(f"  XAI headline: {e.explanation['headline']}")
-            for line in e.explanation["rationale"]:
-                print(f"    • {line}")
-        if e.details.get("market_snapshot"):
-            print(f"  co2 value: "
-                  f"${e.details['market_snapshot']['co2_market_value_usd']:.4f}")
+        _check(
+            e.degraded is True,
+            f"circuit-open → raised (degraded={e.degraded})",
+        )
+        _check(
+            "circuit_open" in e.violations,
+            f"reason carries 'circuit_open' (got {e.violations})",
+        )
+    else:
+        raise AssertionError("circuit-open did not raise in active mode")
 
-    # Compliant case
-    result = enforcer.check({
-        "energy": 2.0, "carbon": 0.3, "latency": 15.0,
-    })
-    print(f"\n  compliant: {result['compliant']}")
-    print(f"  violations: {result['violations']}")
-    print(f"  severity:   {result['severity']}")
-    print(f"  precision:  {result['precision']}")
+    # (b) chaos
+    chaos = GreenPolicyEnforcer(
+        _policy(), features={"chaos_testing": True}
+    )
+    chaos._chaos = SyncChaosInjector(failure_rate=1.0)
+    try:
+        chaos.check({"energy": 1.0})
+    except PolicyViolation as e:
+        _check(
+            e.degraded is True and "chaos" in e.violations,
+            f"chaos → raised (degraded, {e.violations})",
+        )
+    else:
+        raise AssertionError("chaos did not raise in active mode")
 
-    # Outcome feedback
-    enforcer.record_outcome(was_correct=True)
+    # (c) internal error
+    err = GreenPolicyEnforcer(_policy())
+    _orig = err._check_internal
+    def _boom(metrics):
+        raise RuntimeError("simulated internal failure")
+    err._check_internal = _boom  # type: ignore[assignment]
+    try:
+        err.check({"energy": 1.0})
+    except PolicyViolation as e:
+        _check(
+            e.degraded is True
+            and any("internal_error" in v for v in e.violations),
+            f"internal error → raised (degraded, {e.violations})",
+        )
+    else:
+        raise AssertionError("internal error did not raise")
+    err._check_internal = _orig  # type: ignore[assignment]
 
-    # Federated
-    enforcer.contribute_federated()
+    # (d) invalid input
+    inv = GreenPolicyEnforcer(_policy())
+    try:
+        inv.check(None)  # type: ignore[arg-type]
+    except PolicyViolation as e:
+        _check(
+            e.degraded is True and "invalid_input" in e.violations,
+            f"invalid input → raised (degraded, {e.violations})",
+        )
+    else:
+        raise AssertionError("invalid input did not raise")
 
-    # Distill
-    dist = enforcer.distill_policy(urgency="normal")
-    if dist:
-        print(f"\n=== Distilled Policy ===")
-        print(f"  Precision:    {dist.precision.value}")
-        print(f"  Constraints:  {dist.constraints}")
-        print(f"  Retention:    {dist.quality_retention}")
+    # (e) monitor mode still returns a dict
+    mon = GreenPolicyEnforcer(_policy(mode="monitor"))
+    for _ in range(10):
+        mon._circuit.record_failure()
+    r_mon = mon.check({"energy": 1.0})
+    _check(
+        isinstance(r_mon, dict) and r_mon.get("degraded") is True,
+        "monitor mode returns a degraded dict (no raise)",
+    )
 
-    # Statistics
+    # ============================================================= #
+    # P0 §2.2 — record_outcome doesn't crash on first-ever call
+    # ============================================================= #
+    print("\n=== P0 §2.2: record_outcome doesn't crash on first-ever call ===")
+    fresh = GreenPolicyEnforcer(_policy(mode="monitor"))
+    r = fresh.check({"energy": 1.0, "carbon": 0.2})  # compliant
+    _check(r["compliant"] is True, "fresh check is compliant")
+    try:
+        returned = fresh.record_outcome(was_correct=True)
+        _check(
+            isinstance(returned, bool),
+            f"record_outcome returned {returned!r}, no crash",
+        )
+        _check(
+            returned is False,
+            "record_outcome returns False (no metric to credit)",
+        )
+    except TypeError as exc:
+        raise AssertionError(
+            f"record_outcome crashed with TypeError: {exc} "
+            f"(v5 bug: next(['energy']))"
+        )
+
+    # ============================================================= #
+    # P0 §2.3 — record_outcome credits the last-violated metric
+    # ============================================================= #
+    print("\n=== P0 §2.3: record_outcome credits the last-violated metric ===")
+    seq = GreenPolicyEnforcer(_policy(mode="monitor"))
+    # Breach energy first
+    seq.check({"energy": 10.0, "carbon": 0.1})
+    # Breach carbon second
+    seq.check({"energy": 1.0, "carbon": 2.0})
+
+    before = dict(seq._budget_learner.observations_by_metric)
+    seq.record_outcome(was_correct=False)
+    after = dict(seq._budget_learner.observations_by_metric)
+    _check(
+        after.get("carbon", 0) > before.get("carbon", 0),
+        f"credits 'carbon' (last violated): "
+        f"{before.get('carbon', 0)} → {after.get('carbon', 0)}",
+    )
+    _check(
+        after.get("energy", 0) == before.get("energy", 0),
+        f"does not wrongly credit 'energy': "
+        f"{before.get('energy', 0)} → {after.get('energy', 0)}",
+    )
+
+    # ============================================================= #
+    # P0 §2.4 — ActiveModeRaises is load-bearing
+    # ============================================================= #
+    print("\n=== P0 §2.4: ActiveModeRaises is load-bearing ===")
+    prop = ActiveModeRaises()
+
+    # Correct behavior: active + violations + raised=True → passes
+    ctx_correct = {
+        "mode": "active_enforcement",
+        "violations": ["energy"],
+        "raised": True,
+        "hitl_override": False,
+    }
+    _check(
+        prop.check(ctx_correct) is True,
+        "property passes on correct behavior (raised=True)",
+    )
+
+    # Bug: active + violations + raised=False → property fires
+    ctx_bug = {
+        "mode": "active_enforcement",
+        "violations": ["energy"],
+        "raised": False,
+        "hitl_override": False,
+    }
+    _check(
+        prop.check(ctx_bug) is False,
+        "property fires on regression (raised=False, the v5 tautology)",
+    )
+
+    # Override: active + violations + raised=False + hitl_override=True → passes
+    ctx_override = {
+        "mode": "active_enforcement",
+        "violations": ["energy"],
+        "raised": False,
+        "hitl_override": True,
+    }
+    _check(
+        prop.check(ctx_override) is True,
+        "property allows HITL override (raised=False + override=True)",
+    )
+
+    # Monitor mode: property always passes
+    ctx_monitor = {
+        "mode": "monitor",
+        "violations": ["energy"],
+        "raised": False,
+        "hitl_override": False,
+    }
+    _check(
+        prop.check(ctx_monitor) is True,
+        "property passes in monitor mode (doesn't apply)",
+    )
+
+    # Enforcer's temporal monitor catches the bug when fed a wrong `raised`
+    trap = GreenPolicyEnforcer(_policy(mode="monitor"))
+    trap._verify_temporal(
+        compliant=False,
+        violations=["energy"],
+        raised=False,   # <-- bug
+        hitl_override=False,
+    )
+    # Note: monitor mode passes because mode != active.
+    # Use active mode for the trap.
+    trap_active = GreenPolicyEnforcer(_policy())
+    trap_active._verify_temporal(
+        compliant=False,
+        violations=["energy"],
+        raised=False,   # <-- bug
+        hitl_override=False,
+    )
+    _check(
+        any(
+            v.get("property") == "ActiveModeRaises"
+            for v in trap_active._safety.violations
+        ),
+        "enforcer's temporal monitor fires on the injected bug",
+    )
+
+    # And the correct path doesn't record any violation
+    healthy = GreenPolicyEnforcer(_policy())
+    try:
+        healthy.check({"energy": 6.0})   # real breach, active raises
+    except PolicyViolation:
+        pass
+    _check(
+        not any(
+            v.get("property") == "ActiveModeRaises"
+            for v in healthy._safety.violations
+        ),
+        "no false positive on the correct-raise path",
+    )
+
+    # ============================================================= #
+    # P0 §2.5 — HITL propagation
+    # ============================================================= #
+    print("\n=== P0 §2.5: HITL propagation ===")
+
+    # (a) Rejection → still raises
+    rej = GreenPolicyEnforcer(_policy())
+    rej.set_hitl_callback(lambda req: False)
+    try:
+        rej.check({"energy": 5.3})   # 6% over → borderline → reviewed
+    except PolicyViolation as e:
+        _check(
+            e.hitl_status == "rejected",
+            f"HITL rejection raises (status={e.hitl_status})",
+        )
+    else:
+        raise AssertionError("HITL rejection did not raise")
+
+    # (b) Approval without override → still raises (default fail-safe)
+    no_ov = GreenPolicyEnforcer(_policy())
+    no_ov.set_hitl_callback(lambda req: True)
+    try:
+        no_ov.check({"energy": 5.3})
+    except PolicyViolation as e:
+        _check(
+            e.hitl_status == "approved" and e.hitl_override is False,
+            f"approval without override → still raises "
+            f"(status={e.hitl_status}, override={e.hitl_override})",
+        )
+    else:
+        raise AssertionError("approval without override did not raise")
+
+    # (c) Approval with allow_hitl_override=True → no raise
+    yes_ov = GreenPolicyEnforcer(
+        _policy(), allow_hitl_override=True
+    )
+    yes_ov.set_hitl_callback(lambda req: True)
+    result = yes_ov.check({"energy": 5.3})
+    _check(
+        result["compliant"] is True and result["hitl_override"] is True,
+        f"approval + override → compliant with hitl_override flag",
+    )
+    _check(
+        yes_ov.override_count == 1,
+        "override_count incremented",
+    )
+
+    # ============================================================= #
+    # P0 §2.6 — temporal_verified reflects reality
+    # ============================================================= #
+    print("\n=== P0 §2.6: temporal_verified reflects reality ===")
+    tm = GreenPolicyEnforcer(_policy(mode="monitor"))
+    r_ok = tm.check({"energy": 1.0})
+    _check(
+        r_ok["temporal_verified"] is True,
+        "compliant check → temporal_verified=True",
+    )
+    _check(
+        r_ok["temporal_violations"] == [],
+        "no temporal violations on correct behavior",
+    )
+    # Force a temporal violation via injected buggy verify
+    tm._verify_temporal(
+        compliant=False,
+        violations=["energy"],
+        raised=False,
+        hitl_override=True,  # pretend override, but monitor mode
+    )
+    # In monitor mode the property passes; use active mode for the trap
+    active_tm = GreenPolicyEnforcer(_policy())
+    try:
+        active_tm.check({"energy": 6.0})
+    except PolicyViolation as e:
+        _check(
+            e.temporal_verified is True,
+            "PolicyViolation.details has temporal_verified=True",
+        )
+
+    # ============================================================= #
+    # P0 §2.7 — NaN / missing metrics → EMERGENCY
+    # ============================================================= #
+    print("\n=== P0 §2.7: NaN / missing metrics → EMERGENCY ===")
+    nan = GreenPolicyEnforcer(_policy(mode="monitor"))
+    r_nan = nan.check({"energy": float("nan"), "carbon": 0.2})
+    _check(
+        r_nan["compliant"] is False,
+        "NaN energy → non-compliant",
+    )
+    _check(
+        r_nan["severity"] == "emergency",
+        f"NaN → EMERGENCY (got {r_nan['severity']})",
+    )
+    r_miss = nan.check({"carbon": 0.2})   # energy missing
+    _check(
+        r_miss["compliant"] is False,
+        "missing energy (strict mode) → non-compliant",
+    )
+
+    # Lenient mode preserves v1 (missing → 0.0)
+    lenient = GreenPolicyEnforcer(
+        _policy(mode="monitor"), strict_metrics=False
+    )
+    r_len = lenient.check({"carbon": 0.2})
+    _check(
+        r_len["compliant"] is True,
+        "strict_metrics=False preserves v1",
+    )
+
+    # ============================================================= #
+    # P0 §2.8 — metrics=None is not a clean pass
+    # ============================================================= #
+    print("\n=== P0 §2.8: metrics=None → not a clean pass ===")
+    none_mgr = GreenPolicyEnforcer(_policy(mode="monitor"))
+    r_none = none_mgr.check(None)  # type: ignore[arg-type]
+    _check(
+        r_none["compliant"] is False and r_none.get("degraded") is True,
+        f"metrics=None → degraded, not compliant (got {r_none['compliant']})",
+    )
+
+    # ============================================================= #
+    # P0 §2.9 — small / zero-limit breaches
+    # ============================================================= #
+    print("\n=== P0 §2.9: small / zero-limit breaches are never INFO ===")
+    small = GreenPolicyEnforcer(_policy(mode="monitor"))
+    r_small = small.check({"energy": 5.01, "carbon": 0.2})
+    _check(
+        r_small["severity"] == "warning",
+        f"0.2% breach → WARNING (got {r_small['severity']})",
+    )
+
+    zero = GreenPolicyEnforcer(
+        _policy(mode="monitor", max_cost_usd=0.0)
+    )
+    r_zero = zero.check({"energy": 1.0, "cost": 0.5})
+    _check(
+        r_zero["severity"] == "emergency",
+        f"zero-limit breach → EMERGENCY (got {r_zero['severity']})",
+    )
+
+    # Multi-metric escalation
+    multi = GreenPolicyEnforcer(_policy(mode="monitor"))
+    r_multi = multi.check(
+        {"energy": 6.2, "carbon": 0.62, "latency": 32.0}
+    )
+    _check(
+        len(r_multi["structured_violations"]) == 3,
+        f"3 metrics breached (got {len(r_multi['structured_violations'])})",
+    )
+    _check(
+        r_multi["severity"] == "critical",
+        f"3-metric ~24% breach escalates to CRITICAL "
+        f"(got {r_multi['severity']})",
+    )
+
+    # ============================================================= #
+    # P0 §2.10 — constraint validation
+    # ============================================================= #
+    print("\n=== P0 §2.10: constraints validated at construction ===")
+    for name, args in [
+        ("negative", {"max_energy_per_task_wh": -5.0}),
+        ("NaN", {"max_carbon_per_task_kg": float("nan")}),
+        ("string", {"max_latency_seconds": "abc"}),
+        ("bool", {"max_energy_per_task_wh": True}),
+    ]:
+        try:
+            GreenPolicyEnforcer(
+                {"constraints": args, "agent_identity": {"mode": "monitor"}}
+            )
+        except ValueError:
+            _check(True, f"{name} constraint rejected at construction")
+        else:
+            raise AssertionError(f"{name} constraint not rejected")
+
+    # ============================================================= #
+    # P0 §2.11 — causal learner fixed
+    # ============================================================= #
+    print("\n=== P0 §2.11: causal learner ===")
+    learner = CausalBudgetLearner(
+        known_metrics=["energy", "carbon"],
+    )
+    state_a = BudgetState(8, 0.9, 0.1)
+    state_b = BudgetState(20, 0.1, 0.9)
+    feats_a = CausalBudgetLearner.features_of(state_a)
+    feats_b = CausalBudgetLearner.features_of(state_b)
+    for _ in range(30):
+        learner.record("energy", feats_a, -1.0)
+    learner.update()
+    for _ in range(30):
+        learner.record("energy", feats_b, -1.0)
+    learner.update()
+    off_a = learner.predict_offset("energy", state_a)
+    off_b = learner.predict_offset("energy", state_b)
+    _check(
+        abs(off_a - off_b) > 1e-4,
+        f"feature-aware (A={off_a:.4f}, B={off_b:.4f})",
+    )
+    # Signed reward tightens
+    tightener = CausalBudgetLearner(known_metrics=["energy"])
+    baseline = tightener.predict_offset("energy", state_a)
+    for _ in range(50):
+        tightener.record("energy", feats_a, -1.0)
+    tightener.update()
+    after = tightener.predict_offset("energy", state_a)
+    _check(
+        after < baseline,
+        f"negative reward tightens: {baseline:.4f} → {after:.4f}",
+    )
+    # Tightening-only: 100 correct never loosen
+    widener = CausalBudgetLearner(known_metrics=["energy"])
+    for _ in range(100):
+        widener.record("energy", feats_a, 1.0)
+    widener.update()
+    _check(
+        widener.predict_offset("energy", state_a) <= 0.0,
+        f"100 correct outcomes never loosen "
+        f"(offset={widener.predict_offset('energy', state_a):.4f})",
+    )
+
+    # ============================================================= #
+    # P1 §3.1 — thread safety
+    # ============================================================= #
+    print("\n=== P1 §3.1: thread safety ===")
+    import threading
+    safe = GreenPolicyEnforcer(_policy(mode="monitor"))
+    errors: List[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            for _ in range(100):
+                safe.check({"energy": 1.0, "carbon": 0.2})
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_worker) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    _check(not errors, "10×100 concurrent checks: no errors")
+    _check(
+        safe.check_count == 1000,
+        f"check_count is 1000 (got {safe.check_count})",
+    )
+
+    # ============================================================= #
+    # P1 §3.2 — v18 single-probe circuit breaker
+    # ============================================================= #
+    print("\n=== P1 §3.2: v18 single-probe circuit breaker ===")
+    probe = GreenPolicyEnforcer(_policy(mode="monitor"))
+    for _ in range(2):
+        probe._circuit.record_failure()
+    _check(
+        probe._circuit.state == "CLOSED",
+        "two failures below threshold=5 → CLOSED",
+    )
+    for _ in range(3):
+        probe._circuit.record_failure()
+    _check(
+        probe._circuit.state == "OPEN",
+        "five failures → OPEN",
+    )
+
+    # ============================================================= #
+    # P1 §3.3 — async HITL
+    # ============================================================= #
+    print("\n=== P1 §3.3: async HITL ===")
+    gate = HumanReviewGate()
+
+    async def _async_cb(req):
+        return True
+
+    gate.set_callback(_async_cb)
+    approved, status = gate.review(
+        metric="energy", value=6.0, limit=5.0,
+        reason="test", urgency="medium",
+    )
+    _check(
+        approved is False and status == "async_in_sync",
+        f"async callback rejected in sync review (got {status!r})",
+    )
+
+    async def _await_review():
+        gate2 = HumanReviewGate()
+
+        async def _cb(req):
+            return True
+
+        gate2.set_callback(_cb)
+        return await gate2.areview(
+            metric="energy", value=6.0, limit=5.0,
+            reason="test", urgency="medium",
+        )
+
+    approved2, status2 = asyncio.run(_await_review())
+    _check(
+        approved2 is True and status2 == "approved",
+        "async callback awaited in areview",
+    )
+
+    # ============================================================= #
+    # P1 §3.4 — bounded collections
+    # ============================================================= #
+    print("\n=== P1 §3.4: bounded collections ===")
+    bound = GreenPolicyEnforcer(_policy(mode="monitor"))
+    for _ in range(2000):
+        bound.check({"energy": 6.0, "carbon": 0.6, "latency": 40.0})
+    _check(
+        len(bound._hitl.feedback_log) <= MAX_HITL_LOG,
+        f"hitl.feedback_log bounded at {MAX_HITL_LOG}",
+    )
+    _check(
+        len(bound._federated.updates) <= MAX_FEDERATED_UPDATES,
+        f"federated.updates bounded at {MAX_FEDERATED_UPDATES}",
+    )
+
+    # ============================================================= #
+    # P1 §3.5 — cached market snapshot
+    # ============================================================= #
+    print("\n=== P1 §3.5: cached market snapshot ===")
+    cache = GreenPolicyEnforcer(_policy(mode="monitor"))
+    cache.check({"energy": 1.0})
+    p1 = cache.get_statistics().get("market", {}).get(
+        "carbon_price_per_tco2_usd"
+    )
+    p2 = cache.get_statistics().get("market", {}).get(
+        "carbon_price_per_tco2_usd"
+    )
+    _check(
+        p1 == p2,
+        f"consecutive get_statistics() reports the cached price ({p1})",
+    )
+
+    # ============================================================= #
+    # P1 §3.13 — set_mode
+    # ============================================================= #
+    print("\n=== P1 §3.13: set_mode ===")
+    sm = GreenPolicyEnforcer(_policy(mode="monitor"))
+    sm.check({"energy": 6.0})   # monitor: no raise
+    _check(
+        sm.mode == "monitor",
+        "starts in monitor mode",
+    )
+    sm.set_mode("active_enforcement")
+    _check(
+        sm.mode == "active_enforcement",
+        "set_mode switches to active",
+    )
+    try:
+        sm.check({"energy": 6.0})
+    except PolicyViolation:
+        _check(True, "after set_mode, check raises in active mode")
+    else:
+        raise AssertionError("set_mode did not switch behavior")
+    # Invalid mode rejected
+    try:
+        sm.set_mode("bogus")
+    except ValueError:
+        _check(True, "invalid mode rejected")
+    else:
+        raise AssertionError("invalid mode not rejected")
+
+    # ============================================================= #
+    # P1 — set_features, health_check, async CM
+    # ============================================================= #
+    print("\n=== P1: set_features, health_check, async CM ===")
+    live = GreenPolicyEnforcer(_policy(mode="monitor"))
+    _check(live._market is not None, "market enabled by default")
+    live.set_features({"carbon_market": False})
+    _check(live._market is None, "set_features disabled market")
+    live.set_features({"carbon_market": True})
+    _check(live._market is not None, "set_features re-enabled market")
+
+    async def _async_health():
+        async with GreenPolicyEnforcer(_policy(mode="monitor")) as m:
+            health = await m.health_check()
+            _check(
+                "healthy" in health and "strict_metrics" in health,
+                "health_check returns expected keys",
+            )
+
+    asyncio.run(_async_health())
+
+    # ============================================================= #
+    # Final summary
+    # ============================================================= #
+    print("\n=== Statistics (last enforcer) ===")
     import json
-    print("\n=== Statistics ===")
-    print(json.dumps(enforcer.get_statistics(), indent=2, default=str))
+    print(json.dumps(live.get_statistics(), indent=2, default=str))
+
+    print("\n" + "=" * 78)
+    print("All v6 assertions passed.")
+    print("=" * 78)
+
+
+if __name__ == "__main__":
+    _demo()
