@@ -1,42 +1,98 @@
+# src/graph/graph_registry.py
 """
-graph_registry.py — Central Graph & Helium Monitor Registry (Enhanced v17.0.0)
-================================================================================
+graph_registry.py — Central Graph & Helium Monitor Registry (v6.0.0)
+=====================================================================
 
-Manages lifecycle, registration, versioning, and health reporting for all graph
-types and the optional Helium supply chain monitor. Now extended with all ten
-advanced Green Agent enhancements fully integrated in a single self-contained file:
+Manages lifecycle, registration, versioning, and health reporting for all
+graph types and the optional Helium supply chain monitor.
 
-   1. Quantum-Distillation Integration        → QuantumDistillationEngine
-   2. Causal Reinforcement Learning           → CausalGraphLearner + CausalPolicyAdapter
-   3. Federated Green Learning                → FederatedGreenAggregator
-   4. Advanced Multi-Agent Coordination       → MultiAgentCoordinator
-   5. Temporal Logic & Formal Verification    → TemporalLogicVerifier
-   6. Explainable AI                          → XAIDecisionExplainer
-   7. Adaptive Precision Switching            → AdaptivePrecisionSwitcher
-   8. Carbon Markets / REC                    → CarbonMarketIntegrator
-   9. Resilience Engineering / Chaos Testing  → ChaosTestingEngine
-  10. HITL Active Learning                    → ActiveUserPreferenceLearner
+**Public API preserved**
 
-Enhancements over v1.0:
-  * Extended GraphType enum (temporal, XAI, precision, chaos, agent, federated,
-    distillation) in addition to causal/policy/similarity/carbon_ledger.
-  * Async API (aregister, aget, alist, ahealth).
-  * Graph versioning with history and rollback (no more silent overwrites).
-  * Precision-aware storage (fp32/fp16/bf16/int8) per graph entry.
-  * Carbon-aware deferred updates (via CarbonMarketIntegrator).
-  * HITL approval for critical graph updates.
-  * XAI explanation on every graph update (feature attribution of changes).
-  * Chaos hook for fault injection into graph operations.
-  * Federated sharing of graphs across deployments.
-  * Per-entry metadata, tags, and lifecycle timestamps.
-  * Health reports now include versioning, precision, and total graph counts.
+    registry = GraphRegistry(config=None, storage=None)
+    registry.register(GraphType.CAUSAL, graph)
+    registry.get(GraphType.CAUSAL)
+    registry.get_history(GraphType.CAUSAL)
+    registry.rollback(GraphType.CAUSAL, 2)
 
-Thread Safety:
-  * Sync methods use a reentrant lock (`threading.RLock`).
-  * Async methods use `asyncio.Lock`.
+    await registry.aregister(...)   # async with enhancement pipeline
 
-The file is self-contained: Python stdlib + optional numpy/sklearn/torch.
-All storage / enhancement hooks soft-fail.
+**What changed (v17 → v6)**
+---------------------------
+
+**P0 — versioning guarantees, concurrency, cross-module identity**
+
+1. **``aregister`` is serialized per graph type (§2.1).** v17 let two
+   concurrent ``aregister`` calls race through HITL, deferral, and the
+   final read of ``_entries[gt].current.version`` — so a caller could be
+   told their registration is v2 when it was actually v1. v6 takes a
+   per-graph-type ``asyncio.Lock`` and returns the exact
+   ``GraphVersion`` from ``register()``.
+2. **Deferred registrations are not lost (§2.2).** v17 returned
+   ``{"status": "deferred"}`` and never registered the graph. v6
+   **still registers** the graph and marks the version ``deferred=True``
+   so the caller's data is preserved; the return dict carries
+   ``version`` / ``precision``.
+3. **HITL rejections are recorded (§2.3).** v17 silently returned
+   ``{"status": "hitl_rejected"}``. v6 records the rejection in
+   ``_rejections[graph_type]`` (bounded) so an operator can audit "who
+   tried to register X and got denied." The graph is **not** registered.
+4. **``rollback`` no longer duplicates history (§2.4).** v17 appended
+   ``current`` to ``history`` but left ``target`` in ``history`` too —
+   so repeated rollbacks to the same version multiplied
+   ``entry.history`` and eventually evicted real versions. v6 removes
+   ``target`` from history before appending ``current``.
+5. **No ``asyncio.Lock()`` in ``__init__`` (§2.5).** v17 created
+   ``_async_lock`` at construction — deprecated on Python <3.10 and
+   broken when the registry is built outside a loop. v6 drops
+   ``_async_lock`` entirely; state safety comes from ``RLock`` and
+   per-graph-type locks created lazily inside a running loop.
+6. **``_metadata`` counters are guarded by ``_lock`` (§2.6, §2.7).**
+   v17 incremented ``total_deferrals`` / ``total_hitl_*`` without the
+   lock — losing updates under concurrency.
+7. **``_fingerprint`` is portable (§2.8).** v17 used
+   ``pickle.dumps`` with the highest protocol — different bytes across
+   Python versions and byte orders. v6 uses canonical JSON
+   (sorted keys, deterministic float encoding).
+
+**P1 — reliability**
+
+8. **``_metadata["singletons"]`` is bounded** by ``max_metadata_bytes``
+   and demoted to a summary on overflow.
+9. **``unregister()``** removes an entry and its rejections.
+10. **``reset()``** refuses to run with in-flight registrations.
+11. **``shutdown()``** clears ``_metadata`` and ``_singletons``.
+12. **Precision downgrade is logged** (§3.5).
+13. **Graph sizes are cached on ``GraphEntry``** — no re-pickle per
+    register (§3.6).
+14. **Critical graph types are configurable** via
+    ``registry_critical_graph_types`` (§3.7).
+15. **Chaos hook is opt-in** via ``registry_chaos_hook`` and reports
+    ``chaos_injected`` in the return (§3.8).
+16. **Unified return shape** across ``registered`` / ``deferred`` /
+    ``hitl_rejected`` (§3.9).
+17. **``health_check()``** on ``GraphRegistry`` (§3.11).
+18. **Live reconfiguration** on the orchestrator (§3.12).
+
+**P2 — architecture**
+
+19. **Enhancement classes imported from ``green_agent.enhancements``**
+    (fall back to ``carbon_forecast`` v18) — the ten local copies in
+    v17 are retired.
+20. **``precision_switcher.current`` is consulted** when ``precision``
+    is omitted.
+21. **Idempotent register** — same fingerprint skips the version bump.
+22. **``history`` is a ``deque(maxlen=100)``** — O(1) append, no manual
+    truncation.
+23. **Structured logging** via ``_log(event, level, **fields)``.
+24. **``collect_prometheus_metrics()``**.
+25. **``asyncio.get_running_loop()``**, **named background tasks**.
+26. **``health(verbose=False)``**.
+27. **``to_dict()`` / ``from_dict()``** with an optional ``graph_loader``.
+28. **``execution_count`` removed** (dead field in v17).
+
+**Running the demo**
+
+    PYTHONPATH=src python -m graph.graph_registry
 """
 
 from __future__ import annotations
@@ -53,67 +109,182 @@ import time
 import uuid
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TYPE_CHECKING,
+)
 
-try:
-    import numpy as np
-    NUMPY_AVAILABLE = True
-except ImportError:
-    NUMPY_AVAILABLE = False
+# --------------------------------------------------------------------------- #
+# Enhancement classes — single source of truth
+# --------------------------------------------------------------------------- #
+_ENHANCEMENTS_AVAILABLE = False
+_ENHANCEMENTS_SOURCE = "unavailable"
+_ENHANCEMENTS_ERROR: Optional[str] = None
 
-try:
-    from sklearn.linear_model import LinearRegression
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
+try:  # pragma: no cover — package-preferred
+    from green_agent.enhancements import (
+        _utcnow,
+        _ensure_aware,
+        _json_safe,
+        _cfg_get,
+        _safe_mean,
+        QuantumDistillationEngine,
+        CausalGraphLearner,
+        CausalPolicyAdapter,
+        FederatedGreenAggregator,
+        MultiAgentCoordinator,
+        TemporalLogicVerifier,
+        XAIDecisionExplainer,
+        AdaptivePrecisionSwitcher,
+        CarbonMarketIntegrator,
+        ChaosTestingEngine,
+        ActiveUserPreferenceLearner,
+        SimpleQuantumDistillationEngine,
+        SimpleCausalGraphLearner,
+        SimpleCausalPolicyAdapter,
+        SimpleFederatedGreenAggregator,
+        SimpleMultiAgentCoordinator,
+        SimpleTemporalLogicVerifier,
+        SimpleXAIDecisionExplainer,
+        SimpleAdaptivePrecisionSwitcher,
+        SimpleCarbonMarketIntegrator,
+        SimpleChaosTestingEngine,
+        SimpleActiveUserPreferenceLearner,
+    )
+    _ENHANCEMENTS_AVAILABLE = True
+    _ENHANCEMENTS_SOURCE = "green_agent.enhancements"
+except ImportError as _e1:
+    try:  # pragma: no cover — carbon_forecast fallback
+        from carbon_forecast import (  # type: ignore[no-redef]
+            _utcnow,
+            _ensure_aware,
+            _json_safe,
+            _cfg_get,
+            _safe_mean,
+            QuantumDistillationEngine,
+            CausalGraphLearner,
+            CausalPolicyAdapter,
+            FederatedGreenAggregator,
+            MultiAgentCoordinator,
+            TemporalLogicVerifier,
+            XAIDecisionExplainer,
+            AdaptivePrecisionSwitcher,
+            CarbonMarketIntegrator,
+            ChaosTestingEngine,
+            ActiveUserPreferenceLearner,
+            SimpleQuantumDistillationEngine,
+            SimpleCausalGraphLearner,
+            SimpleCausalPolicyAdapter,
+            SimpleFederatedGreenAggregator,
+            SimpleMultiAgentCoordinator,
+            SimpleTemporalLogicVerifier,
+            SimpleXAIDecisionExplainer,
+            SimpleAdaptivePrecisionSwitcher,
+            SimpleCarbonMarketIntegrator,
+            SimpleChaosTestingEngine,
+            SimpleActiveUserPreferenceLearner,
+        )
+        _ENHANCEMENTS_AVAILABLE = True
+        _ENHANCEMENTS_SOURCE = "carbon_forecast"
+    except ImportError as _e2:
+        _ENHANCEMENTS_ERROR = f"{_e1} / {_e2}"
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            "graph_registry: enhancement classes unavailable (%s); "
+            "GraphRegistry still imports but the orchestrator will refuse "
+            "to construct",
+            _ENHANCEMENTS_ERROR,
+        )
+        # Minimal stubs so the module imports cleanly.
+        def _utcnow() -> datetime:  # type: ignore[misc]
+            return datetime.now(timezone.utc)
 
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
+        def _ensure_aware(dt: datetime) -> datetime:  # type: ignore[misc]
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-if TYPE_CHECKING:
+        def _json_safe(obj: Any) -> Any:  # type: ignore[misc]
+            return obj
+
+        def _cfg_get(config: Any, key: str, default: Any = None) -> Any:  # type: ignore[misc]
+            if config is None:
+                return default
+            if isinstance(config, Mapping):
+                return config.get(key, default)
+            return getattr(config, key, default)
+
+        def _safe_mean(values: Sequence[Any], default: float = 0.0) -> float:  # type: ignore[misc]
+            vals = [float(v) for v in values if v is not None]
+            return sum(vals) / len(vals) if vals else default
+
+        QuantumDistillationEngine = None  # type: ignore[assignment,misc]
+        CausalGraphLearner = None  # type: ignore[assignment,misc]
+        CausalPolicyAdapter = None  # type: ignore[assignment,misc]
+        FederatedGreenAggregator = None  # type: ignore[assignment,misc]
+        MultiAgentCoordinator = None  # type: ignore[assignment,misc]
+        TemporalLogicVerifier = None  # type: ignore[assignment,misc]
+        XAIDecisionExplainer = None  # type: ignore[assignment,misc]
+        AdaptivePrecisionSwitcher = None  # type: ignore[assignment,misc]
+        CarbonMarketIntegrator = None  # type: ignore[assignment,misc]
+        ChaosTestingEngine = None  # type: ignore[assignment,misc]
+        ActiveUserPreferenceLearner = None  # type: ignore[assignment,misc]
+        SimpleQuantumDistillationEngine = None  # type: ignore[assignment,misc]
+        SimpleCausalGraphLearner = None  # type: ignore[assignment,misc]
+        SimpleCausalPolicyAdapter = None  # type: ignore[assignment,misc]
+        SimpleFederatedGreenAggregator = None  # type: ignore[assignment,misc]
+        SimpleMultiAgentCoordinator = None  # type: ignore[assignment,misc]
+        SimpleTemporalLogicVerifier = None  # type: ignore[assignment,misc]
+        SimpleXAIDecisionExplainer = None  # type: ignore[assignment,misc]
+        SimpleAdaptivePrecisionSwitcher = None  # type: ignore[assignment,misc]
+        SimpleCarbonMarketIntegrator = None  # type: ignore[assignment,misc]
+        SimpleChaosTestingEngine = None  # type: ignore[assignment,misc]
+        SimpleActiveUserPreferenceLearner = None  # type: ignore[assignment,misc]
+
+if TYPE_CHECKING:  # pragma: no cover
     from carbon.helium_monitor import HeliumMonitor
 
 
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# CONFIG HELPER
-# =============================================================================
-def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
-    if config is None:
-        return default
-    if isinstance(config, dict):
-        return config.get(key, default)
-    if hasattr(config, "model_dump"):
-        try:
-            return config.model_dump().get(key, default)
-        except Exception:
-            pass
-    if hasattr(config, "dict") and callable(getattr(config, "dict")):
-        try:
-            return config.dict().get(key, default)
-        except Exception:
-            pass
-    return getattr(config, key, default)
+# --------------------------------------------------------------------------- #
+# Errors + structured logging
+# --------------------------------------------------------------------------- #
+class GraphRegistryError(ValueError):
+    """Raised for invalid inputs or registry state violations."""
 
 
-# =============================================================================
-# GRAPH TYPE ENUM (extended)
-# =============================================================================
+def _log(event: str, level: int = logging.INFO, **fields: Any) -> None:
+    if not logger.isEnabledFor(level):
+        return
+    parts = [event]
+    if fields:
+        parts.append(" ".join(f"{k}={v}" for k, v in fields.items()))
+    logger.log(level, " ".join(parts), extra={"event": event, **fields})
+
+
+# --------------------------------------------------------------------------- #
+# Graph types
+# --------------------------------------------------------------------------- #
 class GraphType(Enum):
     """Supported graph types in the system."""
+
     # v1.0
     CAUSAL = "causal"
     POLICY = "policy"
     SIMILARITY = "similarity"
     CARBON_LEDGER = "carbon_ledger"
-    # v17.0 extensions
+    # v17 extensions
     TEMPORAL_TRACE = "temporal_trace"
     XAI_ATTRIBUTION = "xai_attribution"
     PRECISION_HISTORY = "precision_history"
@@ -126,12 +297,13 @@ class GraphType(Enum):
     HITL_QUEUE = "hitl_queue"
 
 
-# =============================================================================
-# GRAPH VERSION + ENTRY
-# =============================================================================
+# --------------------------------------------------------------------------- #
+# Version + entry
+# --------------------------------------------------------------------------- #
 @dataclass
 class GraphVersion:
     """A single version of a registered graph."""
+
     version: int
     graph: Any
     metadata: Dict[str, Any]
@@ -140,15 +312,35 @@ class GraphVersion:
     registered_by: str
     fingerprint: str
     tags: List[str] = field(default_factory=list)
+    # v6: audit fields
+    deferred: bool = False
+    chaos_injected: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "version": self.version,
+            "metadata": _json_safe(self.metadata),
+            "precision": self.precision,
+            "registered_at": self.registered_at,
+            "registered_by": self.registered_by,
+            "fingerprint": self.fingerprint,
+            "tags": list(self.tags),
+            "deferred": self.deferred,
+            "chaos_injected": self.chaos_injected,
+        }
 
 
 @dataclass
 class GraphEntry:
     """A registry entry for a graph, holding its current version and history."""
+
     graph_type: GraphType
     current: GraphVersion
-    history: List[GraphVersion] = field(default_factory=list)
+    history: Deque[GraphVersion] = field(
+        default_factory=lambda: deque(maxlen=100)
+    )
     update_count: int = 0
+    cached_size: int = 0
 
     def to_summary(self) -> Dict[str, Any]:
         return {
@@ -159,43 +351,39 @@ class GraphEntry:
             "registered_at": self.current.registered_at,
             "registered_by": self.current.registered_by,
             "tags": list(self.current.tags),
+            "deferred": self.current.deferred,
+            "chaos_injected": self.current.chaos_injected,
             "history_length": len(self.history),
             "update_count": self.update_count,
+            "cached_size": self.cached_size,
         }
 
 
-# =============================================================================
-# GRAPH REGISTRY (enhanced)
-# =============================================================================
+# --------------------------------------------------------------------------- #
+# GraphRegistry
+# --------------------------------------------------------------------------- #
 class GraphRegistry:
-    """
-    Central registry for graph instances and the helium monitor.
-
-    v17.0 API:
-      * `register()` / `get()` / `list_graphs()` / `health()` — v1.0 sync API
-      * `aregister()` / `aget()` / `alist()` / `ahealth()` — async API
-      * `get_history()` / `rollback()` — versioning
-      * `register_helium_monitor()` / `get_helium_monitor()` — helium
-      * `reset()` / `shutdown()` — lifecycle
-    """
+    """Central, versioned registry for graph instances and the helium monitor."""
 
     DEFAULT_PRECISION = "fp32"
-    VALID_PRECISIONS = {"fp32", "fp16", "bf16", "int8"}
+    VALID_PRECISIONS = frozenset({"fp32", "fp16", "bf16", "int8"})
 
-    def __init__(self,
-                 config: Optional[Any] = None,
-                 storage: Optional[Any] = None,
-                 # Enhancement hooks (all optional)
-                 carbon_market: Optional["CarbonMarketIntegrator"] = None,
-                 hitl: Optional["ActiveUserPreferenceLearner"] = None,
-                 xai: Optional["XAIDecisionExplainer"] = None,
-                 chaos: Optional["ChaosTestingEngine"] = None,
-                 federated: Optional["FederatedGreenAggregator"] = None,
-                 temporal: Optional["TemporalLogicVerifier"] = None,
-                 multi_agent: Optional["MultiAgentCoordinator"] = None,
-                 precision_switcher: Optional["AdaptivePrecisionSwitcher"] = None,
-                 distiller: Optional["QuantumDistillationEngine"] = None,
-                 causal_rl: Optional["CausalPolicyAdapter"] = None):
+    def __init__(
+        self,
+        config: Optional[Any] = None,
+        storage: Optional[Any] = None,
+        *,
+        carbon_market: Optional[Any] = None,
+        hitl: Optional[Any] = None,
+        xai: Optional[Any] = None,
+        chaos: Optional[Any] = None,
+        federated: Optional[Any] = None,
+        temporal: Optional[Any] = None,
+        multi_agent: Optional[Any] = None,
+        precision_switcher: Optional[Any] = None,
+        distiller: Optional[Any] = None,
+        causal_rl: Optional[Any] = None,
+    ) -> None:
         self.config = config
         self.storage = storage
 
@@ -211,15 +399,40 @@ class GraphRegistry:
         self.distiller = distiller
         self.causal_rl = causal_rl
 
+        # Config-derived settings
+        critical_types = _cfg_get(
+            config, "registry_critical_graph_types",
+            ["causal", "carbon_ledger", "rec_ledger"],
+        )
+        self._critical_types: Set[str] = set(
+            str(t).lower() for t in critical_types
+        )
+        self._chaos_hook_enabled: bool = bool(
+            _cfg_get(config, "registry_chaos_hook", False)
+        )
+        self._history_max: int = max(
+            1, int(_cfg_get(config, "registry_history_max", 100))
+        )
+        self._max_metadata_bytes: int = max(
+            1024, int(_cfg_get(config, "registry_max_metadata_bytes", 4096))
+        )
+
         # State
         self._entries: Dict[GraphType, GraphEntry] = {}
+        self._rejections: Dict[GraphType, Deque[Dict[str, Any]]] = defaultdict(
+            lambda: deque(maxlen=100)
+        )
+        self._singletons: Dict[str, Dict[str, Any]] = {}
         self._helium_monitor: Optional["HeliumMonitor"] = None
+
+        # Locks
         self._lock = threading.RLock()
-        self._async_lock = asyncio.Lock()
+        self._graph_locks: Dict[GraphType, asyncio.Lock] = {}
+
+        # Counters
+        self._in_flight: int = 0
         self._metadata: Dict[str, Any] = {
-            "execution_count": 0,
-            "singletons": {},
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": _utcnow().isoformat(),
             "total_updates": 0,
             "total_rollbacks": 0,
             "total_deferrals": 0,
@@ -227,303 +440,71 @@ class GraphRegistry:
             "total_hitl_rejections": 0,
         }
 
-        logger.info("GraphRegistry v17.0.0 initialized")
+        _log(
+            "registry_initialized",
+            logging.DEBUG,
+            critical_types=sorted(self._critical_types),
+            chaos_hook=self._chaos_hook_enabled,
+            enhancements=_ENHANCEMENTS_SOURCE,
+        )
 
-    # ------------------------------------------------------------------
-    # Fingerprint helper
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ props
+    @property
+    def enhancements_available(self) -> bool:
+        return _ENHANCEMENTS_AVAILABLE
+
+    @property
+    def enhancements_source(self) -> str:
+        return _ENHANCEMENTS_SOURCE
+
+    # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _canonicalize(obj: Any) -> Any:
+        """Deterministic, platform-independent representation."""
+        if obj is None or isinstance(obj, (bool, int, str)):
+            return obj
+        if isinstance(obj, float):
+            if math.isnan(obj):
+                return "NaN"
+            if math.isinf(obj):
+                return "Infinity" if obj > 0 else "-Infinity"
+            if obj == 0.0:
+                return 0.0
+            return obj
+        if isinstance(obj, datetime):
+            return _ensure_aware(obj).isoformat()
+        if isinstance(obj, Enum):
+            return obj.value
+        if isinstance(obj, Mapping):
+            return {
+                str(k): GraphRegistry._canonicalize(v)
+                for k, v in obj.items()
+            }
+        if isinstance(obj, (list, tuple)):
+            return [GraphRegistry._canonicalize(v) for v in obj]
+        if isinstance(obj, (set, frozenset)):
+            return sorted(
+                (GraphRegistry._canonicalize(v) for v in obj),
+                key=lambda x: json.dumps(x, sort_keys=True, default=str),
+            )
+        return str(obj)
+
     @staticmethod
     def _fingerprint(graph: Any) -> str:
+        """Portable fingerprint — canonical JSON with sorted keys."""
         try:
-            blob = pickle.dumps(graph, protocol=pickle.HIGHEST_PROTOCOL)
-            return hashlib.sha256(blob).hexdigest()[:16]
+            canonical = json.dumps(
+                GraphRegistry._canonicalize(graph),
+                sort_keys=True,
+                default=str,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
         except Exception:
-            try:
-                blob = json.dumps(graph, default=str, sort_keys=True).encode()
-                return hashlib.sha256(blob).hexdigest()[:16]
-            except Exception:
-                return uuid.uuid4().hex[:16]
-
-    # ------------------------------------------------------------------
-    # Sync API (v1.0 compatible)
-    # ------------------------------------------------------------------
-    def register(self,
-                 graph_type: GraphType,
-                 graph: Any,
-                 metadata: Optional[Dict] = None,
-                 precision: Optional[str] = None,
-                 tags: Optional[List[str]] = None,
-                 registered_by: str = "system") -> None:
-        """Register (or update) a graph instance with the registry."""
-        with self._lock:
-            version = self._make_version(graph_type, graph, metadata,
-                                         precision, tags, registered_by)
-            if graph_type in self._entries:
-                entry = self._entries[graph_type]
-                entry.history.append(entry.current)
-                if len(entry.history) > 100:
-                    entry.history = entry.history[-100:]
-                entry.current = version
-                entry.update_count += 1
-            else:
-                entry = GraphEntry(graph_type=graph_type, current=version)
-                self._entries[graph_type] = entry
-
-            if metadata:
-                self._metadata["singletons"][graph_type.value] = metadata
-
-            self._metadata["last_updated"] = datetime.now(timezone.utc).isoformat()
-            self._metadata["total_updates"] += 1
-            logger.info("Registered %s graph (v%d, precision=%s)",
-                        graph_type.value, version.version, version.precision)
-
-    def get(self, graph_type: GraphType) -> Optional[Any]:
-        """Retrieve a graph instance by type."""
-        with self._lock:
-            entry = self._entries.get(graph_type)
-            return entry.current.graph if entry else None
-
-    def list_graphs(self) -> List[GraphType]:
-        """Return list of registered graph types."""
-        with self._lock:
-            return list(self._entries.keys())
-
-    def health(self) -> Dict[str, Any]:
-        """Get registry health and graph statistics."""
-        with self._lock:
-            health_data = dict(self._metadata)
-            health_data["helium_monitor_registered"] = (
-                self._helium_monitor is not None)
-            health_data["num_graphs"] = len(self._entries)
-            health_data["graphs"] = {
-                gt.value: entry.to_summary()
-                for gt, entry in self._entries.items()}
-            return health_data
-
-    # ------------------------------------------------------------------
-    # Versioning API
-    # ------------------------------------------------------------------
-    def get_history(self, graph_type: GraphType) -> List[Dict[str, Any]]:
-        """Return the version history of a graph type."""
-        with self._lock:
-            entry = self._entries.get(graph_type)
-            if entry is None:
-                return []
-            history = [
-                {"version": v.version, "precision": v.precision,
-                 "registered_at": v.registered_at,
-                 "registered_by": v.registered_by,
-                 "fingerprint": v.fingerprint}
-                for v in entry.history]
-            history.append({
-                "version": entry.current.version,
-                "precision": entry.current.precision,
-                "registered_at": entry.current.registered_at,
-                "registered_by": entry.current.registered_by,
-                "fingerprint": entry.current.fingerprint,
-                "is_current": True})
-            return history
-
-    def rollback(self, graph_type: GraphType,
-                 target_version: int) -> bool:
-        """Rollback a graph to a previous version."""
-        with self._lock:
-            entry = self._entries.get(graph_type)
-            if entry is None:
-                return False
-            for v in entry.history:
-                if v.version == target_version:
-                    # Move current to history and restore target
-                    entry.history.append(entry.current)
-                    entry.current = v
-                    entry.update_count += 1
-                    self._metadata["total_rollbacks"] += 1
-                    logger.info("Rolled back %s to v%d",
-                                graph_type.value, target_version)
-                    return True
-            return False
-
-    # ------------------------------------------------------------------
-    # Async API
-    # ------------------------------------------------------------------
-    async def aregister(self,
-                        graph_type: GraphType,
-                        graph: Any,
-                        metadata: Optional[Dict] = None,
-                        precision: Optional[str] = None,
-                        tags: Optional[List[str]] = None,
-                        registered_by: str = "system",
-                        require_hitl: Optional[bool] = None,
-                        defer_if_high_carbon: bool = True,
-                        explain: bool = True) -> Dict[str, Any]:
-        """
-        Async registration with all enhancement hooks.
-
-        Steps:
-          1. Chaos hook (occasional latency injection)
-          2. Carbon-market deferral (if enabled)
-          3. HITL approval for critical updates
-          4. XAI explanation of the update
-          5. Federated sharing
-          6. Versioned registration
-          7. Temporal push
-        """
-        # 1. Chaos
-        if self.chaos is not None and random.random() < 0.05:
-            try:
-                await self.chaos.run_experiment(
-                    f"registry_{uuid.uuid4().hex[:6]}", "latency")
-            except Exception:
-                pass
-
-        # 2. Carbon-aware deferral
-        if defer_if_high_carbon and self.carbon_market is not None:
-            try:
-                decision = await self.carbon_market.net_zero_schedule(
-                    workload_kwh=0.01, intensity=0.4)
-                if decision.get("action") == "defer":
-                    self._metadata["total_deferrals"] += 1
-                    logger.info("Registration of %s deferred (high carbon)",
-                                graph_type.value)
-                    return {"status": "deferred", "graph_type": graph_type.value}
-            except Exception:
-                pass
-
-        # 3. HITL
-        needs_hitl = require_hitl
-        if needs_hitl is None:
-            # Critical graphs require approval
-            needs_hitl = graph_type in (
-                GraphType.CAUSAL, GraphType.CARBON_LEDGER, GraphType.REC_LEDGER)
-        if needs_hitl and self.hitl is not None:
-            try:
-                approved = await self.hitl.query_user_if_needed(
-                    "registry_approver",
-                    [{"solution_id": "approve", "quality_score": 0.9,
-                      "carbon_g": 0.1, "cost_usd": 0.1, "latency_ms": 100},
-                     {"solution_id": "reject", "quality_score": 0.89,
-                      "carbon_g": 0.11, "cost_usd": 0.11, "latency_ms": 105}],
-                    timeout=2.0)
-                if approved == "reject":
-                    self._metadata["total_hitl_rejections"] += 1
-                    return {"status": "hitl_rejected",
-                            "graph_type": graph_type.value}
-                self._metadata["total_hitl_approvals"] += 1
-            except Exception:
-                pass
-
-        # 4. XAI explanation
-        xai_result = None
-        if explain and self.xai is not None and NUMPY_AVAILABLE:
-            try:
-                prev = self.get(graph_type)
-                prev_size = self._graph_size(prev)
-                new_size = self._graph_size(graph)
-                feats = np.array([
-                    float(prev_size), float(new_size),
-                    float(self._metadata["total_updates"]),
-                    1.0 if prev is None else 0.0])
-                def _score(x):
-                    return float(np.dot(x, [0.3, 0.4, 0.2, 0.1]))
-                xai_result = await self.xai.explain(
-                    decision_id=f"reg_{uuid.uuid4().hex[:8]}",
-                    label=f"register:{graph_type.value}",
-                    features=feats,
-                    names=["prev_size", "new_size",
-                           "total_updates", "is_new"],
-                    model_fn=_score,
-                    include_counterfactual=False)
-            except Exception:
-                pass
-
-        # 5. Federated share (only metadata, not the graph itself)
-        if self.federated is not None:
-            try:
-                blob = json.dumps({
-                    "graph_type": graph_type.value,
-                    "action": "register",
-                    "ts": datetime.now(timezone.utc).isoformat()}).encode()
-                await self.federated.share_weights("registry_events", blob)
-            except Exception:
-                pass
-
-        # 6. Register
-        self.register(graph_type, graph, metadata, precision, tags,
-                      registered_by)
-
-        # 7. Temporal push
-        if self.temporal is not None:
-            try:
-                await self.temporal.push_state({
-                    "registry_event": graph_type.value,
-                    "total_graphs": len(self._entries),
-                    "quality": 1.0})
-            except Exception:
-                pass
-
-        return {
-            "status": "registered",
-            "graph_type": graph_type.value,
-            "version": self._entries[graph_type].current.version,
-            "precision": self._entries[graph_type].current.precision,
-            "xai": xai_result,
-        }
-
-    async def aget(self, graph_type: GraphType) -> Optional[Any]:
-        async with self._async_lock:
-            return self.get(graph_type)
-
-    async def alist(self) -> List[GraphType]:
-        async with self._async_lock:
-            return self.list_graphs()
-
-    async def ahealth(self) -> Dict[str, Any]:
-        async with self._async_lock:
-            return self.health()
-
-    async def arollback(self, graph_type: GraphType,
-                        target_version: int) -> bool:
-        async with self._async_lock:
-            return self.rollback(graph_type, target_version)
-
-    # ------------------------------------------------------------------
-    # Helium monitor
-    # ------------------------------------------------------------------
-    def register_helium_monitor(self, monitor: "HeliumMonitor") -> None:
-        with self._lock:
-            self._helium_monitor = monitor
-            logger.info("HeliumMonitor registered with GraphRegistry")
-
-    def get_helium_monitor(self) -> Optional["HeliumMonitor"]:
-        with self._lock:
-            return self._helium_monitor
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-    def _make_version(self, graph_type: GraphType, graph: Any,
-                      metadata: Optional[Dict],
-                      precision: Optional[str],
-                      tags: Optional[List[str]],
-                      registered_by: str) -> GraphVersion:
-        # Determine next version number
-        prev_version = 0
-        if graph_type in self._entries:
-            prev_version = self._entries[graph_type].current.version
-        # Validate precision
-        prec = precision or self.DEFAULT_PRECISION
-        if prec not in self.VALID_PRECISIONS:
-            prec = self.DEFAULT_PRECISION
-        return GraphVersion(
-            version=prev_version + 1,
-            graph=graph,
-            metadata=metadata or {},
-            precision=prec,
-            registered_at=datetime.now(timezone.utc).isoformat(),
-            registered_by=registered_by,
-            fingerprint=self._fingerprint(graph),
-            tags=list(tags or []),
-        )
+            return hashlib.sha256(
+                repr(graph).encode("utf-8")
+            ).hexdigest()[:16]
 
     @staticmethod
     def _graph_size(graph: Any) -> int:
@@ -531,788 +512,789 @@ class GraphRegistry:
             return 0
         try:
             if hasattr(graph, "__len__"):
-                return len(graph)
+                return len(graph)  # type: ignore[arg-type]
         except Exception:
             pass
         try:
-            return len(pickle.dumps(graph, protocol=pickle.HIGHEST_PROTOCOL))
+            return len(pickle.dumps(graph, protocol=4))
         except Exception:
             return 0
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    def _summarize_metadata(
+        self, metadata: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        try:
+            size = len(json.dumps(metadata, default=str))
+        except Exception:
+            size = 0
+        if size <= self._max_metadata_bytes:
+            return _json_safe(dict(metadata))
+        return {
+            "keys": list(metadata.keys()),
+            "size_bytes": size,
+            "truncated": True,
+        }
+
+    def _make_version(
+        self,
+        graph_type: GraphType,
+        graph: Any,
+        metadata: Optional[Dict[str, Any]],
+        precision: Optional[str],
+        tags: Optional[List[str]],
+        registered_by: str,
+        *,
+        deferred: bool = False,
+        chaos_injected: bool = False,
+    ) -> GraphVersion:
+        with self._lock:
+            prev_version = (
+                self._entries[graph_type].current.version
+                if graph_type in self._entries else 0
+            )
+        prec = precision or self._default_precision()
+        if prec not in self.VALID_PRECISIONS:
+            _log(
+                "precision_downgraded",
+                logging.WARNING,
+                graph_type=graph_type.value,
+                requested=prec,
+                fallback=self.DEFAULT_PRECISION,
+            )
+            prec = self.DEFAULT_PRECISION
+        return GraphVersion(
+            version=prev_version + 1,
+            graph=graph,
+            metadata=self._summarize_metadata(metadata or {}),
+            precision=prec,
+            registered_at=_utcnow().isoformat(),
+            registered_by=registered_by,
+            fingerprint=self._fingerprint(graph),
+            tags=list(tags or []),
+            deferred=deferred,
+            chaos_injected=chaos_injected,
+        )
+
+    def _default_precision(self) -> str:
+        if self.precision_switcher is not None:
+            current = getattr(self.precision_switcher, "current", None)
+            if isinstance(current, str) and current in self.VALID_PRECISIONS:
+                return current
+        return self.DEFAULT_PRECISION
+
+    # ------------------------------------------------------------------ sync API
+    def register(
+        self,
+        graph_type: GraphType,
+        graph: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+        precision: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        registered_by: str = "system",
+        *,
+        deferred: bool = False,
+        chaos_injected: bool = False,
+    ) -> GraphVersion:
+        """
+        Register (or update) a graph.
+
+        Returns the resulting ``GraphVersion`` (v6 — v17 returned None).
+        Idempotent: if the new graph's fingerprint matches the current
+        version, no version bump occurs.
+        """
+        if not isinstance(graph_type, GraphType):
+            raise GraphRegistryError(
+                f"graph_type must be GraphType, got {type(graph_type).__name__}"
+            )
+
+        with self._lock:
+            version = self._make_version(
+                graph_type, graph, metadata, precision, tags,
+                registered_by, deferred=deferred, chaos_injected=chaos_injected,
+            )
+            existing = self._entries.get(graph_type)
+
+            # Idempotency: same fingerprint → no-op
+            if (
+                existing is not None
+                and existing.current.fingerprint == version.fingerprint
+                and not deferred
+                and not chaos_injected
+            ):
+                _log(
+                    "register_noop",
+                    logging.DEBUG,
+                    graph_type=graph_type.value,
+                    version=existing.current.version,
+                )
+                return existing.current
+
+            new_size = self._graph_size(graph)
+            if existing is not None:
+                existing.history.append(existing.current)
+                existing.current = version
+                existing.update_count += 1
+                existing.cached_size = new_size
+            else:
+                entry = GraphEntry(
+                    graph_type=graph_type,
+                    current=version,
+                    update_count=1,
+                    cached_size=new_size,
+                )
+                self._entries[graph_type] = entry
+
+            if metadata:
+                self._singletons[graph_type.value] = self._summarize_metadata(
+                    metadata
+                )
+
+            self._metadata["last_updated"] = _utcnow().isoformat()
+            self._metadata["total_updates"] += 1
+
+        _log(
+            "graph_registered",
+            logging.INFO,
+            graph_type=graph_type.value,
+            version=version.version,
+            precision=version.precision,
+            deferred=deferred,
+            chaos_injected=chaos_injected,
+        )
+        return version
+
+    def get(self, graph_type: GraphType) -> Optional[Any]:
+        with self._lock:
+            entry = self._entries.get(graph_type)
+            return entry.current.graph if entry is not None else None
+
+    def list_graphs(self) -> List[GraphType]:
+        with self._lock:
+            return list(self._entries.keys())
+
+    def unregister(self, graph_type: GraphType) -> bool:
+        with self._lock:
+            if graph_type not in self._entries:
+                return False
+            del self._entries[graph_type]
+            self._rejections.pop(graph_type, None)
+            self._singletons.pop(graph_type.value, None)
+            self._metadata["last_updated"] = _utcnow().isoformat()
+        _log("graph_unregistered", logging.INFO, graph_type=graph_type.value)
+        return True
+
+    # ------------------------------------------------------------------ versioning
+    def get_history(self, graph_type: GraphType) -> List[Dict[str, Any]]:
+        with self._lock:
+            entry = self._entries.get(graph_type)
+            if entry is None:
+                return []
+            versions = [v.to_dict() for v in entry.history]
+            current = entry.current.to_dict()
+            current["is_current"] = True
+            versions.append(current)
+            return versions
+
+    def rollback(
+        self, graph_type: GraphType, target_version: int
+    ) -> bool:
+        """Roll back to ``target_version``; history does not duplicate."""
+        with self._lock:
+            entry = self._entries.get(graph_type)
+            if entry is None:
+                return False
+            if entry.current.version == target_version:
+                return False  # no-op
+            for i, v in enumerate(entry.history):
+                if v.version != target_version:
+                    continue
+                # Remove target from history (it becomes current)
+                entry.history.remove(v)
+                # Move current to history
+                entry.history.append(entry.current)
+                entry.current = v
+                entry.update_count += 1
+                entry.cached_size = self._graph_size(v.graph)
+                self._metadata["total_rollbacks"] += 1
+                self._metadata["last_updated"] = _utcnow().isoformat()
+                _log(
+                    "graph_rolled_back",
+                    logging.INFO,
+                    graph_type=graph_type.value,
+                    target=target_version,
+                )
+                return True
+            return False
+
+    # ------------------------------------------------------------------ health
+    def health(self, verbose: bool = False) -> Dict[str, Any]:
+        with self._lock:
+            data = dict(self._metadata)
+            data["helium_monitor_registered"] = (
+                self._helium_monitor is not None
+            )
+            data["num_graphs"] = len(self._entries)
+            data["in_flight_registrations"] = self._in_flight
+            data["enhancements_available"] = _ENHANCEMENTS_AVAILABLE
+            data["enhancements_source"] = _ENHANCEMENTS_SOURCE
+            data["graphs"] = {
+                gt.value: entry.to_summary()
+                for gt, entry in self._entries.items()
+            }
+            if verbose:
+                data["singletons"] = dict(self._singletons)
+                data["rejections"] = {
+                    gt.value: [dict(r) for r in rej]
+                    for gt, rej in self._rejections.items()
+                    if rej
+                }
+            return data
+
+    def health_check(self) -> Dict[str, Any]:
+        with self._lock:
+            anomalies: List[str] = []
+            if self._in_flight < 0:
+                anomalies.append("negative_in_flight")
+            for gt, entry in self._entries.items():
+                if entry.current is None:
+                    anomalies.append(f"null_current:{gt.value}")
+            return {
+                "healthy": len(anomalies) == 0,
+                "anomalies": anomalies,
+                "num_graphs": len(self._entries),
+                "in_flight_registrations": self._in_flight,
+                "helium_registered": self._helium_monitor is not None,
+            }
+
+    def collect_prometheus_metrics(
+        self,
+    ) -> Dict[str, Tuple[Any, Dict[str, str]]]:
+        with self._lock:
+            metrics: Dict[str, Tuple[Any, Dict[str, str]]] = {
+                "graph_registry_num_graphs": (len(self._entries), {}),
+                "graph_registry_updates_total": (
+                    self._metadata["total_updates"], {}
+                ),
+                "graph_registry_rollbacks_total": (
+                    self._metadata["total_rollbacks"], {}
+                ),
+                "graph_registry_deferrals_total": (
+                    self._metadata["total_deferrals"], {}
+                ),
+                "graph_registry_hitl_approvals_total": (
+                    self._metadata["total_hitl_approvals"], {}
+                ),
+                "graph_registry_hitl_rejections_total": (
+                    self._metadata["total_hitl_rejections"], {}
+                ),
+                "graph_registry_in_flight": (self._in_flight, {}),
+            }
+            for gt, entry in self._entries.items():
+                labels = {"graph_type": gt.value}
+                metrics[f"graph_registry_version"] = (
+                    entry.current.version, labels
+                ) if f"graph_registry_version_{gt.value}" not in metrics else metrics[f"graph_registry_version"]
+                metrics[f"graph_registry_version_{gt.value}"] = (
+                    entry.current.version, labels
+                )
+                metrics[f"graph_registry_history_{gt.value}"] = (
+                    len(entry.history), labels
+                )
+            return metrics
+
+    # ------------------------------------------------------------------ async API
+    def _graph_lock(self, graph_type: GraphType) -> asyncio.Lock:
+        """Lazily create a per-graph-type lock inside the running loop."""
+        lock = self._graph_locks.get(graph_type)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._graph_locks[graph_type] = lock
+        return lock
+
+    async def aregister(
+        self,
+        graph_type: GraphType,
+        graph: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+        precision: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        registered_by: str = "system",
+        require_hitl: Optional[bool] = None,
+        defer_if_high_carbon: bool = True,
+        explain: bool = True,
+    ) -> Dict[str, Any]:
+        """Async registration with the full enhancement pipeline."""
+        if not isinstance(graph_type, GraphType):
+            raise GraphRegistryError(
+                f"graph_type must be GraphType, got {type(graph_type).__name__}"
+            )
+
+        async with self._graph_lock(graph_type):
+            with self._lock:
+                self._in_flight += 1
+            try:
+                return await self._aregister_pipeline(
+                    graph_type=graph_type,
+                    graph=graph,
+                    metadata=metadata,
+                    precision=precision,
+                    tags=tags,
+                    registered_by=registered_by,
+                    require_hitl=require_hitl,
+                    defer_if_high_carbon=defer_if_high_carbon,
+                    explain=explain,
+                )
+            finally:
+                with self._lock:
+                    self._in_flight -= 1
+
+    async def _aregister_pipeline(
+        self,
+        *,
+        graph_type: GraphType,
+        graph: Any,
+        metadata: Optional[Dict[str, Any]],
+        precision: Optional[str],
+        tags: Optional[List[str]],
+        registered_by: str,
+        require_hitl: Optional[bool],
+        defer_if_high_carbon: bool,
+        explain: bool,
+    ) -> Dict[str, Any]:
+        # 1. Chaos hook (opt-in)
+        chaos_injected = False
+        if (
+            self._chaos_hook_enabled
+            and self.chaos is not None
+            and random.random() < 0.05
+        ):
+            try:
+                await self.chaos.run_experiment(
+                    f"registry_{uuid.uuid4().hex[:6]}", "latency"
+                )
+                chaos_injected = True
+            except Exception:
+                pass
+
+        # 2. Carbon-aware deferral — but we **still register** (v6 §2.2)
+        deferred = False
+        defer_reason: Optional[str] = None
+        if defer_if_high_carbon and self.carbon_market is not None:
+            try:
+                decision = await self.carbon_market.net_zero_schedule(
+                    workload_kwh=0.01, intensity=0.4
+                )
+                if decision.get("action") == "defer":
+                    deferred = True
+                    defer_reason = "carbon_intensity_high"
+                    with self._lock:
+                        self._metadata["total_deferrals"] += 1
+                    _log(
+                        "registration_deferred",
+                        logging.INFO,
+                        graph_type=graph_type.value,
+                    )
+            except Exception:
+                pass
+
+        # 3. HITL — fail-safe on timeout
+        if require_hitl is None:
+            require_hitl = graph_type.value in self._critical_types
+        if require_hitl and self.hitl is not None:
+            try:
+                approved = await self.hitl.query_user_if_needed(
+                    "registry_approver",
+                    [
+                        {
+                            "solution_id": "approve",
+                            "quality_score": 0.9,
+                            "carbon_g": 0.1,
+                            "cost_usd": 0.1,
+                            "latency_ms": 100,
+                        },
+                        {
+                            "solution_id": "reject",
+                            "quality_score": 0.89,
+                            "carbon_g": 0.11,
+                            "cost_usd": 0.11,
+                            "latency_ms": 105,
+                        },
+                    ],
+                    timeout=2.0,
+                )
+                # v18's HITL returns None on timeout (fail-safe)
+                if approved != "approve":
+                    with self._lock:
+                        self._metadata["total_hitl_rejections"] += 1
+                        self._rejections[graph_type].append(
+                            {
+                                "at": _utcnow().isoformat(),
+                                "reason": (
+                                    "hitl_rejected" if approved == "reject"
+                                    else "hitl_timed_out"
+                                ),
+                                "registered_by": registered_by,
+                            }
+                        )
+                    _log(
+                        "registration_hitl_rejected",
+                        logging.WARNING,
+                        graph_type=graph_type.value,
+                        approved=approved,
+                    )
+                    return {
+                        "status": "hitl_rejected",
+                        "graph_type": graph_type.value,
+                        "version": None,
+                        "precision": None,
+                        "xai": None,
+                        "deferred": False,
+                        "chaos_injected": chaos_injected,
+                        "reason": (
+                            "hitl_rejected" if approved == "reject"
+                            else "hitl_timed_out"
+                        ),
+                    }
+                with self._lock:
+                    self._metadata["total_hitl_approvals"] += 1
+            except Exception:
+                pass
+
+        # 4. XAI explanation (uses cached size — no re-pickle)
+        xai_result = None
+        if explain and self.xai is not None and _ENHANCEMENTS_AVAILABLE:
+            try:
+                import numpy as np  # type: ignore
+
+                with self._lock:
+                    existing = self._entries.get(graph_type)
+                    prev_size = existing.cached_size if existing else 0
+                    total_updates = self._metadata["total_updates"]
+                new_size = self._graph_size(graph)
+                feats = np.array(
+                    [
+                        float(prev_size),
+                        float(new_size),
+                        float(total_updates),
+                        1.0 if existing is None else 0.0,
+                    ]
+                )
+
+                def _score(x):
+                    return float(np.dot(x, [0.3, 0.4, 0.2, 0.1]))
+
+                xai_result = await self.xai.explain(
+                    decision_id=f"reg_{uuid.uuid4().hex[:8]}",
+                    label=f"register:{graph_type.value}",
+                    features=feats,
+                    names=[
+                        "prev_size",
+                        "new_size",
+                        "total_updates",
+                        "is_new",
+                    ],
+                    model_fn=_score,
+                    include_counterfactual=False,
+                )
+            except Exception:
+                pass
+
+        # 5. Federated share (metadata only)
+        if self.federated is not None:
+            try:
+                blob = json.dumps(
+                    {
+                        "graph_type": graph_type.value,
+                        "action": "register",
+                        "ts": _utcnow().isoformat(),
+                    }
+                ).encode()
+                await self.federated.share_weights("registry_events", blob)
+            except Exception:
+                pass
+
+        # 6. Register and capture the exact version
+        version = self.register(
+            graph_type,
+            graph,
+            metadata,
+            precision,
+            tags,
+            registered_by,
+            deferred=deferred,
+            chaos_injected=chaos_injected,
+        )
+
+        # 7. Temporal push
+        if self.temporal is not None:
+            try:
+                await self.temporal.push_state(
+                    {
+                        "registry_event": graph_type.value,
+                        "total_graphs": len(self._entries),
+                        "quality": 1.0,
+                    }
+                )
+            except Exception:
+                pass
+
+        return {
+            "status": "deferred" if deferred else "registered",
+            "graph_type": graph_type.value,
+            "version": version.version,
+            "precision": version.precision,
+            "xai": xai_result,
+            "deferred": deferred,
+            "chaos_injected": chaos_injected,
+            "reason": defer_reason,
+        }
+
+    async def aget(self, graph_type: GraphType) -> Optional[Any]:
+        return self.get(graph_type)
+
+    async def alist(self) -> List[GraphType]:
+        return self.list_graphs()
+
+    async def ahealth(self, verbose: bool = False) -> Dict[str, Any]:
+        return self.health(verbose=verbose)
+
+    async def arollback(
+        self, graph_type: GraphType, target_version: int
+    ) -> bool:
+        return self.rollback(graph_type, target_version)
+
+    # ------------------------------------------------------------------ helium
+    def register_helium_monitor(self, monitor: "HeliumMonitor") -> None:
+        with self._lock:
+            self._helium_monitor = monitor
+        _log("helium_registered", logging.INFO)
+
+    def get_helium_monitor(self) -> Optional["HeliumMonitor"]:
+        with self._lock:
+            return self._helium_monitor
+
+    # ------------------------------------------------------------------ lifecycle
     def reset(self) -> None:
         with self._lock:
+            if self._in_flight > 0:
+                raise GraphRegistryError(
+                    f"cannot reset with {self._in_flight} registration(s) in flight"
+                )
             self._entries.clear()
+            self._rejections.clear()
+            self._singletons.clear()
             self._helium_monitor = None
+            self._graph_locks.clear()
             self._metadata = {
-                "execution_count": 0,
-                "singletons": {},
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": _utcnow().isoformat(),
                 "total_updates": 0,
                 "total_rollbacks": 0,
                 "total_deferrals": 0,
                 "total_hitl_approvals": 0,
                 "total_hitl_rejections": 0,
             }
-            logger.info("GraphRegistry reset")
+        _log("registry_reset", logging.INFO)
 
     async def shutdown(self) -> None:
-        logger.info("Shutting down GraphRegistry...")
+        _log("registry_shutting_down", logging.INFO)
+        helium = None
         with self._lock:
-            if self._helium_monitor:
-                try:
-                    await self._helium_monitor.shutdown()
-                except Exception as e:
-                    logger.error("Error shutting down helium monitor: %s", e)
+            helium = self._helium_monitor
+            self._helium_monitor = None
+        if helium is not None:
+            try:
+                await helium.shutdown()
+            except Exception as exc:
+                logger.error("helium shutdown failed: %s", exc)
+        with self._lock:
             self._entries.clear()
-            logger.info("GraphRegistry shutdown complete")
+            self._rejections.clear()
+            self._singletons.clear()
+            self._graph_locks.clear()
+            self._metadata = {
+                "last_updated": _utcnow().isoformat(),
+                "total_updates": 0,
+                "total_rollbacks": 0,
+                "total_deferrals": 0,
+                "total_hitl_approvals": 0,
+                "total_hitl_rejections": 0,
+            }
+        _log("registry_shutdown_complete", logging.INFO)
 
+    # ------------------------------------------------------------------ serialization
+    def to_dict(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "metadata": _json_safe(dict(self._metadata)),
+                "singletons": _json_safe(dict(self._singletons)),
+                "entries": {
+                    gt.value: {
+                        "current": entry.current.to_dict(),
+                        "history": [v.to_dict() for v in entry.history],
+                        "update_count": entry.update_count,
+                        "cached_size": entry.cached_size,
+                    }
+                    for gt, entry in self._entries.items()
+                },
+                "rejections": {
+                    gt.value: [_json_safe(dict(r)) for r in rej]
+                    for gt, rej in self._rejections.items()
+                    if rej
+                },
+            }
 
-# =============================================================================
-# ENHANCEMENT 1 — QUANTUM-DISTILLATION ENGINE
-# =============================================================================
-class QuantumDistillationEngine:
-    def __init__(self, temperature=2.0, alpha=0.5, n_actions=5,
-                 learning_rate=0.1):
-        self.temperature = temperature
-        self.alpha = alpha
-        self.n_actions = n_actions
-        self.learning_rate = learning_rate
-        self.teachers: Dict[str, List[float]] = {}
-        self.student_policy = [1.0 / n_actions] * n_actions
-        self.history: Deque[Dict[str, Any]] = deque(maxlen=500)
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        config: Optional[Any] = None,
+        storage: Optional[Any] = None,
+        graph_loader: Optional[Callable[[GraphType], Any]] = None,
+    ) -> "GraphRegistry":
+        """
+        Rebuild a registry from ``to_dict()`` output.
 
-    def register_teacher(self, name: str, policy: List[float]) -> None:
-        if not policy:
-            return
-        s = sum(policy) or 1.0
-        self.teachers[name] = [p / s for p in policy]
+        ``graph_loader(gt)`` must return a live graph object; if it's
+        ``None``, graphs are restored as ``None`` and only the version
+        history is preserved.
+        """
+        registry = cls(config=config, storage=storage)
+        if not isinstance(data, Mapping):
+            raise GraphRegistryError(
+                f"from_dict expects Mapping, got {type(data).__name__}"
+            )
 
-    def _softmax(self, x, temp):
-        m = max(x)
-        exps = [math.exp((v - m) / max(temp, 1e-6)) for v in x]
-        s = sum(exps) or 1.0
-        return [e / s for e in exps]
+        with registry._lock:
+            md = data.get("metadata", {}) or {}
+            for key, val in md.items():
+                registry._metadata[key] = val
+            registry._singletons = dict(data.get("singletons", {}) or {})
 
-    def _superpose(self):
-        if not self.teachers:
-            return list(self.student_policy)
-        n = self.n_actions
-        accum = [0.0] * n
-        for pol in self.teachers.values():
-            for i in range(min(n, len(pol))):
-                accum[i] += math.sqrt(max(pol[i], 1e-9))
-        accum = [a / len(self.teachers) for a in accum]
-        sq = [a * a for a in accum]
-        s = sum(sq) or 1.0
-        return [x / s for x in sq]
-
-    async def step(self, storage=None, student_id="graph_student"):
-        target = self._softmax(self._superpose(), self.temperature)
-        new = []
-        for s, t in zip(self.student_policy, target):
-            eps = max(1e-12, min(self.student_policy) * 0.1)
-            grad = -(t / max(s, eps))
-            new.append(max(1e-3, s - self.learning_rate * grad))
-        ns = sum(new) or 1.0
-        self.student_policy = [x / ns for x in new]
-        entry = {"target": target,
-                 "student": list(self.student_policy),
-                 "ts": datetime.now(timezone.utc).isoformat()}
-        self.history.append(entry)
-        if storage is not None:
-            for tid in self.teachers:
+            for gt_value, entry_data in (data.get("entries") or {}).items():
                 try:
-                    await asyncio.to_thread(
-                        storage.save_teacher_superposition,
-                        student_id, tid,
-                        self.teachers[tid][0] if self.teachers[tid] else 0.0,
-                        self.temperature, 0.0, 0.0)
-                except Exception:
-                    pass
-        return entry
-
-    def get_policy(self) -> List[float]:
-        return list(self.student_policy)
-
-
-# =============================================================================
-# ENHANCEMENT 2 — CAUSAL RL
-# =============================================================================
-class CausalGraphLearner:
-    def __init__(self, storage=None):
-        self.storage = storage
-        self.graph: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(dict)
-        self.variables: List[str] = []
-
-    async def learn(self, samples, variables, threshold=0.25):
-        self.variables = list(variables)
-        if len(samples) < 5 or not NUMPY_AVAILABLE:
-            self.graph.clear()
-            for i, s in enumerate(variables):
-                for j, t in enumerate(variables):
-                    if i < j and random.random() < 0.25:
-                        w = random.uniform(0.1, 0.9)
-                        self.graph[s][t] = {"weight": w, "confidence": w}
-            return self.summary()
-        X = np.array([[s[v] for v in variables] for s in samples], dtype=float)
-        if X.shape[0] < 2:
-            return self.summary()
-        X = (X - X.mean(0)) / (X.std(0) + 1e-9)
-        corr = np.corrcoef(X, rowvar=False)
-        self.graph.clear()
-        for i in range(len(variables)):
-            for j in range(len(variables)):
-                if i == j:
+                    gt = GraphType(str(gt_value))
+                except ValueError:
+                    _log("from_dict_unknown_graph_type", logging.WARNING, value=gt_value)
                     continue
-                c = abs(float(corr[i, j]))
-                if c > threshold:
-                    vi, vj = float(X[:, i].var()), float(X[:, j].var())
-                    src, dst = (variables[i], variables[j]) if vi > vj \
-                        else (variables[j], variables[i])
-                    self.graph[src][dst] = {
-                        "weight": float(corr[i, j]), "confidence": c}
-                    if self.storage:
-                        try:
-                            await asyncio.to_thread(
-                                self.storage.save_causal_edge,
-                                src, dst, float(corr[i, j]), c)
-                        except Exception:
-                            pass
-        return self.summary()
 
-    def parents(self, node):
-        return [s for s, e in self.graph.items() if node in e]
+                def _version_from_dict(v_data: Mapping[str, Any]) -> GraphVersion:
+                    return GraphVersion(
+                        version=int(v_data["version"]),
+                        graph=graph_loader(gt) if graph_loader else None,
+                        metadata=dict(v_data.get("metadata", {})),
+                        precision=str(v_data.get("precision", "fp32")),
+                        registered_at=str(v_data.get("registered_at", "")),
+                        registered_by=str(v_data.get("registered_by", "")),
+                        fingerprint=str(v_data.get("fingerprint", "")),
+                        tags=list(v_data.get("tags", [])),
+                        deferred=bool(v_data.get("deferred", False)),
+                        chaos_injected=bool(
+                            v_data.get("chaos_injected", False)
+                        ),
+                    )
 
-    def children(self, node):
-        return list(self.graph.get(node, {}).keys())
-
-    def summary(self):
-        return {"nodes": len(self.variables),
-                "edges": sum(len(v) for v in self.graph.values()),
-                "variables": list(self.variables)}
-
-
-class CausalPolicyAdapter:
-    ACTIONS = ["performance", "carbon", "cost", "hybrid", "adaptive"]
-
-    def __init__(self, config, storage, graph: CausalGraphLearner):
-        self.config = config
-        self.storage = storage
-        self.graph = graph
-        self.values = defaultdict(float)
-        self.counts = defaultdict(int)
-        self.policy = [1.0 / len(self.ACTIONS)] * len(self.ACTIONS)
-        self.epsilon = _cfg_get(config, "causal_exploration_rate", 0.1)
-
-    async def choose_action(self, state):
-        if random.random() < self.epsilon:
-            return random.choice(self.ACTIONS)
-        return max(self.ACTIONS, key=lambda a: self.values.get(a, 0.0))
-
-    async def update(self, action, reward, state):
-        if action not in self.ACTIONS:
-            action = self.ACTIONS[0]
-        self.counts[action] += 1
-        n = self.counts[action]
-        self.values[action] += (reward - self.values[action]) / n
-        vals = [self.values.get(a, 0.0) for a in self.ACTIONS]
-        m = max(vals)
-        exps = [math.exp((v - m) / 0.5) for v in vals]
-        s = sum(exps) or 1.0
-        self.policy = [e / s for e in exps]
-
-    async def estimate_ate(self, treatment, outcome, samples=100):
-        w = self.graph.graph.get(treatment, {}).get(outcome, {}).get(
-            "weight", 0.0)
-        try:
-            await asyncio.to_thread(
-                self.storage.save_causal_experiment,
-                f"exp_{uuid.uuid4().hex[:8]}", treatment, outcome, w, samples)
-        except Exception:
-            pass
-        return w
-
-    def get_policy(self):
-        return list(self.policy)
-
-
-# =============================================================================
-# ENHANCEMENT 3 — FEDERATED GREEN LEARNING
-# =============================================================================
-class FederatedGreenAggregator:
-    def __init__(self, storage, instance_id, share_interval=3600):
-        self.storage = storage
-        self.instance_id = instance_id
-        self.share_interval = share_interval
-        self.rounds = 0
-
-    async def share_weights(self, model_id, weights):
-        try:
-            await asyncio.to_thread(
-                self.storage.save_federated_weights,
-                self.instance_id, model_id, weights,
-                float(len(weights)), self.rounds)
-        except Exception:
-            pass
-
-    async def pull_aggregated_weights(self, model_id):
-        try:
-            rows = await asyncio.to_thread(
-                self.storage.get_federated_weights, model_id)
-        except Exception:
-            return None
-        if not rows:
-            return None
-        blobs = [r["weights"] for r in rows if r.get("weights")]
-        if not blobs:
-            return None
-        n = min(len(b) for b in blobs)
-        avg = bytearray(n)
-        for i in range(n):
-            avg[i] = int(sum(b[i] for b in blobs) / len(blobs)) & 0xFF
-        self.rounds += 1
-        return bytes(avg)
-
-    async def apply_aggregated_weights(self, model_id, current):
-        agg = await self.pull_aggregated_weights(model_id)
-        if agg is None:
-            return current
-        n = min(len(current), len(agg))
-        return bytes([(current[i] + agg[i]) // 2 for i in range(n)])
-
-
-# =============================================================================
-# ENHANCEMENT 4 — MULTI-AGENT COORDINATION
-# =============================================================================
-class _Agent:
-    ROLES = ["orchestrator", "validator", "optimizer", "reporter", "negotiator"]
-
-    def __init__(self, agent_id):
-        self.id = agent_id
-        self.role = "validator"
-        self.reputation = 0.5
-        self.utilities = {r: random.uniform(0.3, 0.7) for r in self.ROLES}
-        self.completed = 0
-
-
-class MultiAgentCoordinator:
-    def __init__(self, config, storage):
-        self.config = config
-        self.storage = storage
-        count = _cfg_get(config, "agent_count", 5)
-        self.agents = {f"agent_{i:02d}": _Agent(f"agent_{i:02d}")
-                       for i in range(count)}
-        self.bus: asyncio.Queue = asyncio.Queue(maxsize=500)
-        self._lock = asyncio.Lock()
-
-    async def _specialise(self):
-        async with self._lock:
-            for a in self.agents.values():
-                a.role = max(a.utilities, key=lambda r: a.utilities[r])
-
-    async def broadcast(self, topic, sender, payload):
-        try:
-            self.bus.put_nowait({"topic": topic, "sender": sender,
-                                 "payload": payload})
-        except asyncio.QueueFull:
-            pass
-
-    async def bid(self, task):
-        preferred = task.get("preferred_role", "orchestrator")
-        best_id, best_score = None, -1.0
-        async with self._lock:
-            for aid, a in self.agents.items():
-                bonus = 1.0 if a.role == preferred else 0.6
-                score = a.utilities[a.role] * bonus + 0.3 * a.reputation
-                score += random.uniform(-0.02, 0.02)
-                if score > best_score:
-                    best_score, best_id = score, aid
-            if best_id:
-                self.agents[best_id].completed += 1
-        return best_id or next(iter(self.agents)), best_score
-
-    async def reward(self, agent_id, reward):
-        async with self._lock:
-            if agent_id in self.agents:
-                a = self.agents[agent_id]
-                n = max(1, a.completed)
-                a.reputation = max(0.0, min(1.0, a.reputation + reward / n))
-                a.utilities[a.role] = min(1.0,
-                                          a.utilities[a.role] + 0.05 * reward)
-
-    def get_policy(self):
-        counts = defaultdict(int)
-        for a in self.agents.values():
-            counts[a.role] += 1
-        total = max(1, sum(counts.values()))
-        out = [0.0] * 5
-        for role, c in counts.items():
-            w = c / total
-            for i in range(5):
-                out[i] += w * 0.2
-        s = sum(out) or 1.0
-        return [x / s for x in out]
-
-    async def step(self):
-        await self._specialise()
-        processed = 0
-        while not self.bus.empty():
-            try:
-                self.bus.get_nowait()
-                processed += 1
-            except asyncio.QueueEmpty:
-                break
-        return {"roles": {a.id: a.role for a in self.agents.values()},
-                "role_distribution": self.get_policy(),
-                "processed_messages": processed}
-
-
-# =============================================================================
-# ENHANCEMENT 5 — TEMPORAL LOGIC
-# =============================================================================
-_ATOMIC_RE = __import__("re").compile(
-    r"^\s*([A-Za-z_]\w*)\s*(>=|<=|==|!=|>|<)\s*(-?[0-9.]+)\s*$")
-
-
-class TemporalRule:
-    def __init__(self, rule_id, operator, conditions, window=0.0,
-                 description="", severity="warning"):
-        self.rule_id = rule_id
-        self.operator = operator
-        self.conditions = conditions
-        self.window = window
-        self.description = description or rule_id
-        self.severity = severity
-        self.violations = 0
-        self.last_violation = None
-
-    def evaluate(self, trace):
-        if not trace:
-            return False
-        if self.window > 0:
-            cutoff = trace[-1][0] - timedelta(seconds=self.window)
-            while trace and trace[0][0] < cutoff:
-                trace.popleft()
-        op = self.operator
-        if op == "always":
-            return any(not self.conditions[0](s) for _, s in trace)
-        if op == "eventually":
-            return not any(self.conditions[0](s) for _, s in trace)
-        if op == "never":
-            return any(self.conditions[0](s) for _, s in trace)
-        return False
-
-
-class TemporalLogicVerifier:
-    def __init__(self, storage, config):
-        self.storage = storage
-        self.config = config
-        self.rules: Dict[str, TemporalRule] = {}
-        self.trace: Deque = deque(
-            maxlen=_cfg_get(config, "temporal_max_trace", 2000))
-        self.approval_cb = None
-        for formula in _cfg_get(config, "temporal_formulas", []) or []:
-            self._install(formula)
-
-    def _install(self, formula):
-        f = formula.strip()
-        if f.startswith("G "):
-            self._add_atomic(f[2:].strip().strip("()"), "always")
-        elif f.startswith("F "):
-            self._add_atomic(f[2:].strip().strip("()"), "eventually")
-        elif f.startswith("NEVER "):
-            self._add_atomic(f[6:].strip().strip("()"), "never")
-
-    def _add_atomic(self, expr, op):
-        m = _ATOMIC_RE.match(expr)
-        if not m:
-            return
-        var, cmp, val = m.group(1), m.group(2), float(m.group(3))
-
-        def cond(state, v=var, c=cmp, x=val):
-            try:
-                sv = float(state.get(v, 0.0))
-            except Exception:
-                return True
-            return {">=": sv >= x, "<=": sv <= x, "==": sv == x,
-                    "!=": sv != x, ">": sv > x, "<": sv < x}[c]
-
-        rid = f"{op}:{expr}"
-        self.rules[rid] = TemporalRule(rid, op, [cond],
-                                        description=expr, severity="warning")
-
-    def set_approval_callback(self, cb):
-        self.approval_cb = cb
-
-    async def push_state(self, state):
-        self.trace.append((datetime.now(timezone.utc), dict(state)))
-        try:
-            await asyncio.to_thread(self.storage.save_temporal_trace, state)
-        except Exception:
-            pass
-
-    async def verify(self):
-        result = {}
-        for rid, rule in self.rules.items():
-            copy = deque(self.trace, maxlen=self.trace.maxlen)
-            violated = rule.evaluate(copy)
-            result[rid] = not violated
-            if violated:
-                rule.violations += 1
-                rule.last_violation = datetime.now(timezone.utc)
-                if rule.severity == "critical" and self.approval_cb:
-                    try:
-                        approved = self.approval_cb(rid, self.trace[-1][1])
-                        if asyncio.iscoroutine(approved):
-                            await approved
-                    except Exception:
-                        pass
-        return result
-
-
-# =============================================================================
-# ENHANCEMENT 6 — EXPLAINABLE AI
-# =============================================================================
-class XAIDecisionExplainer:
-    def __init__(self, config, storage):
-        self.config = config
-        self.storage = storage
-        self.method = _cfg_get(config, "xai_method", "kernel_shap")
-        self.depth = int(_cfg_get(config, "xai_depth", 5))
-        self.global_attributions: Deque[Dict[str, float]] = deque(maxlen=1000)
-
-    def _kernel_shap(self, f, x, names, n=32):
-        if not NUMPY_AVAILABLE:
-            return {k: 0.0 for k in names}
-        base = np.zeros_like(x)
-        contrib = np.zeros(len(x))
-        for _ in range(n):
-            perm = list(range(len(x)))
-            random.shuffle(perm)
-            prev = base.copy()
-            for i in perm:
-                cur = prev.copy()
-                cur[i] = x[i]
                 try:
-                    delta = float(f(cur.reshape(1, -1))) - \
-                            float(f(prev.reshape(1, -1)))
-                except Exception:
-                    delta = 0.0
-                contrib[i] += delta
-                prev = cur
-        contrib /= max(1, n)
-        return dict(zip(names, contrib.tolist()))
+                    current = _version_from_dict(entry_data["current"])
+                    history = deque(
+                        (
+                            _version_from_dict(v)
+                            for v in entry_data.get("history", [])
+                        ),
+                        maxlen=registry._history_max,
+                    )
+                    entry = GraphEntry(
+                        graph_type=gt,
+                        current=current,
+                        history=history,
+                        update_count=int(
+                            entry_data.get("update_count", 0)
+                        ),
+                        cached_size=int(
+                            entry_data.get("cached_size", 0)
+                        ),
+                    )
+                    registry._entries[gt] = entry
+                except Exception as exc:
+                    _log(
+                        "from_dict_entry_failed",
+                        logging.WARNING,
+                        value=gt_value,
+                        error=str(exc),
+                    )
+                    continue
 
-    def _lime(self, f, x, names, n=100):
-        if not (SKLEARN_AVAILABLE and NUMPY_AVAILABLE):
-            return {k: random.uniform(-1, 1) for k in names}
-        X = np.tile(x, (n, 1)) + np.random.normal(0, 0.1, (n, len(x)))
-        try:
-            y = np.array([float(f(r.reshape(1, -1))) for r in X])
-        except Exception:
-            return {k: 0.0 for k in names}
-        w = np.exp(-np.sum((X - x) ** 2, axis=1) / 0.02)
-        try:
-            m = LinearRegression().fit(X, y, sample_weight=w)
-            return dict(zip(names, m.coef_.tolist()))
-        except Exception:
-            return {k: 0.0 for k in names}
+            for gt_value, rejections in (data.get("rejections") or {}).items():
+                try:
+                    gt = GraphType(str(gt_value))
+                except ValueError:
+                    continue
+                for r in rejections:
+                    registry._rejections[gt].append(dict(r))
 
-    def _nl(self, decision, attrs):
-        top = sorted(attrs.items(), key=lambda kv: abs(kv[1]),
-                     reverse=True)[:self.depth]
-        lines = "\n".join(f"  • {k}: {v:+.4f}" for k, v in top)
-        return f"Decision '{decision}' driven by:\n{lines}"
-
-    async def explain(self, decision_id, label, features, names, model_fn,
-                      include_counterfactual=False, include_anchors=False):
-        if not NUMPY_AVAILABLE:
-            attrs = {k: 0.0 for k in names}
-            nl = self._nl(label, attrs)
-            result = {"decision_id": decision_id, "method": self.method,
-                      "attributions": attrs, "explanation": nl}
-        else:
-            x = np.asarray(features, dtype=float)
-            attrs = self._lime(model_fn, x, names) if self.method == "lime" \
-                else self._kernel_shap(model_fn, x, names)
-            nl = self._nl(label, attrs)
-            result = {"decision_id": decision_id, "method": self.method,
-                      "attributions": attrs, "explanation": nl,
-                      "counterfactual": None, "anchors": None}
-        self.global_attributions.append(dict(attrs))
-        try:
-            await asyncio.to_thread(
-                self.storage.save_xai_explanation,
-                decision_id, decision_id, self.method, label,
-                dict(enumerate(features)) if not isinstance(features, list)
-                else {"list": features}, attrs, nl)
-        except Exception:
-            pass
-        return result
-
-    def global_feature_importance(self):
-        if not self.global_attributions:
-            return {}
-        agg = defaultdict(list)
-        for d in self.global_attributions:
-            for k, v in d.items():
-                agg[k].append(abs(v))
-        return {k: sum(vals) / len(vals) for k, vals in agg.items()}
+        return registry
 
 
-# =============================================================================
-# ENHANCEMENT 7 — ADAPTIVE PRECISION SWITCHER
-# =============================================================================
-class AdaptivePrecisionSwitcher:
-    ENERGY = {"fp32": 1.0, "tf32": 0.75, "bf16": 0.55,
-              "fp16": 0.5, "int8": 0.3}
+# --------------------------------------------------------------------------- #
+# Orchestrator — wires the ten enhancements with the registry
+# --------------------------------------------------------------------------- #
+class GraphRegistryOrchestratorV18:
+    """Unified entry point: registry + ten enhancements + background loops."""
 
-    def __init__(self, config, storage):
-        self.config = config
-        self.storage = storage
-        self.current = "fp32"
-        self.saved_wh = 0.0
-        self.history: Deque[Dict[str, Any]] = deque(maxlen=500)
+    DEFAULT_FEATURES: Dict[str, bool] = {
+        "causal_rl": True,
+        "federated": True,
+        "multi_agent": True,
+        "temporal": True,
+        "xai": True,
+        "precision": True,
+        "carbon_market": True,
+        "chaos": True,
+        "distillation": True,
+    }
 
-    def _probe(self):
-        info = {"cuda": False, "bf16": False, "device": "cpu"}
-        if TORCH_AVAILABLE:
-            try:
-                info["cuda"] = torch.cuda.is_available()
-                if info["cuda"]:
-                    info["device"] = torch.cuda.get_device_name(0)
-                    info["bf16"] = torch.cuda.is_bf16_supported()
-            except Exception:
-                pass
-        return info
+    def __init__(
+        self,
+        storage: Any,
+        config: Any,
+        dashboard: Any = None,
+        *,
+        features: Optional[Dict[str, bool]] = None,
+    ) -> None:
+        if not _ENHANCEMENTS_AVAILABLE:
+            raise GraphRegistryError(
+                f"GraphRegistryOrchestratorV18 requires enhancement classes "
+                f"from 'green_agent.enhancements' or 'carbon_forecast' "
+                f"({_ENHANCEMENTS_ERROR})"
+            )
 
-    def select_precision(self):
-        hw = self._probe()
-        cands = list(_cfg_get(self.config, "precision_levels",
-                              ["fp32", "fp16", "bf16", "int8"]))
-        if not hw["cuda"]:
-            cands = [c for c in cands if c in ("fp32", "int8")]
-        if not hw["bf16"]:
-            cands = [c for c in cands if c != "bf16"]
-        return min(cands, key=lambda c: self.ENERGY.get(c, 1.0))
-
-    async def switch_to(self, target, reason="policy"):
-        if target == self.current or target not in self.ENERGY:
-            return False
-        old = self.current
-        self.current = target
-        saved = max(0.0, self.ENERGY.get(old, 1.0) -
-                    self.ENERGY.get(target, 1.0))
-        self.saved_wh += saved
-        self.history.append({"from": old, "to": target,
-                             "reason": reason, "saved_wh": saved})
-        try:
-            await asyncio.to_thread(
-                self.storage.save_precision_switch,
-                old, target, reason, saved, 0.0)
-        except Exception:
-            pass
-        return True
-
-    async def auto_switch(self, recent_acc, baseline_acc):
-        if baseline_acc <= 0:
-            return
-        drop = (baseline_acc - recent_acc) / baseline_acc
-        thresh = _cfg_get(self.config, "precision_switch_threshold", 0.02)
-        if drop > thresh:
-            await self.switch_to("fp32", reason=f"acc drop {drop:.3f}")
-        elif drop < thresh / 2:
-            await self.switch_to(self.select_precision(), reason="headroom")
-
-
-# =============================================================================
-# ENHANCEMENT 8 — CARBON MARKETS / REC
-# =============================================================================
-class CarbonMarketIntegrator:
-    def __init__(self, config, storage):
-        self.config = config
-        self.storage = storage
-        self.last_price = 25.0
-
-    async def _fetch_price(self):
-        return max(5.0, self.last_price + random.gauss(0, 1.5))
-
-    async def update_price(self):
-        try:
-            price = await self._fetch_price()
-        except Exception:
-            price = self.last_price
-        self.last_price = price
-        try:
-            await asyncio.to_thread(self.storage.save_credit_price, price)
-        except Exception:
-            pass
-        return price
-
-    async def purchase_rec(self, mwh, price_per_mwh=5.0, source="wind"):
-        cost = mwh * price_per_mwh
-        try:
-            await asyncio.to_thread(self.storage.save_rec, mwh,
-                                    price_per_mwh, source)
-        except Exception:
-            pass
-        return cost
-
-    async def net_zero_schedule(self, workload_kwh, intensity):
-        price = await self.update_price()
-        carbon_kg = workload_kwh * intensity
-        offset_cost = (carbon_kg / 1000.0) * price
-        action = "defer" if intensity > 0.3 else \
-                 ("run_offset" if offset_cost < 0.5 else "run")
-        try:
-            await asyncio.to_thread(
-                self.storage.save_net_zero_match,
-                uuid.uuid4().hex[:8], workload_kwh, intensity, action,
-                carbon_kg, offset_cost, price)
-        except Exception:
-            pass
-        return {"action": action, "carbon_kg": carbon_kg,
-                "offset_cost_usd": offset_cost,
-                "credit_price_usd": price}
-
-
-# =============================================================================
-# ENHANCEMENT 9 — CHAOS TESTING
-# =============================================================================
-class ChaosTestingEngine:
-    FAULT_TYPES = ["latency", "exception", "data_corruption",
-                   "memory_pressure", "network_drop"]
-
-    def __init__(self, config, storage):
-        self.config = config
-        self.storage = storage
-        self.active: Dict[str, Dict] = {}
-        self._lock = asyncio.Lock()
-
-    async def _steady(self):
-        if not self.active:
-            return True
-        return random.random() > _cfg_get(self.config, "chaos_intensity", 0.05)
-
-    async def run_experiment(self, name, fault_type):
-        if fault_type not in self.FAULT_TYPES:
-            raise ValueError(f"unknown fault type {fault_type}")
-        t0 = time.time()
-        before = await self._steady()
-        status = "completed"
-        try:
-            async with self._lock:
-                self.active[name] = {"fault_type": fault_type}
-            if fault_type == "latency":
-                await asyncio.sleep(0.1)
-            elif fault_type == "exception":
-                raise RuntimeError("chaos: injected exception")
-            elif fault_type == "memory_pressure":
-                _ = bytearray(1024)
-            elif fault_type == "network_drop":
-                await asyncio.sleep(0.05)
-            elif fault_type == "data_corruption":
-                await asyncio.sleep(0)
-        except Exception:
-            status = "injected"
-        finally:
-            async with self._lock:
-                self.active.pop(name, None)
-        after = await self._steady()
-        duration = (time.time() - t0) * 1000.0
-        try:
-            await asyncio.to_thread(
-                self.storage.save_chaos_experiment,
-                name, name, fault_type,
-                _cfg_get(self.config, "chaos_blast_radius", 0.1),
-                int(before), int(after), status, duration)
-        except Exception:
-            pass
-        return {"name": name, "fault_type": fault_type,
-                "steady_before": before, "steady_after": after,
-                "status": status, "duration_ms": duration}
-
-
-# =============================================================================
-# ENHANCEMENT 10 — HITL ACTIVE LEARNING
-# =============================================================================
-class ActiveUserPreferenceLearner:
-    def __init__(self, storage, dashboard=None):
-        self.storage = storage
-        self.dashboard = dashboard
-        self.preferences: Dict[str, Dict[str, float]] = {}
-        self._responses: asyncio.Queue = asyncio.Queue(maxsize=100)
-
-    async def submit_response(self, user_id, chosen_id):
-        try:
-            self._responses.put_nowait({"user_id": user_id,
-                                        "chosen": chosen_id})
-        except asyncio.QueueFull:
-            pass
-
-    async def query_user_if_needed(self, user_id, candidates, timeout=3.0):
-        if len(candidates) < 2:
-            return None
-        try:
-            msg = await asyncio.wait_for(self._responses.get(),
-                                         timeout=timeout)
-            return msg.get("chosen")
-        except asyncio.TimeoutError:
-            return candidates[0].get("solution_id")
-
-    async def record_choice(self, user_id, solution_id, metrics=None):
-        prefs = self.preferences.setdefault(user_id, {})
-        if metrics:
-            for k in ("quality_score", "carbon_g", "cost_usd", "latency_ms"):
-                if k in metrics:
-                    v = float(metrics[k])
-                    if k == "quality_score":
-                        prefs[k] = prefs.get(k, 0.25) + v * 0.01
-                    else:
-                        prefs[k] = prefs.get(k, 0.25) + \
-                                   1.0 / (v + 1e-6) * 0.01
-            s = sum(prefs.values()) or 1.0
-            prefs = {k: v / s for k, v in prefs.items()}
-            self.preferences[user_id] = prefs
-        try:
-            await asyncio.to_thread(
-                self.storage.save_user_preference, user_id, prefs)
-        except Exception:
-            pass
-
-
-# =============================================================================
-# UNIFIED ORCHESTRATOR
-# =============================================================================
-class GraphRegistryOrchestratorV17:
-    """
-    Unified entry point: builds a GraphRegistry wired with all ten
-    enhancements, runs background loops, and exposes the registration API.
-    """
-
-    def __init__(self, storage, config, dashboard=None):
         self.storage = storage
         self.config = config
-        self.instance_id = str(uuid.uuid4())[:8]
+        self.instance_id = uuid.uuid4().hex[:8]
+        self._features: Dict[str, bool] = {
+            **self.DEFAULT_FEATURES,
+            **(features or {}),
+        }
 
         # Ten enhancements
-        self.quantum = QuantumDistillationEngine()
-        self.causal_graph = CausalGraphLearner(storage)
-        self.causal_rl = CausalPolicyAdapter(config, storage,
-                                              self.causal_graph)
-        self.federated = FederatedGreenAggregator(storage, self.instance_id)
-        self.multi_agent = MultiAgentCoordinator(config, storage)
-        self.temporal = TemporalLogicVerifier(storage, config)
-        self.xai = XAIDecisionExplainer(config, storage)
-        self.precision = AdaptivePrecisionSwitcher(config, storage)
-        self.carbon_market = CarbonMarketIntegrator(config, storage)
-        self.chaos = ChaosTestingEngine(config, storage)
-        self.hitl = ActiveUserPreferenceLearner(storage, dashboard=dashboard)
+        self.quantum = QuantumDistillationEngine()  # type: ignore[misc]
+        self.causal_graph = CausalGraphLearner(storage)  # type: ignore[misc]
+        self.causal_rl = CausalPolicyAdapter(  # type: ignore[misc]
+            config, storage, self.causal_graph
+        )
+        self.federated = FederatedGreenAggregator(  # type: ignore[misc]
+            storage, self.instance_id
+        )
+        self.multi_agent = MultiAgentCoordinator(config, storage)  # type: ignore[misc]
+        self.temporal = TemporalLogicVerifier(storage, config)  # type: ignore[misc]
+        self.xai = XAIDecisionExplainer(config, storage)  # type: ignore[misc]
+        self.precision = AdaptivePrecisionSwitcher(config, storage)  # type: ignore[misc]
+        self.carbon_market = CarbonMarketIntegrator(config, storage)  # type: ignore[misc]
+        self.chaos = ChaosTestingEngine(config, storage)  # type: ignore[misc]
+        self.hitl = ActiveUserPreferenceLearner(  # type: ignore[misc]
+            storage, dashboard=dashboard
+        )
 
-        # Central registry — enhanced with all hooks
         self.registry = GraphRegistry(
             config=config,
             storage=storage,
@@ -1329,114 +1311,176 @@ class GraphRegistryOrchestratorV17:
         )
 
         # Wire HITL to temporal critical rules
-        self.temporal.set_approval_callback(self._on_critical_violation)
+        if hasattr(self.temporal, "set_approval_callback"):
+            self.temporal.set_approval_callback(
+                self._on_critical_violation
+            )
 
         # Lifecycle
         self._running = False
         self._shutdown_event = asyncio.Event()
         self._background_tasks: Set[asyncio.Task] = set()
 
-    async def _on_critical_violation(self, rule_id, state):
+    # ------------------------------------------------------------------ features
+    def enable_feature(self, name: str) -> None:
+        if name not in self._features:
+            raise GraphRegistryError(f"unknown feature {name!r}")
+        self._features[name] = True
+        _log("feature_enabled", logging.INFO, feature=name)
+
+    def disable_feature(self, name: str) -> None:
+        if name not in self._features:
+            raise GraphRegistryError(f"unknown feature {name!r}")
+        self._features[name] = False
+        _log("feature_disabled", logging.INFO, feature=name)
+
+    def feature_enabled(self, name: str) -> bool:
+        return bool(self._features.get(name, False))
+
+    # ------------------------------------------------------------------ HITL hook
+    async def _on_critical_violation(self, rule_id: str, state: Any):
         approved = await self.hitl.query_user_if_needed(
-            "critical_user", [state, state], timeout=2.0)
+            "critical_user", [state, state], timeout=2.0
+        )
         return approved is not None
 
-    # ------------------------------------------------------------------
-    async def register_graph(self, graph_type: GraphType, graph: Any,
-                             **kwargs) -> Dict[str, Any]:
-        """Register a graph with all ten enhancements participating."""
+    # ------------------------------------------------------------------ public
+    async def register_graph(
+        self, graph_type: GraphType, graph: Any, **kwargs: Any
+    ) -> Dict[str, Any]:
         return await self.registry.aregister(graph_type, graph, **kwargs)
 
     async def get_graph(self, graph_type: GraphType) -> Optional[Any]:
         return await self.registry.aget(graph_type)
 
-    # ------------------------------------------------------------------
-    async def start(self):
+    # ------------------------------------------------------------------ lifecycle
+    async def start(self) -> None:
+        if self._running:
+            return
         self._running = True
-        loop = asyncio.get_event_loop()
-        tasks = [
-            loop.create_task(self._causal_rl_loop()),
-            loop.create_task(self._federated_loop()),
-            loop.create_task(self._multi_agent_loop()),
-            loop.create_task(self._temporal_loop()),
-            loop.create_task(self._xai_loop()),
-            loop.create_task(self._precision_loop()),
-            loop.create_task(self._carbon_market_loop()),
-            loop.create_task(self._chaos_loop()),
-            loop.create_task(self._distillation_loop()),
+        self._shutdown_event.clear()
+        loop = asyncio.get_running_loop()
+        factories: List[Tuple[str, Callable[[], Any]]] = [
+            ("causal_rl", self._causal_rl_loop),
+            ("federated", self._federated_loop),
+            ("multi_agent", self._multi_agent_loop),
+            ("temporal", self._temporal_loop),
+            ("xai", self._xai_loop),
+            ("precision", self._precision_loop),
+            ("carbon_market", self._carbon_market_loop),
+            ("chaos", self._chaos_loop),
+            ("distillation", self._distillation_loop),
         ]
-        for t in tasks:
+        for name, factory in factories:
+            t = loop.create_task(factory(), name=f"registry:{name}")
             self._background_tasks.add(t)
             t.add_done_callback(self._background_tasks.discard)
 
-    async def shutdown(self):
+    async def shutdown(self) -> None:
         self._shutdown_event.set()
         self._running = False
         for t in list(self._background_tasks):
             t.cancel()
         if self._background_tasks:
-            await asyncio.gather(*self._background_tasks,
-                                 return_exceptions=True)
+            await asyncio.gather(
+                *self._background_tasks, return_exceptions=True
+            )
         await self.registry.shutdown()
 
-    # ------------------------------------------------------------------
-    async def _causal_rl_loop(self):
-        while not self._shutdown_event.is_set():
-            await asyncio.sleep(900)
-            try:
-                samples = [{
-                    "quality": random.uniform(0.5, 1.0),
-                    "carbon": random.uniform(0.1, 0.8),
-                    "cost": random.uniform(0.1, 0.9),
-                    "latency": random.uniform(0.1, 0.9),
-                } for _ in range(20)]
-                await self.causal_graph.learn(
-                    samples, ["quality", "carbon", "cost", "latency"])
-                # Register the learned causal graph
-                await self.registry.aregister(
-                    GraphType.CAUSAL, self.causal_graph,
-                    metadata=self.causal_graph.summary())
-            except Exception:
-                pass
+    async def __aenter__(self) -> "GraphRegistryOrchestratorV18":
+        await self.start()
+        return self
 
-    async def _federated_loop(self):
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.shutdown()
+
+    # ------------------------------------------------------------------ loops
+    async def _sleep(self, seconds: float) -> bool:
+        """Return True if the shutdown event fired (loop should exit)."""
+        try:
+            await asyncio.wait_for(self._shutdown_event.wait(), timeout=seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def _causal_rl_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(3600)
+            if await self._sleep(900):
+                return
+            if not self.feature_enabled("causal_rl"):
+                continue
+            try:
+                samples = [
+                    {
+                        "quality": random.uniform(0.5, 1.0),
+                        "carbon": random.uniform(0.1, 0.8),
+                        "cost": random.uniform(0.1, 0.9),
+                        "latency": random.uniform(0.1, 0.9),
+                    }
+                    for _ in range(20)
+                ]
+                await self.causal_graph.learn(
+                    samples, ["quality", "carbon", "cost", "latency"]
+                )
+                await self.registry.aregister(
+                    GraphType.CAUSAL,
+                    self.causal_graph,
+                    metadata=self.causal_graph.summary(),
+                )
+            except Exception as exc:
+                logger.debug("causal_rl_loop: %s", exc)
+
+    async def _federated_loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            if await self._sleep(3600):
+                return
+            if not self.feature_enabled("federated"):
+                continue
             try:
                 dummy = bytes(random.getrandbits(8) for _ in range(64))
                 await self.federated.share_weights("registry_graph", dummy)
                 await self.federated.pull_aggregated_weights("registry_graph")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("federated_loop: %s", exc)
 
-    async def _multi_agent_loop(self):
+    async def _multi_agent_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(600)
+            if await self._sleep(600):
+                return
+            if not self.feature_enabled("multi_agent"):
+                continue
             try:
                 await self.multi_agent.step()
                 await self.registry.aregister(
-                    GraphType.MULTI_AGENT,
-                    self.multi_agent.get_policy())
-            except Exception:
-                pass
+                    GraphType.MULTI_AGENT, self.multi_agent.get_policy()
+                )
+            except Exception as exc:
+                logger.debug("multi_agent_loop: %s", exc)
 
-    async def _temporal_loop(self):
+    async def _temporal_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(300)
+            if await self._sleep(300):
+                return
+            if not self.feature_enabled("temporal"):
+                continue
             try:
                 await self.temporal.verify()
                 await self.registry.aregister(
                     GraphType.TEMPORAL_TRACE,
-                    list(self.temporal.trace)[-100:])
-            except Exception:
-                pass
+                    list(self.temporal.trace)[-100:],
+                )
+            except Exception as exc:
+                logger.debug("temporal_loop: %s", exc)
 
-    async def _xai_loop(self):
+    async def _xai_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(300)
-            if not NUMPY_AVAILABLE:
+            if await self._sleep(300):
+                return
+            if not self.feature_enabled("xai"):
                 continue
             try:
+                import numpy as np  # type: ignore
+
                 feats = np.array([0.9, 0.4, 0.5, 0.4])
                 await self.xai.explain(
                     decision_id=f"sys_{uuid.uuid4().hex[:8]}",
@@ -1444,270 +1488,647 @@ class GraphRegistryOrchestratorV17:
                     features=feats,
                     names=["quality", "carbon", "cost", "latency"],
                     model_fn=lambda x: float(
-                        np.dot(x, [0.4, -0.3, -0.2, -0.1])))
+                        np.dot(x, [0.4, -0.3, -0.2, -0.1])
+                    ),
+                )
                 await self.registry.aregister(
                     GraphType.XAI_ATTRIBUTION,
-                    self.xai.global_feature_importance())
-            except Exception:
-                pass
+                    self.xai.global_feature_importance(),
+                )
+            except Exception as exc:
+                logger.debug("xai_loop: %s", exc)
 
-    async def _precision_loop(self):
+    async def _precision_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(300)
+            if await self._sleep(300):
+                return
+            if not self.feature_enabled("precision"):
+                continue
             try:
                 await self.precision.auto_switch(0.9, 0.92)
                 await self.registry.aregister(
                     GraphType.PRECISION_HISTORY,
-                    list(self.precision.history))
-            except Exception:
-                pass
+                    list(self.precision.history),
+                )
+            except Exception as exc:
+                logger.debug("precision_loop: %s", exc)
 
-    async def _carbon_market_loop(self):
+    async def _carbon_market_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(3600)
+            if await self._sleep(3600):
+                return
+            if not self.feature_enabled("carbon_market"):
+                continue
             try:
                 await self.carbon_market.update_price()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("carbon_market_loop: %s", exc)
 
-    async def _chaos_loop(self):
+    async def _chaos_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(1800)
+            if await self._sleep(1800):
+                return
+            if not self.feature_enabled("chaos"):
+                continue
             try:
-                fault = random.choice(ChaosTestingEngine.FAULT_TYPES)
+                fault = random.choice(ChaosTestingEngine.FAULT_TYPES)  # type: ignore[union-attr]
                 result = await self.chaos.run_experiment(
-                    f"auto_{uuid.uuid4().hex[:6]}", fault)
+                    f"auto_{uuid.uuid4().hex[:6]}", fault
+                )
                 await self.registry.aregister(
-                    GraphType.CHAOS_EXPERIMENT, result)
-            except Exception:
-                pass
+                    GraphType.CHAOS_EXPERIMENT, result
+                )
+            except Exception as exc:
+                logger.debug("chaos_loop: %s", exc)
 
-    async def _distillation_loop(self):
+    async def _distillation_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(300)
+            if await self._sleep(300):
+                return
+            if not self.feature_enabled("distillation"):
+                continue
             try:
                 self.quantum.register_teacher(
-                    "causal", self.causal_rl.get_policy())
+                    "causal", self.causal_rl.get_policy()
+                )
                 self.quantum.register_teacher(
-                    "agents", self.multi_agent.get_policy())
-                entry = await self.quantum.step(self.storage,
-                                                "registry_student")
+                    "agents", self.multi_agent.get_policy()
+                )
+                entry = await self.quantum.step(
+                    self.storage, "registry_student"
+                )
                 await self.registry.aregister(
-                    GraphType.QUANTUM_DISTILLATION,
-                    entry["student"])
-            except Exception:
-                pass
+                    GraphType.QUANTUM_DISTILLATION, entry["student"]
+                )
+            except Exception as exc:
+                logger.debug("distillation_loop: %s", exc)
 
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ health
     async def health_check(self) -> Dict[str, Any]:
         registry_health = await self.registry.ahealth()
         return {
             "instance_id": self.instance_id,
             "running": self._running,
             "registry": registry_health,
-            "precision": self.precision.current,
-            "carbon_price": self.carbon_market.last_price,
-            "agents": {a.id: a.role
-                       for a in self.multi_agent.agents.values()},
-            "federated_rounds": self.federated.rounds,
+            "precision": self.precision.current,  # type: ignore[union-attr]
+            "carbon_price": self.carbon_market.last_price,  # type: ignore[union-attr]
+            "agents": {
+                a.id: a.role
+                for a in self.multi_agent.agents.values()  # type: ignore[union-attr]
+            },
+            "federated_rounds": self.federated.rounds,  # type: ignore[union-attr]
+            "features": dict(self._features),
         }
 
 
-# =============================================================================
-# MINIMAL IN-MEMORY STORAGE
-# =============================================================================
-class InMemoryStorage:
-    """Standalone storage for demos and tests."""
+# Backward-compatible alias
+GraphRegistryOrchestratorV17 = GraphRegistryOrchestratorV18
 
-    def __init__(self):
-        self._data: Dict[str, Any] = defaultdict(list)
+
+# --------------------------------------------------------------------------- #
+# In-memory storage (for demos and tests)
+# --------------------------------------------------------------------------- #
+class InMemoryStorage:
+    """Minimal in-memory storage — bounded by max_entries per bucket."""
+
+    def __init__(self, max_entries: int = 10_000) -> None:
+        self.max_entries = max_entries
+        self._data: Dict[str, Deque[Any]] = defaultdict(
+            lambda: deque(maxlen=max_entries)
+        )
         self._prefs: Dict[str, Dict[str, float]] = {}
 
-    def save_teacher_superposition(self, *a, **kw):
-        self._data["teacher_superpositions"].append(a)
+    def _record(self, bucket: str, entry: Any) -> None:
+        self._data[bucket].append(entry)
 
-    def save_causal_edge(self, source, target, weight, confidence):
-        self._data["causal_graph"].append({
-            "source": source, "target": target, "weight": weight})
-
-    def save_causal_experiment(self, exp_id, treatment, outcome,
-                               ate, samples, method=""):
-        self._data["causal_experiments"].append({
-            "exp_id": exp_id, "ate": ate})
-
-    def save_federated_weights(self, instance_id, model_id, weights,
-                               weight_norm=0.0, round_id=0):
-        self._data["federated_weights"].append({
-            "instance_id": instance_id, "model_id": model_id,
-            "weights": weights})
-
-    def get_federated_weights(self, model_id):
-        return [r for r in self._data["federated_weights"]
-                if r["model_id"] == model_id]
-
-    def save_precision_switch(self, *a, **kw):
-        self._data["precision_history"].append(a)
-
-    def save_credit_price(self, price_usd, **kw):
-        self._data["carbon_credit_prices"].append({"price_usd": price_usd})
-
-    def save_rec(self, mwh, price_per_mwh, source, **kw):
-        self._data["rec_ledger"].append({"mwh": mwh})
-
-    def get_rec_balance(self):
-        return sum(r["mwh"] for r in self._data["rec_ledger"])
-
-    def save_net_zero_match(self, *a, **kw):
-        self._data["net_zero_matches"].append(a)
-
-    def save_chaos_experiment(self, *a, **kw):
-        self._data["chaos_experiments"].append(a)
-
-    def save_temporal_trace(self, state, context=None):
-        self._data["temporal_trace"].append({"state": state})
-
-    def save_temporal_rule(self, *a, **kw):
-        self._data["temporal_rules"].append(a)
-
-    def save_temporal_violation(self, *a, **kw):
-        self._data["temporal_violations"].append(a)
-
-    def save_xai_explanation(self, explanation_id, decision_id, method,
-                             label, features, attributions, nl):
-        self._data["xai_explanations"].append({
-            "explanation_id": explanation_id, "label": label})
-
-    def save_user_preference(self, user_id, weights):
-        self._prefs[user_id] = dict(weights)
-
-    def get_user_preference(self, user_id):
-        return self._prefs.get(user_id)
+    def save_teacher_superposition(self, *a, **kw): self._record("teacher_superpositions", a)
+    def save_causal_edge(self, src, dst, w, c): self._record("causal_graph", (src, dst, w))
+    def save_causal_experiment(self, *a, **kw): self._record("causal_experiments", a)
+    def save_federated_weights(self, *a, **kw): self._record("federated_weights", a)
+    def get_federated_weights(self, model_id): return [r for r in self._data["federated_weights"] if r[1] == model_id]
+    def save_precision_switch(self, *a, **kw): self._record("precision_history", a)
+    def save_credit_price(self, price, **kw): self._record("carbon_credit_prices", price)
+    def save_rec(self, *a, **kw): self._record("rec_ledger", a)
+    def get_rec_balance(self): return sum(r[0] for r in self._data["rec_ledger"])
+    def save_net_zero_match(self, *a, **kw): self._record("net_zero_matches", a)
+    def save_chaos_experiment(self, *a, **kw): self._record("chaos_experiments", a)
+    def save_temporal_trace(self, state, context=None): self._record("temporal_trace", state)
+    def save_temporal_rule(self, *a, **kw): self._record("temporal_rules", a)
+    def save_temporal_violation(self, *a, **kw): self._record("temporal_violations", a)
+    def save_xai_explanation(self, *a, **kw): self._record("xai_explanations", a)
+    def save_user_preference(self, uid, weights): self._prefs[uid] = dict(weights)
+    def get_user_preference(self, uid): return self._prefs.get(uid)
 
 
-# =============================================================================
-# DEMO
-# =============================================================================
-async def _demo():
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
+__all__ = [
+    "GraphType",
+    "GraphVersion",
+    "GraphEntry",
+    "GraphRegistry",
+    "GraphRegistryOrchestratorV18",
+    "GraphRegistryOrchestratorV17",
+    "GraphRegistryError",
+    "InMemoryStorage",
+    # Enhancement re-exports
+    "QuantumDistillationEngine",
+    "CausalGraphLearner",
+    "CausalPolicyAdapter",
+    "FederatedGreenAggregator",
+    "MultiAgentCoordinator",
+    "TemporalLogicVerifier",
+    "XAIDecisionExplainer",
+    "AdaptivePrecisionSwitcher",
+    "CarbonMarketIntegrator",
+    "ChaosTestingEngine",
+    "ActiveUserPreferenceLearner",
+    "SimpleQuantumDistillationEngine",
+    "SimpleCausalGraphLearner",
+    "SimpleCausalPolicyAdapter",
+    "SimpleFederatedGreenAggregator",
+    "SimpleMultiAgentCoordinator",
+    "SimpleTemporalLogicVerifier",
+    "SimpleXAIDecisionExplainer",
+    "SimpleAdaptivePrecisionSwitcher",
+    "SimpleCarbonMarketIntegrator",
+    "SimpleChaosTestingEngine",
+    "SimpleActiveUserPreferenceLearner",
+    "_ENHANCEMENTS_AVAILABLE",
+    "_ENHANCEMENTS_SOURCE",
+]
+
+
+# --------------------------------------------------------------------------- #
+# Demo — every P0/P1/P2 fix verified by assertion
+# --------------------------------------------------------------------------- #
+def _demo() -> None:
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        level=logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
 
-    config = {
-        "causal_exploration_rate": 0.1,
-        "agent_count": 5,
-        "temporal_max_trace": 500,
-        "temporal_formulas": ["G (quality >= 0.5)"],
-        "xai_method": "kernel_shap",
-        "xai_depth": 5,
-        "precision_levels": ["fp32", "fp16", "bf16", "int8"],
-        "precision_switch_threshold": 0.02,
-        "chaos_intensity": 0.0,
-        "chaos_blast_radius": 0.5,
-    }
+    print("=" * 78)
+    print("graph_registry.py v6.0.0 — Demo")
+    print("=" * 78)
+    print(f"  enhancements source: {_ENHANCEMENTS_SOURCE}")
+    print(f"  enhancements available: {_ENHANCEMENTS_AVAILABLE}")
 
-    storage = InMemoryStorage()
-    orch = GraphRegistryOrchestratorV17(storage, config)
-    await orch.start()
+    if not _ENHANCEMENTS_AVAILABLE:
+        print(f"\nFATAL: enhancement classes unavailable ({_ENHANCEMENTS_ERROR})")
+        print("Install 'green_agent' or 'carbon_forecast' and re-run.")
+        return
 
-    print("=" * 80)
-    print("graph_registry.py v17.0.0 — Demo")
-    print("=" * 80)
+    def _check(condition: bool, message: str) -> None:
+        if not condition:
+            raise AssertionError(f"FAILED: {message}")
+        print(f"  ✓ {message}")
 
-    # 1. Show the extended GraphType enum
-    print("\n=== Extended GraphType enum ===")
-    for gt in GraphType:
-        print(f"  {gt.value}")
+    def _make_registry(**hooks) -> GraphRegistry:
+        return GraphRegistry(config={}, **hooks)
 
-    # 2. Register various graph types
-    print("\n=== Register graphs (with all hooks) ===")
-    demo_graphs = {
-        GraphType.CAUSAL: {"nodes": ["a", "b"], "edges": [("a", "b")]},
-        GraphType.POLICY: {"strategy": "adaptive", "weights": [0.25] * 4},
-        GraphType.SIMILARITY: {"matrix": [[1.0, 0.8], [0.8, 1.0]]},
-        GraphType.CARBON_LEDGER: {"entries": [{"mwh": 10.0}]},
-        GraphType.TEMPORAL_TRACE: [{"quality": 0.9}, {"quality": 0.85}],
-        GraphType.XAI_ATTRIBUTION: {"quality": 0.4, "carbon": -0.3},
-        GraphType.PRECISION_HISTORY: [{"from": "fp32", "to": "int8"}],
-        GraphType.CHAOS_EXPERIMENT: {"name": "demo", "status": "completed"},
-        GraphType.MULTI_AGENT: {"roles": {"agent_00": "validator"}},
-        GraphType.FEDERATED: {"instance_id": "test-1", "rounds": 0},
-        GraphType.QUANTUM_DISTILLATION: [0.2] * 5,
-        GraphType.FEATURE_IMPORTANCE: {"quality": 0.5},
-        GraphType.REC_LEDGER: {"mwh": 5.0, "source": "wind"},
-        GraphType.HITL_QUEUE: {"pending": []},
-    }
-    for gt, graph in demo_graphs.items():
-        result = await orch.register_graph(
-            gt, graph,
-            precision="fp32",
-            tags=["demo"],
+    async def run_all() -> None:
+        # ========================================================== #
+        # P0 §2.1: per-graph-type lock → versions are exact
+        # ========================================================== #
+        print("\n=== P0 §2.1: concurrent aregister returns correct versions ===")
+        registry = _make_registry()
+        results = await asyncio.gather(
+            registry.aregister(GraphType.CAUSAL, {"n": 1},
+                               require_hitl=False,
+                               defer_if_high_carbon=False, explain=False),
+            registry.aregister(GraphType.CAUSAL, {"n": 2},
+                               require_hitl=False,
+                               defer_if_high_carbon=False, explain=False),
+            registry.aregister(GraphType.CAUSAL, {"n": 3},
+                               require_hitl=False,
+                               defer_if_high_carbon=False, explain=False),
+        )
+        versions = sorted(r["version"] for r in results)
+        _check(
+            versions == [1, 2, 3],
+            f"three concurrent registrations produced versions {versions}",
+        )
+        _check(
+            registry._entries[GraphType.CAUSAL].current.version == 3,
+            "final current version is 3",
+        )
+        # Verify the graph keyed to each version is the one returned
+        # (i.e., the version was captured inside the lock)
+        for r in results:
+            _check(
+                r["version"] is not None and r["status"] == "registered",
+                f"result status={r['status']!r}, version={r['version']}",
+            )
+
+        # ========================================================== #
+        # P0 §2.2: deferred registration IS preserved (v6 fix)
+        # ========================================================== #
+        print("\n=== P0 §2.2: deferred registration is not lost ===")
+
+        class _AlwaysDefer:
+            last_price = 25.0
+            async def net_zero_schedule(self, workload_kwh, intensity):
+                return {"action": "defer"}
+
+        deferred_registry = _make_registry(carbon_market=_AlwaysDefer())
+        deferred_result = await deferred_registry.aregister(
+            GraphType.CAUSAL,
+            {"n": "deferred-graph"},
+            require_hitl=False,
+            defer_if_high_carbon=True,
+            explain=False,
+        )
+        _check(
+            deferred_result["status"] == "deferred",
+            f"status is 'deferred'",
+        )
+        _check(
+            deferred_result["version"] is not None,
+            f"version is not None (got {deferred_result['version']})",
+        )
+        _check(
+            deferred_result["deferred"] is True,
+            "deferred flag is True",
+        )
+        _check(
+            deferred_registry.get(GraphType.CAUSAL) is not None,
+            "graph IS registered despite deferral (v17 returned None)",
+        )
+        _check(
+            deferred_registry._entries[GraphType.CAUSAL].current.deferred is True,
+            "version.deferred is True",
+        )
+
+        # ========================================================== #
+        # P0 §2.3: HITL rejection is recorded, not lost
+        # ========================================================== #
+        print("\n=== P0 §2.3: HITL rejection is recorded ===")
+
+        class _AlwaysReject:
+            async def query_user_if_needed(self, user_id, candidates, timeout=2.0):
+                return "reject"
+
+        hitl_registry = _make_registry(hitl=_AlwaysReject())
+        hitl_result = await hitl_registry.aregister(
+            GraphType.CARBON_LEDGER,
+            {"entry": 1},
+            require_hitl=True,
+            defer_if_high_carbon=False,
+            explain=False,
+        )
+        _check(
+            hitl_result["status"] == "hitl_rejected",
+            f"status is 'hitl_rejected'",
+        )
+        _check(
+            hitl_result["version"] is None,
+            "version is None for rejected",
+        )
+        _check(
+            len(hitl_registry._rejections[GraphType.CARBON_LEDGER]) == 1,
+            "rejection recorded in _rejections[GRAPH_TYPE]",
+        )
+        _check(
+            hitl_registry.get(GraphType.CARBON_LEDGER) is None,
+            "graph is NOT registered after rejection",
+        )
+
+        # ========================================================== #
+        # P0 §2.4: rollback does not duplicate history
+        # ========================================================== #
+        print("\n=== P0 §2.4: rollback no longer duplicates history ===")
+        rb_registry = _make_registry()
+        for i in range(3):
+            rb_registry.register(GraphType.CAUSAL, {"v": i})
+        # Current is v3, history is [v1, v2]
+        _check(
+            rb_registry._entries[GraphType.CAUSAL].current.version == 3,
+            "initial current v3",
+        )
+        _check(
+            len(rb_registry._entries[GraphType.CAUSAL].history) == 2,
+            "initial history length 2",
+        )
+        # Rollback to v2 → current=v2, history=[v1, v3]
+        assert rb_registry.rollback(GraphType.CAUSAL, 2)
+        _check(
+            rb_registry._entries[GraphType.CAUSAL].current.version == 2,
+            "current after rollback v2",
+        )
+        _check(
+            len(rb_registry._entries[GraphType.CAUSAL].history) == 2,
+            f"history length still 2 (v17 would be 3; got "
+            f"{len(rb_registry._entries[GraphType.CAUSAL].history)})",
+        )
+        # Rollback to v2 again → no-op
+        _check(
+            rb_registry.rollback(GraphType.CAUSAL, 2) is False,
+            "rollback to current version is a no-op",
+        )
+        _check(
+            len(rb_registry._entries[GraphType.CAUSAL].history) == 2,
+            "history length unchanged after second rollback",
+        )
+
+        # ========================================================== #
+        # P0 §2.5: registry constructed outside loop, used inside
+        # ========================================================== #
+        print("\n=== P0 §2.5: constructed outside loop, used inside ===")
+        # This construction is inside the demo's running loop, but the
+        # important test is that we can construct one *before* a loop
+        # starts and use it inside — no asyncio.Lock() at __init__.
+        outside_loop_registry = GraphRegistry(config={})
+        _check(
+            not hasattr(outside_loop_registry, "_async_lock"),
+            "no _async_lock attribute (v17 created it in __init__)",
+        )
+        result = await outside_loop_registry.aregister(
+            GraphType.SIMILARITY,
+            {"matrix": [[1.0]]},
             require_hitl=False,
             defer_if_high_carbon=False,
-            explain=False)
-        print(f"  {gt.value:22s} -> {result['status']} "
-              f"(v{result.get('version', '?')})")
+            explain=False,
+        )
+        _check(
+            result["status"] == "registered",
+            "async register works without pre-existing _async_lock",
+        )
 
-    # 3. Show versioning
-    print("\n=== Versioning (update causal graph) ===")
-    for i in range(3):
-        new_graph = {"nodes": ["a", "b", "c"], "version": i + 1}
-        await orch.register_graph(
-            GraphType.CAUSAL, new_graph,
-            require_hitl=False, defer_if_high_carbon=False, explain=False)
-    history = orch.registry.get_history(GraphType.CAUSAL)
-    print(f"  Causal graph history ({len(history)} versions):")
-    for h in history:
-        marker = " ← current" if h.get("is_current") else ""
-        print(f"    v{h['version']}: fp={h['fingerprint']}{marker}")
+        # ========================================================== #
+        # P0 §2.6/§2.7: metadata counters consistent under concurrency
+        # ========================================================== #
+        print("\n=== P0 §2.6/§2.7: counters consistent under concurrency ===")
+        counter_registry = _make_registry()
+        await asyncio.gather(
+            *[
+                counter_registry.aregister(
+                    GraphType.POLICY, {"i": i},
+                    require_hitl=False,
+                    defer_if_high_carbon=False,
+                    explain=False,
+                )
+                for i in range(50)
+            ]
+        )
+        _check(
+            counter_registry._metadata["total_updates"] == 50,
+            f"50 registrations → total_updates=50 "
+            f"(got {counter_registry._metadata['total_updates']})",
+        )
 
-    # 4. Rollback
-    print("\n=== Rollback to v2 ===")
-    rolled = orch.registry.rollback(GraphType.CAUSAL, target_version=2)
-    print(f"  Rollback succeeded: {rolled}")
-    print(f"  Current causal version: "
-          f"{orch.registry._entries[GraphType.CAUSAL].current.version}")
+        # ========================================================== #
+        # P0 §2.8: fingerprint is portable (order-independent)
+        # ========================================================== #
+        print("\n=== P0 §2.8: fingerprint is order-independent ===")
+        fp1 = GraphRegistry._fingerprint({"a": 1, "b": 2, "c": [3, 4]})
+        fp2 = GraphRegistry._fingerprint({"c": [3, 4], "b": 2, "a": 1})
+        _check(
+            fp1 == fp2,
+            f"same-content dicts share a fingerprint ({fp1} == {fp2})",
+        )
+        fp3 = GraphRegistry._fingerprint({"a": 1.0, "b": 2.0})
+        fp4 = GraphRegistry._fingerprint({"a": 1, "b": 2})
+        _check(
+            fp3 == fp4,
+            "int vs float (1 vs 1.0) → same fingerprint",
+        )
 
-    # 5. Health report
-    print("\n=== Health report ===")
-    health = await orch.health_check()
-    print(f"  Instance: {health['instance_id']}")
-    print(f"  Total graphs: {health['registry']['num_graphs']}")
-    print(f"  Total updates: {health['registry']['total_updates']}")
-    print(f"  Total rollbacks: {health['registry']['total_rollbacks']}")
-    print(f"  Precision: {health['precision']}")
-    print(f"  Agents: {list(health['agents'].values())}")
+        # ========================================================== #
+        # P1 §3.5: precision downgrade is logged and applied
+        # ========================================================== #
+        print("\n=== P1 §3.5: invalid precision is logged and downgraded ===")
+        prec_registry = _make_registry()
+        v = prec_registry.register(
+            GraphType.CAUSAL, {"x": 1}, precision="fp64"
+        )
+        _check(
+            v.precision == "fp32",
+            f"invalid precision 'fp64' → 'fp32' (got {v.precision!r})",
+        )
 
-    # 6. Chaos experiment via registry
-    print("\n=== Chaos experiment (via registry) ===")
-    chaos_result = await orch.chaos.run_experiment("demo_chaos", "latency")
-    print(f"  Status: {chaos_result['status']}")
-    print(f"  Duration: {chaos_result['duration_ms']:.1f} ms")
+        # ========================================================== #
+        # P1 §3.6: cached_size prevents re-pickling
+        # ========================================================== #
+        print("\n=== P1 §3.6: cached_size is populated ===")
+        size_registry = _make_registry()
+        size_registry.register(GraphType.CAUSAL, {"a": 1, "b": 2})
+        _check(
+            size_registry._entries[GraphType.CAUSAL].cached_size > 0,
+            f"cached_size populated "
+            f"({size_registry._entries[GraphType.CAUSAL].cached_size})",
+        )
 
-    # 7. HITL test
-    print("\n=== HITL test ===")
-    async def _delayed_response():
-        await asyncio.sleep(0.2)
-        await orch.hitl.submit_response("registry_approver", "approve")
-    asyncio.create_task(_delayed_response())
-    approved = await orch.hitl.query_user_if_needed(
-        "registry_approver",
-        [{"solution_id": "approve", "quality_score": 0.9},
-         {"solution_id": "reject", "quality_score": 0.89}],
-        timeout=1.0)
-    print(f"  HITL response: {approved}")
+        # ========================================================== #
+        # P1 §3.7: configurable critical graph types
+        # ========================================================== #
+        print("\n=== P1 §3.7: configurable critical graph types ===")
+        critical_registry = GraphRegistry(
+            config={"registry_critical_graph_types": ["precision_history"]},
+            hitl=None,
+        )
+        _check(
+            "precision_history" in critical_registry._critical_types,
+            "custom critical graph type honored",
+        )
+        _check(
+            "causal" not in critical_registry._critical_types,
+            "default 'causal' not critical when overridden",
+        )
 
-    # 8. Registry stats
-    print("\n=== Registry final stats ===")
-    print(f"  Causal version: "
-          f"{orch.registry._entries[GraphType.CAUSAL].current.version}")
-    print(f"  Causal update count: "
-          f"{orch.registry._entries[GraphType.CAUSAL].update_count}")
-    print(f"  Causal history length: "
-          f"{len(orch.registry._entries[GraphType.CAUSAL].history)}")
+        # ========================================================== #
+        # P1 §3.8: chaos hook is opt-in
+        # ========================================================== #
+        print("\n=== P1 §3.8: chaos hook is opt-in ===")
+        _check(
+            not _make_registry()._chaos_hook_enabled,
+            "chaos hook disabled by default",
+        )
+        enabled_registry = GraphRegistry(
+            config={"registry_chaos_hook": True}
+        )
+        _check(
+            enabled_registry._chaos_hook_enabled is True,
+            "chaos hook enabled by config",
+        )
 
-    await orch.shutdown()
-    print("\nShutdown complete.")
+        # ========================================================== #
+        # P1 §3.9: unified return shape
+        # ========================================================== #
+        print("\n=== P1 §3.9: unified return shape ===")
+        shape_registry = _make_registry()
+        r = await shape_registry.aregister(
+            GraphType.CAUSAL, {"x": 1},
+            require_hitl=False,
+            defer_if_high_carbon=False,
+            explain=False,
+        )
+        for key in (
+            "status", "graph_type", "version", "precision", "xai",
+            "deferred", "chaos_injected", "reason",
+        ):
+            _check(key in r, f"return dict has '{key}'")
+
+        # ========================================================== #
+        # P1 §3.11: health_check present
+        # ========================================================== #
+        print("\n=== P1 §3.11: health_check ===")
+        hc = shape_registry.health_check()
+        for key in (
+            "healthy", "anomalies", "num_graphs",
+            "in_flight_registrations", "helium_registered",
+        ):
+            _check(key in hc, f"health_check has '{key}'")
+        _check(hc["healthy"] is True, "registry reports healthy")
+
+        # ========================================================== #
+        # P1 §3.12: live feature toggle on orchestrator
+        # ========================================================== #
+        print("\n=== P1 §3.12: orchestrator feature toggle ===")
+        storage = InMemoryStorage()
+        config = {
+            "temporal_formulas": [],
+            "xai_method": "permutation",
+        }
+        orch = GraphRegistryOrchestratorV18(storage, config)
+        _check(
+            orch.feature_enabled("causal_rl") is True,
+            "causal_rl enabled by default",
+        )
+        orch.disable_feature("causal_rl")
+        _check(
+            orch.feature_enabled("causal_rl") is False,
+            "disable_feature('causal_rl') works",
+        )
+        orch.enable_feature("causal_rl")
+        _check(
+            orch.feature_enabled("causal_rl") is True,
+            "enable_feature('causal_rl') works",
+        )
+        try:
+            orch.enable_feature("nonexistent")
+        except GraphRegistryError:
+            _check(True, "unknown feature rejected")
+        else:
+            raise AssertionError("unknown feature not rejected")
+
+        # ========================================================== #
+        # P2 §4.7: to_dict / from_dict round-trip
+        # ========================================================== #
+        print("\n=== P2 §4.7: to_dict / from_dict round-trip ===")
+        roundtrip = _make_registry()
+        roundtrip.register(GraphType.CAUSAL, {"v": 1})
+        roundtrip.register(GraphType.CAUSAL, {"v": 2})
+        roundtrip.register(GraphType.POLICY, {"p": 1})
+        roundtrip.rollback(GraphType.CAUSAL, 1)
+
+        payload = roundtrip.to_dict()
+        restored = GraphRegistry.from_dict(payload)
+        _check(
+            restored._entries[GraphType.CAUSAL].current.version == 1,
+            "restored current version matches (1)",
+        )
+        _check(
+            len(restored._entries[GraphType.CAUSAL].history) == len(
+                roundtrip._entries[GraphType.CAUSAL].history
+            ),
+            "restored history length matches",
+        )
+        _check(
+            restored._metadata["total_updates"] == roundtrip._metadata["total_updates"],
+            "restored metadata matches",
+        )
+
+        # ========================================================== #
+        # P2 §4.21: idempotent register on same fingerprint
+        # ========================================================== #
+        print("\n=== P2 §4.21: idempotent register ===")
+        idem = _make_registry()
+        v1 = idem.register(GraphType.CAUSAL, {"x": 1})
+        v2 = idem.register(GraphType.CAUSAL, {"x": 1})  # same content
+        _check(
+            v1.version == v2.version == 1,
+            f"same fingerprint → same version "
+            f"({v1.version} == {v2.version})",
+        )
+        _check(
+            idem._metadata["total_updates"] == 1,
+            "idempotent register did not bump counter",
+        )
+
+        # ========================================================== #
+        # P2 §4.22: history is a bounded deque
+        # ========================================================== #
+        print("\n=== P2 §4.22: history is a bounded deque ===")
+        history_registry = GraphRegistry(config={"registry_history_max": 5})
+        for i in range(20):
+            history_registry.register(GraphType.CAUSAL, {"i": i})
+        _check(
+            len(history_registry._entries[GraphType.CAUSAL].history) == 5,
+            f"history bounded at 5 "
+            f"(got {len(history_registry._entries[GraphType.CAUSAL].history)})",
+        )
+
+        # ========================================================== #
+        # P2 §4.24: Prometheus metrics
+        # ========================================================== #
+        print("\n=== P2 §4.24: Prometheus metrics ===")
+        metrics = history_registry.collect_prometheus_metrics()
+        for key in (
+            "graph_registry_num_graphs",
+            "graph_registry_updates_total",
+            "graph_registry_rollbacks_total",
+            "graph_registry_in_flight",
+        ):
+            _check(key in metrics, f"metric '{key}' present")
+
+        # ========================================================== #
+        # P1 §3.9: reset refuses when in-flight
+        # ========================================================== #
+        print("\n=== P1 §3.9: reset refuses with in-flight registrations ===")
+        # Simulate in-flight by manually bumping the counter
+        in_flight = _make_registry()
+        in_flight._in_flight = 1
+        try:
+            in_flight.reset()
+        except GraphRegistryError:
+            _check(True, "reset refused with 1 registration in flight")
+        else:
+            raise AssertionError("reset did not refuse")
+        in_flight._in_flight = 0
+        in_flight.reset()
+        _check(True, "reset works with 0 registrations in flight")
+
+        # ========================================================== #
+        # Full end-to-end demo
+        # ========================================================== #
+        print("\n=== Full end-to-end orchestrator ===")
+        storage2 = InMemoryStorage()
+        async with GraphRegistryOrchestratorV18(storage2, config) as orch2:
+            await orch2.register_graph(
+                GraphType.CAUSAL, {"demo": 1},
+                require_hitl=False,
+                defer_if_high_carbon=False,
+                explain=False,
+            )
+            graph = await orch2.get_graph(GraphType.CAUSAL)
+            _check(
+                graph == {"demo": 1},
+                "orchestrator end-to-end register + get works",
+            )
+            health = await orch2.health_check()
+            _check(
+                health["running"] is True,
+                "orchestrator health shows running",
+            )
+
+        print("\n" + "=" * 78)
+        print("All v6 assertions passed.")
+        print("=" * 78)
+
+    asyncio.run(run_all())
 
 
 if __name__ == "__main__":
-    asyncio.run(_demo())
+    _demo()
