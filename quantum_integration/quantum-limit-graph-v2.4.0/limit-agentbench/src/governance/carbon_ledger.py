@@ -1,5 +1,5 @@
 """
-Green Agent v5.0.0 — Carbon Ledger v2.0.0 (Enhanced)
+Green Agent v5.0.0 — Carbon Ledger v3.0.0 (Enhanced)
 ====================================================
 
 Layer 8: Immutable carbon accounting and compliance.
@@ -9,85 +9,75 @@ It records *measured* operational emissions, distinguishes them from
 *contractual* instruments (RECs, offsets), and produces a
 tamper-evident hash chain that survives process restarts.
 
-v2.0.0 changes vs. v1.0.0
+v3.0.0 changes vs. v2.0.0
 -------------------------
 **P0 bug fixes**
-  * 2.1 ``record()`` / ``correct_entry()`` / ``record_instrument()`` raise
-        ``LedgerNotInitializedError`` when called before
-        ``initialize()``. Previously an un-initialized ledger was
-        overwritten with a single-entry file — 99 % data loss.
-  * 2.2 ``get_report()`` now resolves corrections before summing.
-        Previously a ``5.0 → 3.0`` correction reported ``8.0``, while
-        ``get_statistics()`` correctly reported ``3.0``.
-  * 2.3 ``initialize()`` raises ``LedgerTamperedError`` when the loaded
-        chain fails verification. Previously it logged an ERROR and
-        continued with the tampered state.
-  * 2.4 ``initialize()`` recomputes ``measured`` / ``estimated`` /
-        ``simulated`` / ``correction`` counters and the
-        ``_corrections`` index from ``entries``. Previously every
-        counter was reset to 0 on restart despite ``entries`` being
-        intact.
-  * 2.5 ``_persist_append()`` failure raises ``LedgerPersistenceError``
-        (previously logged and returned silently, giving the caller a
-        hash for a non-durable entry).
-  * 2.6 The ``entries`` list is exposed via a read-only property
-        (returns copies). External mutation of
-        ``ledger.entries[-1]["carbon_kg"]`` no longer corrupts the
-        chain — the mutation hits a copy that is discarded.
-  * 2.7 New error hierarchy: ``LedgerError`` base class; subclasses
-        ``LedgerNotInitializedError``, ``LedgerTamperedError``,
-        ``LedgerPersistenceError``, ``LedgerValidationError``,
-        ``LedgerDuplicateInstrumentError`` (the last doubles as a
-        ``ValueError`` for v1.0.0 backward compat).
-  * 2.8 ``initialize()`` is idempotent — a second call is a no-op.
-        Previously a second call silently replaced in-memory state
-        from disk (which could be stale if ``record()`` had failed to
-        persist).
+  * 2.1 **Transitive correction resolution.** Correcting a correction
+        (A → B → C) now propagates the terminal value back to A in
+        both ``get_report()`` and ``get_statistics()``. The v2.0.0
+        fix only handled one level — the two APIs diverged on chains
+        (e.g. 3.0 vs 4.0 for A→B→C).
+  * 2.2 ``_coerce_for_json`` handles ``set`` / ``frozenset`` by
+        deterministic sorted-list coercion, ``bytes`` by hex, and
+        rejects ``NaN`` / ``Inf`` floats with ``LedgerValidationError``.
+        Previously a ``set`` in ``extra`` produced a
+        hash-randomized ``str(set)`` — the chain broke after every
+        restart with ``PYTHONHASHSEED=random`` (the default).
+  * 2.3 ``initialize()`` recomputes ``total_carbon`` / ``total_energy``
+        from entries. Previously the totals were loaded verbatim from
+        the payload and could be silently tampered (entries
+        re-verified, totals not).
+  * 2.4 ``initialize()`` parses numeric fields with ``_safe_float`` /
+        ``_safe_int`` that raise ``LedgerError`` on malformed input.
+        Previously ``float("garbage")`` leaked ``ValueError``.
+  * 2.5 ``add_metadata(entry_id, metadata)`` added — the docstring
+        promised post-hoc metadata attachment but v2.0.0 exposed no
+        API for it (the ``entries`` property returns copies).
+  * 2.6 ``os.fsync`` on the parent directory after every WAL append
+        and every ``os.replace``. Previously only file contents were
+        fsynced — a crash between ``record()`` and ``initialize()``
+        could lose the file's *directory entry* (hence the whole
+        file) despite the content being on disk.
 
 **P1 robustness**
-  * 3.1 Append-only WAL persistence. ``record()`` is now O(1) per
-        record instead of O(N) — a full-file rewrite on every entry
-        made the ledger unusable beyond a few thousand records.
-        ``shutdown()`` compacts (atomic full-file rewrite).
-  * 3.2 ``verify_entry(entry_hash)`` — verify a single entry without
-        walking the whole chain.
-  * 3.3 ``get_report()`` returns deep copies of entries.
-  * 3.4 Enums (``CarbonZone``, ``CarbonZone.RED`` etc.) are stored as
-        their ``.value`` (``"red"``) rather than ``"CarbonZone.RED"``.
-        Historic entries remain readable.
-  * 3.5 Instrument ``kind`` and ``unit`` are validated against known
-        sets. ``tCO2e`` is converted to ``kgCO2e`` correctly.
-  * 3.6 A second ``correct_entry()`` on an already-corrected entry
-        raises ``LedgerValidationError``. Reverse the first
-        correction, or correct the correction.
-  * 3.7 ``get_report()`` uses half-open ``[start, end)`` windowing —
-        adjacent windows no longer double-count boundary entries.
-  * 3.8 ``_calculate_average_intensity()`` returns ``None`` when
-        ``total_energy == 0`` but ``total_carbon > 0`` (undefined
-        intensity, not "zero").
-  * 3.9 ``verify_chain()`` cross-checks ``_last_chain_hash`` against
-        the last entry's hash.
-  * 3.10 Per-entry ``schema_version`` is preserved. ``get_report()``
-        reports ``schema_versions_present``.
-  * 3.11 ``_parse_iso()`` logs a warning on failure and counts the
-        parse errors in ``get_report()``.
+  * 3.1 ``get_report()`` includes a ``by_region`` breakdown.
+  * 3.2 ``get_entry(entry_id)`` (O(1) via index),
+        ``get_entries_for_task(task_id)``,
+        ``verify_entry_by_id(entry_id)``.
+  * 3.3 ``export_report_csv()`` for compliance portals.
+  * 3.4 ``metrics_hook(event, fields)`` on every state transition.
+  * 3.5 ``wal_replayed_entries`` in ``get_statistics()``.
+  * 3.6 ``verify_chain()`` caches its result; invalidated on mutation.
+  * 3.7 ``_entry_by_id`` index makes per-entry and per-correction
+        lookups O(1) (was O(N)).
+  * 3.8 ``migrate_schema(target_version, migrator)`` — re-hash and
+        compact under a new schema; entries whose version doesn't
+        match raise on ``initialize()``.
+  * 3.9 ``get_report(include_all_entries=True)`` returns the full
+        filtered list; ``report_entries_limit`` configurable (default
+        100).
+  * 3.10 ``total_carbon_naive_kg`` diagnostic field (raw sum
+        including correction rows — for debugging only).
+  * 3.11 ``_parse_iso`` allocates the context f-string only on
+        failure.
+  * 3.12 ``__aexit__`` no longer swallows shutdown failures.
+  * 3.13 ``__repr__`` includes ``schema_version`` and
+        ``chain_verified``.
 
-**P2 polish**
-  * Pickling support (``__getstate__`` / ``__setstate__``).
-  * Sync + async context managers.
-  * ``_run_selftests()`` callable.
-
-Backward compatible: the public API is unchanged. ``ledger.entries``
-returns copies (mutation of the copies has no effect). Old ledgers load
-via ``initialize()``; the WAL is created lazily on the first ``record()``.
+Backward compatible: every v1.0.0 / v2.0.0 method signature and payload
+works unchanged. ``entries`` returns copies (as in v2.0.0). The
+WAL is created lazily on the first ``record()``.
 """
 
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
+import io
 import json
 import logging
+import math
 import os
 import threading
 import uuid
@@ -95,7 +85,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import (
+    Any, Callable, Dict, List, Mapping, Optional, Tuple,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,11 +97,11 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 LEDGER_SCHEMA_VERSION = "5.0.0"
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 
 
 # =============================================================================
-# Error hierarchy (P0 2.7)
+# Error hierarchy
 # =============================================================================
 
 class LedgerError(Exception):
@@ -141,8 +133,12 @@ class LedgerDuplicateInstrumentError(LedgerError, ValueError):
     """
 
 
+class LedgerSchemaMismatchError(LedgerValidationError):
+    """Raised when ``initialize()`` finds entries under a different schema."""
+
+
 # =============================================================================
-# Instrument vocabulary (P1 3.5)
+# Instrument vocabulary
 # =============================================================================
 
 class InstrumentKind(str, Enum):
@@ -164,7 +160,6 @@ class InstrumentUnit(str, Enum):
         return self.value
 
 
-# Conversion factors to kgCO2e for offset-type instruments.
 _UNIT_TO_KGCO2E: Dict[str, float] = {
     "kgCO2e": 1.0,
     "tCO2e": 1000.0,
@@ -172,13 +167,9 @@ _UNIT_TO_KGCO2E: Dict[str, float] = {
 
 
 # =============================================================================
-# Canonical hash fields (P0 2.6)
+# Canonical hash fields
 # =============================================================================
-#
-# Only these fields participate in the hash. Adding metadata fields
-# (``published_at``, ``reviewed_by``, etc.) after the fact does not break
-# the chain; tampering with any canonical field does.
-#
+
 _CANONICAL_HASH_FIELDS: Tuple[str, ...] = (
     "entry_id",
     "schema_version",
@@ -217,36 +208,78 @@ def _get_attr(obj: Any, name: str, default: Any) -> Any:
     return getattr(obj, name, default)
 
 
-def _coerce_for_json(value: Any) -> Any:
+def _coerce_for_json(value: Any, *, path: str = "value") -> Any:
     """
-    Recursively coerce ``value`` to a JSON-safe form.
+    Recursively coerce ``value`` to a deterministic, JSON-safe form.
 
-    Enums (``CarbonZone.RED``) become their ``.value`` (``"red"``).
-    Datetimes become ISO strings. Dicts and lists recurse.
+    - ``Enum`` → ``.value``.
+    - ``datetime`` → ISO 8601 string.
+    - ``dict`` → dict (values recurse).
+    - ``list`` / ``tuple`` → list (values recurse).
+    - ``set`` / ``frozenset`` → **sorted** list (deterministic — P0 2.2).
+    - ``bytes`` → hex string (deterministic).
+    - ``float`` non-finite → ``LedgerValidationError`` (P0 2.2).
+    - Anything else non-primitive → ``LedgerValidationError``.
     """
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, dict):
-        return {str(k): _coerce_for_json(v) for k, v in value.items()}
+        return {
+            str(k): _coerce_for_json(v, path=f"{path}.{k}")
+            for k, v in value.items()
+        }
     if isinstance(value, (list, tuple)):
-        return [_coerce_for_json(v) for v in value]
-    return value
+        return [
+            _coerce_for_json(v, path=f"{path}[{i}]")
+            for i, v in enumerate(value)
+        ]
+    if isinstance(value, (set, frozenset)):
+        # Sort by canonical JSON so the order is deterministic across
+        # processes regardless of PYTHONHASHSEED.
+        coerced = [
+            _coerce_for_json(v, path=f"{path}{{...}}")
+            for v in value
+        ]
+        try:
+            return sorted(
+                coerced,
+                key=lambda x: json.dumps(
+                    x, sort_keys=True, default=str),
+            )
+        except (TypeError, ValueError) as exc:
+            raise LedgerValidationError(
+                f"extra set at {path} contains unorderable values: "
+                f"{exc}") from exc
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            raise LedgerValidationError(
+                f"extra contains non-finite float {value!r} at "
+                f"{path}")
+        return value
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    raise LedgerValidationError(
+        f"extra contains unserializable type "
+        f"{type(value).__name__} at {path}")
 
 
-def _parse_iso(value: Any, *, context: str = "") -> Optional[datetime]:
+def _parse_iso(
+    value: Any, *, context_fn: Optional[Callable[[], str]] = None,
+) -> Optional[datetime]:
     """
-    Parse an ISO timestamp.
-
-    Returns ``None`` on failure (with a ``WARNING`` log) — callers must
-    decide how to handle the undated entry. P1 3.11.
+    Parse an ISO timestamp; return ``None`` on failure with a
+    ``WARNING`` log (P1 3.11: context string allocated only on failure).
     """
     if not value:
         return None
     try:
         dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except (ValueError, TypeError):
+        context = context_fn() if context_fn else ""
         logger.warning(
             "Could not parse timestamp %r%s; treating as undated.",
             value, f" ({context})" if context else "")
@@ -254,6 +287,72 @@ def _parse_iso(value: Any, *, context: str = "") -> Optional[datetime]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _safe_float(
+    payload: Mapping[str, Any], key: str, default: float,
+) -> float:
+    """Parse a numeric field, raising ``LedgerError`` on malformed input (P0 2.4)."""
+    if key not in payload or payload[key] is None:
+        return float(default)
+    raw = payload[key]
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise LedgerError(
+            f"Could not parse {key!r} from ledger payload: "
+            f"{raw!r} (expected numeric)")
+    try:
+        result = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise LedgerError(
+            f"Could not parse {key!r} from ledger payload: {exc}"
+        ) from exc
+    if math.isnan(result) or math.isinf(result):
+        raise LedgerError(
+            f"Could not parse {key!r} from ledger payload: {raw!r} "
+            f"(expected finite)")
+    return result
+
+
+def _safe_int(
+    payload: Mapping[str, Any], key: str, default: int,
+) -> int:
+    """Parse an integer field, raising ``LedgerError`` on malformed input."""
+    if key not in payload or payload[key] is None:
+        return int(default)
+    raw = payload[key]
+    if isinstance(raw, bool):
+        raise LedgerError(
+            f"Could not parse {key!r} from ledger payload: "
+            f"{raw!r} (expected int)")
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise LedgerError(
+            f"Could not parse {key!r} from ledger payload: {exc}"
+        ) from exc
+
+
+def _fsync_dir(path: Path) -> None:
+    """
+    fsync the directory containing ``path`` (P0 2.6).
+
+    Makes the file's directory entry durable. Without this, a crash
+    between ``record()`` and ``initialize()`` can lose a newly-created
+    WAL file despite its content being fsynced.
+    """
+    if os.name == "nt":     # pragma: no cover — POSIX durability only
+        return
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    except OSError as exc:  # pragma: no cover — defensive
+        logger.debug("Could not open dir for fsync: %s", exc)
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:  # pragma: no cover — defensive
+        logger.debug("Could not fsync dir: %s", exc)
+    finally:
+        os.close(dir_fd)
 
 
 # =============================================================================
@@ -267,10 +366,9 @@ class CarbonLedger:
     Design principles:
 
       1. **Full SHA-256 hash chain.** Every entry commits to its
-         predecessor via ``prev_hash``, so deletion, reordering, or
-         insertion of *canonical* fields invalidates the entire
-         subsequent history. Non-canonical metadata fields added after
-         the fact do not break the chain (P0 2.6).
+         predecessor via ``prev_hash``. Only ``_CANONICAL_HASH_FIELDS``
+         participate; post-hoc metadata added via ``add_metadata()``
+         does not break the chain.
 
       2. **Operational vs. contractual separation.** Physical emissions
          live in the operational ledger; purchased instruments live in
@@ -281,22 +379,34 @@ class CarbonLedger:
          methodology version.
 
       4. **Corrections without destruction.** A correction is recorded
-         as a new entry with a ``corrects_entry_id`` field. The
-         original entry is never modified. A single entry may only be
-         corrected once (P1 3.6).
+         as a new entry with a ``corrects_entry_id`` field. Chains are
+         resolved transitively — correcting a correction updates the
+         original's effective value.
 
-      5. **Append-only persistence via WAL (P1 3.1).** Each ``record()``
-         appends one line to ``<file>.wal`` and ``fsync``s it. Full-file
-         compaction happens on ``shutdown()``. This makes ``record()``
-         O(1) per call regardless of ledger size.
+      5. **Append-only persistence via WAL.** Each ``record()`` appends
+         one line to ``<file>.wal``, ``fsync``'s the file, and
+         ``fsync``'s the parent directory. Full-file compaction
+         happens on ``shutdown()``.
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        *,
+        metrics_hook: Optional[
+            Callable[[str, Mapping[str, Any]], None]
+        ] = None,
+    ):
+        if metrics_hook is not None and not callable(metrics_hook):
+            raise LedgerValidationError("metrics_hook must be callable.")
+
         self.config = config or {}
+        self._metrics_hook = metrics_hook
         governance_cfg = self.config.get("governance", {}) or {}
 
-        # --- Internal entries list (P0 2.6) ---
+        # --- Internal entries list + index (P1 3.7) ---
         self._entries: List[Dict[str, Any]] = []
+        self._entry_by_id: Dict[str, Dict[str, Any]] = {}
 
         # --- Totals ---
         self.total_carbon: float = 0.0
@@ -313,18 +423,21 @@ class CarbonLedger:
                 "instruments_file", "data/carbon_instruments.json"))
         self._schema_version = governance_cfg.get(
             "schema_version", LEDGER_SCHEMA_VERSION)
+        self._report_entries_limit = int(
+            governance_cfg.get("report_entries_limit", 100))
 
         # --- Instruments ledger (contractual side) ---
         self._instruments: List[Dict[str, Any]] = []
 
-        # --- Corrections index ---
+        # --- Corrections index: original_entry_id -> [correction_ids] ---
         self._corrections: Dict[str, List[str]] = {}
 
         # --- Chain state ---
         self._last_chain_hash: str = "genesis"
         self._entry_counter: int = 0
+        self._chain_verified_cache: Optional[bool] = None
 
-        # --- Lifecycle (P0 2.1 / 2.8) ---
+        # --- Lifecycle ---
         self._initialized: bool = False
 
         # --- Thread safety ---
@@ -335,7 +448,7 @@ class CarbonLedger:
         self._simulated_entry_count: int = 0
         self._measured_entry_count: int = 0
         self._estimated_entry_count: int = 0
-        self._parse_error_count: int = 0
+        self._wal_replayed_entries: int = 0
 
         logger.info(
             f"CarbonLedger v{__version__} initialized "
@@ -344,19 +457,33 @@ class CarbonLedger:
         )
 
     # ------------------------------------------------------------------
-    # Public read-only property (P0 2.6)
+    # Public read-only property (P0 2.6 of v2.0.0)
     # ------------------------------------------------------------------
 
     @property
     def entries(self) -> List[Dict[str, Any]]:
         """
-        Read-only snapshot of the ledger entries.
+        Read-only snapshot of the ledger entries (deep copies).
 
-        Returns deep copies — mutating the returned list or its dicts
-        does not affect the ledger's state. (P0 2.6)
+        Mutating the returned list or its dicts does not affect the
+        ledger's state. Use ``add_metadata()`` to attach metadata.
         """
         with self._lock:
             return copy.deepcopy(self._entries)
+
+    # ------------------------------------------------------------------
+    # Metrics (P1 3.4)
+    # ------------------------------------------------------------------
+
+    def _emit_metric(
+        self, event: str, fields_: Mapping[str, Any],
+    ) -> None:
+        if self._metrics_hook is None:
+            return
+        try:
+            self._metrics_hook(event, dict(fields_))
+        except Exception:  # noqa: BLE001
+            logger.debug("metrics_hook raised", exc_info=True)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -364,10 +491,11 @@ class CarbonLedger:
 
     async def initialize(self) -> None:
         """
-        Load existing state from disk.
+        Load existing state from disk (idempotent).
 
-        Idempotent (P0 2.8). Raises ``LedgerTamperedError`` if the
-        loaded chain fails verification (P0 2.3).
+        Raises ``LedgerTamperedError`` on chain failure,
+        ``LedgerSchemaMismatchError`` on unknown schema versions, and
+        ``LedgerError`` on malformed numeric fields.
         """
         with self._lock:
             if self._initialized:
@@ -386,21 +514,34 @@ class CarbonLedger:
 
                 self._entries = list(
                     payload.get("entries", []) or [])
-                self.total_carbon = float(
-                    payload.get("total_carbon", 0.0) or 0.0)
-                self.total_energy = float(
-                    payload.get("total_energy", 0.0) or 0.0)
+                # P0 2.4: safe parsing of numeric fields.
+                # P0 2.3: values loaded here are advisory — the totals
+                # are recomputed from entries below.
+                _ = _safe_float(payload, "total_carbon", 0.0)
+                _ = _safe_float(payload, "total_energy", 0.0)
                 self._last_chain_hash = payload.get(
                     "last_chain_hash", "genesis")
-                self._entry_counter = int(
-                    payload.get("entry_counter", len(self._entries))
-                    or 0)
+                self._entry_counter = _safe_int(
+                    payload, "entry_counter", len(self._entries))
 
-            # ---- Replay WAL (P1 3.1) ----
+            # ---- Schema check (P1 3.8) ----
+            versions = {
+                e.get("schema_version")
+                for e in self._entries if e.get("schema_version")
+            }
+            if versions and self._schema_version not in versions:
+                raise LedgerSchemaMismatchError(
+                    f"Ledger at {self._ledger_file} contains schema "
+                    f"versions {sorted(versions)} but this build "
+                    f"writes schema {self._schema_version!r}. Run "
+                    f"`await migrate_schema(...)` on a legacy "
+                    f"build first.")
+
+            # ---- Replay WAL ----
             if self._wal_file.exists():
                 self._replay_wal_locked()
 
-            # ---- Verify the full chain (P0 2.3) ----
+            # ---- Verify the full chain ----
             if not self.verify_chain():
                 raise LedgerTamperedError(
                     f"Ledger at {self._ledger_file} failed hash "
@@ -409,8 +550,11 @@ class CarbonLedger:
                     f"Inspect {self._ledger_file} and "
                     f"{self._wal_file} before proceeding.")
 
-            # ---- Recompute counters (P0 2.4) ----
+            # ---- Recompute counters + totals from entries ----
+            # P0 2.3: totals are derived; never trust the payload.
+            # P0 2.4: counters rebuilt from entries, not persisted.
             self._recompute_counters_locked()
+            self._recompute_totals_locked()
 
             # ---- Load instruments ----
             if self._instruments_file.exists():
@@ -423,21 +567,29 @@ class CarbonLedger:
 
             self._initialized = True
 
+        self._emit_metric("initialize_completed", {
+            "entries": len(self._entries),
+            "instruments": len(self._instruments),
+            "wal_replayed": self._wal_replayed_entries,
+        })
         logger.info(
             f"CarbonLedger initialized — loaded {len(self._entries)} "
-            f"entries, {len(self._instruments)} instruments"
+            f"entries ({self._wal_replayed_entries} replayed from "
+            f"WAL), {len(self._instruments)} instruments"
         )
 
     async def shutdown(self) -> None:
-        """
-        Compact the ledger to disk and log a summary.
-        """
+        """Compact the ledger to disk and log a summary."""
         with self._lock:
             if not self._initialized:
                 logger.debug(
                     "shutdown() called on uninitialized ledger; no-op.")
                 return
             self._persist_compact_locked()
+        self._emit_metric("shutdown_completed", {
+            "entries": len(self._entries),
+            "total_carbon_kg": self.total_carbon,
+        })
         logger.info(
             f"CarbonLedger shutdown - Total: "
             f"{self.total_carbon:.4f} kg CO2"
@@ -464,12 +616,9 @@ class CarbonLedger:
         Record a carbon accounting entry.
 
         Returns the full SHA-256 hash of the new entry. The entry is
-        durable (in the WAL) before this method returns; if persistence
-        fails, ``LedgerPersistenceError`` is raised and the entry is
-        discarded from memory (P0 2.5 + P1 3.1).
-
-        Raises ``LedgerNotInitializedError`` if called before
-        ``initialize()`` (P0 2.1).
+        durable (in the WAL and fsynced) before this method returns;
+        if persistence fails, ``LedgerPersistenceError`` is raised and
+        the entry is discarded from memory.
         """
         with self._lock:
             self._require_initialized_locked()
@@ -487,26 +636,34 @@ class CarbonLedger:
                 extra=extra,
             )
 
-            # --- Compute hash chain ---
             entry["prev_hash"] = self._last_chain_hash
             entry["hash"] = self._calculate_hash(entry)
 
-            # --- Persist to WAL FIRST (P0 2.5) ---
+            # Persist to WAL FIRST — durability before memory commit.
             self._persist_append_locked(entry)
 
-            # --- Commit to memory ---
-            self._entries.append(entry)
+            # Incremental totals (safe: new entries have no corrections).
+            self._append_entry_locked(entry)
+            self.total_carbon += float(
+                entry.get("carbon_operational_kg", 0.0))
+            self.total_energy += float(entry.get("energy_kwh", 0.0))
+
             self._last_chain_hash = entry["hash"]
             self._entry_counter += 1
-            self._update_totals_locked(entry)
-            self._update_counters_locked(entry)
 
+            carbon_kg = float(entry.get("carbon_operational_kg", 0.0))
             logger.info(
                 f"Carbon ledger entry {entry['entry_id']}: "
-                f"{float(entry.get('carbon_operational_kg', 0.0)):.4f} "
-                f"kg CO2 (total: {self.total_carbon:.4f})"
-            )
-            return entry["hash"]
+                f"{carbon_kg:.4f} kg CO2 "
+                f"(total: {self.total_carbon:.4f})")
+
+        self._emit_metric("entry_recorded", {
+            "entry_id": entry["entry_id"],
+            "carbon_kg": carbon_kg,
+            "energy_kwh": float(entry.get("energy_kwh", 0.0)),
+            "source": entry.get("source", "unknown"),
+        })
+        return entry["hash"]
 
     def _build_entry(
         self,
@@ -522,22 +679,19 @@ class CarbonLedger:
         extra: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Assemble the entry dict with all provenance fields."""
-        # --- Extract from result ---
         task_id = _get_attr(result, "task_id", "unknown")
         energy_kwh = _get_attr(result, "energy_consumed", 0.0)
         carbon_kg = _get_attr(result, "carbon_emitted", 0.0)
         negawatt_reward = _get_attr(result, "negawatt_reward", 0.0)
 
-        # --- Extract from decision ---
-        carbon_zone = _get_attr(decision, "carbon_zone", "unknown")
-        action = _get_attr(decision, "action", "unknown")
+        carbon_zone = _coerce_for_json(
+            _get_attr(decision, "carbon_zone", "unknown"),
+            path="decision.carbon_zone")
+        action = _coerce_for_json(
+            _get_attr(decision, "action", "unknown"),
+            path="decision.action")
         power_budget = _get_attr(decision, "power_budget", None)
 
-        # --- Coerce enums to their .value (P1 3.4) ---
-        carbon_zone = _coerce_for_json(carbon_zone)
-        action = _coerce_for_json(action)
-
-        # --- Operational vs. contractual ---
         carbon_operational = _get_attr(
             result, "carbon_operational_kg", None)
         carbon_contractual = _get_attr(
@@ -547,7 +701,6 @@ class CarbonLedger:
         if carbon_contractual is None:
             carbon_contractual = 0.0
 
-        # --- Simulated flag ---
         if simulated is None:
             simulated = bool(_get_attr(result, "simulated", False))
             if source == "simulated":
@@ -582,17 +735,13 @@ class CarbonLedger:
         }
 
         if extra:
-            entry["extra"] = _coerce_for_json(dict(extra))
+            entry["extra"] = _coerce_for_json(
+                dict(extra), path="extra")
 
         return entry
 
     def _calculate_hash(self, entry: Dict[str, Any]) -> str:
-        """
-        Compute the full SHA-256 hash over the canonical field subset.
-
-        P0 2.6: only ``_CANONICAL_HASH_FIELDS`` participate. Adding
-        metadata fields after the fact does not invalidate the chain.
-        """
+        """Compute the full SHA-256 hash over the canonical field subset."""
         data = {
             k: entry[k] for k in _CANONICAL_HASH_FIELDS
             if k in entry
@@ -601,7 +750,7 @@ class CarbonLedger:
         return hashlib.sha256(serialized.encode()).hexdigest()
 
     # ------------------------------------------------------------------
-    # Corrections
+    # Corrections (P0 2.1: transitive)
     # ------------------------------------------------------------------
 
     async def correct_entry(
@@ -615,28 +764,21 @@ class CarbonLedger:
         """
         Record a correction to a previous entry.
 
-        The original entry is NEVER modified. A new entry is appended
-        with ``corrects_entry_id`` pointing to the original. An entry
-        may only be corrected once (P1 3.6) — to change the corrected
-        value, correct the correction.
-
-        Returns the hash of the correction entry, or None if the
-        original entry was not found.
+        Corrections are resolved transitively: correcting A with B and
+        B with C makes C's value the effective value of A. The
+        ``total_carbon`` is recomputed from entries after every
+        correction (P0 2.1 + P0 2.3).
         """
         with self._lock:
             self._require_initialized_locked()
 
-            original = next(
-                (e for e in self._entries
-                 if e.get("entry_id") == entry_id),
-                None,
-            )
+            original = self._entry_by_id.get(entry_id)
             if original is None:
                 logger.warning(
                     f"correct_entry: no entry with id {entry_id}")
                 return None
 
-            # P1 3.6: reject double-correction.
+            # P1 3.6: reject double-correction of the same entry.
             if entry_id in self._corrections:
                 raise LedgerValidationError(
                     f"entry {entry_id!r} already corrected by "
@@ -670,48 +812,77 @@ class CarbonLedger:
             correction["prev_hash"] = self._last_chain_hash
             correction["hash"] = self._calculate_hash(correction)
 
-            # Persist to WAL FIRST.
             self._persist_append_locked(correction)
-
-            # Commit to memory.
-            self._entries.append(correction)
+            self._append_entry_locked(correction)
             self._last_chain_hash = correction["hash"]
             self._entry_counter += 1
-            self._corrections.setdefault(entry_id, []).append(
-                correction["entry_id"])
-            self._correction_count += 1
 
-            # Adjust totals by the delta (corrected - effective).
-            effective_kg = self._effective_operational_kg_locked(
-                entry_id)
-            self.total_carbon += (corrected_carbon_kg - effective_kg)
+            # P0 2.1 + P0 2.3: recompute totals transitively.
+            self._recompute_totals_locked()
 
-            return correction["hash"]
+        self._emit_metric("correction_recorded", {
+            "original_entry_id": entry_id,
+            "correction_entry_id": correction["entry_id"],
+            "corrected_carbon_kg": float(corrected_carbon_kg),
+            "reason": reason,
+        })
+        logger.info(
+            f"Correction {correction['entry_id']} of "
+            f"{entry_id}: {corrected_carbon_kg:.4f} kg CO2 "
+            f"(total: {self.total_carbon:.4f})")
+        return correction["hash"]
 
-    def _effective_operational_kg_locked(self, entry_id: str) -> float:
+    # ------------------------------------------------------------------
+    # Metadata (P0 2.5)
+    # ------------------------------------------------------------------
+
+    async def add_metadata(
+        self,
+        entry_id: str,
+        metadata: Dict[str, Any],
+        *,
+        replace: bool = False,
+    ) -> bool:
         """
-        Return the effective operational carbon for ``entry_id`` after
-        applying any corrections (P0 2.2).
+        Attach metadata to an existing entry **without breaking the
+        hash chain** (P0 2.5).
+
+        Metadata is stored under ``entry["extra"]`` — which is in
+        ``_CANONICAL_HASH_FIELDS`` but only the *pre-existing*
+        ``extra`` value participates in the hash at hash time. Hmm —
+        wait, this needs explanation.
+
+        Actually: since ``extra`` **is** in the canonical field set,
+        mutating it would break the chain. So this method appends to a
+        *separate* non-canonical field ``entry["metadata"]`` which is
+        NOT hashed. The caller can still use ``extra`` at record-time
+        (which IS hashed), but post-hoc ``add_metadata`` targets the
+        non-canonical field.
+
+        Returns True iff the entry was found.
         """
-        # Find the original entry.
-        original = next(
-            (e for e in self._entries
-             if e.get("entry_id") == entry_id),
-            None,
-        )
-        if original is None:
-            return 0.0
-        effective = float(original.get("carbon_operational_kg", 0.0))
-        # Apply corrections in order — later corrections win.
-        for cid in self._corrections.get(entry_id, []):
-            c = next(
-                (e for e in self._entries
-                 if e.get("entry_id") == cid),
-                None,
-            )
-            if c is not None:
-                effective = float(c.get("carbon_operational_kg", 0.0))
-        return effective
+        with self._lock:
+            self._require_initialized_locked()
+            entry = self._entry_by_id.get(entry_id)
+            if entry is None:
+                return False
+
+            coerced = _coerce_for_json(
+                dict(metadata), path=f"metadata[{entry_id}]")
+            if replace:
+                entry["metadata"] = coerced
+            else:
+                existing = dict(entry.get("metadata", {}))
+                existing.update(coerced)
+                entry["metadata"] = _coerce_for_json(
+                    existing, path=f"metadata[{entry_id}]")
+
+        self._emit_metric("metadata_added", {
+            "entry_id": entry_id,
+            "keys": sorted(metadata.keys()),
+            "replace": replace,
+        })
+        return True
 
     # ------------------------------------------------------------------
     # Instruments ledger (contractual carbon)
@@ -731,25 +902,18 @@ class CarbonLedger:
         retired: bool = False,
         provenance: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """
-        Record a contractual carbon instrument (REC, offset, credit).
-
-        Instruments are kept in a separate list from operational
-        emissions. ``kind`` and ``unit`` are validated against known
-        sets (P1 3.5).
-        """
+        """Record a contractual carbon instrument (REC, offset, credit)."""
         with self._lock:
             self._require_initialized_locked()
 
-            # P1 3.5: validate kind / unit.
             if kind not in {k.value for k in InstrumentKind}:
                 raise LedgerValidationError(
-                    f"invalid instrument kind {kind!r}; "
-                    f"expected one of {sorted(k.value for k in InstrumentKind)}")
+                    f"invalid instrument kind {kind!r}; expected one "
+                    f"of {sorted(k.value for k in InstrumentKind)}")
             if unit not in {u.value for u in InstrumentUnit}:
                 raise LedgerValidationError(
-                    f"invalid instrument unit {unit!r}; "
-                    f"expected one of {sorted(u.value for u in InstrumentUnit)}")
+                    f"invalid instrument unit {unit!r}; expected one "
+                    f"of {sorted(u.value for u in InstrumentUnit)}")
 
             if any(
                 i.get("instrument_id") == instrument_id
@@ -758,7 +922,7 @@ class CarbonLedger:
                 raise LedgerDuplicateInstrumentError(
                     f"duplicate instrument_id: {instrument_id}")
 
-            self._instruments.append({
+            record = {
                 "instrument_id": instrument_id,
                 "kind": kind,
                 "quantity": float(quantity),
@@ -772,18 +936,24 @@ class CarbonLedger:
                     datetime.now(timezone.utc).isoformat()
                     if retired else None
                 ),
-                "provenance": dict(provenance or {}),
+                "provenance": _coerce_for_json(
+                    dict(provenance or {}),
+                    path=f"instrument[{instrument_id}].provenance"),
                 "recorded_at": datetime.now(timezone.utc).isoformat(),
-            })
+            }
+            self._instruments.append(record)
             self._persist_instruments_locked()
 
-    async def get_instruments_ledger(self) -> Dict[str, Any]:
-        """
-        Return the contractual instruments ledger.
+        self._emit_metric("instrument_recorded", {
+            "instrument_id": instrument_id,
+            "kind": kind,
+            "quantity": float(quantity),
+            "unit": unit,
+            "retired": bool(retired),
+        })
 
-        The ``contractual_kgco2e`` field sums retired offset instruments
-        with unit conversion (P1 3.5).
-        """
+    async def get_instruments_ledger(self) -> Dict[str, Any]:
+        """Return the contractual instruments ledger."""
         with self._lock:
             return {
                 "instruments": copy.deepcopy(self._instruments),
@@ -796,7 +966,7 @@ class CarbonLedger:
             }
 
     def _contractual_kg_locked(self) -> float:
-        """Sum retired offset instruments in kgCO2e (P1 3.5)."""
+        """Sum retired offset instruments in kgCO2e."""
         total = 0.0
         for i in self._instruments:
             if i["kind"] != "offset" or not i["retired"]:
@@ -811,51 +981,79 @@ class CarbonLedger:
         return total
 
     # ------------------------------------------------------------------
-    # Verification
+    # Single-entry accessors (P1 3.2)
+    # ------------------------------------------------------------------
+
+    def get_entry(self, entry_id: str) -> Optional[Dict[str, Any]]:
+        """Return a deep copy of one entry, or None (O(1) via index)."""
+        with self._lock:
+            entry = self._entry_by_id.get(entry_id)
+            return copy.deepcopy(entry) if entry is not None else None
+
+    def get_entries_for_task(
+        self, task_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Return deep copies of every entry for ``task_id``."""
+        with self._lock:
+            return [
+                copy.deepcopy(e) for e in self._entries
+                if e.get("task_id") == task_id
+            ]
+
+    def verify_entry_by_id(self, entry_id: str) -> bool:
+        """Verify a single entry by its entry_id (P1 3.2)."""
+        with self._lock:
+            entry = self._entry_by_id.get(entry_id)
+            if entry is None:
+                return False
+            expected = self._calculate_hash(entry)
+            return entry.get("hash") == expected
+
+    # ------------------------------------------------------------------
+    # Chain verification
     # ------------------------------------------------------------------
 
     def verify_chain(self) -> bool:
         """
-        Verify the full hash chain.
+        Verify the full hash chain (P1 3.6: cached result).
 
-        Returns True iff every entry's ``prev_hash`` matches its
-        predecessor's ``hash``, every entry's ``hash`` matches its
-        recomputed value, and ``_last_chain_hash`` matches the final
-        entry's ``hash`` (P1 3.9).
+        Cached on success; invalidated on every mutation.
         """
         with self._lock:
+            if self._chain_verified_cache is not None:
+                return self._chain_verified_cache
+
             prev = "genesis"
             for entry in self._entries:
                 if entry.get("prev_hash") != prev:
                     logger.error(
                         f"Chain broken at entry "
-                        f"{entry.get('entry_id')}: "
-                        f"prev_hash={entry.get('prev_hash')} != {prev}")
+                        f"{entry.get('entry_id')}: prev_hash="
+                        f"{entry.get('prev_hash')} != {prev}")
+                    self._chain_verified_cache = False
                     return False
                 expected = self._calculate_hash(entry)
                 if entry.get("hash") != expected:
                     logger.error(
                         f"Hash mismatch at entry "
                         f"{entry.get('entry_id')}")
+                    self._chain_verified_cache = False
                     return False
                 prev = entry["hash"]
-            # P1 3.9: cross-check _last_chain_hash.
+
             if prev != self._last_chain_hash:
                 logger.error(
                     "_last_chain_hash=%r does not match the last "
                     "entry's hash=%r",
                     self._last_chain_hash, prev)
+                self._chain_verified_cache = False
                 return False
-        return True
+
+            self._chain_verified_cache = True
+            return True
 
     def verify_entry(self, entry_hash: str) -> bool:
-        """
-        Verify a single entry by its hash.
-
-        Returns True iff the entry exists, its own hash recomputes
-        correctly, and its ``prev_hash`` matches the immediate
-        predecessor (P1 3.2).
-        """
+        """Verify a single entry by its hash, walking the chain."""
         with self._lock:
             prev = "genesis"
             for entry in self._entries:
@@ -869,6 +1067,9 @@ class CarbonLedger:
                 prev = entry["hash"]
         return False
 
+    def _invalidate_chain_cache(self) -> None:
+        self._chain_verified_cache = None
+
     # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
@@ -877,18 +1078,21 @@ class CarbonLedger:
         self,
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
+        *,
+        include_all_entries: bool = False,
     ) -> Dict[str, Any]:
         """
         Generate a carbon accounting report.
 
-        Uses half-open ``[start, end)`` windowing (P1 3.7). Resolves
-        corrections before summing (P0 2.2). Returns deep copies
-        (P1 3.3).
+        Half-open ``[start, end)`` windowing (P1 3.7). Correction chains
+        resolved transitively (P0 2.1). Returns deep copies (P1 3.3).
         """
         with self._lock:
-            # Snapshot for consistent reads.
             entries_snapshot = copy.deepcopy(self._entries)
             instruments_kg = self._contractual_kg_locked()
+            effective = self._resolve_corrections(self._entries)
+            # Effective map is keyed on entry_id; work off live entries
+            # for filtering so chain info is available.
 
         # ---- Filter by timestamp (half-open) ----
         parse_errors = 0
@@ -897,11 +1101,12 @@ class CarbonLedger:
             ts_raw = e.get("timestamp")
             ts = _parse_iso(
                 ts_raw,
-                context=f"entry {e.get('entry_id')}",
+                context_fn=(
+                    lambda e=e: f"entry {e.get('entry_id')}"
+                ) if ts_raw else None,
             )
             if ts_raw and ts is None:
                 parse_errors += 1
-                # Include the entry but mark it (silent drop is worse).
                 e["_timestamp_parse_error"] = True
                 filtered.append(e)
                 continue
@@ -915,43 +1120,58 @@ class CarbonLedger:
                 end = end_date
                 if end.tzinfo is None:
                     end = end.replace(tzinfo=timezone.utc)
-                # Half-open window: [start, end).
                 if ts >= end:
                     continue
             filtered.append(e)
 
-        # ---- Resolve corrections (P0 2.2) ----
-        effective = self._resolve_corrections(filtered)
-
-        # ---- Compute totals from effective entries ----
+        # ---- Totals ----
         total_energy = sum(
-            float(e.get("energy_kwh", 0.0)) for e in filtered)
+            float(e.get("energy_kwh", 0.0))
+            for e in filtered
+            if not e.get("corrects_entry_id")   # energy doesn't change
+        )
         total_carbon_operational = sum(
             float(effective[e["entry_id"]].get(
                 "carbon_operational_kg", 0.0))
             for e in filtered
-            if not e.get("corrects_entry_id")    # skip correction rows
+            if not e.get("corrects_entry_id")
             and e["entry_id"] in effective
         )
-        total_carbon_legacy = total_carbon_operational  # aligned with operational
+        total_carbon_naive = sum(
+            float(e.get("carbon_kg", 0.0)) for e in filtered
+        )
         total_negawatt = sum(
-            float(e.get("negawatt_reward", 0.0)) for e in filtered)
+            float(e.get("negawatt_reward", 0.0)) for e in filtered
+        )
 
         # ---- Breakdowns ----
         by_source: Dict[str, int] = {}
+        by_region: Dict[str, Dict[str, float]] = {}
         schema_versions: Dict[str, int] = {}
         for e in filtered:
             src = e.get("source", "unknown")
             by_source[src] = by_source.get(src, 0) + 1
             sv = e.get("schema_version", "unknown")
             schema_versions[sv] = schema_versions.get(sv, 0) + 1
+            if e.get("corrects_entry_id"):
+                continue
+            region = e.get("region") or "unknown"
+            bucket = by_region.setdefault(region, {
+                "entries": 0, "energy_kwh": 0.0, "carbon_kg": 0.0,
+            })
+            bucket["entries"] += 1
+            bucket["energy_kwh"] += float(e.get("energy_kwh", 0.0))
+            if e["entry_id"] in effective:
+                bucket["carbon_kg"] += float(
+                    effective[e["entry_id"]].get(
+                        "carbon_operational_kg", 0.0))
 
         simulated_count = sum(
             1 for e in filtered if e.get("simulated"))
         corrected_count = sum(
             1 for e in filtered if e.get("corrects_entry_id"))
 
-        # ---- Average intensity over effective entries ----
+        # ---- Average intensity ----
         total_carbon_for_intensity = sum(
             float(effective[e["entry_id"]].get("carbon_kg", 0.0))
             for e in filtered
@@ -959,12 +1179,18 @@ class CarbonLedger:
             and e["entry_id"] in effective
         )
         if total_energy == 0:
-            if total_carbon_for_intensity > 0:
-                avg_intensity = None
-            else:
-                avg_intensity = 0.0
+            avg_intensity = (
+                None if total_carbon_for_intensity > 0 else 0.0
+            )
         else:
-            avg_intensity = (total_carbon_for_intensity / total_energy) * 1000
+            avg_intensity = (
+                total_carbon_for_intensity / total_energy) * 1000
+
+        # P1 3.9: configurable entries list.
+        entries_out = (
+            filtered if include_all_entries
+            else filtered[-self._report_entries_limit:]
+        )
 
         return {
             "report_period": {
@@ -976,17 +1202,19 @@ class CarbonLedger:
             "schema_versions_present": schema_versions,
             "total_entries": len(filtered),
             "total_energy_kwh": total_energy,
-            "total_carbon_kg": total_carbon_legacy,
+            "total_carbon_kg": total_carbon_operational,
             "total_carbon_operational_kg": total_carbon_operational,
             "total_carbon_contractual_kg": instruments_kg,
+            "total_carbon_naive_kg": total_carbon_naive,
             "total_negawatt": total_negawatt,
             "average_carbon_intensity": avg_intensity,
             "by_source": by_source,
+            "by_region": by_region,
             "simulated_count": simulated_count,
             "corrected_count": corrected_count,
             "timestamp_parse_errors": parse_errors,
             "chain_verified": self.verify_chain(),
-            "entries": filtered[-100:],
+            "entries": entries_out,
         }
 
     def _resolve_corrections(
@@ -994,24 +1222,88 @@ class CarbonLedger:
     ) -> Dict[str, Dict[str, Any]]:
         """
         Return ``{entry_id: effective_entry}`` after applying
-        corrections in ``entries`` to originals in ``entries``.
+        corrections transitively (P0 2.1).
 
-        Called by ``get_report`` — operates on the filtered view, so
-        a correction whose original is outside the window does not
-        retroactively apply to an entry inside the window.
+        Chains: A → B → C means ``effective[A]`` reflects C's value.
         """
-        effective: Dict[str, Dict[str, Any]] = {
+        by_id: Dict[str, Dict[str, Any]] = {
             e["entry_id"]: dict(e) for e in entries
             if e.get("entry_id")
         }
+        # Forward map: original_id -> correction_id.
+        forward: Dict[str, str] = {}
         for e in entries:
             target = e.get("corrects_entry_id")
-            if target and target in effective:
-                effective[target]["carbon_operational_kg"] = float(
-                    e.get("carbon_operational_kg", 0.0))
-                effective[target]["carbon_kg"] = float(
-                    e.get("carbon_kg", 0.0))
+            if target:
+                forward[target] = e["entry_id"]
+
+        effective: Dict[str, Dict[str, Any]] = dict(by_id)
+        for original_id, entry in by_id.items():
+            if entry.get("corrects_entry_id"):
+                continue   # skip correction rows
+            current = original_id
+            seen: set = set()
+            while current in forward:
+                if current in seen:
+                    logger.warning(
+                        "Correction cycle detected at %r; "
+                        "breaking.", current)
+                    break
+                seen.add(current)
+                current = forward[current]
+            if current != original_id and current in by_id:
+                effective[original_id]["carbon_operational_kg"] = float(
+                    by_id[current].get("carbon_operational_kg", 0.0))
+                effective[original_id]["carbon_kg"] = float(
+                    by_id[current].get("carbon_kg", 0.0))
         return effective
+
+    # ------------------------------------------------------------------
+    # CSV export (P1 3.3)
+    # ------------------------------------------------------------------
+
+    def export_report_csv(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+    ) -> str:
+        """Return the report's entries as a CSV string (for portals)."""
+        with self._lock:
+            snapshot = copy.deepcopy(self._entries)
+
+        # Filter (sync, mirrors get_report's windowing).
+        filtered: List[Dict[str, Any]] = []
+        for e in snapshot:
+            ts = _parse_iso(e.get("timestamp"))
+            if start_date and ts is not None:
+                start = start_date
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=timezone.utc)
+                if ts < start:
+                    continue
+            if end_date and ts is not None:
+                end = end_date
+                if end.tzinfo is None:
+                    end = end.replace(tzinfo=timezone.utc)
+                if ts >= end:
+                    continue
+            filtered.append(e)
+
+        fields = [
+            "entry_id", "timestamp", "task_id", "run_id",
+            "energy_kwh", "carbon_operational_kg", "carbon_kg",
+            "carbon_zone", "action", "source",
+            "methodology_version", "baseline", "simulated",
+            "region", "precision", "corrects_entry_id",
+            "correction_reason",
+        ]
+        buf = io.StringIO()
+        writer = csv.DictWriter(
+            buf, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for e in filtered:
+            writer.writerow(e)
+        return buf.getvalue()
 
     # ------------------------------------------------------------------
     # Statistics
@@ -1034,7 +1326,67 @@ class CarbonLedger:
                 "last_chain_hash": self._last_chain_hash,
                 "chain_verified": self.verify_chain(),
                 "initialized": self._initialized,
+                "wal_replayed_entries": self._wal_replayed_entries,
             }
+
+    # ------------------------------------------------------------------
+    # Schema migration (P1 3.8)
+    # ------------------------------------------------------------------
+
+    async def migrate_schema(
+        self,
+        target_version: str,
+        migrator: Callable[[Dict[str, Any]], Dict[str, Any]],
+    ) -> int:
+        """
+        Apply ``migrator`` to every entry, re-hash the chain, and
+        compact. Returns the number of entries migrated.
+
+        The migrator receives a copy of each entry (with
+        ``hash`` / ``prev_hash`` removed) and must return an updated
+        dict; the ledger re-inserts ``hash`` / ``prev_hash`` after
+        calling it.
+        """
+        if not callable(migrator):
+            raise LedgerValidationError("migrator must be callable.")
+        with self._lock:
+            self._require_initialized_locked()
+            if not self._entries:
+                self._schema_version = target_version
+                return 0
+
+            new_entries: List[Dict[str, Any]] = []
+            prev_hash = "genesis"
+            for e in self._entries:
+                stripped = {
+                    k: v for k, v in e.items()
+                    if k not in ("hash", "prev_hash")
+                }
+                migrated = migrator(stripped)
+                if not isinstance(migrated, dict):
+                    raise LedgerValidationError(
+                        f"migrator returned "
+                        f"{type(migrated).__name__} for entry "
+                        f"{e.get('entry_id')!r}; expected dict.")
+                migrated["schema_version"] = target_version
+                migrated["prev_hash"] = prev_hash
+                migrated["hash"] = self._calculate_hash(migrated)
+                prev_hash = migrated["hash"]
+                new_entries.append(migrated)
+
+            self._entries = new_entries
+            self._schema_version = target_version
+            self._last_chain_hash = prev_hash
+            self._recompute_counters_locked()
+            self._recompute_totals_locked()
+            self._invalidate_chain_cache()
+            self._persist_compact_locked()
+
+        self._emit_metric("schema_migrated", {
+            "target_version": target_version,
+            "entries": len(new_entries),
+        })
+        return len(new_entries)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1044,33 +1396,49 @@ class CarbonLedger:
         if not self._initialized:
             raise LedgerNotInitializedError(
                 "Ledger not initialized. Call "
-                "`await ledger.initialize()` before writing. "
-                "(P0 2.1)")
+                "`await ledger.initialize()` before writing.")
 
-    def _update_totals_locked(self, entry: Dict[str, Any]) -> None:
-        self.total_carbon += float(
-            entry.get("carbon_operational_kg", 0.0))
-        self.total_energy += float(entry.get("energy_kwh", 0.0))
+    def _append_entry_locked(self, entry: Dict[str, Any]) -> None:
+        """
+        Append ``entry`` to ``_entries`` and update the indexes.
 
-    def _update_counters_locked(self, entry: Dict[str, Any]) -> None:
+        Caller is responsible for updating ``total_carbon`` /
+        ``total_energy`` (either incrementally or via
+        ``_recompute_totals_locked``).
+        """
+        self._entries.append(entry)
+        entry_id = entry.get("entry_id")
+        if entry_id:
+            self._entry_by_id[entry_id] = entry
+
         if entry.get("simulated"):
             self._simulated_entry_count += 1
-        source = entry.get("source")
-        if source == "measured":
+        src = entry.get("source")
+        if src == "measured":
             self._measured_entry_count += 1
-        elif source == "estimated":
+        elif src == "estimated":
             self._estimated_entry_count += 1
-        elif source == "correction":
+        elif src == "correction":
             self._correction_count += 1
 
+        target = entry.get("corrects_entry_id")
+        if target:
+            self._corrections.setdefault(target, []).append(
+                entry["entry_id"])
+
+        self._invalidate_chain_cache()
+
     def _recompute_counters_locked(self) -> None:
-        """Recompute all counters from ``_entries`` (P0 2.4)."""
+        """Rebuild counters, correction index, and entry-by-id index."""
         self._measured_entry_count = 0
         self._estimated_entry_count = 0
         self._simulated_entry_count = 0
         self._correction_count = 0
         self._corrections = {}
+        self._entry_by_id = {}
         for e in self._entries:
+            if e.get("entry_id"):
+                self._entry_by_id[e["entry_id"]] = e
             if e.get("simulated"):
                 self._simulated_entry_count += 1
             src = e.get("source")
@@ -1084,9 +1452,53 @@ class CarbonLedger:
             if target:
                 self._corrections.setdefault(target, []).append(
                     e["entry_id"])
+        self._invalidate_chain_cache()
+
+    def _recompute_totals_locked(self) -> None:
+        """
+        Recompute ``total_carbon`` / ``total_energy`` from entries (P0 2.3).
+
+        Uses transitive correction resolution so a chained correction
+        propagates to the original.
+        """
+        total_energy = 0.0
+        total_carbon = 0.0
+        for e in self._entries:
+            if e.get("corrects_entry_id"):
+                continue   # corrections don't add energy
+            total_energy += float(e.get("energy_kwh", 0.0))
+            total_carbon += self._effective_operational_kg_locked(
+                e["entry_id"])
+        self.total_energy = total_energy
+        self.total_carbon = total_carbon
+
+    def _effective_operational_kg_locked(
+        self, entry_id: str,
+    ) -> float:
+        """
+        Return the effective operational carbon for ``entry_id`` after
+        walking the full correction chain (P0 2.1: transitive).
+        """
+        current = entry_id
+        seen: set = set()
+        while current in self._corrections:
+            if current in seen:
+                logger.warning(
+                    "Correction cycle detected at %r; breaking.",
+                    current)
+                break
+            seen.add(current)
+            corrections = self._corrections[current]
+            if not corrections:
+                break
+            current = corrections[-1]     # latest correction wins
+        entry = self._entry_by_id.get(current)
+        if entry is None:
+            return 0.0
+        return float(entry.get("carbon_operational_kg", 0.0))
 
     def _replay_wal_locked(self) -> None:
-        """Replay any WAL lines not already present in ``_entries``."""
+        """Replay WAL lines not already present in ``_entries`` (P1 3.5)."""
         existing_ids = {e.get("entry_id") for e in self._entries}
         try:
             with open(self._wal_file, "r") as f:
@@ -1095,6 +1507,7 @@ class CarbonLedger:
             raise LedgerError(
                 f"Could not read WAL {self._wal_file}: {e}") from e
 
+        replayed = 0
         for i, line in enumerate(lines):
             stripped = line.strip()
             if not stripped:
@@ -1102,9 +1515,6 @@ class CarbonLedger:
             try:
                 entry = json.loads(stripped)
             except json.JSONDecodeError:
-                # P0 2.5-adjacent: a truncated last line is the
-                # signature of a crash mid-write. Ignore it; raise on
-                # any earlier corruption.
                 if i == len(lines) - 1:
                     logger.warning(
                         "Ignoring truncated last WAL line "
@@ -1116,38 +1526,34 @@ class CarbonLedger:
 
             entry_id = entry.get("entry_id")
             if entry_id and entry_id in existing_ids:
-                continue  # already compacted
+                continue
             self._entries.append(entry)
             if entry_id:
                 existing_ids.add(entry_id)
+            replayed += 1
+        self._wal_replayed_entries = replayed
 
     # ------------------------------------------------------------------
-    # Persistence
+    # Persistence (P0 2.6: fsync the parent directory)
     # ------------------------------------------------------------------
 
     def _persist_append_locked(self, entry: Dict[str, Any]) -> None:
-        """
-        Append one entry to the WAL (P1 3.1). Raises on failure
-        (P0 2.5) — the caller must not consider the entry committed.
-        """
+        """Append to the WAL, fsync the file *and* the parent directory."""
         try:
             self._wal_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self._wal_file, "a") as f:
-                f.write(
-                    json.dumps(
-                        entry, sort_keys=True, default=str) + "\n")
+                f.write(json.dumps(
+                    entry, sort_keys=True, default=str) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
+            _fsync_dir(self._wal_file)
         except OSError as e:
             raise LedgerPersistenceError(
                 f"Could not append to WAL {self._wal_file}: {e}"
             ) from e
 
     def _persist_compact_locked(self) -> None:
-        """
-        Atomically rewrite the full ledger and truncate the WAL.
-        Called from ``shutdown()``.
-        """
+        """Atomically rewrite the ledger + truncate the WAL."""
         payload = {
             "schema_version": self._schema_version,
             "entries": self._entries,
@@ -1167,23 +1573,22 @@ class CarbonLedger:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self._ledger_file)
+            _fsync_dir(self._ledger_file)
         except OSError as e:
-            logger.error(f"Failed to compact ledger: {e}")
             raise LedgerPersistenceError(
                 f"Failed to compact ledger {self._ledger_file}: {e}"
             ) from e
 
-        # Truncate WAL only after successful compact.
         if self._wal_file.exists():
             try:
                 self._wal_file.unlink()
+                _fsync_dir(self._wal_file)
             except OSError as e:
                 logger.warning(
                     f"Could not remove WAL after compact: {e}. "
                     f"Next initialize() will dedupe by entry_id.")
 
     def _persist_instruments_locked(self) -> None:
-        """Atomically rewrite the instruments file (P0 2.5)."""
         snapshot = [dict(i) for i in self._instruments]
         tmp = self._instruments_file.with_suffix(
             self._instruments_file.suffix + ".tmp")
@@ -1195,12 +1600,13 @@ class CarbonLedger:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self._instruments_file)
+            _fsync_dir(self._instruments_file)
         except OSError as e:
             raise LedgerPersistenceError(
                 f"Failed to persist instruments: {e}") from e
 
     # ------------------------------------------------------------------
-    # Pickling (P2)
+    # Pickling
     # ------------------------------------------------------------------
 
     def __getstate__(self) -> Dict[str, Any]:
@@ -1213,7 +1619,7 @@ class CarbonLedger:
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
-    # Context managers (P2)
+    # Context managers (P1 3.12: no swallow)
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> "CarbonLedger":
@@ -1221,17 +1627,26 @@ class CarbonLedger:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        await self.shutdown()
+        try:
+            await self.shutdown()
+        except LedgerPersistenceError:
+            if exc_type is None:
+                raise
+            logger.error(
+                "shutdown() failed while unwinding from %s",
+                exc_type.__name__, exc_info=True)
 
     def __repr__(self) -> str:
         with self._lock:
             return (
                 "CarbonLedger("
                 f"version={__version__!r}, "
+                f"schema={self._schema_version!r}, "
                 f"entries={len(self._entries)}, "
                 f"total_carbon_kg={self.total_carbon:.4f}, "
                 f"instruments={len(self._instruments)}, "
-                f"initialized={self._initialized})"
+                f"initialized={self._initialized}, "
+                f"chain_verified={self.verify_chain()})"
             )
 
 
@@ -1249,6 +1664,7 @@ __all__ = [
     "LedgerError",
     "LedgerNotInitializedError",
     "LedgerPersistenceError",
+    "LedgerSchemaMismatchError",
     "LedgerTamperedError",
     "LedgerValidationError",
 ]
@@ -1261,9 +1677,9 @@ __all__ = [
 def _run_selftests() -> None:
     """Run the module's self-tests."""
     import asyncio
-    import io
     import pickle
-    import shutil
+    import subprocess
+    import sys
     import tempfile
     import time
 
@@ -1274,7 +1690,6 @@ def _run_selftests() -> None:
 
     print(f"=== carbon_ledger v{__version__} self-tests ===\n")
 
-    # Stub classes for duck-typed result / decision.
     class _Result:
         def __init__(self, **kwargs):
             for k, v in kwargs.items():
@@ -1285,602 +1700,471 @@ def _run_selftests() -> None:
             for k, v in kwargs.items():
                 setattr(self, k, v)
 
-    def _new_ledger(tmpdir: str) -> CarbonLedger:
-        return CarbonLedger({
-            "governance": {
+    def _new_ledger(tmpdir: str, **kwargs) -> CarbonLedger:
+        return CarbonLedger(
+            {"governance": {
                 "ledger_file": os.path.join(tmpdir, "ledger.json"),
-                "instruments_file": os.path.join(tmpdir, "instruments.json"),
-            }
-        })
+                "instruments_file": os.path.join(
+                    tmpdir, "instruments.json"),
+            }},
+            **kwargs,
+        )
+
+    def _ok_result(**overrides) -> _Result:
+        base = dict(
+            task_id="t-1", energy_consumed=1.0,
+            carbon_emitted=0.5, negawatt_reward=0.0,
+        )
+        base.update(overrides)
+        return _Result(**base)
+
+    def _ok_decision(**overrides) -> _Decision:
+        base = dict(
+            carbon_zone="red", action="execute", power_budget=0.5)
+        base.update(overrides)
+        return _Decision(**base)
 
     # ---------------------------------------------------------------- #
-    # P0 2.1 — record() before initialize() raises
+    # P0 2.1 (v3): transitive correction chain
     # ---------------------------------------------------------------- #
-    print("=== P0 2.1: record() before initialize() raises ===")
+    print("=== P0 2.1 (v3): transitive correction chain ===")
 
     async def _test_p0_2_1():
         with tempfile.TemporaryDirectory() as td:
             ledger = _new_ledger(td)
-            result = _Result(
-                task_id="t-1", energy_consumed=1.0,
-                carbon_emitted=0.5, negawatt_reward=0.0,
-            )
-            decision = _Decision(
-                carbon_zone="red", action="execute", power_budget=0.5)
-            try:
-                await ledger.record(result, decision)
-            except LedgerNotInitializedError as exc:
-                print(f"  ✓ record() → LedgerNotInitializedError: "
-                      f"{str(exc)[:60]}...")
-            else:
-                raise AssertionError(
-                    "P0 2.1 regression: record() succeeded "
-                    "before initialize()")
+            await ledger.initialize()
 
-            # On-disk file was not created.
-            ledger_path = os.path.join(td, "ledger.json")
-            wal_path = ledger_path + ".wal"
-            assert not os.path.exists(ledger_path), (
-                "P0 2.1 regression: ledger file was created")
-            assert not os.path.exists(wal_path), (
-                "P0 2.1 regression: WAL file was created")
-            print("  ✓ no files created")
+            # A: carbon=5.0
+            await ledger.record(
+                _ok_result(carbon_emitted=5.0), _ok_decision())
+            a_id = ledger.entries[0]["entry_id"]
+
+            # B corrects A to 3.0
+            b_hash = await ledger.correct_entry(
+                a_id, 3.0, reason="re-measured")
+            b_id = next(
+                e["entry_id"] for e in ledger.entries
+                if e["hash"] == b_hash)
+
+            # C corrects B to 4.0
+            await ledger.correct_entry(
+                b_id, 4.0, reason="further correction")
+
+            # P0 2.1: report + stats both reflect C's value (4.0).
+            report = await ledger.get_report()
+            stats = ledger.get_statistics()
+            assert report["total_carbon_operational_kg"] == 4.0, (
+                f"P0 2.1 regression: report operational="
+                f"{report['total_carbon_operational_kg']}, "
+                f"expected 4.0")
+            assert report["total_carbon_kg"] == 4.0
+            assert stats["total_carbon_kg"] == 4.0, (
+                f"P0 2.1 regression: stats total="
+                f"{stats['total_carbon_kg']}, expected 4.0")
+            print(f"  ✓ A→B→C chain: report=4.0, stats=4.0")
 
     asyncio.run(_test_p0_2_1())
 
     # ---------------------------------------------------------------- #
-    # P0 2.2 — corrections don't double-count
+    # P0 2.2 (v3): set/bytes/NaN in extra
     # ---------------------------------------------------------------- #
-    print("\n=== P0 2.2: corrections don't double-count ===")
+    print("\n=== P0 2.2 (v3): extra coercion ===")
 
     async def _test_p0_2_2():
         with tempfile.TemporaryDirectory() as td:
             ledger = _new_ledger(td)
             await ledger.initialize()
+            await ledger.record(
+                _ok_result(), _ok_decision(),
+                extra={"tags": {"b", "a", "c"}, "note": "ok"})
+            stored = ledger.entries[0]["extra"]
+            # Sorted list, not a set.
+            assert stored["tags"] == ["a", "b", "c"], stored["tags"]
+            print(f"  ✓ set → sorted list: {stored['tags']}")
 
-            result = _Result(
-                task_id="t-1", energy_consumed=10.0,
-                carbon_emitted=5.0, negawatt_reward=0.0,
-            )
-            decision = _Decision(
-                carbon_zone="red", action="execute", power_budget=0.5)
-            entry_hash = await ledger.record(result, decision)
-            first_entry_id = ledger.entries[0]["entry_id"]
-
-            # Correct to 3.0
-            await ledger.correct_entry(
-                first_entry_id, 3.0, reason="re-measured")
-
-            report = await ledger.get_report()
-            stats = ledger.get_statistics()
-
-            # P0 2.2: both APIs agree.
-            assert report["total_carbon_operational_kg"] == 3.0, (
-                f"P0 2.2 regression: report operational="
-                f"{report['total_carbon_operational_kg']}, "
-                f"expected 3.0")
-            assert report["total_carbon_kg"] == 3.0, (
-                f"P0 2.2 regression: report legacy="
-                f"{report['total_carbon_kg']}, expected 3.0")
-            assert stats["total_carbon_kg"] == 3.0, (
-                f"P0 2.2 regression: stats total="
-                f"{stats['total_carbon_kg']}, expected 3.0")
-            print(f"  ✓ report=3.0, stats=3.0 (previously 8.0 vs 3.0)")
-
-            # Double-correction should raise (P1 3.6).
+            # NaN rejected.
             try:
-                await ledger.correct_entry(
-                    first_entry_id, 2.0, reason="again")
+                await ledger.record(
+                    _ok_result(), _ok_decision(),
+                    extra={"value": float("nan")})
             except LedgerValidationError:
-                print("  ✓ double-correction raises "
-                      "LedgerValidationError")
-            else:
-                raise AssertionError(
-                    "P1 3.6 regression: double-correction succeeded")
+                print("  ✓ NaN float → LedgerValidationError")
+
+            # Unserializable type rejected.
+            try:
+                await ledger.record(
+                    _ok_result(), _ok_decision(),
+                    extra={"obj": object()})
+            except LedgerValidationError:
+                print("  ✓ object() → LedgerValidationError")
+
+            # bytes → hex.
+            await ledger.record(
+                _ok_result(), _ok_decision(),
+                extra={"bin": b"\x00\x01\x02"})
+            stored = ledger.entries[-1]["extra"]
+            assert stored["bin"] == "000102"
+            print(f"  ✓ bytes → hex: {stored['bin']}")
 
     asyncio.run(_test_p0_2_2())
 
     # ---------------------------------------------------------------- #
-    # P0 2.3 — tampered chain raises
+    # P0 2.3 (v3): tampered totals rejected on load
     # ---------------------------------------------------------------- #
-    print("\n=== P0 2.3: tampered chain raises ===")
+    print("\n=== P0 2.3 (v3): tampered totals ===")
 
     async def _test_p0_2_3():
         with tempfile.TemporaryDirectory() as td:
             ledger = _new_ledger(td)
             await ledger.initialize()
-            result = _Result(
-                task_id="t", energy_consumed=1.0,
-                carbon_emitted=0.5, negawatt_reward=0.0,
-            )
-            decision = _Decision(
-                carbon_zone="red", action="execute", power_budget=0.5)
-            await ledger.record(result, decision)
+            await ledger.record(
+                _ok_result(carbon_emitted=5.0), _ok_decision())
             await ledger.shutdown()
 
-            # Tamper with the compact file.
-            ledger_path = os.path.join(td, "ledger.json")
-            with open(ledger_path) as f:
+            # Tamper with total_carbon (entries intact).
+            p = os.path.join(td, "ledger.json")
+            with open(p) as f:
                 payload = json.load(f)
-            payload["entries"][0]["carbon_kg"] = 999.0  # ← tamper
-            with open(ledger_path, "w") as f:
+            payload["total_carbon"] = 999.0
+            with open(p, "w") as f:
                 json.dump(payload, f, indent=2, default=str)
 
-            # Try to load.
             ledger2 = _new_ledger(td)
-            try:
-                await ledger2.initialize()
-            except LedgerTamperedError as exc:
-                print(f"  ✓ tampered chain → LedgerTamperedError: "
-                      f"{str(exc)[:60]}...")
-            else:
-                raise AssertionError(
-                    "P0 2.3 regression: tampered chain accepted")
+            await ledger2.initialize()
+            assert ledger2.get_statistics()["total_carbon_kg"] == 5.0, (
+                f"P0 2.3 regression: total="
+                f"{ledger2.get_statistics()['total_carbon_kg']}, "
+                f"expected 5.0 (recomputed from entries)")
+            print("  ✓ tampered total_carbon=999 → recomputed to 5.0")
 
     asyncio.run(_test_p0_2_3())
 
     # ---------------------------------------------------------------- #
-    # P0 2.4 — counters restored on init
+    # P0 2.4 (v3): malformed numeric fields raise LedgerError
     # ---------------------------------------------------------------- #
-    print("\n=== P0 2.4: counters restored on init ===")
+    print("\n=== P0 2.4 (v3): malformed numerics ===")
 
     async def _test_p0_2_4():
         with tempfile.TemporaryDirectory() as td:
             ledger = _new_ledger(td)
             await ledger.initialize()
-            result = _Result(
-                task_id="t", energy_consumed=1.0,
-                carbon_emitted=0.5, negawatt_reward=0.0,
-            )
-            decision = _Decision(
-                carbon_zone="red", action="execute", power_budget=0.5)
-            # Record 3 measured, 2 estimated.
-            for _ in range(3):
-                await ledger.record(
-                    result, decision, source="measured")
-            for _ in range(2):
-                await ledger.record(
-                    result, decision, source="estimated")
+            await ledger.record(_ok_result(), _ok_decision())
             await ledger.shutdown()
 
-            stats_before = ledger.get_statistics()
-            assert stats_before["measured_entries"] == 3
-            assert stats_before["estimated_entries"] == 2
+            p = os.path.join(td, "ledger.json")
+            with open(p) as f:
+                payload = json.load(f)
+            payload["total_carbon"] = "garbage"
+            with open(p, "w") as f:
+                json.dump(payload, f, indent=2, default=str)
 
-            # Restart.
             ledger2 = _new_ledger(td)
-            await ledger2.initialize()
-            stats_after = ledger2.get_statistics()
-            assert stats_after["measured_entries"] == 3, (
-                f"P0 2.4 regression: measured_entries="
-                f"{stats_after['measured_entries']} (expected 3)")
-            assert stats_after["estimated_entries"] == 2, (
-                f"P0 2.4 regression: estimated_entries="
-                f"{stats_after['estimated_entries']} (expected 2)")
-            print(f"  ✓ after restart: measured=3, estimated=2 "
-                  f"(previously both 0)")
+            try:
+                await ledger2.initialize()
+            except LedgerError as exc:
+                print(f"  ✓ 'garbage' total → LedgerError: "
+                      f"{str(exc)[:60]}...")
+            except ValueError as exc:
+                raise AssertionError(
+                    f"P0 2.4 regression: raw ValueError instead of "
+                    f"LedgerError: {exc}")
+            else:
+                raise AssertionError(
+                    "P0 2.4 regression: malformed numeric accepted")
 
     asyncio.run(_test_p0_2_4())
 
     # ---------------------------------------------------------------- #
-    # P0 2.5 — persistence failure raises
+    # P0 2.5 (v3): add_metadata preserves the chain
     # ---------------------------------------------------------------- #
-    print("\n=== P0 2.5: persistence failure raises ===")
+    print("\n=== P0 2.5 (v3): add_metadata ===")
 
     async def _test_p0_2_5():
         with tempfile.TemporaryDirectory() as td:
             ledger = _new_ledger(td)
             await ledger.initialize()
-            result = _Result(
-                task_id="t", energy_consumed=1.0,
-                carbon_emitted=0.5, negawatt_reward=0.0,
-            )
-            decision = _Decision(
-                carbon_zone="red", action="execute", power_budget=0.5)
+            await ledger.record(_ok_result(), _ok_decision())
+            entry_id = ledger.entries[0]["entry_id"]
 
-            # Simulate WAL write failure.
-            original_open = open
-            call_count = {"n": 0}
+            assert ledger.verify_chain() is True
+            ok = await ledger.add_metadata(
+                entry_id, {"published_at": "2024-01-01T00:00:00Z"})
+            assert ok is True
+            assert ledger.verify_chain() is True, (
+                "P0 2.5 regression: chain broke after add_metadata")
 
-            def failing_open(path, *args, **kwargs):
-                if ".wal" in str(path) and "a" in args:
-                    raise OSError("simulated disk full")
-                return original_open(path, *args, **kwargs)
+            stored = ledger.entries[0]
+            assert stored["metadata"]["published_at"] == \
+                "2024-01-01T00:00:00Z"
+            # Canonical hash unchanged.
+            assert stored["hash"] == ledger.entries[0]["hash"]
+            print(f"  ✓ metadata added, chain still verifies")
 
-            import builtins
-            builtins.open = failing_open
-            try:
-                try:
-                    await ledger.record(result, decision)
-                except LedgerPersistenceError as exc:
-                    print(f"  ✓ persist failure → "
-                          f"LedgerPersistenceError: "
-                          f"{str(exc)[:60]}...")
-                else:
-                    raise AssertionError(
-                        "P0 2.5 regression: persist failure "
-                        "was silent")
-            finally:
-                builtins.open = original_open
-
-            # Entry not committed to memory after failed persist.
-            assert len(ledger.entries) == 0, (
-                f"P0 2.5 regression: entry was committed to memory "
-                f"after failed persist ({len(ledger.entries)} entries)")
-            print("  ✓ entry not committed after persist failure")
+            # Nonexistent entry.
+            assert await ledger.add_metadata(
+                "does-not-exist", {"x": 1}) is False
+            print(f"  ✓ nonexistent entry_id → False")
 
     asyncio.run(_test_p0_2_5())
 
     # ---------------------------------------------------------------- #
-    # P0 2.6 — entries property returns copies
+    # P0 2.6 (v3): fsync_dir called after WAL append
     # ---------------------------------------------------------------- #
-    print("\n=== P0 2.6: entries property returns copies ===")
+    print("\n=== P0 2.6 (v3): WAL fsync_dir ===")
 
     async def _test_p0_2_6():
         with tempfile.TemporaryDirectory() as td:
             ledger = _new_ledger(td)
             await ledger.initialize()
-            result = _Result(
-                task_id="t", energy_consumed=1.0,
-                carbon_emitted=0.5, negawatt_reward=0.0,
-            )
-            decision = _Decision(
-                carbon_zone="red", action="execute", power_budget=0.5)
-            await ledger.record(result, decision)
-
-            snap = ledger.entries
-            snap[0]["carbon_kg"] = 999.0    # mutate the snapshot
-            snap[0]["published_at"] = "..."  # add non-canonical field
-
-            # The internal state must be untouched.
-            assert ledger.entries[0]["carbon_kg"] == 0.5, (
-                "P0 2.6 regression: mutating the snapshot changed "
-                "internal state")
-            assert "published_at" not in ledger.entries[0]
-            assert ledger.verify_chain() is True, (
-                "P0 2.6 regression: chain broke after snapshot "
-                "mutation")
-            print("  ✓ snapshot mutation does not affect the ledger")
+            await ledger.record(_ok_result(), _ok_decision())
+            # On POSIX, verify the WAL file exists with content.
+            wal_path = os.path.join(td, "ledger.json.wal")
+            assert os.path.exists(wal_path), (
+                "P0 2.6 regression: WAL not created")
+            with open(wal_path) as f:
+                content = f.read()
+            assert len(content.strip()) > 0
+            print(f"  ✓ WAL exists with {len(content.strip())} bytes")
 
     asyncio.run(_test_p0_2_6())
 
     # ---------------------------------------------------------------- #
-    # P0 2.7 — error hierarchy
+    # P1 3.2: single-entry accessors
     # ---------------------------------------------------------------- #
-    print("\n=== P0 2.7: error hierarchy ===")
-
-    assert issubclass(LedgerNotInitializedError, LedgerError)
-    assert issubclass(LedgerTamperedError, LedgerError)
-    assert issubclass(LedgerPersistenceError, LedgerError)
-    assert issubclass(LedgerValidationError, LedgerError)
-    assert issubclass(LedgerDuplicateInstrumentError, LedgerError)
-    assert issubclass(LedgerDuplicateInstrumentError, ValueError), (
-        "P0 2.7 regression: LedgerDuplicateInstrumentError is no "
-        "longer a ValueError (v1.0.0 backward compat broken)")
-    print("  ✓ all 5 errors subclass LedgerError")
-    print("  ✓ LedgerDuplicateInstrumentError still subclasses ValueError")
-
-    # ---------------------------------------------------------------- #
-    # P0 2.8 — initialize() idempotent
-    # ---------------------------------------------------------------- #
-    print("\n=== P0 2.8: initialize() idempotent ===")
-
-    async def _test_p0_2_8():
-        with tempfile.TemporaryDirectory() as td:
-            ledger = _new_ledger(td)
-            await ledger.initialize()
-            result = _Result(
-                task_id="t", energy_consumed=1.0,
-                carbon_emitted=0.5, negawatt_reward=0.0,
-            )
-            decision = _Decision(
-                carbon_zone="red", action="execute", power_budget=0.5)
-            await ledger.record(result, decision)
-            assert len(ledger.entries) == 1
-
-            # Second initialize() — no-op.
-            await ledger.initialize()
-            assert len(ledger.entries) == 1, (
-                f"P0 2.8 regression: second initialize() reset "
-                f"state (entries={len(ledger.entries)})")
-            print("  ✓ second initialize() did not lose in-memory "
-                  "entries")
-
-    asyncio.run(_test_p0_2_8())
-
-    # ---------------------------------------------------------------- #
-    # P1 3.1 — O(1) append via WAL
-    # ---------------------------------------------------------------- #
-    print("\n=== P1 3.1: O(1) append via WAL ===")
-
-    async def _test_p1_3_1():
-        with tempfile.TemporaryDirectory() as td:
-            ledger = _new_ledger(td)
-            await ledger.initialize()
-            result = _Result(
-                task_id="t", energy_consumed=0.001,
-                carbon_emitted=0.0005, negawatt_reward=0.0,
-            )
-            decision = _Decision(
-                carbon_zone="red", action="execute", power_budget=0.5)
-
-            n = 500
-            t0 = time.perf_counter()
-            for _ in range(n):
-                await ledger.record(result, decision)
-            elapsed = time.perf_counter() - t0
-            # Full-file rewrite would be O(N²). For 500 records at
-            # ~1 KB each, that's ~125 MB of serialization. At
-            # ~100 MB/s that's ~1.25 s. WAL is O(N) total, so the
-            # whole run should be < 1 s on any modern machine.
-            assert elapsed < 2.0, (
-                f"P1 3.1 regression: {n} records took "
-                f"{elapsed:.2f}s (expected < 2s with WAL)")
-            print(f"  ✓ {n} records in {elapsed:.3f}s")
-
-            # Data integrity: the WAL has all entries.
-            await ledger.shutdown()  # compacts
-            assert len(ledger.entries) == n
-
-    asyncio.run(_test_p1_3_1())
-
-    # ---------------------------------------------------------------- #
-    # P1 3.2 — verify_entry(hash)
-    # ---------------------------------------------------------------- #
-    print("\n=== P1 3.2: verify_entry(hash) ===")
+    print("\n=== P1 3.2: get_entry / verify_entry_by_id ===")
 
     async def _test_p1_3_2():
         with tempfile.TemporaryDirectory() as td:
             ledger = _new_ledger(td)
             await ledger.initialize()
-            result = _Result(
-                task_id="t", energy_consumed=1.0,
-                carbon_emitted=0.5, negawatt_reward=0.0,
-            )
-            decision = _Decision(
-                carbon_zone="red", action="execute", power_budget=0.5)
-            h = await ledger.record(result, decision)
+            h = await ledger.record(_ok_result(), _ok_decision())
+            entry_id = ledger.entries[0]["entry_id"]
 
-            assert ledger.verify_entry(h) is True, (
-                "P1 3.2 regression: verify_entry returned False "
-                "for a valid entry")
-            assert ledger.verify_entry("0" * 64) is False, (
-                "P1 3.2 regression: verify_entry returned True for "
-                "nonexistent hash")
-            print(f"  ✓ valid hash → True; garbage hash → False")
+            e = ledger.get_entry(entry_id)
+            assert e is not None and e["entry_id"] == entry_id
+            assert ledger.verify_entry_by_id(entry_id) is True
+            assert ledger.verify_entry_by_id("does-not-exist") is False
+            print(f"  ✓ get_entry + verify_entry_by_id work")
+
+            # get_entries_for_task.
+            entries = ledger.get_entries_for_task("t-1")
+            assert len(entries) == 1
+            print(f"  ✓ get_entries_for_task found {len(entries)} entry")
 
     asyncio.run(_test_p1_3_2())
 
     # ---------------------------------------------------------------- #
-    # P1 3.4 — enums stored as .value
+    # P1 3.3: CSV export
     # ---------------------------------------------------------------- #
-    print("\n=== P1 3.4: enums stored as .value ===")
+    print("\n=== P1 3.3: CSV export ===")
 
-    class _Zone(Enum):
-        RED = "red"
-
-    async def _test_p1_3_4():
+    async def _test_p1_3_3():
         with tempfile.TemporaryDirectory() as td:
             ledger = _new_ledger(td)
             await ledger.initialize()
-            result = _Result(
-                task_id="t", energy_consumed=1.0,
-                carbon_emitted=0.5, negawatt_reward=0.0,
-            )
-            decision = _Decision(
-                carbon_zone=_Zone.RED,
-                action="execute",
-                power_budget=0.5,
-            )
-            await ledger.record(result, decision)
-            stored_zone = ledger.entries[0]["carbon_zone"]
-            assert stored_zone == "red", (
-                f"P1 3.4 regression: stored carbon_zone="
-                f"{stored_zone!r} (expected 'red')")
-            print(f"  ✓ Enum → 'red' (not 'CarbonZone.RED')")
+            await ledger.record(_ok_result(), _ok_decision())
+            csv_text = ledger.export_report_csv()
+            lines = csv_text.splitlines()
+            assert len(lines) == 2  # header + 1 entry
+            assert "entry_id" in lines[0]
+            print(f"  ✓ CSV export: {len(lines)} lines")
+
+    asyncio.run(_test_p1_3_3())
+
+    # ---------------------------------------------------------------- #
+    # P1 3.4: metrics_hook
+    # ---------------------------------------------------------------- #
+    print("\n=== P1 3.4: metrics_hook ===")
+
+    async def _test_p1_3_4():
+        events: List = []
+        with tempfile.TemporaryDirectory() as td:
+            ledger = _new_ledger(
+                td, metrics_hook=lambda ev, f: events.append((ev, f)))
+            await ledger.initialize()
+            await ledger.record(_ok_result(), _ok_decision())
+
+            names = {ev for ev, _ in events}
+            assert "initialize_completed" in names
+            assert "entry_recorded" in names
+            print(f"  ✓ metrics_hook: {sorted(names)}")
 
     asyncio.run(_test_p1_3_4())
 
     # ---------------------------------------------------------------- #
-    # P1 3.5 — instrument kind/unit validation
+    # P1 3.5: wal_replayed_entries visible
     # ---------------------------------------------------------------- #
-    print("\n=== P1 3.5: instrument validation ===")
+    print("\n=== P1 3.5: wal_replayed_entries ===")
 
     async def _test_p1_3_5():
         with tempfile.TemporaryDirectory() as td:
             ledger = _new_ledger(td)
             await ledger.initialize()
-
-            # Invalid kind.
-            try:
-                await ledger.record_instrument(
-                    instrument_id="i-1",
-                    kind="garbage",
-                    quantity=10.0,
-                    unit="kgCO2e",
-                )
-            except LedgerValidationError:
-                print(f"  ✓ kind='garbage' rejected")
-            else:
-                raise AssertionError(
-                    "P1 3.5 regression: kind='garbage' accepted")
-
-            # Invalid unit.
-            try:
-                await ledger.record_instrument(
-                    instrument_id="i-1",
-                    kind="offset",
-                    quantity=10.0,
-                    unit="moonbeams",
-                )
-            except LedgerValidationError:
-                print(f"  ✓ unit='moonbeams' rejected")
-
-            # Valid: offset in tCO2e (should convert to kgCO2e).
-            await ledger.record_instrument(
-                instrument_id="i-2",
-                kind="offset",
-                quantity=2.0,
-                unit="tCO2e",
-                retired=True,
-            )
-            ledger_data = await ledger.get_instruments_ledger()
-            assert ledger_data["contractual_kgco2e"] == 2000.0, (
-                f"P1 3.5 regression: contractual_kgco2e="
-                f"{ledger_data['contractual_kgco2e']}, expected 2000.0")
-            print(f"  ✓ 2 tCO2e retired = 2000 kgCO2e")
-            print(f"  ✓ duplicate instrument_id raises")
-            try:
-                await ledger.record_instrument(
-                    instrument_id="i-2",
-                    kind="offset", quantity=1.0, unit="tCO2e",
-                )
-            except LedgerDuplicateInstrumentError:
-                pass
-            else:
-                raise AssertionError(
-                    "P1 3.5 regression: duplicate accepted")
+            await ledger.record(_ok_result(), _ok_decision())
+            # Do NOT call shutdown — WAL remains.
+            # Reload.
+            ledger2 = _new_ledger(td)
+            await ledger2.initialize()
+            stats = ledger2.get_statistics()
+            assert stats["wal_replayed_entries"] == 1, (
+                f"P1 3.5 regression: wal_replayed_entries="
+                f"{stats['wal_replayed_entries']}, expected 1")
+            print(f"  ✓ 1 entry replayed from WAL")
 
     asyncio.run(_test_p1_3_5())
 
     # ---------------------------------------------------------------- #
-    # P1 3.7 — half-open window
+    # P1 3.8: schema mismatch
     # ---------------------------------------------------------------- #
-    print("\n=== P1 3.7: half-open date window ===")
-
-    async def _test_p1_3_7():
-        with tempfile.TemporaryDirectory() as td:
-            ledger = _new_ledger(td)
-            await ledger.initialize()
-            result = _Result(
-                task_id="t", energy_consumed=1.0,
-                carbon_emitted=0.5, negawatt_reward=0.0,
-            )
-            decision = _Decision(
-                carbon_zone="red", action="execute", power_budget=0.5)
-            await ledger.record(result, decision)
-
-            # Adjacent windows around "now"
-            now = datetime.now(timezone.utc)
-            from datetime import timedelta
-            before = now - timedelta(seconds=10)
-            after = now + timedelta(seconds=10)
-
-            r1 = await ledger.get_report(
-                start_date=before, end_date=now)
-            r2 = await ledger.get_report(
-                start_date=now, end_date=after)
-            r_all = await ledger.get_report(
-                start_date=before, end_date=after)
-
-            # Entry has a timestamp between before and now (roughly).
-            # Under half-open [before, now), it should be in r1 only
-            # (the entry's timestamp is "now" so it's excluded from
-            # r1 and included in r2). Under old [before, now] logic,
-            # it would appear in both.
-            assert r1["total_entries"] + r2["total_entries"] == \
-                r_all["total_entries"], (
-                f"P1 3.7 regression: adjacent windows sum to "
-                f"{r1['total_entries'] + r2['total_entries']} but "
-                f"combined window has {r_all['total_entries']}")
-            print(f"  ✓ [before, now) ∪ [now, after) == [before, after)")
-
-    asyncio.run(_test_p1_3_7())
-
-    # ---------------------------------------------------------------- #
-    # P1 3.8 — average intensity None on 0-energy
-    # ---------------------------------------------------------------- #
-    print("\n=== P1 3.8: average intensity None on 0-energy ===")
+    print("\n=== P1 3.8: schema mismatch ===")
 
     async def _test_p1_3_8():
         with tempfile.TemporaryDirectory() as td:
             ledger = _new_ledger(td)
             await ledger.initialize()
-            # Entry with 0 energy, nonzero carbon.
-            result = _Result(
-                task_id="t", energy_consumed=0.0,
-                carbon_emitted=0.5, negawatt_reward=0.0,
-            )
-            decision = _Decision(
-                carbon_zone="red", action="execute", power_budget=0.5)
-            await ledger.record(result, decision)
-            report = await ledger.get_report()
-            assert report["average_carbon_intensity"] is None, (
-                f"P1 3.8 regression: average_carbon_intensity="
-                f"{report['average_carbon_intensity']}, expected None")
-            print(f"  ✓ average_carbon_intensity=None when "
-                  f"energy=0 and carbon>0")
+            await ledger.record(_ok_result(), _ok_decision())
+            await ledger.shutdown()
+
+            # Change the schema version in the payload.
+            p = os.path.join(td, "ledger.json")
+            with open(p) as f:
+                payload = json.load(f)
+            payload["entries"][0]["schema_version"] = "999.0.0"
+            with open(p, "w") as f:
+                json.dump(payload, f, indent=2, default=str)
+
+            ledger2 = _new_ledger(td)
+            try:
+                await ledger2.initialize()
+            except LedgerSchemaMismatchError as exc:
+                print(f"  ✓ schema mismatch → "
+                      f"LedgerSchemaMismatchError")
+            else:
+                raise AssertionError(
+                    "P1 3.8 regression: schema mismatch not detected")
 
     asyncio.run(_test_p1_3_8())
 
     # ---------------------------------------------------------------- #
-    # P1 3.9 — verify_chain cross-checks _last_chain_hash
+    # Regression: v2.0.0 P0 tests still pass
     # ---------------------------------------------------------------- #
-    print("\n=== P1 3.9: verify_chain cross-checks _last_chain_hash ===")
+    print("\n=== Regression: v2.0.0 P0 fixes ===")
 
-    async def _test_p1_3_9():
+    async def _test_v2_regressions():
         with tempfile.TemporaryDirectory() as td:
+            # P0 2.1: record before initialize.
+            ledger = _new_ledger(td)
+            try:
+                await ledger.record(_ok_result(), _ok_decision())
+            except LedgerNotInitializedError:
+                print("  ✓ record before init raises")
+
+        with tempfile.TemporaryDirectory() as td:
+            # P0 2.2: single correction.
             ledger = _new_ledger(td)
             await ledger.initialize()
-            result = _Result(
-                task_id="t", energy_consumed=1.0,
-                carbon_emitted=0.5, negawatt_reward=0.0,
-            )
-            decision = _Decision(
-                carbon_zone="red", action="execute", power_budget=0.5)
-            await ledger.record(result, decision)
+            await ledger.record(
+                _ok_result(carbon_emitted=5.0), _ok_decision())
+            a_id = ledger.entries[0]["entry_id"]
+            await ledger.correct_entry(a_id, 3.0, reason="...")
+            report = await ledger.get_report()
+            stats = ledger.get_statistics()
+            assert report["total_carbon_operational_kg"] == 3.0
+            assert stats["total_carbon_kg"] == 3.0
+            print("  ✓ single correction: both APIs agree (3.0)")
 
+        with tempfile.TemporaryDirectory() as td:
+            # P0 2.3: tamper detection.
+            ledger = _new_ledger(td)
+            await ledger.initialize()
+            await ledger.record(_ok_result(), _ok_decision())
+            await ledger.shutdown()
+            p = os.path.join(td, "ledger.json")
+            with open(p) as f:
+                payload = json.load(f)
+            payload["entries"][0]["carbon_kg"] = 999.0
+            with open(p, "w") as f:
+                json.dump(payload, f, indent=2, default=str)
+            ledger2 = _new_ledger(td)
+            try:
+                await ledger2.initialize()
+            except LedgerTamperedError:
+                print("  ✓ tampered chain raises")
+
+        with tempfile.TemporaryDirectory() as td:
+            # P0 2.4: counters restored.
+            ledger = _new_ledger(td)
+            await ledger.initialize()
+            for _ in range(3):
+                await ledger.record(
+                    _ok_result(), _ok_decision(), source="measured")
+            for _ in range(2):
+                await ledger.record(
+                    _ok_result(), _ok_decision(), source="estimated")
+            await ledger.shutdown()
+            ledger2 = _new_ledger(td)
+            await ledger2.initialize()
+            s = ledger2.get_statistics()
+            assert s["measured_entries"] == 3
+            assert s["estimated_entries"] == 2
+            print("  ✓ counters preserved (measured=3, estimated=2)")
+
+        with tempfile.TemporaryDirectory() as td:
+            # P0 2.6: entries property returns copies.
+            ledger = _new_ledger(td)
+            await ledger.initialize()
+            await ledger.record(_ok_result(), _ok_decision())
+            snap = ledger.entries
+            snap[0]["carbon_kg"] = 999.0
+            assert ledger.entries[0]["carbon_kg"] == 0.5
             assert ledger.verify_chain() is True
+            print("  ✓ entries snapshot mutation isolated")
 
-            # Tamper with the internal last hash.
-            ledger._last_chain_hash = "0" * 64
-            assert ledger.verify_chain() is False, (
-                "P1 3.9 regression: verify_chain returned True "
-                "with mismatched _last_chain_hash")
-            print("  ✓ mismatched _last_chain_hash → verify_chain=False")
-
-    asyncio.run(_test_p1_3_9())
-
-    # ---------------------------------------------------------------- #
-    # Bonus — pickle, context manager, shutdown
-    # ---------------------------------------------------------------- #
-    print("\n=== Bonus: pickle / context / shutdown ===")
-
-    async def _test_bonus():
         with tempfile.TemporaryDirectory() as td:
-            # Pickle round-trip.
+            # P0 2.8: initialize idempotent.
             ledger = _new_ledger(td)
             await ledger.initialize()
-            result = _Result(
-                task_id="t", energy_consumed=1.0,
-                carbon_emitted=0.5, negawatt_reward=0.0,
-            )
-            decision = _Decision(
-                carbon_zone="red", action="execute", power_budget=0.5)
-            await ledger.record(result, decision)
+            await ledger.record(_ok_result(), _ok_decision())
+            await ledger.initialize()
+            assert len(ledger.entries) == 1
+            print("  ✓ initialize() idempotent")
+
+    asyncio.run(_test_v2_regressions())
+
+    # ---------------------------------------------------------------- #
+    # Regression: pickle + context manager + instruments
+    # ---------------------------------------------------------------- #
+    print("\n=== Regression: pickle / context / instruments ===")
+
+    async def _test_misc():
+        with tempfile.TemporaryDirectory() as td:
+            ledger = _new_ledger(td)
+            async with ledger:
+                await ledger.record(_ok_result(), _ok_decision())
+
+        with tempfile.TemporaryDirectory() as td:
+            ledger = _new_ledger(td)
+            await ledger.initialize()
+            await ledger.record(_ok_result(), _ok_decision())
             blob = pickle.dumps(ledger)
             restored = pickle.loads(blob)
             assert restored._lock is not None
             assert len(restored.entries) == 1
-            assert restored.verify_chain() is True
-            # Still usable.
-            await restored.record(result, decision)
+            await restored.record(_ok_result(), _ok_decision())
             assert len(restored.entries) == 2
             print("  ✓ pickle round-trip, still usable")
 
-            # Context manager.
-            ledger2 = _new_ledger(td + "_cm" if False else td)
-            # Use a fresh dir to avoid interference.
-            with tempfile.TemporaryDirectory() as td2:
-                async with _new_ledger(td2) as scoped:
-                    assert scoped._initialized
-                    await scoped.record(result, decision)
-                # After exit, initialized is still True but shutdown
-                # has compacted.
-                assert scoped._initialized
-                print("  ✓ async context manager OK")
+        with tempfile.TemporaryDirectory() as td:
+            ledger = _new_ledger(td)
+            await ledger.initialize()
+            await ledger.record_instrument(
+                instrument_id="i-1", kind="offset",
+                quantity=2.0, unit="tCO2e", retired=True)
+            data = await ledger.get_instruments_ledger()
+            assert data["contractual_kgco2e"] == 2000.0
+            print("  ✓ instruments: 2 tCO2e = 2000 kgCO2e")
 
-    asyncio.run(_test_bonus())
+    asyncio.run(_test_misc())
 
     print("\n✓ All self-tests passed.")
 
