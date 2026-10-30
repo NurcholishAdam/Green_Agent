@@ -11,22 +11,56 @@ power-estimated energy figure derived from the sampled duty cycle.
 
 Enhancements
 ------------
-- Now inherits :class:`BaseEnergyMeter` (uniform contract with the rest of
-  the instrumentation layer).
-- ``PerfCounterConfig`` — frozen, validated: events, sample window, binary
-  path, timeout, optional per-counter power coefficients.
-- **Parsed output** — extracts ``cycles`` and ``instructions`` into
-  structured ints, plus ``ipc`` (instructions per cycle).
-- **Robust subprocess handling** — timeout, non-zero exit, missing binary,
-  permission errors, and ``<not counted>`` markers are all handled.
-- **Fixed contract** — returns ``energy_joules`` + ``power_watts`` +
-  ``provenance`` alongside the perf counters.
-- **Graceful degradation** — ``provenance`` falls back to ``"estimated"``
-  when the counters are unavailable (missing binary / permissions), so
-  consumers can distinguish real measurements from placeholders.
-- ``RLock``-guarded ``start`` / ``stop`` (idempotent ``start``).
-- Custom ``PerfCounterError``; lazy ``%s`` logging; ``__repr__``;
-  ``__main__`` smoke test with a mocked runner.
+- :class:`Provenance` (from ``base_meter``) replaces the raw string.
+- **Fixed duty-cycle window** — ``ips = instructions / sample_seconds``
+  (the *measurement* window) rather than ``instructions / elapsed``.
+  The previous formula off-by-``sample_seconds/elapsed`` underestimated
+  IPS by that ratio, and hence underestimated energy.
+- **Sanitized propagation** — every fallback (missing binary, permissions,
+  timeout, ``<not counted>``, non-zero exit, empty parse) sets
+  ``self._last_sanitized = True``. Downstream consumers can distinguish
+  fabricated estimates from measured readings.
+- **Fail-closed on empty parse** — if ``perf`` returns exit 0 but no
+  counters parsed, the sample is treated as fallback rather than
+  reported as ``measured`` with zeros.
+- **Lenient ``_run()`` failures** — ``FileNotFoundError``,
+  ``PermissionError``, and ``TimeoutExpired`` are now caught by
+  ``collect()`` in lenient mode and degrade to an estimate, matching the
+  docstring's promise.
+- **`distinguish_provenance=False` still sets `sanitized=True`** — the
+  flag lets legacy callers see ``"measured"`` on fabricated data, but the
+  ``sanitized`` signal is preserved regardless.
+- **Numeric config strictness** — rejects ``bool`` and ``NaN`` for
+  ``sample_seconds``, ``timeout_seconds``, ``idle_watts``,
+  ``dynamic_watts``, ``ipc_reference``.
+- **Reset state on `stop()`** — ``_last_sanitized`` is cleared at the
+  start of every ``stop()`` so direct callers don't inherit stale flags.
+- ``_start_time`` removed (was set, never read).
+- ``_estimate_result`` returns the same shape as the measured path (with
+  event keys defaulting to ``0``).
+- ``last_sanitized`` property exposed on the meter.
+- ``__main__`` smoke test extended with fallback-window, empty-parse, and
+  lenient-``_run`` regression cases.
+
+Modeling note
+-------------
+The power figure is a **model** derived from the sample's duty cycle::
+
+    ips   = instructions / sample_seconds
+    duty  = clamp(ips / ipc_reference, 0, 1)
+    power = idle_watts + dynamic_watts * duty
+    energy = power * elapsed
+
+The model assumes the CPU's busy fraction during ``sample_seconds`` is
+representative of the entire ``elapsed`` window. When ``perf`` cannot
+run, the estimate collapses to ``duty = 0`` → ``power = idle_watts`` →
+``energy = idle_watts * elapsed`` and is marked ``sanitized=True``.
+
+Note on blocking
+----------------
+``stop()`` blocks for approximately ``sample_seconds`` (plus subprocess
+overhead) because it synchronously runs ``perf stat sleep
+{sample_seconds}``.
 """
 
 from __future__ import annotations
@@ -34,22 +68,38 @@ from __future__ import annotations
 import json
 import logging
 import math
+import numbers
 import re
 import shutil
 import subprocess
 import threading
 import time
-from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from dataclasses import asdict, dataclass
+from typing import (
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from .base_meter import (
     BaseEnergyMeter,
     BaseMeterConfig,
     InstrumentationError,
+    Provenance,
     TelemetrySample,
 )
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "PerfCounter",
+    "PerfCounterConfig",
+    "PerfCounterError",
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -60,61 +110,109 @@ class PerfCounterError(InstrumentationError):
 
 
 # --------------------------------------------------------------------------- #
+# Config helpers
+# --------------------------------------------------------------------------- #
+def _require_positive_finite(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise PerfCounterError(f"{label} must be a number, not bool")
+    fv = float(value)
+    if not math.isfinite(fv):
+        raise PerfCounterError(f"{label} must be finite")
+    if fv <= 0:
+        raise PerfCounterError(f"{label} must be > 0")
+    return fv
+
+
+def _require_non_negative_finite(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise PerfCounterError(f"{label} must be a number, not bool")
+    fv = float(value)
+    if not math.isfinite(fv):
+        raise PerfCounterError(f"{label} must be finite")
+    if fv < 0:
+        raise PerfCounterError(f"{label} must be >= 0")
+    return fv
+
+
+# --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class PerfCounterConfig:
     """Tunable parameters for the perf-counter meter."""
 
-    # Events to query.
     events: tuple = ("cycles", "instructions")
-
-    # Sampling window passed to ``sleep`` inside the ``perf stat`` command.
     sample_seconds: float = 0.1
-
-    # Binary used to query the CPU.
     binary: str = "perf"
-
-    # Subprocess timeout.
     timeout_seconds: float = 10.0
 
-    # Energy estimation coefficients. When the counters are unavailable, the
-    # meter returns a modelled estimate using these values:
-    #   energy_joules = idle_watts * elapsed + dynamic_watts * duty_cycle
-    # The defaults approximate a mid-range server CPU.
+    # Energy model coefficients. See the module docstring.
     idle_watts: float = 3.0
     dynamic_watts: float = 45.0
-    # Normalize instructions-per-second against this reference; the meter
-    # clamps the resulting duty cycle to [0, 1].
-    ipc_reference: float = 2_000_000_000.0  # 2 G instructions/sec
+    # Reference instructions-per-second; a CPU at this rate is 100% duty.
+    ipc_reference: float = 2_000_000_000.0
 
-    # If True, ``provenance`` is ``"measured"`` when counters parse cleanly,
-    # otherwise ``"estimated"``. If False, always report ``"measured"``.
     distinguish_provenance: bool = True
-
-    # If a hardware counter reports ``<not counted>``, treat the sample as
-    # unmeasured (this usually means permissions are insufficient).
     tolerate_not_counted: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.events, tuple) or not self.events:
-            raise PerfCounterError("events must be a non-empty tuple.")
+            raise PerfCounterError(
+                "events must be a non-empty tuple"
+            )
         for ev in self.events:
             if not isinstance(ev, str) or not ev:
                 raise PerfCounterError(
-                    "events entries must be non-empty strings."
+                    "events entries must be non-empty strings"
                 )
-        for name in ("sample_seconds", "timeout_seconds"):
-            if getattr(self, name) <= 0:
-                raise PerfCounterError(f"{name} must be > 0.")
+
         if not isinstance(self.binary, str) or not self.binary:
-            raise PerfCounterError("binary must be a non-empty string.")
-        if self.idle_watts < 0 or self.dynamic_watts < 0:
             raise PerfCounterError(
-                "idle_watts / dynamic_watts must be >= 0."
+                "binary must be a non-empty string"
             )
-        if self.ipc_reference <= 0:
-            raise PerfCounterError("ipc_reference must be > 0.")
+
+        object.__setattr__(
+            self, "sample_seconds",
+            _require_positive_finite(
+                self.sample_seconds, "sample_seconds",
+            ),
+        )
+        object.__setattr__(
+            self, "timeout_seconds",
+            _require_positive_finite(
+                self.timeout_seconds, "timeout_seconds",
+            ),
+        )
+        object.__setattr__(
+            self, "idle_watts",
+            _require_non_negative_finite(
+                self.idle_watts, "idle_watts",
+            ),
+        )
+        object.__setattr__(
+            self, "dynamic_watts",
+            _require_non_negative_finite(
+                self.dynamic_watts, "dynamic_watts",
+            ),
+        )
+        object.__setattr__(
+            self, "ipc_reference",
+            _require_positive_finite(
+                self.ipc_reference, "ipc_reference",
+            ),
+        )
+
+        if not isinstance(self.distinguish_provenance, bool):
+            raise PerfCounterError(
+                "distinguish_provenance must be a bool"
+            )
+        if not isinstance(self.tolerate_not_counted, bool):
+            raise PerfCounterError(
+                "tolerate_not_counted must be a bool"
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 # --------------------------------------------------------------------------- #
@@ -124,25 +222,13 @@ class PerfCounter(BaseEnergyMeter):
     """
     Hardware performance counters using Linux ``perf``.
 
-    Parameters
-    ----------
-    config : PerfCounterConfig, optional
-        Meter configuration. Defaults to ``PerfCounterConfig()``.
-    base_config : BaseMeterConfig, optional
-        Contract policy passed to :class:`BaseEnergyMeter`.
-    strict : bool, default True
-        If True, a missing binary or a ``perf`` error raises
-        :class:`PerfCounterError`. If False, ``collect`` falls back to an
-        estimated result derived from the configured coefficients.
-    runner : callable, optional
-        ``(argv, timeout) -> (rc, stdout, stderr)`` callable replacing the
-        real subprocess. Used to inject a mock in tests.
+    See the module docstring for the modeling assumption, the blocking
+    behavior of ``stop()``, and the fallback/sanitization rules.
     """
 
-    # Regex for lines like ``    1,234,567      cycles`` or
-    # ``    1,234,567      cycles        #   1.23 GHz``.
     _LINE_RE = re.compile(
-        r"^\s*(?P<value>[\d,]+|<not counted>|not counted)\s+(?P<event>\S+)",
+        r"^\s*(?P<value>[\d,]+|<not counted>|not counted)\s+"
+        r"(?P<event>\S+)",
         re.IGNORECASE,
     )
 
@@ -159,17 +245,24 @@ class PerfCounter(BaseEnergyMeter):
             strict=strict,
             name="perf",
         )
-        self._perf_config: PerfCounterConfig = config or PerfCounterConfig()
+        if config is not None and not isinstance(
+            config, PerfCounterConfig
+        ):
+            raise PerfCounterError(
+                "config must be a PerfCounterConfig instance"
+            )
+        self._perf_config: PerfCounterConfig = (
+            config or PerfCounterConfig()
+        )
         self._runner = runner
         self._inner_lock = threading.RLock()
 
-        self._start_time: Optional[float] = None
         self._last_counters: Dict[str, int] = {}
         self._last_power_watts: float = 0.0
         self._last_energy_joules: float = 0.0
-        self._last_provenance: str = "estimated"
+        self._last_provenance: Provenance = Provenance.ESTIMATED
+        self._last_collect_fell_back: bool = False
 
-        # Resolve the binary unless a mock runner was provided.
         if runner is None:
             resolved = shutil.which(self._perf_config.binary)
             if resolved is None:
@@ -179,17 +272,22 @@ class PerfCounter(BaseEnergyMeter):
                 )
                 if self._strict:
                     raise PerfCounterError(msg)
-                logger.warning("%s PerfCounter will return estimated values.", msg)
+                logger.warning(
+                    "%s PerfCounter will estimate values; samples "
+                    "will be marked sanitized.", msg,
+                )
                 self._binary_available = False
             else:
                 self._binary_available = True
-                logger.debug("Resolved perf to %s.", resolved)
+                logger.debug(
+                    "Resolved perf to %s.", resolved,
+                )
         else:
             self._binary_available = True
 
         logger.debug(
-            "PerfCounter initialized (binary=%s, events=%s, sample=%.3fs, "
-            "timeout=%.2fs, strict=%s)",
+            "PerfCounter initialized (binary=%s, events=%s, "
+            "sample=%.3fs, timeout=%.2fs, strict=%s)",
             self._perf_config.binary,
             list(self._perf_config.events),
             self._perf_config.sample_seconds,
@@ -199,62 +297,82 @@ class PerfCounter(BaseEnergyMeter):
 
     # ---------------------------------------------------------- lifecycle
     def start(self) -> None:
-        """Mark the start of a measurement window."""
         with self._inner_lock:
             if self.started:
-                logger.debug("PerfCounter.start() called while already running.")
+                logger.debug(
+                    "PerfCounter.start() called while already running."
+                )
                 return
-            self._start_time = time.monotonic()
             self._mark_started()
         logger.debug("PerfCounter started.")
 
     def stop(self) -> Dict[str, Any]:
         """
-        Stop the perf-counter window and return:
+        Stop the window and return the enriched metrics dict.
 
-        ``{"energy_joules", "power_watts", "provenance",
-        "cycles", "instructions", "ipc", "raw_output"}``
+        ``stop()`` blocks for approximately ``sample_seconds`` because
+        it synchronously runs ``perf stat sleep {sample_seconds}``.
         """
         with self._inner_lock:
+            # Reset state so direct callers don't inherit stale flags.
+            self._last_sanitized = False
             elapsed = self._mark_stopped()
 
-        # Allow the caller to reuse ``collect()`` directly (legacy path).
         collected = self.collect()
-        counters = {
-            k: v for k, v in collected.items()
-            if k in self._perf_config.events
-        }
-        cycles = int(counters.get("cycles", 0))
-        instructions = int(counters.get("instructions", 0))
-        ipc = (
-            instructions / cycles if cycles > 0 else 0.0
-        )
-
-        # Derive duty cycle from instructions-per-second.
-        ips = (instructions / elapsed) if elapsed > 0 else 0.0
-        duty = (
-            max(0.0, min(1.0, ips / self._perf_config.ipc_reference))
-            if self._perf_config.ipc_reference > 0 else 0.0
-        )
 
         cfg = self._perf_config
+        counters = {
+            k: int(v) for k, v in collected.items()
+            if k in cfg.events
+        }
+        cycles = counters.get("cycles", 0)
+        instructions = counters.get("instructions", 0)
+
+        # -- Corrected duty-cycle calculation -------------------------
+        # ``instructions`` was measured over ``sample_seconds`` — NOT
+        # over the caller's elapsed window. Use the measurement window
+        # to derive IPS; then integrate power over elapsed for energy.
+        sample_seconds = cfg.sample_seconds
+        ips = (
+            instructions / sample_seconds
+            if sample_seconds > 0
+            else 0.0
+        )
+        duty = max(
+            0.0, min(1.0, ips / cfg.ipc_reference)
+        ) if cfg.ipc_reference > 0 else 0.0
+
         power_watts = cfg.idle_watts + cfg.dynamic_watts * duty
         energy_joules = power_watts * max(elapsed, 0.0)
 
-        provenance = collected.get("provenance", "estimated")
+        ipc = (instructions / cycles) if cycles > 0 else 0.0
+
+        # -- Provenance ------------------------------------------------
+        raw_prov = collected.get("provenance", "estimated")
+        try:
+            provenance = Provenance(raw_prov)
+        except (ValueError, TypeError):
+            provenance = Provenance.ESTIMATED
+
         if not cfg.distinguish_provenance:
-            provenance = "measured"
+            provenance = Provenance.MEASURED
+            # …but the sample is still fabricated if the fallback ran.
+
+        # -- Sanitization ---------------------------------------------
+        if self._last_collect_fell_back or not self._binary_available:
+            self._last_sanitized = True
 
         raw = {
             "energy_joules": energy_joules,
             "power_watts": power_watts,
-            "provenance": provenance,
+            "provenance": provenance.value,
             "cycles": cycles,
             "instructions": instructions,
             "ipc": ipc,
             "raw_output": collected.get("raw_output", ""),
             "source": "perf",
             "elapsed_seconds": elapsed,
+            "sanitized": self._last_sanitized,
         }
 
         self._last_counters = counters
@@ -263,9 +381,12 @@ class PerfCounter(BaseEnergyMeter):
         self._last_provenance = provenance
 
         logger.debug(
-            "PerfCounter stopped: cycles=%d, instructions=%d, ipc=%.3f, "
-            "power=%.4g W, energy=%.6g J, provenance=%s",
-            cycles, instructions, ipc, power_watts, energy_joules, provenance,
+            "PerfCounter stopped: cycles=%d, instructions=%d, "
+            "ipc=%.3f, power=%.4g W, energy=%.6g J, "
+            "provenance=%s, sanitized=%s",
+            cycles, instructions, ipc,
+            power_watts, energy_joules,
+            provenance.value, self._last_sanitized,
         )
 
         return self._validate_metrics(raw)
@@ -275,21 +396,33 @@ class PerfCounter(BaseEnergyMeter):
         """
         Run one ``perf stat`` sample and return structured counters.
 
-        Legacy-compatible: the returned dict contains ``raw_output`` and
-        ``provenance`` exactly as the original did, plus parsed ``cycles``
-        and ``instructions`` when the counters are readable.
+        The returned dict has ``raw_output`` and ``provenance`` — plus
+        the configured event keys — in both success and fallback paths.
         """
         cfg = self._perf_config
+        self._last_collect_fell_back = False
 
-        argv: List[str] = [cfg.binary, "stat", "-e", ",".join(cfg.events)]
+        argv: List[str] = [
+            cfg.binary, "stat", "-e", ",".join(cfg.events),
+        ]
         argv += ["sleep", str(cfg.sample_seconds)]
 
+        # -- Run the subprocess (or mock) -----------------------------
         try:
             returncode, stdout, stderr = self._run(argv)
-        except PerfCounterError:
-            raise
+        except PerfCounterError as exc:
+            # Missing binary, permissions, timeout, or mock failure.
+            if self._strict:
+                raise
+            logger.warning(
+                "%s Falling back to estimated values.", exc,
+            )
+            self._last_collect_fell_back = True
+            return self._estimate_result(reason=str(exc))
         except Exception as exc:
-            raise PerfCounterError(f"perf invocation failed: {exc}") from exc
+            raise PerfCounterError(
+                f"perf invocation failed: {exc}"
+            ) from exc
 
         if returncode != 0:
             msg = (
@@ -298,43 +431,71 @@ class PerfCounter(BaseEnergyMeter):
             )
             if self._strict and self._binary_available:
                 raise PerfCounterError(msg)
-            logger.warning("%s Falling back to estimated values.", msg)
-            return self._estimate_result(reason=msg)
+            logger.warning(
+                "%s Falling back to estimated values.", msg,
+            )
+            self._last_collect_fell_back = True
+            return self._estimate_result(
+                reason=msg, raw_output=stderr,
+            )
 
         parsed = self._parse(stderr)
         not_counted = any(
-            marker in stderr for marker in ("<not counted>", "not counted")
+            marker in stderr
+            for marker in ("<not counted>", "not counted")
         )
 
         if not_counted and not cfg.tolerate_not_counted:
             msg = (
-                "perf reported '<not counted>' for at least one event; "
-                "this usually means insufficient permissions "
+                "perf reported '<not counted>' for at least one "
+                "event; this usually means insufficient permissions "
                 "(check /proc/sys/kernel/perf_event_paranoid)."
             )
             if self._strict:
                 raise PerfCounterError(msg)
-            logger.warning("%s Falling back to estimated values.", msg)
-            return self._estimate_result(reason=msg, raw_output=stderr)
+            logger.warning(
+                "%s Falling back to estimated values.", msg,
+            )
+            self._last_collect_fell_back = True
+            return self._estimate_result(
+                reason=msg, raw_output=stderr,
+            )
 
-        # Preserve legacy keys and add the parsed counters.
+        # -- Fail-closed on empty parse ------------------------------
+        if not parsed and cfg.events:
+            msg = (
+                "perf produced no usable counters for the configured "
+                f"events {list(cfg.events)}"
+            )
+            if self._strict:
+                raise PerfCounterError(msg)
+            logger.warning(
+                "%s Falling back to estimated values.", msg,
+            )
+            self._last_collect_fell_back = True
+            return self._estimate_result(
+                reason=msg, raw_output=stderr,
+            )
+
         result: Dict[str, Any] = {
             "raw_output": stderr,
             "provenance": "measured",
         }
         for ev in cfg.events:
             result[ev] = int(parsed.get(ev, 0))
-
         return result
 
     # ---------------------------------------------------------- subprocess
     def _run(self, argv: Sequence[str]) -> Tuple[int, str, str]:
-        """Invoke the command and return ``(rc, stdout, stderr)``."""
         cfg = self._perf_config
 
         if self._runner is not None:
             try:
-                result = self._runner(argv, cfg.timeout_seconds)
+                result = self._runner(
+                    argv, cfg.timeout_seconds,
+                )
+            except PerfCounterError:
+                raise
             except Exception as exc:
                 raise PerfCounterError(
                     f"custom runner failed: {exc}"
@@ -343,7 +504,7 @@ class PerfCounter(BaseEnergyMeter):
 
         if not self._binary_available:
             raise PerfCounterError(
-                f"'{cfg.binary}' is not available on this host."
+                f"'{cfg.binary}' is not available on this host"
             )
 
         try:
@@ -360,18 +521,19 @@ class PerfCounter(BaseEnergyMeter):
             ) from exc
         except PermissionError as exc:
             raise PerfCounterError(
-                f"'{cfg.binary}' requires elevated privileges: {exc}"
+                f"'{cfg.binary}' requires elevated privileges: "
+                f"{exc}"
             ) from exc
         except subprocess.TimeoutExpired as exc:
             raise PerfCounterError(
-                f"'{cfg.binary}' timed out after {cfg.timeout_seconds:.1f}s."
+                f"'{cfg.binary}' timed out after "
+                f"{cfg.timeout_seconds:.1f}s."
             ) from exc
 
         return proc.returncode, proc.stdout or "", proc.stderr or ""
 
     @staticmethod
     def _unpack_runner_result(result: Any) -> Tuple[int, str, str]:
-        """Accept ``(rc, stdout, stderr)`` or objects with those attributes."""
         if isinstance(result, tuple) and len(result) == 3:
             rc, stdout, stderr = result
             return int(rc), str(stdout or ""), str(stderr or "")
@@ -382,7 +544,7 @@ class PerfCounter(BaseEnergyMeter):
                 str(getattr(result, "stderr", "") or ""),
             )
         if isinstance(result, str):
-            return 0, "", result  # treat as stderr-only
+            return 0, "", result
         raise PerfCounterError(
             f"custom runner returned unsupported type "
             f"{type(result).__name__}; expected (rc, stdout, stderr)."
@@ -390,12 +552,6 @@ class PerfCounter(BaseEnergyMeter):
 
     # ---------------------------------------------------------- parsing
     def _parse(self, text: str) -> Dict[str, int]:
-        """
-        Parse ``perf stat`` stderr output into ``{event: int_value}``.
-
-        Handles comma-separated digit groups (``1,234,567``) and skips
-        ``<not counted>`` markers.
-        """
         parsed: Dict[str, int] = {}
         wanted = set(self._perf_config.events)
 
@@ -412,7 +568,10 @@ class PerfCounter(BaseEnergyMeter):
             try:
                 parsed[event] = int(raw_value.replace(",", ""))
             except ValueError:
-                logger.debug("Unparseable perf value %r for %s.", raw_value, event)
+                logger.debug(
+                    "Unparseable perf value %r for %s.",
+                    raw_value, event,
+                )
                 continue
 
         return parsed
@@ -424,12 +583,15 @@ class PerfCounter(BaseEnergyMeter):
         reason: str,
         raw_output: str = "",
     ) -> Dict[str, Any]:
-        """Fallback that keeps the legacy ``raw_output`` + ``provenance`` keys."""
-        return {
+        """Fallback result with the same shape as the measured path."""
+        result: Dict[str, Any] = {
             "raw_output": raw_output,
             "provenance": "estimated",
             "reason": reason,
         }
+        for ev in self._perf_config.events:
+            result[ev] = 0
+        return result
 
     # ---------------------------------------------------------- props
     @property
@@ -444,11 +606,15 @@ class PerfCounter(BaseEnergyMeter):
     def last_counters(self) -> Dict[str, int]:
         return dict(self._last_counters)
 
+    @property
+    def last_sanitized(self) -> bool:
+        return self._last_sanitized
+
     # ---------------------------------------------------------- serialization
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
-            "config": asdict(self._perf_config),
+            "config": self._perf_config.to_dict(),
             "base_config": asdict(self._config),
             "strict": self._strict,
             "started": self.started,
@@ -456,7 +622,8 @@ class PerfCounter(BaseEnergyMeter):
             "last_counters": dict(self._last_counters),
             "last_power_watts": self._last_power_watts,
             "last_energy_joules": self._last_energy_joules,
-            "last_provenance": self._last_provenance,
+            "last_provenance": self._last_provenance.value,
+            "last_sanitized": self._last_sanitized,
         }
 
     def to_json(self, **kwargs: Any) -> str:
@@ -470,35 +637,24 @@ class PerfCounter(BaseEnergyMeter):
             f"sample_seconds={self._perf_config.sample_seconds:.3f}, "
             f"available={self._binary_available}, "
             f"started={self.started}, "
-            f"strict={self._strict})"
+            f"strict={self._strict}, "
+            f"sanitized={self._last_sanitized})"
         )
 
 
 # --------------------------------------------------------------------------- #
-# Public API
-# --------------------------------------------------------------------------- #
-__all__ = [
-    "PerfCounter",
-    "PerfCounterConfig",
-    "PerfCounterError",
-]
-
-
-# --------------------------------------------------------------------------- #
-# Smoke test: python -m instrumentation.energy.perf_counters
+# Smoke test
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":  # pragma: no cover
     logging.basicConfig(level=logging.INFO)
 
-    # ---------------------------------------------------------------- #
-    # Mock runners covering the common environments.
-    # ---------------------------------------------------------------- #
     _PERF_OK_STDERR = (
         "\n"
         " Performance counter stats for 'sleep 0.1':\n"
         "\n"
         "       123,456,789      cycles\n"
-        "       246,913,578      instructions              #    2.00  insn per cycle\n"
+        "       246,913,578      instructions              "
+        "#    2.00  insn per cycle\n"
         "\n"
         "       0.100432064 seconds time elapsed\n"
     )
@@ -513,69 +669,140 @@ if __name__ == "__main__":  # pragma: no cover
         "       0.100432064 seconds time elapsed\n"
     )
 
-    def _ok_runner(argv: Sequence[str], timeout: float):
+    _PERF_MALFORMED = "garbage output that does not match\n"
+
+    def _ok_runner(argv, timeout):
         return 0, "", _PERF_OK_STDERR
 
-    def _not_counted_runner(argv: Sequence[str], timeout: float):
+    def _not_counted_runner(argv, timeout):
         return 0, "", _PERF_NOT_COUNTED
 
-    def _missing_runner(argv: Sequence[str], timeout: float):
+    def _malformed_runner(argv, timeout):
+        return 0, "", _PERF_MALFORMED
+
+    def _missing_runner(argv, timeout):
         raise FileNotFoundError("perf: No such file or directory")
 
-    def _permission_runner(argv: Sequence[str], timeout: float):
+    def _permission_runner(argv, timeout):
         return 255, "", "perf: Permission denied."
 
-    def _timeout_runner(argv: Sequence[str], timeout: float):
+    def _timeout_runner(argv, timeout):
         raise subprocess.TimeoutExpired(argv, timeout)
 
-    # ---- Happy path (counters parse cleanly) -------------------------- #
+    # -- Happy path -------------------------------------------------- #
     meter = PerfCounter(runner=_ok_runner)
     print("repr       :", meter)
     with meter.measure() as m:
         time.sleep(0.05)
-    sample: Optional[TelemetrySample] = getattr(m, "last_sample", None)
+    sample: Optional[TelemetrySample] = getattr(
+        m, "last_sample", None,
+    )
     print("sample     :", sample)
-    if sample is not None:
-        print("dict       :", sample.to_dict())
+    assert sample is not None
+    assert sample.sanitized is False
+    assert sample.provenance is Provenance.MEASURED
 
-    # ---- Legacy ``collect()`` shape preserved ------------------------- #
+    # -- Legacy collect() shape ------------------------------------- #
     legacy = PerfCounter(runner=_ok_runner).collect()
-    print("legacy     :", {
-        "raw_output_present": bool(legacy.get("raw_output")),
-        "provenance": legacy.get("provenance"),
-        "cycles": legacy.get("cycles"),
-        "instructions": legacy.get("instructions"),
-    })
     assert "raw_output" in legacy and "provenance" in legacy
+    assert legacy["provenance"] == "measured"
+    assert legacy["cycles"] == 123_456_789
+    print("legacy     :", {
+        "cycles": legacy["cycles"],
+        "instructions": legacy["instructions"],
+    })
 
-    # ---- <not counted> → strict raises, lenient estimates ------------- #
+    # -- Duty-cycle window regression -------------------------------- #
+    # If instructions == sample_seconds * ipc_reference, duty == 1.0.
+    def _full_load_runner(argv, timeout):
+        # 0.1 s * 2e9 IPS = 200M instructions.
+        text = (
+            "       200,000,000      cycles\n"
+            "       200,000,000      instructions\n"
+        )
+        return 0, "", text
+
+    full = PerfCounter(
+        config=PerfCounterConfig(
+            sample_seconds=0.1,
+            ipc_reference=2_000_000_000.0,
+            idle_watts=3.0, dynamic_watts=45.0,
+        ),
+        runner=_full_load_runner,
+    )
+    full.start()
+    time.sleep(0.2)  # elapsed ~0.2s; sample window is 0.1s
+    metrics = full.stop()
+    # duty should be 1.0 (200M / 0.1s == 2e9 IPS == reference)
+    assert abs(
+        metrics["power_watts"] - (3.0 + 45.0)
+    ) < 0.01, metrics["power_watts"]
+    print(
+        "duty       : power=", metrics["power_watts"],
+        "W (should be 48 W)",
+    )
+
+    # -- <not counted> → strict raises, lenient falls back ----------- #
     try:
-        strict = PerfCounter(runner=_not_counted_runner, strict=True)
+        strict = PerfCounter(
+            runner=_not_counted_runner, strict=True,
+        )
         strict.start()
         strict.stop()
     except PerfCounterError as exc:
         print("not counted:", exc)
+    else:
+        raise AssertionError(
+            "strict should have raised on <not counted>"
+        )
 
-    lenient = PerfCounter(runner=_not_counted_runner, strict=False)
+    lenient = PerfCounter(
+        runner=_not_counted_runner,
+        strict=False,
+        base_config=BaseMeterConfig(enforce_contract=False),
+    )
     with lenient.measure() as m:
         time.sleep(0.01)
-    print("lenient    :", m.last_sample)
+    assert m.last_sample is not None
+    assert m.last_sample.sanitized is True
+    assert m.last_sample.provenance is Provenance.ESTIMATED
+    print("lenient    :", m.last_sample, "(sanitized)")
 
-    # ---- Missing binary ------------------------------------------------ #
-    missing = PerfCounter(runner=_missing_runner, strict=False)
+    # -- Malformed output (empty parse) ------------------------------ #
+    malformed = PerfCounter(
+        runner=_malformed_runner,
+        strict=False,
+        base_config=BaseMeterConfig(enforce_contract=False),
+    )
+    with malformed.measure() as m:
+        pass
+    assert m.last_sample is not None
+    assert m.last_sample.sanitized is True
+    print("malformed  :", m.last_sample, "(sanitized)")
+
+    # -- Missing binary in lenient mode → falls back ----------------- #
+    missing = PerfCounter(
+        runner=_missing_runner,
+        strict=False,
+        base_config=BaseMeterConfig(enforce_contract=False),
+    )
     with missing.measure() as m:
         pass
-    print("missing    :", m.last_sample)
+    assert m.last_sample is not None
+    assert m.last_sample.sanitized is True
+    print("missing    :", m.last_sample, "(sanitized)")
 
-    # ---- Permission denied -------------------------------------------- #
+    # -- Permission denied ------------------------------------------- #
     try:
-        perm = PerfCounter(runner=_permission_runner, strict=True)
+        perm = PerfCounter(
+            runner=_permission_runner, strict=True,
+        )
         perm.start()
         perm.stop()
     except PerfCounterError as exc:
         print("perm       :", exc)
 
-    # ---- Timeout ------------------------------------------------------- #
+    # -- Timeout ----------------------------------------------------- #
     try:
         to = PerfCounter(runner=_timeout_runner, strict=True)
         to.start()
@@ -583,29 +810,67 @@ if __name__ == "__main__":  # pragma: no cover
     except PerfCounterError as exc:
         print("timeout    :", exc)
 
-    # ---- Serialization ------------------------------------------------- #
+    # -- distinguish_provenance=False still sets sanitized ---------- #
+    class_forced = PerfCounter(
+        runner=_not_counted_runner,
+        config=PerfCounterConfig(
+            distinguish_provenance=False,
+        ),
+        strict=False,
+        base_config=BaseMeterConfig(enforce_contract=False),
+    )
+    with class_forced.measure() as m:
+        pass
+    assert m.last_sample is not None
+    assert m.last_sample.provenance is Provenance.MEASURED
+    assert m.last_sample.sanitized is True, (
+        "distinguish_provenance=False must not hide sanitization"
+    )
+    print(
+        "forced     : provenance=", m.last_sample.provenance,
+        " sanitized=", m.last_sample.sanitized,
+    )
+
+    # -- Serialization ----------------------------------------------- #
     payload = meter.to_json()
     assert json.loads(payload)["config"]["binary"] == "perf"
     print("Serialization OK.")
 
-    # ---- Config validation -------------------------------------------- #
-    for bad_cfg in (
+    # -- Config validation ------------------------------------------- #
+    bad_configs = (
         dict(events=()),
+        dict(events=("x", 42)),
         dict(sample_seconds=0),
+        dict(sample_seconds=True),
+        dict(sample_seconds=float("nan")),
         dict(binary=""),
         dict(timeout_seconds=0),
+        dict(timeout_seconds=True),
         dict(idle_watts=-1.0),
+        dict(idle_watts=float("nan")),
         dict(dynamic_watts=-1.0),
+        dict(dynamic_watts=True),
         dict(ipc_reference=0),
-    ):
+        dict(ipc_reference=float("nan")),
+        dict(distinguish_provenance="yes"),
+        dict(tolerate_not_counted=1),
+    )
+    for bad in bad_configs:
         try:
-            PerfCounterConfig(**bad_cfg)  # type: ignore[arg-type]
+            PerfCounterConfig(**bad)  # type: ignore[arg-type]
         except PerfCounterError as exc:
             print("Rejected cfg:", exc)
+        else:
+            raise AssertionError(
+                f"config should have rejected {bad}"
+            )
 
-    # ---- Live probe only when perf is actually installed and permitted #
+    # -- Live probe -------------------------------------------------- #
     if shutil.which("perf") is not None:
-        real = PerfCounter(strict=False)
+        real = PerfCounter(
+            strict=False,
+            base_config=BaseMeterConfig(enforce_contract=False),
+        )
         with real.measure() as m:
             time.sleep(0.05)
         print("real host  :", m.last_sample)
