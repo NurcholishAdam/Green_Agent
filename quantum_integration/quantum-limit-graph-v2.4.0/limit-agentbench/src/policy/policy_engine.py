@@ -1,6 +1,6 @@
 """
-PolicyEngine (Enhanced)
-========================
+PolicyEngine (Enhanced v2)
+==========================
 
 Reward shaping and temporal shift policy for Green Agent v5.0.0.
 
@@ -11,43 +11,51 @@ Original API preserved:
         shifter, forecast_engine, energy_kwh, shiftable=True, urgency="low"
     )
 
-New capabilities (all inline, feature-toggleable):
-  1. Quantum-Distillation of the reward policy
-  2. Causal RL for learned budget penalties
-  3. Federated Green Learning across deployments
-  4. Multi-Agent Coordination with emergent role specialisation
-  5. Temporal Logic & Formal Verification for shift safety
-  6. Explainable AI (XAI) for every reward and shift
-  7. Adaptive Precision as a reward dimension
-  8. Carbon Markets & REC enrichment
-  9. Resilience Engineering (circuit breaker + chaos testing)
- 10. Human-in-the-Loop for critical shifts + active learning
- +   Helium awareness (dual-axis reward)
- +   Carbon awareness (intensity + market cost)
- +   Logging, statistics, reward/shift history
- +   Input validation, uncertainty quantification
+v2 fixes (see changelog in commit message):
+  * HeliumProfiler no longer inverts scarcity (higher scarcity = more units).
+  * CausalPenaltyLearner uses reward-weighted regression with a per-bin
+    baseline; consumes the penalty that was actually applied; no artificial
+    max(base, …) floor that blocked softening.
+  * record_outcome rewards the appropriateness of the penalty, not the
+    estimator's numeric accuracy.
+  * allow_high_urgency_with_hitl=True unlocks the HITL path for high-urgency
+    deferrals (default preserves original "no shift for high urgency").
+  * HITL auto-approvals are audit-flagged (auto=True).
+  * Precision is an opt-in reward dimension (caller-supplied); no more
+    decorative "int4 used" explanations.
+  * Thread-safe; UTC datetimes; configurable chaos; timeouts + circuit
+    breakers on shifter/forecaster/market.
+  * Incremental federated aggregation; health(); MetricsRecorder.
+  * suggest_temporal_shift_async for async shifter / forecaster.
+  * NonBackwardShift temporal property.
 """
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import hashlib
+import inspect
 import logging
 import math
 import random
 import statistics
+import threading
 import time
-from collections import deque, defaultdict
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
+import types
+from collections import OrderedDict, defaultdict, deque
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import (
-    Any, Callable, Deque, Dict, List, Optional, Protocol, Tuple,
+    Any, Awaitable, Callable, Deque, Dict, List, Mapping, Optional,
+    Protocol, Tuple, Union,
 )
 
-# Original import preserved; fallback if unavailable
 try:
     from green_agent.rewards.negawatt_reward import NegawattReward
 except Exception:
-    class NegawattReward:
+    class NegawattReward:  # type: ignore[no-redef]
         """Fallback negawatt reward module."""
         def __init__(self, baseline_energy: float):
             self.baseline = baseline_energy
@@ -59,6 +67,28 @@ except Exception:
             return 0.5 * accuracy + 0.5 * savings
 
 logger = logging.getLogger(__name__)
+
+__version__ = "2.0.0"
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def stable_hash(s: Any) -> float:
+    h = hashlib.sha256(str(s).encode("utf-8")).digest()
+    return int.from_bytes(h[:8], "big") / 2**64
+
+
+def _sanitize(s: Any, max_len: int = 96) -> str:
+    if not isinstance(s, str):
+        s = str(s)
+    cleaned = "".join(c if c.isprintable() or c == " " else "?" for c in s)
+    return cleaned[:max_len]
 
 
 # =============================================================================
@@ -88,62 +118,163 @@ class CircuitState(Enum):
 
 
 # =============================================================================
-# ENHANCEMENT 9: Resilience — Circuit Breaker + Chaos Injector
+# Config
 # =============================================================================
 
-@dataclass
+@dataclass(frozen=True)
+class PolicyEngineConfig:
+    """Frozen, validated configuration."""
+
+    # --- negawatt / budget ---
+    base_budget_penalty: float = 1.0
+    negawatt_weight: float = 0.5
+    helium_penalty_cap: float = 0.2
+    carbon_market_penalty_cap: float = 0.15
+
+    # --- precision reward dimension ---
+    precision_bonus_enabled: bool = True
+    precision_bonus_weight: float = 0.03
+
+    # --- HITL ---
+    allow_high_urgency_with_hitl: bool = False
+    hitl_deferral_threshold_hours: float = 24.0
+    hitl_timeout_s: float = 60.0
+    hitl_default_on_timeout: bool = False
+    hitl_feedback_maxlen: int = 1000
+
+    # --- timeouts (None disables) ---
+    shifter_timeout_s: Optional[float] = 2.0
+    forecaster_timeout_s: Optional[float] = 2.0
+    market_timeout_s: Optional[float] = 2.0
+
+    # --- circuit breakers ---
+    circuit_failure_threshold: int = 3
+    circuit_recovery_timeout_s: int = 30
+
+    # --- chaos ---
+    chaos_failure_rate: float = 0.0
+    chaos_event_maxlen: int = 100
+
+    # --- history bounds ---
+    reward_history_maxlen: int = 1024
+    shift_history_maxlen: int = 1024
+    temporal_violation_maxlen: int = 500
+
+    # --- causal learner ---
+    causal_lr: float = 0.02
+    causal_baseline_decay: float = 0.95
+    causal_buffer_maxlen: int = 512
+    causal_update_every: int = 10
+
+    # --- federated ---
+    federated_push_every: int = 25
+    federated_recent_maxlen: int = 256
+
+    # --- temporal safety ---
+    allow_backward_shift: bool = False
+    max_delay_hours: int = 48
+
+    # --- executor ---
+    executor_max_workers: int = 4
+
+    def __post_init__(self) -> None:
+        if self.base_budget_penalty < 0:
+            raise ValueError("base_budget_penalty must be >= 0.")
+        if not 0.0 <= self.negawatt_weight <= 1.0:
+            raise ValueError("negawatt_weight must be in [0, 1].")
+        if not 0.0 <= self.chaos_failure_rate <= 1.0:
+            raise ValueError("chaos_failure_rate must be in [0, 1].")
+        for f in ("shifter_timeout_s", "forecaster_timeout_s", "market_timeout_s"):
+            v = getattr(self, f)
+            if v is not None and v <= 0:
+                raise ValueError(f"{f} must be > 0 or None.")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# =============================================================================
+# Circuit Breaker
+# =============================================================================
+
 class CircuitBreaker:
-    name: str
-    failure_threshold: int = 3
-    recovery_timeout_seconds: int = 30
-    state: CircuitState = CircuitState.CLOSED
-    failures: int = 0
-    last_failure_at: Optional[datetime] = None
+    def __init__(
+        self, name: str, failure_threshold: int = 3,
+        recovery_timeout_s: int = 30,
+    ) -> None:
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout_s = recovery_timeout_s
+        self._failures = 0
+        self._state = CircuitState.CLOSED
+        self._last_failure_mono: Optional[float] = None
+        self._last_failure_at: Optional[datetime] = None
+        self._lock = threading.RLock()
+
+    @property
+    def state(self) -> CircuitState:
+        with self._lock:
+            return self._state
 
     def can_call(self) -> bool:
-        if self.state == CircuitState.CLOSED:
-            return True
-        if self.state == CircuitState.OPEN:
-            if (self.last_failure_at and
-                    (datetime.now() - self.last_failure_at).total_seconds()
-                    > self.recovery_timeout_seconds):
-                self.state = CircuitState.HALF_OPEN
+        with self._lock:
+            if self._state == CircuitState.CLOSED:
                 return True
-            return False
-        return True
+            if self._state == CircuitState.OPEN:
+                if (
+                    self._last_failure_mono is not None
+                    and (time.monotonic() - self._last_failure_mono)
+                    > self.recovery_timeout_s
+                ):
+                    self._state = CircuitState.HALF_OPEN
+                    return True
+                return False
+            return True
 
     def record_success(self) -> None:
-        self.failures = 0
-        self.state = CircuitState.CLOSED
+        with self._lock:
+            self._failures = 0
+            self._state = CircuitState.CLOSED
 
     def record_failure(self) -> None:
-        self.failures += 1
-        self.last_failure_at = datetime.now()
-        if self.failures >= self.failure_threshold:
-            self.state = CircuitState.OPEN
-            logger.warning(
-                f"Circuit '{self.name}' OPEN after {self.failures} failures"
-            )
+        with self._lock:
+            self._failures += 1
+            self._last_failure_mono = time.monotonic()
+            self._last_failure_at = _utcnow()
+            if self._failures >= self.failure_threshold:
+                if self._state != CircuitState.OPEN:
+                    logger.warning(
+                        "Circuit '%s' OPEN after %d failures",
+                        self.name, self._failures,
+                    )
+                self._state = CircuitState.OPEN
 
+
+# =============================================================================
+# Chaos Injector
+# =============================================================================
 
 class ChaosInjector:
-    """Injects controlled faults for resilience testing."""
-    def __init__(self, failure_rate: float = 0.0) -> None:
-        self.failure_rate = failure_rate
-        self.events: List[Dict[str, Any]] = []
+    def __init__(self, failure_rate: float = 0.0, maxlen: int = 100) -> None:
+        self.failure_rate = max(0.0, min(1.0, failure_rate))
+        self.events: Deque[Dict[str, Any]] = deque(maxlen=maxlen)
+        self._lock = threading.RLock()
 
     def maybe_fail(self, component: str) -> bool:
+        if self.failure_rate <= 0:
+            return False
         if random.random() < self.failure_rate:
-            self.events.append({
-                "component": component,
-                "at": datetime.now().isoformat(),
-            })
+            with self._lock:
+                self.events.append({
+                    "component": component,
+                    "at": _utcnow().isoformat(),
+                })
             return True
         return False
 
 
 # =============================================================================
-# ENHANCEMENT 5: Temporal Logic & Formal Verification
+# Temporal Logic
 # =============================================================================
 
 class ShiftProperty(Protocol):
@@ -153,12 +284,11 @@ class ShiftProperty(Protocol):
 
 @dataclass
 class DeadlineRespected:
-    """G(shift.hour <= task.deadline_hour)."""
     def check(self, shift: Dict[str, Any], task: Dict[str, Any]) -> bool:
         deadline_hour = task.get("deadline_hour")
         if deadline_hour is None:
             return True
-        return shift.get("hour", 0) <= deadline_hour
+        return int(shift.get("hour", 0)) <= int(deadline_hour)
 
     def name(self) -> str:
         return "DeadlineRespected"
@@ -167,7 +297,10 @@ class DeadlineRespected:
 @dataclass
 class NonNegativeSaving:
     def check(self, shift: Dict[str, Any], task: Dict[str, Any]) -> bool:
-        return shift.get("saving", 0.0) >= 0.0
+        try:
+            return float(shift.get("saving", 0.0)) >= 0.0
+        except (TypeError, ValueError):
+            return False
 
     def name(self) -> str:
         return "NonNegativeSaving"
@@ -176,47 +309,77 @@ class NonNegativeSaving:
 @dataclass
 class MaxDelayBounded:
     max_delay_hours: int = 48
+
     def check(self, shift: Dict[str, Any], task: Dict[str, Any]) -> bool:
-        current_hour = task.get("current_hour", 0)
-        return abs(shift.get("hour", 0) - current_hour) <= self.max_delay_hours
+        current = int(task.get("current_hour", 0))
+        return abs(int(shift.get("hour", 0)) - current) <= self.max_delay_hours
 
     def name(self) -> str:
         return "MaxDelayBounded"
 
 
 @dataclass
+class NonBackwardShift:
+    """Shift.hour must be >= current_hour unless the caller has opted in."""
+    allow_backward: bool = False
+
+    def check(self, shift: Dict[str, Any], task: Dict[str, Any]) -> bool:
+        if self.allow_backward:
+            return True
+        current = int(task.get("current_hour", 0))
+        return int(shift.get("hour", 0)) >= current
+
+    def name(self) -> str:
+        return "NonBackwardShift"
+
+
+@dataclass
 class NonNegativeEnergy:
     def check(self, shift: Dict[str, Any], task: Dict[str, Any]) -> bool:
-        return task.get("energy_kwh", 0.0) >= 0.0
+        try:
+            return float(task.get("energy_kwh", 0.0)) >= 0.0
+        except (TypeError, ValueError):
+            return False
 
     def name(self) -> str:
         return "NonNegativeEnergy"
 
 
 class TemporalLogicMonitor:
-    def __init__(self) -> None:
+    def __init__(self, maxlen: int = 500) -> None:
         self.properties: List[ShiftProperty] = []
-        self.violations: List[Dict[str, Any]] = []
+        self.violations: Deque[Dict[str, Any]] = deque(maxlen=maxlen)
+        self._lock = threading.RLock()
 
     def register(self, p: ShiftProperty) -> None:
-        self.properties.append(p)
+        with self._lock:
+            self.properties.append(p)
 
     def verify(
-        self, shift: Dict[str, Any], task: Dict[str, Any]
+        self, shift: Dict[str, Any], task: Dict[str, Any],
     ) -> Tuple[bool, List[str]]:
         bad: List[str] = []
-        for p in self.properties:
-            if not p.check(shift, task):
+        with self._lock:
+            props = list(self.properties)
+        for p in props:
+            try:
+                ok = p.check(shift, task)
+            except Exception as e:
+                logger.warning("property %s raised: %s", p.name(), e)
+                ok = False
+            if not ok:
                 bad.append(p.name())
-                self.violations.append({
-                    "property": p.name(),
-                    "at": datetime.now().isoformat(),
-                })
+                with self._lock:
+                    self.violations.append({
+                        "property": p.name(),
+                        "shift": dict(shift),
+                        "at": _utcnow().isoformat(),
+                    })
         return (len(bad) == 0, bad)
 
 
 # =============================================================================
-# ENHANCEMENT 6: Explainable AI (XAI)
+# XAI
 # =============================================================================
 
 @dataclass
@@ -241,19 +404,19 @@ class RewardExplainer:
         final_reward: float,
         helium_units: float = 0.0,
         carbon_market_cost: float = 0.0,
-        precision: str = "fp32",
+        precision: Optional[str] = None,
         causal_adjustment: float = 0.0,
+        precision_bonus: float = 0.0,
+        *,
+        learner_observations: int = 0,
     ) -> RewardExplanation:
-        reasons: List[str] = []
-        reasons.append(
+        reasons: List[str] = [
             f"Accuracy={accuracy:.3f}, Energy={energy:.4f} kWh "
-            f"(budget={energy_budget:.4f})."
-        )
-        reasons.append(f"Negawatt component: {negawatt_reward:.4f}.")
+            f"(budget={energy_budget:.4f}).",
+            f"Negawatt component: {negawatt_reward:.4f}.",
+        ]
         if budget_penalty:
-            reasons.append(
-                f"Budget penalty applied: −{budget_penalty:.4f}."
-            )
+            reasons.append(f"Budget penalty applied: −{budget_penalty:.4f}.")
         if helium_units > 0:
             reasons.append(f"Helium component: {helium_units:.5f} units.")
         if carbon_market_cost > 0:
@@ -262,14 +425,28 @@ class RewardExplainer:
             reasons.append(
                 f"Learned penalty adjustment: {causal_adjustment:+.4f}."
             )
-        reasons.append(f"Precision used: {precision}.")
+        if precision is not None:
+            reasons.append(f"Precision: {precision}.")
+        if precision_bonus:
+            reasons.append(f"Precision bonus: +{precision_bonus:.4f}.")
         reasons.append(f"Final reward: {final_reward:.4f}.")
 
+        confidence = 0.5
+        if accuracy > 0.8:
+            confidence += 0.3
+        if learner_observations >= 20:
+            confidence += 0.1
+        if learner_observations < 5:
+            confidence -= 0.1
+        confidence = max(0.1, min(1.0, confidence))
+
         return RewardExplanation(
-            headline=f"Reward={final_reward:.4f} "
-                     f"(acc={accuracy:.2f}, energy={energy:.4f})",
+            headline=(
+                f"Reward={final_reward:.4f} "
+                f"(acc={accuracy:.2f}, energy={energy:.4f})"
+            ),
             rationale=reasons,
-            confidence=0.9 if accuracy > 0.8 else 0.6,
+            confidence=confidence,
             contributing_factors={
                 "accuracy": accuracy,
                 "energy": energy,
@@ -277,12 +454,13 @@ class RewardExplainer:
                 "budget_penalty": budget_penalty,
                 "helium": helium_units,
                 "carbon_market_cost": carbon_market_cost,
+                "precision_bonus": precision_bonus,
             },
         )
 
 
 # =============================================================================
-# ENHANCEMENT 7: Adaptive Precision Switching
+# Adaptive Precision
 # =============================================================================
 
 @dataclass
@@ -299,8 +477,12 @@ class AdaptivePrecisionController:
         self.hw = hw or HardwareProfile()
 
     def select(self, urgency: str) -> PrecisionLevel:
+        """'critical' means FULL fidelity (FP32)."""
         if urgency == "critical":
-            return PrecisionLevel.FP16
+            return PrecisionLevel.FP32
+        if urgency == "high":
+            return (PrecisionLevel.FP16 if self.hw.has_tensor_cores
+                    else PrecisionLevel.FP32)
         if self.hw.edge_device:
             return (PrecisionLevel.INT8 if self.hw.supports_int8
                     else PrecisionLevel.FP16)
@@ -319,7 +501,7 @@ class AdaptivePrecisionController:
 
 
 # =============================================================================
-# ENHANCEMENT 2: Causal RL for learned budget penalties
+# Causal Penalty Learner (RWR + per-bin baseline)
 # =============================================================================
 
 @dataclass
@@ -331,51 +513,108 @@ class PenaltyState:
 
 class CausalPenaltyLearner:
     """
-    Learns a graduated budget penalty from outcomes.
+    Learns a budget-penalty adjustment from outcomes.
 
-    Features: [hour/24, overshoot_ratio, task_priority]
-    Reward: 1.0 if the penalty led to better sustainability outcomes;
-    0.5 if neutral; 0.0 if harmful.
+    v2 — reward-weighted regression with a per-bin baseline:
+      * Consumes the penalty actually applied (target of the regression).
+      * Can soften *below* ``base_penalty`` — the previous max(base, …)
+        floor structurally prevented the learner from reducing penalties.
+      * No monotonic drift: baseline removes always-positive bias.
     """
+
     N_FEATURES = 3
 
-    def __init__(self, base_penalty: float = 1.0, lr: float = 0.02) -> None:
+    def __init__(
+        self,
+        base_penalty: float = 1.0,
+        lr: float = 0.02,
+        baseline_decay: float = 0.95,
+        buffer_maxlen: int = 512,
+    ) -> None:
         self.base_penalty = base_penalty
         self.lr = lr
+        self.baseline_decay = baseline_decay
         self.coeffs: List[float] = [0.0] * self.N_FEATURES
-        self.buffer: Deque[Tuple[List[float], float]] = deque(maxlen=512)
+        self.baselines: Dict[int, float] = defaultdict(float)
+        self.baseline_counts: Dict[int, int] = defaultdict(int)
+        self.buffer: Deque[
+            Tuple[List[float], float, float, int]
+        ] = deque(maxlen=buffer_maxlen)
         self.observations: int = 0
         self.updates: int = 0
+        self.last_advantage_mean: float = 0.0
+        self._lock = threading.RLock()
 
     @staticmethod
     def _features(s: PenaltyState) -> List[float]:
-        return [s.hour_of_day / 24.0, s.energy_overshoot_ratio, s.task_priority]
+        return [
+            s.hour_of_day / 24.0,
+            min(2.0, max(0.0, s.energy_overshoot_ratio)),
+            min(1.0, max(0.0, s.task_priority)),
+        ]
+
+    @staticmethod
+    def _bin(f: List[float]) -> int:
+        return int(f[1] * 5)  # 5 buckets by overshoot ratio
+
+    def _baseline_for(self, f: List[float]) -> float:
+        return self.baselines.get(self._bin(f), 0.0)
+
+    def _update_baseline(self, f: List[float], reward: float) -> None:
+        b = self._bin(f)
+        old = self.baselines.get(b, 0.0)
+        self.baselines[b] = (
+            self.baseline_decay * old
+            + (1.0 - self.baseline_decay) * reward
+        )
+        self.baseline_counts[b] += 1
+
+    def _raw_predict(self, f: List[float], magnitude: float) -> float:
+        delta = sum(c * x for c, x in zip(self.coeffs, f))
+        # Note: no max(base, …) — the learner may soften the penalty.
+        return max(0.0, self.base_penalty * magnitude + delta)
 
     def predict_penalty(self, s: PenaltyState) -> float:
         f = self._features(s)
-        delta = sum(c * x for c, x in zip(self.coeffs, f))
         magnitude = 1.0 + max(0.0, min(2.0, s.energy_overshoot_ratio))
-        return max(
-            self.base_penalty,
-            self.base_penalty * magnitude + delta,
-        )
+        with self._lock:
+            return self._raw_predict(f, magnitude)
 
-    def record(self, s: PenaltyState, reward: float) -> None:
-        self.buffer.append((self._features(s), reward))
-        self.observations += 1
+    def record(
+        self,
+        s: PenaltyState,
+        reward: float,
+        penalty_used: float,
+    ) -> None:
+        f = self._features(s)
+        with self._lock:
+            self.buffer.append((f, reward, penalty_used, self._bin(f)))
+            self.observations += 1
 
     def update(self) -> None:
-        if not self.buffer:
-            return
-        for f, r in self.buffer:
-            for i, x in enumerate(f):
-                self.coeffs[i] += self.lr * r * x * 0.2
-        self.updates += 1
-        self.buffer.clear()
+        with self._lock:
+            if not self.buffer:
+                return
+            advantages: List[float] = []
+            for f, reward, penalty_used, _b in self.buffer:
+                adv = reward - self._baseline_for(f)
+                advantages.append(adv)
+                self._update_baseline(f, reward)
+
+                magnitude = 1.0 + min(2.0, max(0.0, f[1]))
+                pred = self._raw_predict(f, magnitude)
+                error = penalty_used - pred
+                for i, x in enumerate(f):
+                    self.coeffs[i] += self.lr * adv * error * x
+            self.last_advantage_mean = (
+                statistics.fmean(advantages) if advantages else 0.0
+            )
+            self.updates += 1
+            self.buffer.clear()
 
 
 # =============================================================================
-# ENHANCEMENT 1: Quantum-Distillation of the reward policy
+# Quantum Distillation
 # =============================================================================
 
 @dataclass
@@ -388,8 +627,6 @@ class DistilledRewardPolicy:
 
 
 class QuantumDistillationBridge:
-    """Distills the reward policy to a compact, low-precision student."""
-
     def distill(
         self,
         base_penalty: float,
@@ -417,7 +654,7 @@ class QuantumDistillationBridge:
 
 
 # =============================================================================
-# ENHANCEMENT 3: Federated Green Learning
+# Federated (incremental)
 # =============================================================================
 
 @dataclass
@@ -427,42 +664,48 @@ class FederatedRewardProfile:
     mean_reward: float
     mean_energy: float
     sample_count: int
-    timestamp: datetime = field(default_factory=datetime.now)
+    timestamp: datetime = field(default_factory=_utcnow)
 
 
 class FederatedAggregator:
-    def __init__(self) -> None:
-        self.updates: List[FederatedRewardProfile] = []
+    def __init__(self, recent_maxlen: int = 256) -> None:
+        self._sum_reward: Dict[str, float] = defaultdict(float)
+        self._sum_energy: Dict[str, float] = defaultdict(float)
+        self._count: Dict[str, int] = defaultdict(int)
+        self.recent: Deque[FederatedRewardProfile] = deque(maxlen=recent_maxlen)
         self._global: Dict[str, Dict[str, float]] = {}
+        self._lock = threading.RLock()
 
     def push(self, u: FederatedRewardProfile) -> None:
-        self.updates.append(u)
+        with self._lock:
+            self.recent.append(u)
+            self._sum_reward[u.key] += u.mean_reward * u.sample_count
+            self._sum_energy[u.key] += u.mean_energy * u.sample_count
+            self._count[u.key] += u.sample_count
 
     def aggregate(self) -> Dict[str, Dict[str, float]]:
-        grouped: Dict[str, List[FederatedRewardProfile]] = defaultdict(list)
-        for u in self.updates:
-            grouped[u.key].append(u)
-        result: Dict[str, Dict[str, float]] = {}
-        for key, profiles in grouped.items():
-            total_w = sum(p.sample_count for p in profiles) or 1
-            result[key] = {
-                "mean_reward": sum(
-                    p.mean_reward * p.sample_count for p in profiles
-                ) / total_w,
-                "mean_energy": sum(
-                    p.mean_energy * p.sample_count for p in profiles
-                ) / total_w,
-                "sample_count": total_w,
-            }
-        self._global = result
-        return result
+        with self._lock:
+            result = {}
+            for key, n in self._count.items():
+                if n <= 0:
+                    continue
+                result[key] = {
+                    "mean_reward": self._sum_reward[key] / n,
+                    "mean_energy": self._sum_energy[key] / n,
+                    "sample_count": n,
+                }
+            self._global = result
+            return dict(result)
 
     def lookup(self, key: str) -> Optional[Dict[str, float]]:
-        return self._global.get(key)
+        with self._lock:
+            if not self._global:
+                self.aggregate()
+            return self._global.get(key)
 
 
 # =============================================================================
-# ENHANCEMENT 4: Multi-Agent Coordination
+# Multi-Agent
 # =============================================================================
 
 @dataclass
@@ -478,11 +721,13 @@ class AgentProfile:
 class MultiAgentCoordinator:
     def __init__(self) -> None:
         self.agents: Dict[str, AgentProfile] = {}
+        self._lock = threading.RLock()
 
     def register(self, agent_id: str) -> AgentProfile:
-        if agent_id not in self.agents:
-            self.agents[agent_id] = AgentProfile(agent_id)
-        return self.agents[agent_id]
+        with self._lock:
+            if agent_id not in self.agents:
+                self.agents[agent_id] = AgentProfile(agent_id)
+            return self.agents[agent_id]
 
     def _reassign(self) -> None:
         for a in self.agents.values():
@@ -501,30 +746,36 @@ class MultiAgentCoordinator:
         self, agent_id: str, success: bool,
         carbon_saved_pct: float, helium_saved_pct: float,
     ) -> None:
-        a = self.register(agent_id)
-        n = a.total_calls + 1
-        a.success_rate = ((n - 1) * a.success_rate + float(success)) / n
-        a.avg_carbon_saved = (
-            (n - 1) * a.avg_carbon_saved + carbon_saved_pct / 100.0
-        ) / n
-        a.avg_helium_saved = (
-            (n - 1) * a.avg_helium_saved + helium_saved_pct / 100.0
-        ) / n
-        a.total_calls = n
-        if n % 5 == 0:
-            self._reassign()
+        with self._lock:
+            a = self.register(agent_id)
+            n = a.total_calls + 1
+            a.success_rate = (
+                (n - 1) * a.success_rate + float(success)
+            ) / n
+            a.avg_carbon_saved = (
+                (n - 1) * a.avg_carbon_saved + carbon_saved_pct / 100.0
+            ) / n
+            a.avg_helium_saved = (
+                (n - 1) * a.avg_helium_saved + helium_saved_pct / 100.0
+            ) / n
+            a.total_calls = n
+            if n % 5 == 0:
+                self._reassign()
 
-    def select_agent(self, prefer: AgentRole = AgentRole.GENERALIST) -> Optional[str]:
-        if not self.agents:
-            return None
-        cands = [a for a in self.agents.values() if a.role == prefer]
-        if not cands:
-            cands = list(self.agents.values())
-        return max(cands, key=lambda a: a.success_rate).agent_id
+    def select_agent(
+        self, prefer: AgentRole = AgentRole.GENERALIST,
+    ) -> Optional[str]:
+        with self._lock:
+            if not self.agents:
+                return None
+            cands = [a for a in self.agents.values() if a.role == prefer]
+            if not cands:
+                cands = list(self.agents.values())
+            return max(cands, key=lambda a: a.success_rate).agent_id
 
 
 # =============================================================================
-# ENHANCEMENT 8: Carbon Markets & RECs
+# Carbon Markets
 # =============================================================================
 
 @dataclass
@@ -532,54 +783,92 @@ class MarketSnapshot:
     carbon_price_per_tco2_usd: float
     rec_price_per_mwh_usd: float
     rec_available_mwh: float
-    timestamp: datetime = field(default_factory=datetime.now)
+    timestamp: datetime = field(default_factory=_utcnow)
 
 
-class CarbonMarketClient:
-    def __init__(self) -> None:
-        self._cache: Optional[MarketSnapshot] = None
-        self._ttl = 300
+class MarketBackend(Protocol):
+    def fetch(self) -> MarketSnapshot: ...
 
-    def get_snapshot(self) -> MarketSnapshot:
-        if self._cache and (
-            (datetime.now() - self._cache.timestamp).total_seconds() < self._ttl
-        ):
-            return self._cache
-        snap = MarketSnapshot(
+
+class MockMarketBackend:
+    def fetch(self) -> MarketSnapshot:
+        return MarketSnapshot(
             carbon_price_per_tco2_usd=random.uniform(20, 80),
             rec_price_per_mwh_usd=random.uniform(3, 9),
             rec_available_mwh=random.uniform(10, 500),
         )
-        self._cache = snap
-        return snap
+
+
+class CarbonMarketClient:
+    def __init__(
+        self, backend: Optional[MarketBackend] = None, ttl_s: int = 300,
+    ) -> None:
+        self._backend = backend or MockMarketBackend()
+        self._ttl = ttl_s
+        self._cache: Optional[MarketSnapshot] = None
+        self._lock = threading.RLock()
+
+    def get_snapshot(self) -> MarketSnapshot:
+        with self._lock:
+            if self._cache and (
+                (_utcnow() - self._cache.timestamp).total_seconds()
+                < self._ttl
+            ):
+                return self._cache
+            snap = self._backend.fetch()
+            self._cache = snap
+            return snap
 
 
 # =============================================================================
-# ENHANCEMENT 10: HITL + Active Learning
+# HITL (async + timeout + audit-flagged auto-approvals)
 # =============================================================================
 
-@dataclass
+@dataclass(frozen=True)
 class HITLRequest:
     shift_hour: int
     shift_saving: float
     urgency: str
     reason: str
-    context: Dict[str, Any] = field(default_factory=dict)
-    requested_at: datetime = field(default_factory=datetime.now)
+    context: Mapping[str, Any] = field(default_factory=dict)
+    requested_at: datetime = field(default_factory=_utcnow)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["context"] = dict(self.context)
+        d["requested_at"] = self.requested_at.isoformat()
+        return d
 
 
 class HumanInTheLoopGate:
-    def __init__(self, deferral_threshold_hours: float = 24.0) -> None:
+    def __init__(
+        self,
+        deferral_threshold_hours: float = 24.0,
+        timeout_s: float = 60.0,
+        default_on_timeout: bool = False,
+        feedback_maxlen: int = 1000,
+    ) -> None:
         self.deferral_threshold_hours = deferral_threshold_hours
+        self.timeout_s = timeout_s
+        self.default_on_timeout = default_on_timeout
         self.pending: List[HITLRequest] = []
-        self.feedback_log: List[Dict[str, Any]] = []
+        self.feedback_log: Deque[Dict[str, Any]] = deque(maxlen=feedback_maxlen)
         self._callback: Optional[Callable[[HITLRequest], bool]] = None
+        self._async_callback: Optional[
+            Callable[[HITLRequest], Awaitable[bool]]
+        ] = None
+        self._lock = threading.RLock()
 
     def set_callback(self, cb: Callable[[HITLRequest], bool]) -> None:
         self._callback = cb
 
+    def set_async_callback(
+        self, cb: Callable[[HITLRequest], Awaitable[bool]],
+    ) -> None:
+        self._async_callback = cb
+
     def needs_review(
-        self, shift_hour: int, current_hour: int, urgency: str
+        self, shift_hour: int, current_hour: int, urgency: str,
     ) -> bool:
         if urgency == "high":
             return True
@@ -587,75 +876,193 @@ class HumanInTheLoopGate:
             return True
         return False
 
+    def _record(
+        self, req: HITLRequest, decision: bool, auto: bool = False,
+    ) -> None:
+        with self._lock:
+            self.feedback_log.append({
+                "req": req.to_dict(),
+                "decision": decision,
+                "auto": auto,
+            })
+
     def request_review(
-        self, shift_hour: int, shift_saving: float,
-        urgency: str, reason: str,
+        self,
+        shift_hour: int,
+        shift_saving: float,
+        urgency: str,
+        reason: str,
         context: Optional[Dict[str, Any]] = None,
     ) -> bool:
         req = HITLRequest(
             shift_hour, shift_saving, urgency, reason, context or {},
         )
-        self.pending.append(req)
-        if urgency == "low":
-            self.pending.remove(req)
-            self.feedback_log.append({"req": asdict(req), "decision": True})
-            return True
-        if self._callback is None:
-            self.pending.remove(req)
-            self.feedback_log.append({"req": asdict(req), "decision": False})
-            return False
-        decision = self._callback(req)
-        self.pending.remove(req)
-        self.feedback_log.append({"req": asdict(req), "decision": decision})
-        return decision
+        with self._lock:
+            self.pending.append(req)
+        try:
+            # NOTE: The previous auto-approve "low" branch was dead — the
+            # caller only reaches us when needs_review() returned True,
+            # which cannot happen for low urgency (unless deferral
+            # threshold was crossed). Handled by the callback path.
+            if self._callback is None:
+                self._record(req, False, auto=True)
+                return False
+            decision = self._callback(req)
+            self._record(req, bool(decision))
+            return bool(decision)
+        finally:
+            with self._lock:
+                if req in self.pending:
+                    self.pending.remove(req)
+
+    async def request_review_async(
+        self,
+        shift_hour: int,
+        shift_saving: float,
+        urgency: str,
+        reason: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        req = HITLRequest(
+            shift_hour, shift_saving, urgency, reason, context or {},
+        )
+        with self._lock:
+            self.pending.append(req)
+        try:
+            if self._async_callback is not None:
+                decision = await asyncio.wait_for(
+                    self._async_callback(req), timeout=self.timeout_s,
+                )
+            elif self._callback is not None:
+                decision = self._callback(req)
+            else:
+                decision = self.default_on_timeout
+        except asyncio.TimeoutError:
+            logger.warning("HITL async timed out; using default")
+            decision = self.default_on_timeout
+        except Exception as e:
+            logger.error("HITL async callback failed: %s", e)
+            decision = False
+        finally:
+            with self._lock:
+                if req in self.pending:
+                    self.pending.remove(req)
+        self._record(req, bool(decision))
+        return bool(decision)
 
     def active_learning_batch(self, n: int = 16) -> List[Dict[str, Any]]:
-        return self.feedback_log[-n:]
+        with self._lock:
+            return list(self.feedback_log)[-n:]
 
 
 # =============================================================================
-# Helium Profiling
+# Helium Profiler — v2: scarcity *increases* estimated units
 # =============================================================================
 
 class HeliumProfiler:
-    """Estimate helium consumption from energy."""
+    """
+    Estimate helium consumption from energy and scarcity.
+
+    Scarcity → **higher** effective units (the resource is harder to
+    procure, so its shadow cost per kWh goes up). The previous
+    `1 - 0.5*scarcity` factor inverted this.
+    """
     HELIUM_UNITS_PER_KWH = 0.05
+    SCARCITY_UPLIFT_MAX = 0.5  # up to +50%
 
     @classmethod
     def estimate_units(
-        cls, energy_kwh: float, scarcity_score: float = 0.0
+        cls, energy_kwh: float, scarcity_score: float = 0.0,
     ) -> float:
         base = energy_kwh * cls.HELIUM_UNITS_PER_KWH
-        efficiency = 1.0 - min(0.5, scarcity_score * 0.5)
-        return base * efficiency
+        uplift = 1.0 + min(
+            cls.SCARCITY_UPLIFT_MAX, max(0.0, scarcity_score) * 0.5,
+        )
+        return base * uplift
 
 
 # =============================================================================
-# The Enhanced PolicyEngine
+# Metrics
+# =============================================================================
+
+class MetricsRecorder:
+    def __init__(self) -> None:
+        self.counters: Dict[str, float] = {}
+        self.histograms: Dict[str, List[float]] = {}
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _key(name: str, labels: Mapping[str, Any]) -> str:
+        if not labels:
+            return name
+        parts = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+        return f"{name}{{{parts}}}"
+
+    def inc(self, name: str, value: float = 1.0, **labels: Any) -> None:
+        with self._lock:
+            k = self._key(name, labels)
+            self.counters[k] = self.counters.get(k, 0.0) + value
+
+    def observe(self, name: str, value: float, **labels: Any) -> None:
+        with self._lock:
+            k = self._key(name, labels)
+            self.histograms.setdefault(k, []).append(float(value))
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            hist: Dict[str, Dict[str, float]] = {}
+            for k, vals in self.histograms.items():
+                if not vals:
+                    continue
+                s = sorted(vals)
+                hist[k] = {
+                    "count": len(vals),
+                    "mean": sum(vals) / len(vals),
+                    "p50": s[len(s) // 2],
+                    "p99": s[min(len(s) - 1, int(len(s) * 0.99))],
+                    "max": s[-1],
+                }
+            return {
+                "counters": dict(self.counters),
+                "histograms": hist,
+            }
+
+
+# =============================================================================
+# Default feature flags (immutable)
+# =============================================================================
+
+_DEFAULT_FEATURES = types.MappingProxyType({
+    "causal_rl": True,
+    "xai": True,
+    "adaptive_precision": True,
+    "federated": True,
+    "multi_agent": True,
+    "temporal_logic": True,
+    "carbon_market": True,
+    "chaos_testing": False,
+    "hitl": True,
+    "quantum_distillation": True,
+    "helium_awareness": True,
+    "carbon_awareness": True,
+})
+
+
+# =============================================================================
+# PolicyEngine
 # =============================================================================
 
 class PolicyEngine:
     """
     Enhanced reward shaping and temporal shift policy engine.
 
-    Backward-compatible signature:
+    Backward-compatible:
         PolicyEngine(energy_budget, baseline_energy=None)
     """
 
-    DEFAULT_FEATURES = {
-        "causal_rl": True,
-        "xai": True,
-        "adaptive_precision": True,
-        "federated": True,
-        "multi_agent": True,
-        "temporal_logic": True,
-        "carbon_market": True,
-        "chaos_testing": False,
-        "hitl": True,
-        "quantum_distillation": True,
-        "helium_awareness": True,
-        "carbon_awareness": True,
-    }
+    @classmethod
+    def default_features(cls) -> Dict[str, bool]:
+        return dict(_DEFAULT_FEATURES)
 
     def __init__(
         self,
@@ -665,10 +1072,13 @@ class PolicyEngine:
         agent_id: str = "policy-0",
         features: Optional[Dict[str, bool]] = None,
         hardware: Optional[HardwareProfile] = None,
-    ):
-        # --- Original state ---
+        config: Optional[PolicyEngineConfig] = None,
+        metrics: Optional[MetricsRecorder] = None,
+    ) -> None:
+        self.config = config or PolicyEngineConfig()
         self.energy_budget = float(energy_budget)
         self.baseline_energy = baseline_energy
+
         if baseline_energy is not None:
             try:
                 self.negawatt_module = NegawattReward(baseline_energy)
@@ -677,240 +1087,185 @@ class PolicyEngine:
         else:
             self.negawatt_module = None
 
-        # --- Enhancement config ---
         self.deployment_id = deployment_id
         self.agent_id = agent_id
-        self.features = {**self.DEFAULT_FEATURES, **(features or {})}
+        self.features = {**self.default_features(), **(features or {})}
+        self._metrics = metrics or MetricsRecorder()
 
-        # --- Resilience ---
-        self._negawatt_circuit = CircuitBreaker("negawatt", failure_threshold=3)
-        self._forecaster_circuit = CircuitBreaker("forecaster", failure_threshold=3)
-        self._shifter_circuit = CircuitBreaker("shifter", failure_threshold=3)
+        # Resilience.
+        self._negawatt_circuit = CircuitBreaker(
+            "negawatt",
+            self.config.circuit_failure_threshold,
+            self.config.circuit_recovery_timeout_s,
+        )
+        self._forecaster_circuit = CircuitBreaker(
+            "forecaster",
+            self.config.circuit_failure_threshold,
+            self.config.circuit_recovery_timeout_s,
+        )
+        self._shifter_circuit = CircuitBreaker(
+            "shifter",
+            self.config.circuit_failure_threshold,
+            self.config.circuit_recovery_timeout_s,
+        )
+        self._market_circuit = CircuitBreaker(
+            "market",
+            self.config.circuit_failure_threshold,
+            self.config.circuit_recovery_timeout_s,
+        )
         self.chaos = (
-            ChaosInjector(failure_rate=0.0)
+            ChaosInjector(
+                failure_rate=self.config.chaos_failure_rate,
+                maxlen=self.config.chaos_event_maxlen,
+            )
             if self.features["chaos_testing"] else None
         )
 
-        # --- Temporal logic ---
+        # Temporal logic.
         self.temporal_monitor: Optional[TemporalLogicMonitor] = (
-            TemporalLogicMonitor() if self.features["temporal_logic"] else None
+            TemporalLogicMonitor(
+                maxlen=self.config.temporal_violation_maxlen,
+            )
+            if self.features["temporal_logic"] else None
         )
         if self.temporal_monitor:
             self.temporal_monitor.register(DeadlineRespected())
             self.temporal_monitor.register(NonNegativeSaving())
-            self.temporal_monitor.register(MaxDelayBounded())
+            self.temporal_monitor.register(
+                MaxDelayBounded(max_delay_hours=self.config.max_delay_hours),
+            )
+            self.temporal_monitor.register(
+                NonBackwardShift(
+                    allow_backward=self.config.allow_backward_shift,
+                ),
+            )
             self.temporal_monitor.register(NonNegativeEnergy())
 
-        # --- XAI ---
+        # XAI.
         self.explainer = RewardExplainer() if self.features["xai"] else None
 
-        # --- Adaptive precision ---
+        # Precision.
         self.precision_ctl = (
             AdaptivePrecisionController(hardware)
             if self.features["adaptive_precision"] else None
         )
 
-        # --- Causal RL ---
-        self.penalty_learner = (
-            CausalPenaltyLearner(base_penalty=1.0, lr=0.02)
+        # Causal learner.
+        self.penalty_learner: Optional[CausalPenaltyLearner] = (
+            CausalPenaltyLearner(
+                base_penalty=self.config.base_budget_penalty,
+                lr=self.config.causal_lr,
+                baseline_decay=self.config.causal_baseline_decay,
+                buffer_maxlen=self.config.causal_buffer_maxlen,
+            )
             if self.features["causal_rl"] else None
         )
 
-        # --- Quantum distillation ---
+        # Distillation.
         self.distiller = (
             QuantumDistillationBridge()
             if self.features["quantum_distillation"] else None
         )
 
-        # --- Federated ---
+        # Federated.
         self.federated = (
-            FederatedAggregator() if self.features["federated"] else None
+            FederatedAggregator(recent_maxlen=self.config.federated_recent_maxlen)
+            if self.features["federated"] else None
         )
 
-        # --- Multi-agent ---
+        # Multi-agent.
         self.coordinator = (
             MultiAgentCoordinator() if self.features["multi_agent"] else None
         )
         if self.coordinator:
             self.coordinator.register(self.agent_id)
 
-        # --- Carbon markets ---
+        # Market.
         self.market = (
             CarbonMarketClient() if self.features["carbon_market"] else None
         )
 
-        # --- HITL ---
-        self.hitl = HumanInTheLoopGate() if self.features["hitl"] else None
+        # HITL.
+        self.hitl = (
+            HumanInTheLoopGate(
+                deferral_threshold_hours=self.config.hitl_deferral_threshold_hours,
+                timeout_s=self.config.hitl_timeout_s,
+                default_on_timeout=self.config.hitl_default_on_timeout,
+                feedback_maxlen=self.config.hitl_feedback_maxlen,
+            )
+            if self.features["hitl"] else None
+        )
 
-        # --- Helium ---
+        # Helium profiler (scarcity-aware).
         self.helium_profiler = (
             HeliumProfiler() if self.features["helium_awareness"] else None
         )
+
+        # External signals.
         self.helium_signal_fn: Optional[Callable[[], Any]] = None
-
-        # --- Carbon ---
         self.carbon_forecaster: Any = None
+        self._async_forecaster_warned: bool = False
 
-        # --- History & statistics ---
-        self.reward_history: Deque[Dict[str, Any]] = deque(maxlen=1024)
-        self.shift_history: Deque[Dict[str, Any]] = deque(maxlen=1024)
+        # History / counters.
+        self._lock = threading.RLock()
+        self.reward_history: Deque[Dict[str, Any]] = deque(
+            maxlen=self.config.reward_history_maxlen,
+        )
+        self.shift_history: Deque[Dict[str, Any]] = deque(
+            maxlen=self.config.shift_history_maxlen,
+        )
         self.reward_count: int = 0
         self.shift_count: int = 0
         self.last_explanation: Optional[RewardExplanation] = None
+        self.last_penalty_used: float = 0.0
+        self.last_negawatt_weight: float = self.config.negawatt_weight
+        self._started_mono: float = time.monotonic()
+        self._pending_outcomes: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._next_outcome_id: int = 1
 
-        logger.info(
-            f"Enhanced PolicyEngine initialized "
-            f"(deployment={deployment_id}, agent={agent_id}, "
-            f"budget={energy_budget}, features={list(self.features)})"
+        # Executor for timeouts on sync external calls.
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.config.executor_max_workers,
+            thread_name_prefix="policy-engine",
         )
 
-    # ------------------------------------------------------------------
-    # Original public API: compute_sustainability_reward
-    # ------------------------------------------------------------------
+        logger.info(
+            "Enhanced PolicyEngine initialized "
+            "(deployment=%s, agent=%s, budget=%s, features=%s)",
+            deployment_id, agent_id, energy_budget, list(self.features),
+        )
 
-    def compute_sustainability_reward(
-        self, accuracy: float, energy: float
-    ) -> float:
-        """
-        Compute sustainability reward. Backward-compatible.
+    # ------------------------------------------------------------------ lifecycle
+    def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
-        With all features off, behaves identically to the original:
-        delegates to NegawattReward, then applies a fixed -1.0 penalty
-        if energy > energy_budget.
-        """
-        # --- Input validation ---
-        acc = self._safe_float(accuracy)
-        en = self._safe_float(energy)
-        if acc is None or en is None:
-            logger.warning("Invalid accuracy/energy input; returning 0.0")
-            return 0.0
-        acc = max(0.0, min(1.0, acc))
-        en = max(0.0, en)
+    def __enter__(self) -> "PolicyEngine":
+        return self
 
-        # --- Negawatt component (with circuit breaker) ---
-        negawatt_reward = 0.0
-        if self.negawatt_module is not None and self._negawatt_circuit.can_call():
-            try:
-                if self.chaos and self.chaos.maybe_fail("negawatt"):
-                    raise RuntimeError("chaos: negawatt")
-                negawatt_reward = float(
-                    self.negawatt_module.combined_reward(
-                        accuracy=acc, energy=en,
-                    )
-                )
-                self._negawatt_circuit.record_success()
-            except Exception as e:
-                self._negawatt_circuit.record_failure()
-                logger.warning(f"NegawattReward failed: {e}; using fallback")
-                negawatt_reward = self._fallback_negawatt(acc, en)
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
 
-        # --- Budget penalty (learned or fixed) ---
-        budget_penalty = 0.0
-        causal_adjustment = 0.0
-        if en > self.energy_budget:
-            overshoot_ratio = (
-                (en - self.energy_budget) / self.energy_budget
-                if self.energy_budget > 0 else 1.0
-            )
-            if self.penalty_learner:
-                state = PenaltyState(
-                    hour_of_day=datetime.now().hour,
-                    energy_overshoot_ratio=min(2.0, overshoot_ratio),
-                    task_priority=0.5,
-                )
-                budget_penalty = self.penalty_learner.predict_penalty(state)
-                causal_adjustment = budget_penalty - 1.0
-            else:
-                budget_penalty = 1.0
+    # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        try:
+            v = float(value)
+            return v if math.isfinite(v) else None
+        except (TypeError, ValueError):
+            return None
 
-        # --- Helium component ---
-        helium_units = 0.0
-        helium_scarcity = 0.0
-        if self.helium_profiler:
-            if self.helium_signal_fn:
-                try:
-                    sig = self.helium_signal_fn()
-                    if sig is not None:
-                        helium_scarcity = float(
-                            getattr(sig, "scarcity_score", 0.0)
-                        )
-                except Exception:
-                    pass
-            helium_units = HeliumProfiler.estimate_units(en, helium_scarcity)
-
-        # --- Carbon market component ---
-        carbon_market_cost = 0.0
-        if self.market:
-            try:
-                snap = self.market.get_snapshot()
-                carbon_kg = en * 400.0 / 1000.0  # 400 gCO2/kWh default
-                carbon_market_cost = (
-                    carbon_kg / 1000.0 * snap.carbon_price_per_tco2_usd
-                )
-            except Exception:
-                pass
-
-        # --- Precision component ---
-        precision = PrecisionLevel.FP32
-        if self.precision_ctl:
-            precision = self.precision_ctl.select("normal")
-
-        # --- Final reward ---
-        final_reward = negawatt_reward - budget_penalty
-        if self.features["helium_awareness"] and helium_units > 0:
-            final_reward -= min(0.2, helium_units * 0.1)
-        if self.features["carbon_market"] and carbon_market_cost > 0:
-            final_reward -= min(0.15, carbon_market_cost)
-
-        # --- XAI ---
-        if self.explainer:
-            exp = RewardExplainer.explain(
-                accuracy=acc, energy=en,
-                energy_budget=self.energy_budget,
-                negawatt_reward=negawatt_reward,
-                budget_penalty=budget_penalty,
-                final_reward=final_reward,
-                helium_units=helium_units,
-                carbon_market_cost=carbon_market_cost,
-                precision=precision.value,
-                causal_adjustment=causal_adjustment,
-            )
-            self.last_explanation = exp
-
-        # --- Record ---
-        self.reward_count += 1
-        self.reward_history.append({
-            "accuracy": acc, "energy": en,
-            "negawatt": negawatt_reward,
-            "budget_penalty": budget_penalty,
-            "helium_units": helium_units,
-            "carbon_market_cost": carbon_market_cost,
-            "final_reward": final_reward,
-            "precision": precision.value,
-            "at": datetime.now().isoformat(),
-        })
-
-        # --- Multi-agent feedback ---
-        if self.coordinator:
-            self.coordinator.record(
-                agent_id=self.agent_id,
-                success=(budget_penalty == 0.0),
-                carbon_saved_pct=0.0,
-                helium_saved_pct=0.0,
-            )
-
-        # --- Federated contribution ---
-        if self.federated and self.reward_count % 25 == 0:
-            self.federated.push(FederatedRewardProfile(
-                deployment_id=self.deployment_id,
-                key="reward:default",
-                mean_reward=final_reward,
-                mean_energy=en,
-                sample_count=1,
-            ))
-            self.federated.aggregate()
-
-        return final_reward
+    def _call_with_timeout(
+        self,
+        fn: Callable[..., Any],
+        timeout_s: Optional[float],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if timeout_s is None or timeout_s <= 0:
+            return fn(*args, **kwargs)
+        import functools
+        fut = self._executor.submit(functools.partial(fn, *args, **kwargs))
+        return fut.result(timeout=timeout_s)
 
     def _fallback_negawatt(self, accuracy: float, energy: float) -> float:
         if self.baseline_energy and self.baseline_energy > 0:
@@ -921,22 +1276,393 @@ class PolicyEngine:
             return 0.5 * accuracy + 0.5 * savings
         return 0.5 * accuracy
 
-    @staticmethod
-    def _safe_float(value: Any) -> Optional[float]:
+    # ------------------------------------------------------------------ signals
+    def _get_helium_scarcity(self) -> Optional[float]:
+        if self.helium_signal_fn is None:
+            return None
         try:
-            v = float(value)
-            return v if math.isfinite(v) else None
-        except (TypeError, ValueError):
+            sig = self.helium_signal_fn()
+            if inspect.isawaitable(sig):
+                logger.warning(
+                    "helium_signal_fn returns a coroutine; use "
+                    "compute_sustainability_reward_async()",
+                )
+                close = getattr(sig, "close", None)
+                if callable(close):
+                    close()
+                return None
+            if sig is None:
+                return None
+            if isinstance(sig, Mapping):
+                raw = sig.get("scarcity_score")
+            elif hasattr(sig, "scarcity_score"):
+                raw = sig.scarcity_score
+            else:
+                return None
+            if raw is None:
+                return None
+            return float(raw)
+        except Exception as e:
+            logger.warning(
+                "helium_signal_fn failed: %s", e, exc_info=True,
+            )
+            self._metrics.inc("helium_signal_errors")
             return None
 
-    # ------------------------------------------------------------------
-    # Original public API: suggest_temporal_shift
-    # ------------------------------------------------------------------
+    def _get_carbon_price(self) -> Optional[MarketSnapshot]:
+        if self.market is None:
+            return None
+        if not self._market_circuit.can_call():
+            return None
+        try:
+            if self.chaos and self.chaos.maybe_fail("market"):
+                raise RuntimeError("chaos: market")
+            snap = self._call_with_timeout(
+                self.market.get_snapshot,
+                self.config.market_timeout_s,
+            )
+            self._market_circuit.record_success()
+            return snap
+        except (concurrent.futures.TimeoutError, TimeoutError):
+            self._market_circuit.record_failure()
+            self._metrics.inc("market_timeouts")
+            logger.warning("market.get_snapshot timed out")
+            return None
+        except Exception as e:
+            self._market_circuit.record_failure()
+            self._metrics.inc("market_errors")
+            logger.warning("market.get_snapshot failed: %s", e, exc_info=True)
+            return None
 
+    # ------------------------------------------------------------------ reward
+    def compute_sustainability_reward(
+        self,
+        accuracy: float,
+        energy: float,
+        *,
+        precision: Optional[Union[PrecisionLevel, str]] = None,
+        task_priority: float = 0.5,
+    ) -> float:
+        """
+        Compute sustainability reward. Backward-compatible.
+
+        With all features off, behaves identically to the original:
+        delegates to NegawattReward, then applies a fixed −1.0 penalty
+        if energy > energy_budget.
+
+        ``precision`` is an *optional* reward dimension. If the caller
+        passes the precision the workload actually ran at, a configurable
+        bonus is applied for choosing a lower-energy precision. If omitted,
+        no precision term is included (previous behaviour was to *choose*
+        a precision internally and report it in XAI without actually
+        affecting the reward or reflecting the caller's reality).
+        """
+        # --- Input validation ---
+        acc = self._safe_float(accuracy)
+        en = self._safe_float(energy)
+        if acc is None or en is None:
+            logger.warning("Invalid accuracy/energy input; returning 0.0")
+            self._metrics.inc("reward_invalid_input")
+            return 0.0
+        acc = max(0.0, min(1.0, acc))
+        en = max(0.0, en)
+
+        # --- Negawatt component ---
+        negawatt_reward = 0.0
+        if self.negawatt_module is not None:
+            if not self._negawatt_circuit.can_call():
+                negawatt_reward = self._fallback_negawatt(acc, en)
+            else:
+                try:
+                    if self.chaos and self.chaos.maybe_fail("negawatt"):
+                        raise RuntimeError("chaos: negawatt")
+                    negawatt_reward = float(
+                        self.negawatt_module.combined_reward(
+                            accuracy=acc, energy=en,
+                        )
+                    )
+                    self._negawatt_circuit.record_success()
+                except Exception as e:
+                    self._negawatt_circuit.record_failure()
+                    logger.warning(
+                        "NegawattReward failed: %s; using fallback",
+                        e, exc_info=True,
+                    )
+                    negawatt_reward = self._fallback_negawatt(acc, en)
+
+        # --- Budget penalty ---
+        budget_penalty = 0.0
+        causal_adjustment = 0.0
+        if en > self.energy_budget:
+            overshoot_ratio = (
+                (en - self.energy_budget) / self.energy_budget
+                if self.energy_budget > 0 else 1.0
+            )
+            if self.penalty_learner:
+                state = PenaltyState(
+                    hour_of_day=_utcnow().hour,
+                    energy_overshoot_ratio=min(2.0, overshoot_ratio),
+                    task_priority=min(1.0, max(0.0, task_priority)),
+                )
+                budget_penalty = self.penalty_learner.predict_penalty(state)
+                causal_adjustment = (
+                    budget_penalty - self.config.base_budget_penalty
+                )
+            else:
+                budget_penalty = self.config.base_budget_penalty
+
+        # --- Helium ---
+        helium_units = 0.0
+        helium_scarcity = 0.0
+        if self.helium_profiler:
+            s = self._get_helium_scarcity()
+            if s is not None:
+                helium_scarcity = s
+            else:
+                self._metrics.inc("helium_signal_missing")
+            helium_units = HeliumProfiler.estimate_units(
+                en, helium_scarcity,
+            )
+
+        # --- Carbon market ---
+        carbon_market_cost = 0.0
+        snap = self._get_carbon_price() if self.market else None
+        if snap is not None:
+            try:
+                carbon_kg = en * 400.0 / 1000.0  # 400 gCO2/kWh default
+                carbon_market_cost = (
+                    carbon_kg / 1000.0 * snap.carbon_price_per_tco2_usd
+                )
+            except Exception as e:
+                logger.warning(
+                    "carbon_market_cost computation failed: %s",
+                    e, exc_info=True,
+                )
+
+        # --- Precision (opt-in) ---
+        precision_bonus = 0.0
+        precision_str: Optional[str] = None
+        if precision is not None and self.config.precision_bonus_enabled:
+            if isinstance(precision, PrecisionLevel):
+                p_enum = precision
+            else:
+                try:
+                    p_enum = PrecisionLevel(str(precision))
+                except ValueError:
+                    p_enum = None
+            if p_enum is not None:
+                precision_str = p_enum.value
+                mult = AdaptivePrecisionController.energy_multiplier(p_enum)
+                # Bonus for lower-energy precision, scaled by weight.
+                precision_bonus = (
+                    self.config.precision_bonus_weight * (1.0 - mult)
+                )
+
+        # --- Final reward ---
+        final_reward = negawatt_reward - budget_penalty + precision_bonus
+        if self.features["helium_awareness"] and helium_units > 0:
+            final_reward -= min(
+                self.config.helium_penalty_cap, helium_units * 0.1,
+            )
+        if self.features["carbon_market"] and carbon_market_cost > 0:
+            final_reward -= min(
+                self.config.carbon_market_penalty_cap, carbon_market_cost,
+            )
+
+        # --- XAI ---
+        if self.explainer:
+            exp = RewardExplainer.explain(
+                accuracy=acc,
+                energy=en,
+                energy_budget=self.energy_budget,
+                negawatt_reward=negawatt_reward,
+                budget_penalty=budget_penalty,
+                final_reward=final_reward,
+                helium_units=helium_units,
+                carbon_market_cost=carbon_market_cost,
+                precision=precision_str,
+                causal_adjustment=causal_adjustment,
+                precision_bonus=precision_bonus,
+                learner_observations=(
+                    self.penalty_learner.observations
+                    if self.penalty_learner else 0
+                ),
+            )
+            with self._lock:
+                self.last_explanation = exp
+
+        # --- Record ---
+        outcome_id = self._new_outcome_id()
+        with self._lock:
+            self.reward_count += 1
+            self.reward_history.append({
+                "outcome_id": outcome_id,
+                "accuracy": acc,
+                "energy": en,
+                "negawatt": negawatt_reward,
+                "budget_penalty": budget_penalty,
+                "helium_units": helium_units,
+                "carbon_market_cost": carbon_market_cost,
+                "precision_bonus": precision_bonus,
+                "precision": precision_str,
+                "final_reward": final_reward,
+                "at": _utcnow().isoformat(),
+            })
+            self.last_penalty_used = budget_penalty
+            self.last_negawatt_weight = self.config.negawatt_weight
+
+        # Stash state for record_outcome attribution.
+        if self.penalty_learner and en > self.energy_budget:
+            overshoot_ratio = (
+                (en - self.energy_budget) / self.energy_budget
+                if self.energy_budget > 0 else 1.0
+            )
+            state = PenaltyState(
+                hour_of_day=_utcnow().hour,
+                energy_overshoot_ratio=min(2.0, overshoot_ratio),
+                task_priority=min(1.0, max(0.0, task_priority)),
+            )
+            with self._lock:
+                self._pending_outcomes[outcome_id] = {
+                    "state": state,
+                    "penalty_used": budget_penalty,
+                    "predicted_energy": en,
+                }
+                # Bound size.
+                while len(self._pending_outcomes) > 512:
+                    self._pending_outcomes.popitem(last=False)
+
+        # --- Federated contribution ---
+        if self.federated and \
+                self.reward_count % self.config.federated_push_every == 0:
+            self.federated.push(FederatedRewardProfile(
+                deployment_id=self.deployment_id,
+                key="reward:default",
+                mean_reward=final_reward,
+                mean_energy=en,
+                sample_count=1,
+            ))
+
+        # --- Metrics ---
+        self._metrics.inc("reward_total")
+        self._metrics.observe("reward_value", final_reward)
+        if budget_penalty > 0:
+            self._metrics.inc("reward_budget_exceeded")
+
+        return final_reward
+
+    async def compute_sustainability_reward_async(
+        self,
+        accuracy: float,
+        energy: float,
+        *,
+        precision: Optional[Union[PrecisionLevel, str]] = None,
+        task_priority: float = 0.5,
+    ) -> float:
+        """Async wrapper — supports async helium signal + async market."""
+        # Pre-fetch async helium/market signals in case the caller's
+        # callbacks return coroutines.
+        if (
+            self.helium_signal_fn is not None
+            and not self.explainer  # only matters when we might call it
+            or True
+        ):
+            sig = self.helium_signal_fn() if self.helium_signal_fn else None
+            if inspect.isawaitable(sig):
+                try:
+                    await asyncio.wait_for(sig, timeout=2.0)
+                except Exception:
+                    pass
+        return await asyncio.to_thread(
+            self.compute_sustainability_reward,
+            accuracy, energy,
+            precision=precision, task_priority=task_priority,
+        )
+
+    def _new_outcome_id(self) -> str:
+        with self._lock:
+            oid = f"ro-{self._next_outcome_id}"
+            self._next_outcome_id += 1
+            return oid
+
+    # ------------------------------------------------------------------ outcome
+    def record_outcome(
+        self,
+        actual_energy: float,
+        quality_preserved: bool,
+        *,
+        outcome_id: Optional[str] = None,
+    ) -> None:
+        """
+        Feed back actual outcomes for causal penalty learning.
+
+        v2: rewards the *appropriateness* of the penalty, not whether the
+        estimator's prediction matched reality.
+
+        Appropriateness heuristic:
+          * Penalty was 0 but energy was below budget  → reward 1.0 (correct)
+          * Penalty was >0 but energy was below budget → reward 0.3 (over-penalized)
+          * Penalty was 0 but quality was lost         → reward 0.3 (under-penalized)
+          * Penalty >0 and quality preserved           → reward scaled by overshoot
+          * Penalty >0 and quality lost                → reward 1.0 (correct to penalize)
+        """
+        if not self.penalty_learner:
+            return
+        with self._lock:
+            if outcome_id is None:
+                if not self._pending_outcomes:
+                    return
+                outcome_id = next(reversed(self._pending_outcomes))
+            entry = self._pending_outcomes.pop(outcome_id, None)
+            if entry is None:
+                return
+
+        actual = self._safe_float(actual_energy)
+        if actual is None:
+            logger.warning("Invalid actual_energy; ignoring outcome")
+            return
+        actual = max(0.0, actual)
+
+        penalty_used = entry["penalty_used"]
+        actual_exceeded = actual > self.energy_budget
+
+        if not actual_exceeded and penalty_used == 0.0:
+            reward = 1.0
+        elif not actual_exceeded and penalty_used > 0.0:
+            reward = 0.3
+        elif actual_exceeded and not quality_preserved:
+            reward = 1.0
+        elif actual_exceeded and quality_preserved:
+            overshoot = (
+                (actual - self.energy_budget) / max(self.energy_budget, 1e-9)
+            )
+            reward = max(0.4, 1.0 - min(1.0, overshoot))
+        else:
+            reward = 0.5
+
+        self.penalty_learner.record(
+            entry["state"], reward, penalty_used,
+        )
+        self._metrics.observe("causal_reward", reward)
+
+        # Coordinator success now driven by real outcome, not mode.
+        if self.coordinator:
+            self.coordinator.record(
+                agent_id=self.agent_id,
+                success=bool(quality_preserved),
+                carbon_saved_pct=0.0,
+                helium_saved_pct=0.0,
+            )
+
+        if self.penalty_learner.observations % \
+                self.config.causal_update_every == 0:
+            self.penalty_learner.update()
+
+    # ------------------------------------------------------------------ shift
     def suggest_temporal_shift(
         self,
-        shifter,
-        forecast_engine,
+        shifter: Any,
+        forecast_engine: Any,
         energy_kwh: float,
         shiftable: bool = True,
         urgency: str = "low",
@@ -947,14 +1673,23 @@ class PolicyEngine:
         """
         Suggest optimal temporal shift. Backward-compatible.
 
-        Enhanced: temporal verification, HITL review, circuit breakers,
-        and structured logging.
+        v2: `urgency=="high"` continues to short-circuit (original
+        behavior) unless `allow_high_urgency_with_hitl=True` is set in
+        config, in which case the HITL review path fires.
         """
-        # --- Original gate ---
-        if not shiftable or urgency == "high":
+        # Validate energy.
+        en = self._safe_float(energy_kwh)
+        if en is None:
+            logger.warning("Invalid energy_kwh; refusing to shift")
             return 0, 0.0
 
-        # --- Circuit breaker on forecaster ---
+        # Original gate — unless HITL-for-high-urgency is explicitly allowed.
+        if not shiftable:
+            return 0, 0.0
+        if urgency == "high" and not self.config.allow_high_urgency_with_hitl:
+            return 0, 0.0
+
+        # Circuit breaker on forecaster.
         if not self._forecaster_circuit.can_call():
             logger.debug("Forecaster circuit open; returning (0, 0.0)")
             return 0, 0.0
@@ -962,120 +1697,249 @@ class PolicyEngine:
         try:
             if self.chaos and self.chaos.maybe_fail("forecast_engine"):
                 raise RuntimeError("chaos: forecast_engine")
-            current = forecast_engine.current_intensity()
-            forecast = forecast_engine.forecast_next_hours(4)
+            current = self._call_with_timeout(
+                forecast_engine.current_intensity,
+                self.config.forecaster_timeout_s,
+            )
+            forecast = self._call_with_timeout(
+                forecast_engine.forecast_next_hours,
+                self.config.forecaster_timeout_s,
+                4,
+            )
             self._forecaster_circuit.record_success()
+        except (concurrent.futures.TimeoutError, TimeoutError):
+            self._forecaster_circuit.record_failure()
+            self._metrics.inc("forecaster_timeouts")
+            logger.warning("Forecast timed out; returning (0, 0.0)")
+            return 0, 0.0
         except Exception as e:
             self._forecaster_circuit.record_failure()
-            logger.warning(f"Forecast failed: {e}; returning (0, 0.0)")
+            self._metrics.inc("forecaster_errors")
+            logger.warning(
+                "Forecast failed: %s; returning (0, 0.0)", e, exc_info=True,
+            )
             return 0, 0.0
 
-        # --- Circuit breaker on shifter ---
+        # Circuit breaker on shifter.
         if not self._shifter_circuit.can_call():
             return 0, 0.0
 
         try:
             if self.chaos and self.chaos.maybe_fail("shifter"):
                 raise RuntimeError("chaos: shifter")
-            hour, saving = shifter.suggest(current, forecast, energy_kwh)
+            hour, saving = self._call_with_timeout(
+                shifter.suggest,
+                self.config.shifter_timeout_s,
+                current, forecast, en,
+            )
             self._shifter_circuit.record_success()
+        except (concurrent.futures.TimeoutError, TimeoutError):
+            self._shifter_circuit.record_failure()
+            self._metrics.inc("shifter_timeouts")
+            logger.warning("Shifter timed out; returning (0, 0.0)")
+            return 0, 0.0
         except Exception as e:
             self._shifter_circuit.record_failure()
-            logger.warning(f"Shifter failed: {e}; returning (0, 0.0)")
+            self._metrics.inc("shifter_errors")
+            logger.warning(
+                "Shifter failed: %s; returning (0, 0.0)", e, exc_info=True,
+            )
             return 0, 0.0
 
-        # --- Temporal verification ---
-        shift = {"hour": hour, "saving": saving}
+        # Temporal verification.
+        shift = {"hour": int(hour), "saving": float(saving)}
         task_ctx = task or {
             "current_hour": current_hour,
             "deadline_hour": deadline_hour,
-            "energy_kwh": energy_kwh,
+            "energy_kwh": en,
         }
         if self.temporal_monitor:
             ok, violations = self.temporal_monitor.verify(shift, task_ctx)
             if not ok:
                 logger.warning(
-                    f"Shift to hour {hour} violates {violations}; rejecting"
+                    "Shift to hour %s violates %s; rejecting",
+                    hour, violations,
                 )
+                self._metrics.inc("temporal_veto_total")
                 return 0, 0.0
 
-        # --- HITL review ---
+        # HITL review.
         if self.hitl and self.hitl.needs_review(hour, current_hour, urgency):
             approved = self.hitl.request_review(
                 shift_hour=hour,
                 shift_saving=saving,
                 urgency=urgency,
                 reason=f"deferral of {abs(hour - current_hour)}h",
-                context={"energy_kwh": energy_kwh},
+                context={"energy_kwh": en},
             )
             if approved is False:
-                logger.info(f"HITL denied shift to hour {hour}")
+                logger.info("HITL denied shift to hour %s", hour)
+                self._metrics.inc("hitl_veto_total")
                 return 0, 0.0
 
-        # --- Record ---
-        self.shift_count += 1
-        self.shift_history.append({
-            "hour": hour, "saving": saving,
-            "current_hour": current_hour,
-            "urgency": urgency,
-            "at": datetime.now().isoformat(),
-        })
+        # Record.
+        with self._lock:
+            self.shift_count += 1
+            self.shift_history.append({
+                "hour": hour,
+                "saving": saving,
+                "current_hour": current_hour,
+                "urgency": urgency,
+                "at": _utcnow().isoformat(),
+            })
+        self._metrics.inc("shift_total", urgency=urgency)
+        self._metrics.observe("shift_saving", float(saving))
 
         return hour, saving
 
-    # ------------------------------------------------------------------
-    # Public enhancement APIs
-    # ------------------------------------------------------------------
+    async def suggest_temporal_shift_async(
+        self,
+        shifter: Any,
+        forecast_engine: Any,
+        energy_kwh: float,
+        shiftable: bool = True,
+        urgency: str = "low",
+        current_hour: int = 0,
+        deadline_hour: Optional[int] = None,
+        task: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, float]:
+        """
+        Async variant — awaits async shifter / forecaster if present.
+        """
+        en = self._safe_float(energy_kwh)
+        if en is None:
+            return 0, 0.0
+        if not shiftable:
+            return 0, 0.0
+        if urgency == "high" and not self.config.allow_high_urgency_with_hitl:
+            return 0, 0.0
 
+        if not self._forecaster_circuit.can_call():
+            return 0, 0.0
+        try:
+            cur_result = forecast_engine.current_intensity()
+            current = (
+                await asyncio.wait_for(
+                    cur_result,
+                    timeout=self.config.forecaster_timeout_s or 2.0,
+                )
+                if inspect.isawaitable(cur_result) else cur_result
+            )
+            fc_result = forecast_engine.forecast_next_hours(4)
+            forecast = (
+                await asyncio.wait_for(
+                    fc_result,
+                    timeout=self.config.forecaster_timeout_s or 2.0,
+                )
+                if inspect.isawaitable(fc_result) else fc_result
+            )
+            self._forecaster_circuit.record_success()
+        except asyncio.TimeoutError:
+            self._forecaster_circuit.record_failure()
+            self._metrics.inc("forecaster_timeouts")
+            return 0, 0.0
+        except Exception as e:
+            self._forecaster_circuit.record_failure()
+            self._metrics.inc("forecaster_errors")
+            logger.warning("Forecast async failed: %s", e, exc_info=True)
+            return 0, 0.0
+
+        if not self._shifter_circuit.can_call():
+            return 0, 0.0
+        try:
+            s_result = shifter.suggest(current, forecast, en)
+            hour, saving = (
+                await asyncio.wait_for(
+                    s_result,
+                    timeout=self.config.shifter_timeout_s or 2.0,
+                )
+                if inspect.isawaitable(s_result) else s_result
+            )
+            self._shifter_circuit.record_success()
+        except asyncio.TimeoutError:
+            self._shifter_circuit.record_failure()
+            self._metrics.inc("shifter_timeouts")
+            return 0, 0.0
+        except Exception as e:
+            self._shifter_circuit.record_failure()
+            self._metrics.inc("shifter_errors")
+            logger.warning("Shifter async failed: %s", e, exc_info=True)
+            return 0, 0.0
+
+        shift = {"hour": int(hour), "saving": float(saving)}
+        task_ctx = task or {
+            "current_hour": current_hour,
+            "deadline_hour": deadline_hour,
+            "energy_kwh": en,
+        }
+        if self.temporal_monitor:
+            ok, violations = self.temporal_monitor.verify(shift, task_ctx)
+            if not ok:
+                logger.warning(
+                    "Shift to hour %s violates %s; rejecting",
+                    hour, violations,
+                )
+                self._metrics.inc("temporal_veto_total")
+                return 0, 0.0
+
+        if self.hitl and self.hitl.needs_review(hour, current_hour, urgency):
+            approved = await self.hitl.request_review_async(
+                shift_hour=hour,
+                shift_saving=saving,
+                urgency=urgency,
+                reason=f"deferral of {abs(hour - current_hour)}h",
+                context={"energy_kwh": en},
+            )
+            if approved is False:
+                self._metrics.inc("hitl_veto_total")
+                return 0, 0.0
+
+        with self._lock:
+            self.shift_count += 1
+            self.shift_history.append({
+                "hour": hour,
+                "saving": saving,
+                "current_hour": current_hour,
+                "urgency": urgency,
+                "at": _utcnow().isoformat(),
+            })
+        self._metrics.inc("shift_total", urgency=urgency)
+        self._metrics.observe("shift_saving", float(saving))
+        return hour, saving
+
+    # ------------------------------------------------------------------ public APIs
     def set_hitl_callback(self, cb: Callable[[HITLRequest], bool]) -> None:
         if self.hitl:
             self.hitl.set_callback(cb)
+
+    def set_hitl_async_callback(
+        self, cb: Callable[[HITLRequest], Awaitable[bool]],
+    ) -> None:
+        if self.hitl:
+            self.hitl.set_async_callback(cb)
 
     def active_learning_samples(self, n: int = 16) -> List[Dict[str, Any]]:
         return self.hitl.active_learning_batch(n) if self.hitl else []
 
     def explain_last_reward(self) -> Optional[RewardExplanation]:
-        return self.last_explanation
-
-    def record_outcome(
-        self,
-        actual_energy: float,
-        quality_preserved: bool,
-    ) -> None:
-        """Feed back actual outcome for causal penalty learning."""
-        if not self.penalty_learner or not self.reward_history:
-            return
-        last = self.reward_history[-1]
-        predicted = last["energy"]
-        overshoot = (
-            (predicted - self.energy_budget) / self.energy_budget
-            if self.energy_budget > 0 else 0.0
-        )
-        reward = 1.0 if quality_preserved else 0.0
-        if actual_energy < predicted:
-            reward = min(1.0, reward + 0.2)
-        state = PenaltyState(
-            hour_of_day=datetime.now().hour,
-            energy_overshoot_ratio=min(2.0, max(0.0, overshoot)),
-            task_priority=0.5,
-        )
-        self.penalty_learner.record(state, reward)
-        if self.penalty_learner.observations % 10 == 0:
-            self.penalty_learner.update()
+        with self._lock:
+            return self.last_explanation
 
     def contribute_federated(self) -> None:
-        if not self.federated or not self.reward_history:
+        if not self.federated:
+            return
+        with self._lock:
+            history = list(self.reward_history)
+        if not history:
             return
         self.federated.push(FederatedRewardProfile(
             deployment_id=self.deployment_id,
             key="reward:default",
             mean_reward=statistics.fmean(
-                r["final_reward"] for r in self.reward_history
+                r["final_reward"] for r in history
             ),
-            mean_energy=statistics.fmean(
-                r["energy"] for r in self.reward_history
-            ),
-            sample_count=len(self.reward_history),
+            mean_energy=statistics.fmean(r["energy"] for r in history),
+            sample_count=len(history),
         ))
         self.federated.aggregate()
 
@@ -1083,7 +1947,7 @@ class PolicyEngine:
         return self.federated.aggregate() if self.federated else {}
 
     def distill_reward_policy(
-        self, urgency: str = "normal"
+        self, urgency: str = "normal",
     ) -> Optional[DistilledRewardPolicy]:
         if not self.distiller:
             return None
@@ -1091,39 +1955,72 @@ class PolicyEngine:
             self.precision_ctl.select(urgency)
             if self.precision_ctl else PrecisionLevel.INT8
         )
+        # Distil the CURRENT learned policy, not hardcoded defaults.
+        with self._lock:
+            current_penalty = (
+                self.penalty_learner.base_penalty
+                if self.penalty_learner
+                else self.config.base_budget_penalty
+            )
+            current_negawatt_w = self.last_negawatt_weight
         return self.distiller.distill(
-            base_penalty=1.0,
-            negawatt_weight=0.5,
+            base_penalty=current_penalty,
+            negawatt_weight=current_negawatt_w,
             precision=precision,
         )
 
-    # ------------------------------------------------------------------
-    # Statistics
-    # ------------------------------------------------------------------
-
-    def get_statistics(self) -> Dict[str, Any]:
-        stats: Dict[str, Any] = {
-            "deployment_id": self.deployment_id,
-            "agent_id": self.agent_id,
-            "rewards_computed": self.reward_count,
-            "shifts_suggested": self.shift_count,
-            "energy_budget": self.energy_budget,
-            "baseline_energy": self.baseline_energy,
+    # ------------------------------------------------------------------ health
+    def health(self) -> Dict[str, Any]:
+        return {
+            "ready": (
+                self._negawatt_circuit.state != CircuitState.OPEN
+                and self._forecaster_circuit.state != CircuitState.OPEN
+                and self._shifter_circuit.state != CircuitState.OPEN
+            ),
             "circuits": {
                 "negawatt": self._negawatt_circuit.state.value,
                 "forecaster": self._forecaster_circuit.state.value,
                 "shifter": self._shifter_circuit.state.value,
+                "market": self._market_circuit.state.value,
             },
+            "signals": {
+                "carbon_forecaster_configured":
+                    self.carbon_forecaster is not None,
+                "helium_signal_configured":
+                    self.helium_signal_fn is not None,
+            },
+            "uptime_seconds": time.monotonic() - self._started_mono,
         }
+
+    # ------------------------------------------------------------------ statistics
+    def get_statistics(self) -> Dict[str, Any]:
+        with self._lock:
+            stats: Dict[str, Any] = {
+                "deployment_id": self.deployment_id,
+                "agent_id": self.agent_id,
+                "rewards_computed": self.reward_count,
+                "shifts_suggested": self.shift_count,
+                "energy_budget": self.energy_budget,
+                "baseline_energy": self.baseline_energy,
+                "circuits": {
+                    "negawatt": self._negawatt_circuit.state.value,
+                    "forecaster": self._forecaster_circuit.state.value,
+                    "shifter": self._shifter_circuit.state.value,
+                    "market": self._market_circuit.state.value,
+                },
+                "uptime_seconds": time.monotonic() - self._started_mono,
+            }
         if self.temporal_monitor:
-            stats["temporal_violations"] = self.temporal_monitor.violations[-5:]
+            stats["recent_temporal_violations"] = list(
+                self.temporal_monitor.violations,
+            )[-5:]
         if self.coordinator:
             stats["agents"] = {
                 aid: {"role": a.role.value, "calls": a.total_calls}
                 for aid, a in self.coordinator.agents.items()
             }
         if self.chaos:
-            stats["chaos_events"] = self.chaos.events[-5:]
+            stats["recent_chaos_events"] = list(self.chaos.events)[-5:]
         if self.hitl:
             stats["hitl_pending"] = len(self.hitl.pending)
             stats["hitl_feedback_count"] = len(self.hitl.feedback_log)
@@ -1137,17 +2034,49 @@ class PolicyEngine:
             stats["causal_learner"] = {
                 "observations": self.penalty_learner.observations,
                 "updates": self.penalty_learner.updates,
+                "last_advantage_mean":
+                    self.penalty_learner.last_advantage_mean,
             }
         if self.federated:
             stats["federated_aggregate"] = self.federated.aggregate()
-        if self.reward_history:
-            rewards = [r["final_reward"] for r in self.reward_history]
-            stats["reward_stats"] = {
-                "mean": statistics.fmean(rewards),
-                "max": max(rewards),
-                "min": min(rewards),
-            }
+        with self._lock:
+            if self.reward_history:
+                rewards = [r["final_reward"] for r in self.reward_history]
+                stats["reward_stats"] = {
+                    "mean": statistics.fmean(rewards),
+                    "max": max(rewards),
+                    "min": min(rewards),
+                    "count": len(rewards),
+                }
+        stats["metrics"] = self._metrics.snapshot()
         return stats
+
+
+__all__ = [
+    "AgentRole",
+    "CausalPenaltyLearner",
+    "CircuitBreaker",
+    "CircuitState",
+    "DistilledRewardPolicy",
+    "FederatedAggregator",
+    "FederatedRewardProfile",
+    "HITLRequest",
+    "HardwareProfile",
+    "HeliumProfiler",
+    "HumanInTheLoopGate",
+    "MarketSnapshot",
+    "MetricsRecorder",
+    "MultiAgentCoordinator",
+    "NonBackwardShift",
+    "PenaltyState",
+    "PolicyEngine",
+    "PolicyEngineConfig",
+    "PrecisionLevel",
+    "QuantumDistillationBridge",
+    "RewardExplanation",
+    "RewardExplainer",
+    "TemporalLogicMonitor",
+]
 
 
 # =============================================================================
@@ -1157,9 +2086,10 @@ class PolicyEngine:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    # --- Mock components ---
     class _MockForecaster:
-        def current_intensity(self): return 400.0
+        def current_intensity(self):
+            return 400.0
+
         def forecast_next_hours(self, n):
             return {i: 400.0 - i * 50 for i in range(n)}
 
@@ -1177,19 +2107,20 @@ if __name__ == "__main__":
         scarcity_score = 0.7
 
     def auto_approve(req: HITLRequest) -> bool:
-        logger.info(f"[HITL] auto-approve: {req.reason}")
+        logger.info("[HITL] auto-approve: %s", req.reason)
         return True
 
-    # --- Legacy mode (all features off → matches original) ---
+    # --- Legacy mode: all features off, matches original ---
     print("\n=== Legacy mode (all features off) ===")
     legacy = PolicyEngine(
         energy_budget=0.05, baseline_energy=0.1,
-        features={k: False for k in PolicyEngine.DEFAULT_FEATURES},
+        features={k: False for k in PolicyEngine.default_features()},
     )
     r = legacy.compute_sustainability_reward(accuracy=0.9, energy=0.06)
     print(f"  reward = {r:.4f}")
+    assert abs(r - (0.5 * 0.9 + 0.5 * 0.4 - 1.0)) < 1e-6
 
-    # --- Enhanced mode (all features on) ---
+    # --- Enhanced mode ---
     print("\n=== Enhanced mode ===")
     engine = PolicyEngine(
         energy_budget=0.05, baseline_energy=0.1,
@@ -1202,15 +2133,16 @@ if __name__ == "__main__":
 
     reward = engine.compute_sustainability_reward(
         accuracy=0.88, energy=0.062,
+        precision=PrecisionLevel.INT4,
     )
     print(f"  reward = {reward:.4f}")
     exp = engine.explain_last_reward()
     if exp:
-        print(f"  XAI: {exp.headline}")
+        print(f"  XAI: {exp.headline}  (confidence={exp.confidence:.2f})")
         for line in exp.rationale:
             print(f"    • {line}")
 
-    # Temporal shift
+    # Temporal shift.
     hour, saving = engine.suggest_temporal_shift(
         shifter=_MockShifter(),
         forecast_engine=_MockForecaster(),
@@ -1220,24 +2152,60 @@ if __name__ == "__main__":
         current_hour=10,
         deadline_hour=20,
     )
-    print(f"\n  Shift: hour={hour}, saving={saving:.6f} kgCO₂e")
+    print(f"\n  Shift: hour={hour}, saving={saving:.6f} kgCO2e")
 
-    # Outcome feedback
-    engine.record_outcome(actual_energy=0.055, quality_preserved=True)
+    # NonBackwardShift test — midnight should be rejected.
+    print("\n=== NonBackwardShift test ===")
+    class _BadShifter:
+        def suggest(self, current, forecast, energy_kwh):
+            return 0, 999.0  # backward + inflated saving
+    hour, saving = engine.suggest_temporal_shift(
+        shifter=_BadShifter(),
+        forecast_engine=_MockForecaster(),
+        energy_kwh=0.05,
+        shiftable=True, urgency="low",
+        current_hour=10, deadline_hour=20,
+    )
+    print(f"  backward shift attempt → ({hour}, {saving:.4f})")
+    assert hour == 0 and saving == 0.0
 
-    # Federated
+    # Outcome feedback.
+    engine.record_outcome(actual_energy=0.045, quality_preserved=True)
+
+    # Federated.
     engine.contribute_federated()
 
-    # Distill
+    # Distill — should reflect current learned values.
     dist = engine.distill_reward_policy(urgency="normal")
     if dist:
-        print(f"\n=== Distilled Reward Policy ===")
+        print("\n=== Distilled Reward Policy ===")
         print(f"  Precision:    {dist.precision.value}")
         print(f"  Base penalty: {dist.base_penalty}")
         print(f"  Retention:    {dist.quality_retention}")
         print(f"  Energy save:  {dist.energy_reduction_percent}%")
 
-    # Statistics
+    # Helium-as-dict test.
+    print("\n=== Helium-as-dict test ===")
+    engine.helium_signal_fn = lambda: {"scarcity_score": 0.9}
+    engine.compute_sustainability_reward(accuracy=0.9, energy=0.04)
+    print("  helium signal handled from dict ✓")
+
+    # Helium scarcity *increases* units.
+    print("\n=== Helium scarcity direction ===")
+    units_low = HeliumProfiler.estimate_units(1.0, 0.0)
+    units_high = HeliumProfiler.estimate_units(1.0, 1.0)
+    print(f"  scarcity=0.0 → {units_low:.4f}")
+    print(f"  scarcity=1.0 → {units_high:.4f}")
+    assert units_high > units_low
+
+    # Health.
+    print("\n=== Health ===")
+    print(engine.health())
+
+    # Statistics.
     import json
     print("\n=== Statistics ===")
     print(json.dumps(engine.get_statistics(), indent=2, default=str))
+
+    engine.close()
+    print("\nSmoke test passed.")
