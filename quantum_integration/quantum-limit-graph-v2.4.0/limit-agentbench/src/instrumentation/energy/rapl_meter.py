@@ -8,20 +8,50 @@ Real CPU energy via Intel RAPL (through ``pyRAPL``).
 
 Enhancements
 ------------
-- Optional ``pyRAPL`` import guarded by ``_PYRAPL_AVAILABLE``.
-- ``RAPLConfig`` — frozen, validated: label, socket count, DRAM toggle,
-  timeout, and fallback power coefficients.
-- **Robust ``pkg`` extraction** — handles ``int``, ``float``, ``list``/``tuple``
-  of numbers, pyRAPL's own result dataclasses, and ``None``.
-- **Fixed contract** — ``stop()`` now returns ``energy_joules`` +
-  ``power_watts`` + ``provenance``.
-- Lifecycle tracking via ``_mark_started`` / ``_mark_stopped``.
-- ``RLock``-guarded ``start`` / ``stop`` (idempotent ``start()``).
-- **Deferred setup** — ``pyRAPL.setup()`` runs lazily on first ``start()``, so
-  a permissions failure surfaces at use-time rather than construction.
-- Full validation of every numeric field; strict / non-strict modes.
-- Custom ``RAPLCPUMeterError``; lazy ``%s`` logging; ``__repr__``;
-  ``__main__`` smoke test with a mocked pyRAPL module.
+- :class:`Provenance` (from ``base_meter``) replaces the raw string.
+- **Sanitized propagation** — every fallback (missing pyRAPL, failed
+  setup, `begin()`/`end()` failure, unparseable domain, overlong
+  measurement) sets ``self._last_sanitized = True``. Downstream consumers
+  can distinguish fabricated estimates from real measurements.
+- **`_extract_joules` returns `(value, ok)`** so "domain legitimately not
+  measured" is distinguishable from "domain was requested but the counter
+  was unreadable (NaN, wrong shape, iterable safety cap)".
+- **`measurement.end()` no longer lies** — if `end()` succeeds but any
+  requested domain is unreadable, the sample is marked sanitized.
+- **Numeric config strictness** — rejects `bool` / `NaN` / negative
+  values; `include_pkg` / `include_dram` / `eager_setup` are type-checked
+  as bools; `fallback_duty_cycle` is bounded to `[0, 1]`.
+- **`max_measurement_seconds` is enforced** — strict mode raises; lenient
+  mode logs and sets ``sanitized``.
+- **`fallback_duty_cycle` is configurable** (default 0.5).
+- **`measurement_factory` / `setup_fn` validated** for callability at
+  construction.
+- **Generic-iterable extraction is bounded** — rejects `str` / `bytes` /
+  `Mapping` and caps at ``256`` items.
+- **`_last_sanitized` reset at start of `stop()`** — direct callers don't
+  inherit stale flags.
+- **`last_sanitized` / `last_provenance` properties** exposed.
+- ``pkg_joules`` / ``dram_joules`` only emitted when the corresponding
+  ``include_*`` flag is set.
+- ``__main__`` smoke test extended with sanitization, overlong-window,
+  and unreadable-domain regression cases.
+
+Modeling note
+-------------
+When RAPL counters are unavailable, the estimate is::
+
+    energy = (fallback_idle_watts
+              + fallback_dynamic_watts * fallback_duty_cycle) * elapsed
+
+``fallback_duty_cycle`` defaults to 0.5 — a "middle-of-the-road" CPU
+assumption. A fabricated estimate is always marked ``sanitized=True``.
+
+Note on ``pyRAPL`` availability
+-------------------------------
+Deferred setup (the default) defers ``pyRAPL.setup()`` to the first
+``start()``, so permission errors surface at use time rather than
+construction time. ``eager_setup=True`` restores the original
+construction-time behavior.
 """
 
 from __future__ import annotations
@@ -29,19 +59,34 @@ from __future__ import annotations
 import json
 import logging
 import math
+import numbers
 import threading
 import time
-from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from dataclasses import asdict, dataclass
+from typing import (
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+)
 
 from .base_meter import (
     BaseEnergyMeter,
     BaseMeterConfig,
     InstrumentationError,
+    Provenance,
     TelemetrySample,
 )
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "RAPLCPUMeter",
+    "RAPLConfig",
+    "RAPLCPUMeterError",
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -65,46 +110,105 @@ class RAPLCPUMeterError(InstrumentationError):
 
 
 # --------------------------------------------------------------------------- #
+# Config helpers
+# --------------------------------------------------------------------------- #
+def _require_non_negative_finite(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise RAPLCPUMeterError(f"{label} must be a number, not bool")
+    fv = float(value)
+    if not math.isfinite(fv):
+        raise RAPLCPUMeterError(f"{label} must be finite")
+    if fv < 0:
+        raise RAPLCPUMeterError(f"{label} must be >= 0")
+    return fv
+
+
+def _require_positive_finite(value: Any, label: str) -> float:
+    fv = _require_non_negative_finite(value, label)
+    if fv <= 0:
+        raise RAPLCPUMeterError(f"{label} must be > 0")
+    return fv
+
+
+def _require_bool(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise RAPLCPUMeterError(f"{label} must be a bool")
+    return value
+
+
+# --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class RAPLConfig:
     """Tunable parameters for the RAPL CPU meter."""
 
-    # Label attached to every Measurement object; used by pyRAPL for CSV dumps.
     label: str = "green_agent"
-
-    # Sub-domains to include in the reported energy figure.
     include_pkg: bool = True
     include_dram: bool = False
 
-    # Fallback coefficients used when RAPL counters are unavailable but the
-    # meter still needs to return a value in non-strict mode.
     fallback_idle_watts: float = 3.0
     fallback_dynamic_watts: float = 30.0
+    fallback_duty_cycle: float = 0.5
 
-    # Upper bound on a single measurement window; used only for documentation
-    # and warning — pyRAPL's own sampling cadence is not influenced.
     max_measurement_seconds: float = 3600.0
-
-    # If True, setup() runs at construction time (original behaviour). If
-    # False, setup() is deferred until the first start() call so that
-    # permission errors surface at use-time rather than import/construct-time.
     eager_setup: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.label, str) or not self.label:
-            raise RAPLCPUMeterError("label must be a non-empty string.")
-        for name in ("fallback_idle_watts", "fallback_dynamic_watts"):
-            value = getattr(self, name)
-            if not isinstance(value, (int, float)) or value < 0:
-                raise RAPLCPUMeterError(f"{name} must be >= 0.")
-        if self.max_measurement_seconds <= 0:
-            raise RAPLCPUMeterError("max_measurement_seconds must be > 0.")
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise RAPLCPUMeterError(
+                "label must be a non-empty string"
+            )
+
+        object.__setattr__(
+            self, "include_pkg",
+            _require_bool(self.include_pkg, "include_pkg"),
+        )
+        object.__setattr__(
+            self, "include_dram",
+            _require_bool(self.include_dram, "include_dram"),
+        )
+        object.__setattr__(
+            self, "eager_setup",
+            _require_bool(self.eager_setup, "eager_setup"),
+        )
+
         if not (self.include_pkg or self.include_dram):
             raise RAPLCPUMeterError(
-                "at least one of include_pkg / include_dram must be True."
+                "at least one of include_pkg / include_dram must be True"
             )
+
+        object.__setattr__(
+            self, "fallback_idle_watts",
+            _require_non_negative_finite(
+                self.fallback_idle_watts,
+                "fallback_idle_watts",
+            ),
+        )
+        object.__setattr__(
+            self, "fallback_dynamic_watts",
+            _require_non_negative_finite(
+                self.fallback_dynamic_watts,
+                "fallback_dynamic_watts",
+            ),
+        )
+
+        duty = _require_non_negative_finite(
+            self.fallback_duty_cycle, "fallback_duty_cycle",
+        )
+        if duty > 1.0:
+            raise RAPLCPUMeterError(
+                "fallback_duty_cycle must be in [0, 1]"
+            )
+        object.__setattr__(self, "fallback_duty_cycle", duty)
+
+        object.__setattr__(
+            self, "max_measurement_seconds",
+            _require_positive_finite(
+                self.max_measurement_seconds,
+                "max_measurement_seconds",
+            ),
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -117,27 +221,14 @@ class RAPLCPUMeter(BaseEnergyMeter):
     """
     Real CPU energy via Intel RAPL.
 
-    Parameters
-    ----------
-    config : RAPLConfig, optional
-        Meter configuration. Defaults to ``RAPLConfig()``.
-    base_config : BaseMeterConfig, optional
-        Contract policy passed to :class:`BaseEnergyMeter`.
-    strict : bool, default True
-        If True, a missing ``pyRAPL`` module, a ``setup()`` failure, or a
-        contract violation raises :class:`RAPLCPUMeterError`. If False, the
-        meter logs and returns a modelled estimate.
-    measurement_factory : callable, optional
-        ``(label) -> measurement`` callable returning a pyRAPL-shaped object
-        with ``begin()``, ``end()``, and a ``result`` attribute exposing
-        ``pkg`` / ``dram``. Used to inject a mock in tests.
-    setup_fn : callable, optional
-        Zero-arg callable replacing ``pyRAPL.setup()``. Used to inject a mock
-        in tests.
+    See the module docstring for the modeling assumption, the deferred
+    setup behavior, and the sanitization contract.
     """
 
-    # Unit conversion: pyRAPL reports microjoules (µJ); joules = µJ / 1e6.
     _MICROJOULES_PER_JOULE = 1e6
+    # Bound the per-socket list. More than this is almost certainly not a
+    # real RAPL reading.
+    _MAX_ITERABLE_ITEMS = 256
 
     def __init__(
         self,
@@ -153,6 +244,19 @@ class RAPLCPUMeter(BaseEnergyMeter):
             strict=strict,
             name="rapl",
         )
+        if config is not None and not isinstance(config, RAPLConfig):
+            raise RAPLCPUMeterError(
+                "config must be a RAPLConfig instance"
+            )
+        if measurement_factory is not None and not callable(
+            measurement_factory
+        ):
+            raise RAPLCPUMeterError(
+                "measurement_factory must be callable"
+            )
+        if setup_fn is not None and not callable(setup_fn):
+            raise RAPLCPUMeterError("setup_fn must be callable")
+
         self._rapl_config: RAPLConfig = config or RAPLConfig()
         self._inner_lock = threading.RLock()
 
@@ -160,21 +264,26 @@ class RAPLCPUMeter(BaseEnergyMeter):
         self._setup_fn = setup_fn
         self._setup_done: bool = False
         self._measurement: Any = None
-        self._start_time: Optional[float] = None
         self._last_energy_joules: float = 0.0
         self._last_power_watts: float = 0.0
+        self._last_provenance: Provenance = Provenance.ESTIMATED
 
-        # ---- Availability determination ---------------------------------
-        if measurement_factory is None and setup_fn is None and not _PYRAPL_AVAILABLE:
+        if (
+            measurement_factory is None
+            and setup_fn is None
+            and not _PYRAPL_AVAILABLE
+        ):
             msg = "pyRAPL is not installed and no mock was provided."
             if self._strict:
                 raise RAPLCPUMeterError(msg)
-            logger.warning("%s RAPLCPUMeter will return estimated values.", msg)
+            logger.warning(
+                "%s RAPLCPUMeter will estimate values; samples will "
+                "be marked sanitized.", msg,
+            )
             self._available = False
         else:
             self._available = True
 
-        # ---- Optional eager setup ---------------------------------------
         if self._rapl_config.eager_setup and self._available:
             try:
                 self._do_setup()
@@ -183,10 +292,10 @@ class RAPLCPUMeter(BaseEnergyMeter):
                     raise
                 self._available = False
                 logger.warning(
-                    "RAPL eager setup failed; falling back to estimates."
+                    "RAPL eager setup failed; estimates will be used "
+                    "and samples will be sanitized."
                 )
 
-        # ---- Construct the shared measurement object --------------------
         if self._available:
             try:
                 self._measurement = self._build_measurement()
@@ -208,7 +317,6 @@ class RAPLCPUMeter(BaseEnergyMeter):
 
     # ---------------------------------------------------------- setup
     def _do_setup(self) -> None:
-        """Ensure ``pyRAPL.setup()`` has been called exactly once."""
         if self._setup_done:
             return
         setup = self._setup_fn
@@ -228,19 +336,17 @@ class RAPLCPUMeter(BaseEnergyMeter):
         logger.debug("pyRAPL.setup() completed.")
 
     def _build_measurement(self) -> Any:
-        """Construct the shared ``Measurement`` object."""
         factory = self._measurement_factory
         if factory is None:
-            # Real pyRAPL path — defer to pyRAPL.Measurement(label=...).
             factory = getattr(pyRAPL, "Measurement", None)
         if not callable(factory):
             raise RAPLCPUMeterError(
-                "pyRAPL.Measurement is not callable; library is unavailable."
+                "pyRAPL.Measurement is not callable; library is "
+                "unavailable."
             )
         try:
             return factory(self._rapl_config.label)
         except TypeError:
-            # Some pyRAPL versions require a keyword argument.
             try:
                 return factory(label=self._rapl_config.label)
             except Exception as exc:
@@ -254,10 +360,11 @@ class RAPLCPUMeter(BaseEnergyMeter):
 
     # ---------------------------------------------------------- lifecycle
     def start(self) -> None:
-        """Begin a RAPL measurement window."""
         with self._inner_lock:
             if self.started:
-                logger.debug("RAPLCPUMeter.start() called while already running.")
+                logger.debug(
+                    "RAPLCPUMeter.start() called while already running."
+                )
                 return
 
             if self._available:
@@ -268,179 +375,219 @@ class RAPLCPUMeter(BaseEnergyMeter):
                         raise
                     self._available = False
                     logger.warning(
-                        "pyRAPL.setup() failed; falling back to estimates."
+                        "pyRAPL.setup() failed; falling back to "
+                        "estimates."
                     )
 
             if self._available and self._measurement is not None:
                 try:
                     self._measurement.begin()
                 except Exception as exc:
-                    logger.exception("measurement.begin() failed: %s", exc)
+                    logger.exception(
+                        "measurement.begin() failed: %s", exc,
+                    )
                     if self._strict:
                         raise RAPLCPUMeterError(
                             f"measurement.begin() failed: {exc}"
                         ) from exc
                     self._available = False
 
-            self._start_time = time.monotonic()
             self._mark_started()
         logger.debug("RAPLCPUMeter started.")
 
     def stop(self) -> Dict[str, Any]:
-        """
-        End the RAPL measurement window and return:
-
-        ``{"energy_joules", "power_watts", "provenance",
-        "pkg_joules", "dram_joules"}``
-        """
         with self._inner_lock:
+            # Reset state so direct callers don't inherit stale flags.
+            self._last_sanitized = False
             elapsed = self._mark_stopped()
 
             pkg_joules = 0.0
             dram_joules = 0.0
-            provenance = "estimated"
+            pkg_ok = True
+            dram_ok = True
+            provenance = Provenance.ESTIMATED
 
             if self._available and self._measurement is not None:
                 try:
                     self._measurement.end()
                 except Exception as exc:
-                    logger.exception("measurement.end() failed: %s", exc)
+                    logger.exception(
+                        "measurement.end() failed: %s", exc,
+                    )
                     if self._strict:
                         raise RAPLCPUMeterError(
                             f"measurement.end() failed: {exc}"
                         ) from exc
                     self._available = False
+                    self._last_sanitized = True
                 else:
-                    pkg_joules = self._extract_joules("pkg")
-                    dram_joules = self._extract_joules("dram")
-                    provenance = "measured"
+                    if self._rapl_config.include_pkg:
+                        pkg_joules, pkg_ok = self._extract_joules("pkg")
+                    if self._rapl_config.include_dram:
+                        dram_joules, dram_ok = self._extract_joules(
+                            "dram",
+                        )
+                    if pkg_ok and dram_ok:
+                        provenance = Provenance.MEASURED
+                    else:
+                        self._last_sanitized = True
 
-            # ---- Aggregate -----------------------------------------------
-            total_joules = 0.0
-            if self._rapl_config.include_pkg:
-                total_joules += pkg_joules
-            if self._rapl_config.include_dram:
-                total_joules += dram_joules
+            total_joules = pkg_joules + dram_joules
 
-            # ---- Non-strict fallback when the counters were unusable ----
-            if provenance != "measured":
+            # -- Fallback if counters were unusable --------------------
+            if provenance is not Provenance.MEASURED:
                 total_joules = self._estimate_energy_joules(elapsed)
+                self._last_sanitized = True
+            elif not self._available:
+                self._last_sanitized = True
 
-            # ---- Derive power -------------------------------------------
+            # -- Enforce max_measurement_seconds ----------------------
+            max_secs = self._rapl_config.max_measurement_seconds
+            if elapsed > max_secs:
+                msg = (
+                    f"RAPL measurement window {elapsed:.3f}s exceeds "
+                    f"max_measurement_seconds={max_secs:.3f}"
+                )
+                if self._strict:
+                    raise RAPLCPUMeterError(msg)
+                logger.warning("%s Marking sample sanitized.", msg)
+                self._last_sanitized = True
+
+            # -- Derive power -----------------------------------------
             power_watts = (
                 total_joules / elapsed
                 if elapsed > 0 and total_joules > 0
                 else 0.0
             )
 
-            raw = {
+            raw: Dict[str, Any] = {
                 "energy_joules": total_joules,
                 "power_watts": power_watts,
-                "provenance": provenance,
-                "pkg_joules": pkg_joules,
-                "dram_joules": dram_joules,
+                "provenance": provenance.value,
                 "source": "rapl",
                 "elapsed_seconds": elapsed,
+                "sanitized": self._last_sanitized,
             }
+            if self._rapl_config.include_pkg:
+                raw["pkg_joules"] = pkg_joules
+            if self._rapl_config.include_dram:
+                raw["dram_joules"] = dram_joules
 
             self._last_energy_joules = total_joules
             self._last_power_watts = power_watts
+            self._last_provenance = provenance
 
         logger.debug(
-            "RAPLCPUMeter stopped: pkg=%.6g J, dram=%.6g J, total=%.6g J, "
-            "power=%.4g W, elapsed=%.3fs, provenance=%s",
+            "RAPLCPUMeter stopped: pkg=%.6g J, dram=%.6g J, "
+            "total=%.6g J, power=%.4g W, elapsed=%.3fs, "
+            "provenance=%s, sanitized=%s",
             pkg_joules,
             dram_joules,
             total_joules,
             power_watts,
             elapsed,
-            provenance,
+            provenance.value,
+            self._last_sanitized,
         )
 
         return self._validate_metrics(raw)
 
     # ---------------------------------------------------------- extraction
-    def _extract_joules(self, domain: str) -> float:
+    def _extract_joules(self, domain: str) -> Tuple[float, bool]:
         """
-        Extract a domain's cumulative energy in joules from the measurement
-        result. ``domain`` is either ``"pkg"`` or ``"dram"``.
+        Extract a domain's cumulative energy from the measurement result.
 
-        Handles the many shapes pyRAPL has produced across versions:
-
-        - ``None`` (domain not measured)
-        - ``int`` / ``float`` (microjoules)
-        - ``list`` / ``tuple`` of numbers (one per socket)
-        - an object with a ``.value`` attribute (pyRAPL dataclass)
-        - an object that is iterable (list-like wrapper)
+        Returns ``(joules, ok)`` where ``ok=False`` means the reading was
+        requested but unreadable (missing result, NaN, unparseable shape,
+        oversize iterable). ``ok=True`` includes the legitimate case where
+        a domain is not measured and we did not request it — but this
+        function is only called for *requested* domains.
         """
         result = getattr(self._measurement, "result", None)
         if result is None:
-            return 0.0
+            logger.warning(
+                "pyRAPL '%s' result is None; counting as sanitized.",
+                domain,
+            )
+            return 0.0, False
 
         value = getattr(result, domain, None)
         if value is None:
-            return 0.0
+            logger.warning(
+                "pyRAPL '%s' domain is None; counting as sanitized.",
+                domain,
+            )
+            return 0.0, False
 
         microjoules = self._coerce_microjoules(value)
         if microjoules is None:
             msg = (
                 f"could not interpret pyRAPL '{domain}' reading of type "
-                f"{type(value).__name__}; returning 0.0 J."
+                f"{type(value).__name__}; counting as sanitized."
             )
             if self._strict:
                 raise RAPLCPUMeterError(msg)
             logger.warning("%s", msg)
-            return 0.0
+            return 0.0, False
 
-        return microjoules / self._MICROJOULES_PER_JOULE
+        return microjoules / self._MICROJOULES_PER_JOULE, True
 
-    @staticmethod
-    def _coerce_microjoules(value: Any) -> Optional[float]:
+    @classmethod
+    def _coerce_microjoules(cls, value: Any) -> Optional[float]:
         """Return the total microjoules from any pyRAPL result shape."""
-        # --- scalar numbers ---------------------------------------------
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            f = float(value)
-            if math.isnan(f) or math.isinf(f) or f < 0:
+        # Scalar numbers.
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, numbers.Real):
+            fv = float(value)
+            if not math.isfinite(fv) or fv < 0:
                 return None
-            return f
+            return fv
 
-        # --- pyRAPL dataclass with ``.value`` ---------------------------
+        # pyRAPL dataclass with ``.value``.
         attr_value = getattr(value, "value", None)
-        if isinstance(attr_value, (int, float)) and not isinstance(
+        if attr_value is not None and not isinstance(
             attr_value, bool
-        ):
-            f = float(attr_value)
-            if math.isnan(f) or math.isinf(f) or f < 0:
+        ) and isinstance(attr_value, numbers.Real):
+            fv = float(attr_value)
+            if not math.isfinite(fv) or fv < 0:
                 return None
-            return f
+            return fv
 
-        # --- iterable of numbers (one per socket / package) -------------
+        # Iterables of numbers — reject str / bytes / Mapping (their
+        # iteration semantics are not "one value per socket").
+        if isinstance(value, (str, bytes, Mapping)):
+            return None
+
         if isinstance(value, (list, tuple)):
-            total = 0.0
-            for item in value:
-                parsed = RAPLCPUMeter._coerce_microjoules(item)
-                if parsed is None:
-                    return None
-                total += parsed
-            return total
-
-        # --- generic iterable ------------------------------------------
-        if hasattr(value, "__iter__"):
+            items = list(value)
+        elif hasattr(value, "__iter__"):
             try:
                 items = list(value)
             except Exception:  # pragma: no cover — defensive
                 return None
-            return RAPLCPUMeter._coerce_microjoules(items)
+        else:
+            return None
 
-        return None
+        if len(items) > cls._MAX_ITERABLE_ITEMS:
+            return None
+
+        total = 0.0
+        for item in items:
+            parsed = cls._coerce_microjoules(item)
+            if parsed is None:
+                return None
+            total += parsed
+        return total
 
     # ---------------------------------------------------------- estimation
     def _estimate_energy_joules(self, elapsed: float) -> float:
         """Modelled fallback used when RAPL counters are unavailable."""
         cfg = self._rapl_config
-        # Without workload signals, assume a mid-range duty cycle (50%).
-        assumed_duty = 0.5
-        power = cfg.fallback_idle_watts + cfg.fallback_dynamic_watts * assumed_duty
+        power = (
+            cfg.fallback_idle_watts
+            + cfg.fallback_dynamic_watts * cfg.fallback_duty_cycle
+        )
         return max(0.0, power * max(elapsed, 0.0))
 
     # ---------------------------------------------------------- props
@@ -464,18 +611,28 @@ class RAPLCPUMeter(BaseEnergyMeter):
     def last_power_watts(self) -> float:
         return self._last_power_watts
 
+    @property
+    def last_provenance(self) -> Provenance:
+        return self._last_provenance
+
+    @property
+    def last_sanitized(self) -> bool:
+        return self._last_sanitized
+
     # ---------------------------------------------------------- serialization
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "label": self._rapl_config.label,
-            "config": asdict(self._rapl_config),
+            "config": self._rapl_config.to_dict(),
             "base_config": asdict(self._config),
             "strict": self._strict,
             "started": self.started,
             "pyrapl_available": _PYRAPL_AVAILABLE,
             "available": self._available,
             "setup_done": self._setup_done,
+            "last_provenance": self._last_provenance.value,
+            "last_sanitized": self._last_sanitized,
         }
 
     def to_json(self, **kwargs: Any) -> str:
@@ -489,55 +646,43 @@ class RAPLCPUMeter(BaseEnergyMeter):
             f"pyrapl={_PYRAPL_AVAILABLE}, "
             f"setup={self._setup_done}, "
             f"started={self.started}, "
-            f"strict={self._strict})"
+            f"strict={self._strict}, "
+            f"sanitized={self._last_sanitized})"
         )
 
 
 # --------------------------------------------------------------------------- #
-# Public API
-# --------------------------------------------------------------------------- #
-__all__ = [
-    "RAPLCPUMeter",
-    "RAPLConfig",
-    "RAPLCPUMeterError",
-]
-
-
-# --------------------------------------------------------------------------- #
-# Smoke test: python -m instrumentation.energy.rapl_meter
+# Smoke test
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":  # pragma: no cover
     logging.basicConfig(level=logging.INFO)
 
-    # ---------------------------------------------------------------- #
-    # Mock pyRAPL covering the many shapes seen across versions.
-    # ---------------------------------------------------------------- #
     class _MeasurementResult:
         def __init__(self, pkg: Any, dram: Any = None) -> None:
             self.pkg = pkg
             self.dram = dram
 
     class _Measurement:
-        def __init__(self, label: str, *, pkg: Any, dram: Any = None) -> None:
+        def __init__(
+            self, label: str, *, pkg: Any, dram: Any = None,
+        ) -> None:
             self.label = label
             self._pkg = pkg
             self._dram = dram
             self.result: Optional[_MeasurementResult] = None
-            self._running = False
 
         def begin(self) -> None:
-            self._running = True
+            pass
 
         def end(self) -> None:
-            self._running = False
             self.result = _MeasurementResult(self._pkg, self._dram)
 
     def _factory_scalar(label: str) -> _Measurement:
-        # pyRAPL on single-socket systems: pkg is a scalar µJ value.
-        return _Measurement(label, pkg=12_500_000.0, dram=2_000_000.0)
+        return _Measurement(
+            label, pkg=12_500_000.0, dram=2_000_000.0,
+        )
 
     def _factory_list(label: str) -> _Measurement:
-        # Multi-socket: pkg is a list of µJ values, one per package.
         return _Measurement(
             label,
             pkg=[10_000_000.0, 8_000_000.0, 6_000_000.0],
@@ -545,124 +690,173 @@ if __name__ == "__main__":  # pragma: no cover
         )
 
     def _factory_dataclass(label: str) -> _Measurement:
-        # Newest pyRAPL wraps the value in a dataclass with ``.value``.
         class _Wrapper:
             def __init__(self, v: float) -> None:
                 self.value = v
-
         return _Measurement(label, pkg=_Wrapper(20_000_000.0))
-
-    def _factory_missing_pkg(label: str) -> _Measurement:
-        # Domain not measured: pkg is None.
-        return _Measurement(label, pkg=None)
 
     def _factory_nan(label: str) -> _Measurement:
         return _Measurement(label, pkg=float("nan"))
 
-    # ---- Happy path (scalar) ------------------------------------------ #
+    # Happy path
     meter = RAPLCPUMeter(measurement_factory=_factory_scalar)
     print("repr       :", meter)
     with meter.measure() as m:
         time.sleep(0.05)
-    sample: Optional[TelemetrySample] = getattr(m, "last_sample", None)
+    sample: Optional[TelemetrySample] = getattr(
+        m, "last_sample", None,
+    )
     print("sample     :", sample)
-    if sample is not None:
-        print("dict       :", sample.to_dict())
+    assert sample is not None
+    assert sample.sanitized is False
+    assert sample.provenance is Provenance.MEASURED
 
-    # ---- Legacy path: explicit start / stop --------------------------- #
+    # Legacy path
     legacy = RAPLCPUMeter(measurement_factory=_factory_scalar)
     legacy.start()
     time.sleep(0.02)
     metrics = legacy.stop()
+    assert "energy_joules" in metrics
+    assert "power_watts" in metrics
     print("legacy     :", {
         "energy_joules": metrics["energy_joules"],
         "power_watts": metrics["power_watts"],
         "provenance": metrics["provenance"],
     })
-    assert "energy_joules" in metrics, "contract requires energy_joules"
-    assert "power_watts" in metrics, "contract requires power_watts"
 
-    # ---- Multi-socket (list of pkg values) ---------------------------- #
+    # Multi-socket
     multi = RAPLCPUMeter(measurement_factory=_factory_list)
     with multi.measure() as m:
         time.sleep(0.01)
+    assert m.last_sample is not None
     print("multi-sock :", m.last_sample)
 
-    # ---- Dataclass-shaped result ------------------------------------- #
+    # Dataclass
     dc = RAPLCPUMeter(measurement_factory=_factory_dataclass)
     with dc.measure() as m:
         time.sleep(0.01)
+    assert m.last_sample is not None
     print("dataclass  :", m.last_sample)
 
-    # ---- None pkg (domain not measured) ------------------------------ #
-    none_meter = RAPLCPUMeter(
-        measurement_factory=_factory_missing_pkg, strict=False
+    # NaN in lenient mode → sanitized
+    nan_meter = RAPLCPUMeter(
+        measurement_factory=_factory_nan,
+        strict=False,
+        base_config=BaseMeterConfig(enforce_contract=False),
     )
-    with none_meter.measure() as m:
-        time.sleep(0.01)
-    print("none-pkg   :", m.last_sample)
-
-    # ---- NaN pkg ------------------------------------------------------ #
-    nan_meter = RAPLCPUMeter(measurement_factory=_factory_nan, strict=False)
     with nan_meter.measure() as m:
         time.sleep(0.01)
-    print("nan-pkg    :", m.last_sample)
+    assert m.last_sample is not None
+    assert m.last_sample.sanitized is True
+    assert m.last_sample.provenance is Provenance.ESTIMATED
+    print("nan        :", m.last_sample, "(sanitized)")
 
-    # ---- include_dram toggle ----------------------------------------- #
+    # DRAM toggle
     dram_meter = RAPLCPUMeter(
         measurement_factory=_factory_scalar,
-        config=RAPLConfig(label="dram_run", include_pkg=True, include_dram=True),
+        config=RAPLConfig(
+            label="dram_run",
+            include_pkg=True,
+            include_dram=True,
+        ),
     )
     with dram_meter.measure() as m:
         time.sleep(0.01)
-    if m.last_sample is not None:
-        print(
-            "with dram  :",
-            m.last_sample.energy_joules,
-            "J (pkg+dram)",
+    assert m.last_sample is not None
+    assert "dram_joules" in m.last_sample.extras
+    print("with dram  :", m.last_sample.energy_joules, "J")
+
+    # Overlong measurement → sanitized (lenient)
+    overlong = RAPLCPUMeter(
+        measurement_factory=_factory_scalar,
+        config=RAPLConfig(max_measurement_seconds=0.01),
+        strict=False,
+        base_config=BaseMeterConfig(enforce_contract=False),
+    )
+    with overlong.measure() as m:
+        time.sleep(0.05)  # > 0.01
+    assert m.last_sample is not None
+    assert m.last_sample.sanitized is True
+    print("overlong   :", m.last_sample, "(sanitized)")
+
+    # Overlong measurement → strict raises
+    try:
+        overlong_strict = RAPLCPUMeter(
+            measurement_factory=_factory_scalar,
+            config=RAPLConfig(max_measurement_seconds=0.01),
+            strict=True,
+        )
+        overlong_strict.start()
+        time.sleep(0.05)
+        overlong_strict.stop()
+    except RAPLCPUMeterError as exc:
+        print("overlong s :", exc)
+    else:
+        raise AssertionError(
+            "strict overlong should have raised"
         )
 
-    # ---- Missing pyRAPL → strict raises, lenient estimates ------------ #
-    # We simulate "missing" by forcing _PYRAPL_AVAILABLE off via a patch.
-    import importlib
-    mod = importlib.import_module(__name__)
-    original = mod._PYRAPL_AVAILABLE
+    # Missing pyRAPL
+    import sys
+    mod = sys.modules[__name__]
+    saved = mod._PYRAPL_AVAILABLE
     mod._PYRAPL_AVAILABLE = False
     try:
-        # force reconstruction path
         try:
             RAPLCPUMeter(strict=True)
         except RAPLCPUMeterError as exc:
             print("no pyRAPL  :", exc)
-
-        lenient = RAPLCPUMeter(strict=False)
+        lenient = RAPLCPUMeter(
+            strict=False,
+            base_config=BaseMeterConfig(enforce_contract=False),
+        )
         with lenient.measure() as m:
             time.sleep(0.01)
-        print("lenient    :", m.last_sample)
+        assert m.last_sample is not None
+        assert m.last_sample.sanitized is True
+        print("lenient    :", m.last_sample, "(sanitized)")
     finally:
-        mod._PYRAPL_AVAILABLE = original
+        mod._PYRAPL_AVAILABLE = saved
 
-    # ---- Serialization ------------------------------------------------- #
+    # Serialization
     payload = meter.to_json()
     assert json.loads(payload)["config"]["label"] == "green_agent"
     print("Serialization OK.")
 
-    # ---- Config validation -------------------------------------------- #
-    for bad_cfg in (
+    # Config validation
+    bad_configs = (
         dict(label=""),
         dict(include_pkg=False, include_dram=False),
+        dict(include_pkg="yes"),  # type: ignore[arg-type]
+        dict(include_dram=1),  # type: ignore[arg-type]
+        dict(eager_setup="yes"),  # type: ignore[arg-type]
         dict(fallback_idle_watts=-1.0),
+        dict(fallback_idle_watts=True),  # type: ignore[arg-type]
+        dict(fallback_idle_watts=float("nan")),
         dict(fallback_dynamic_watts=-1.0),
+        dict(fallback_dynamic_watts=float("nan")),
+        dict(fallback_duty_cycle=-0.1),
+        dict(fallback_duty_cycle=1.5),
+        dict(fallback_duty_cycle=float("nan")),
         dict(max_measurement_seconds=0),
-    ):
+        dict(max_measurement_seconds=float("nan")),
+    )
+    for bad in bad_configs:
         try:
-            RAPLConfig(**bad_cfg)  # type: ignore[arg-type]
+            RAPLConfig(**bad)  # type: ignore[arg-type]
         except RAPLCPUMeterError as exc:
             print("Rejected cfg:", exc)
+        else:
+            raise AssertionError(
+                f"config should have rejected {bad}"
+            )
 
-    # ---- Live probe if pyRAPL is actually installed and permitted ------ #
+    # Live probe
     if _PYRAPL_AVAILABLE:
-        real = RAPLCPUMeter(strict=False)
+        real = RAPLCPUMeter(
+            strict=False,
+            base_config=BaseMeterConfig(enforce_contract=False),
+        )
         with real.measure() as m:
             time.sleep(0.05)
         print("real host  :", m.last_sample)
