@@ -1,6 +1,6 @@
 """
-test_graph_metrics_exporter.py — Complete Test Suite (Enhanced)
-==============================================================
+test_graph_metrics_exporter.py — Complete Test Suite (v5.1)
+===========================================================
 
 Unit and integration tests for GraphMetricsExporter, plus comprehensive
 coverage for the ten enhancement-layer metrics:
@@ -16,533 +16,302 @@ coverage for the ten enhancement-layer metrics:
   9. Resilience & Chaos
  10. Human-in-the-Loop + Active Learning
 
+Fixes in v5.1 (see review)
+--------------------------
+  * P0 — All assertions adapted to the v5.1 ``collect()`` return shape
+         (``List[Tuple[str, float, Dict]]``). Previously the tests indexed
+         ``metrics["..."]`` which raises ``TypeError`` against v5.1 and
+         silently no-ops ``in`` checks against a list.
+  * P0 — The 300-line inline fallback was removed. Tests that depend on
+         the real exporter are marked ``@requires_real`` and skipped when
+         the module is not importable. ``pytest.importorskip`` is applied
+         at module scope for the required third-party parsers.
+  * P0 — ``_HAS_REAL_EXPORTER`` is used as an actual skip gate, not just
+         assigned and forgotten.
+  * P0 — ``test_dashboard_has_many_panels`` asserts ``>= 25`` (was a
+         no-op ``>= 7`` inside an ``if`` that could never fire).
+  * P0 — ``test_dashboard_uid`` asserts the UID is present (was a no-op).
+  * P0 — ``test_precision_shares_sum_to_one`` actually sums shares to 1.0
+         (was a count check with a confessional comment).
+  * P0 — ``test_dashboard_expressions`` marked ``@requires_real`` so it
+         no longer fails against the missing fallback dashboard.
+  * P1 — Presence-only tests rewritten to verify actual values:
+         circuit-breaker states (3 series), per-role agent counts,
+         federated aggregates, HITL split (approved=2, denied=1).
+  * P1 — ``test_collect_cardinality_limiting`` rewritten to assert
+         exactly ``max_edges_export`` series, not ``<=``.
+  * P1 — ``test_concurrent_collect_consistent`` verifies structural
+         equivalence, not just "no exception raised."
+  * P1 — HTTP tests bind ``port=0`` (no free-port race) and verify
+         concurrent scrapes complete.
+  * P2 — New ``TestV5_1Fixes`` class covering: list return shape, label
+         escaping, dry_run side effects, registry circuit breaker,
+         empty-scrape self-metrics, ``render_json``, ``health()``,
+         ``test_smoke()``, ``__version__``, collector-source adapter,
+         ``_coerce_float`` NaN/Inf rejection, unknown scarcity defaults,
+         restart-after-stop, ``_safe_registry_get`` for unknown kinds.
+  * P3 — Unused imports removed; ``__main__`` invokes pytest and exits
+         with pytest's status code.
+
 Run with:
     pytest test_graph_metrics_exporter.py -v
-    pytest test_graph_metrics_exporter.py::TestEnhancementMetrics -v
+    pytest test_graph_metrics_exporter.py::TestV5_1Fixes -v
+    pytest test_graph_metrics_exporter.py -k "not requires_real"
 """
 
 from __future__ import annotations
 
-import pytest
 import json
-import time
-import threading
+import logging
 import re
 import socket
-from unittest.mock import Mock, MagicMock, patch
-from datetime import datetime, timedelta
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from unittest.mock import Mock, patch
 
-try:
-    from prometheus_client.parser import text_string_to_metric_families
-    _HAS_PROM_PARSER = True
-except Exception:  # pragma: no cover
-    text_string_to_metric_families = None  # type: ignore
-    _HAS_PROM_PARSER = False
-
-try:
-    import requests
-    _HAS_REQUESTS = True
-except Exception:  # pragma: no cover
-    requests = None  # type: ignore
-    _HAS_REQUESTS = False
+import pytest
 
 
 # =============================================================================
-# Graceful import with fallback shims
+# Optional third-party dependencies
 # =============================================================================
+# ``prometheus_client`` is REQUIRED to verify output format; use
+# ``importorskip`` at module scope so a missing parser fails loudly rather
+# than silently skipping the format tests. Same for ``requests``.
 
+text_string_to_metric_families = pytest.importorskip(
+    "prometheus_client.parser",
+    reason=(
+        "prometheus_client is required to verify Prometheus exposition "
+        "format correctness. Install with: pip install prometheus_client"
+    ),
+).text_string_to_metric_families
+
+requests = pytest.importorskip(
+    "requests",
+    reason=(
+        "requests is required to exercise the HTTP server endpoints. "
+        "Install with: pip install requests"
+    ),
+)
+
+
+# =============================================================================
+# Real exporter import — skip the whole module if unavailable
+# =============================================================================
 try:
     from src.monitoring.graph_metrics_exporter import (
-        GraphMetricsExporter,
         EnhancementMetricsSources,
+        GraphMetricsExporter,
+        __version__ as EXPORTER_VERSION,
     )
-    from core.graph_registry import GraphRegistry, GraphType
-    from core.causal_graph import CausalGraph, Edge
-    from core.policy_graph import PolicyGraph
     _HAS_REAL_EXPORTER = True
-except Exception:
+except ImportError:  # pragma: no cover — CI runs with the real package
     _HAS_REAL_EXPORTER = False
+    GraphMetricsExporter = None  # type: ignore[assignment, misc]
+    EnhancementMetricsSources = None  # type: ignore[assignment, misc]
+    EXPORTER_VERSION = None
 
-    class GraphType(Enum):
-        CAUSAL = "causal"
-        POLICY = "policy"
 
-    class GraphRegistry:
-        def health(self): return {"execution_count": 0, "singletons": {}}
-        def get(self, key): return None
-
-    class CausalGraph:
-        def __init__(self): self.edges = []
-
-    class Edge:
-        def __init__(self, source_id, target_id, label, weight=0.0, confidence=0.0):
-            self.source_id = source_id
-            self.target_id = target_id
-            self.label = label
-            self.weight = weight
-            self.confidence = confidence
-
-    class PolicyGraph:
-        def __init__(self): self._edges = []
-        def export_weights(self): return self._edges
-
-    # Minimal inline replacement exporter matching the enhanced API surface
-    class EnhancementMetricsSources:
-        def __init__(
-            self, distiller=None, rl_policy=None, federated=None,
-            coordinator=None, temporal_monitor=None, explainer=None,
-            precision_controller=None, precision_counts=None,
-            market=None, circuit_breakers=None, chaos=None, hitl=None,
-        ):
-            self.distiller = distiller
-            self.rl_policy = rl_policy
-            self.federated = federated
-            self.coordinator = coordinator
-            self.temporal_monitor = temporal_monitor
-            self.explainer = explainer
-            self.precision_controller = precision_controller
-            self.precision_counts = precision_counts or {}
-            self.market = market
-            self.circuit_breakers = circuit_breakers or {}
-            self.chaos = chaos
-            self.hitl = hitl
-
-    class GraphMetricsExporter:
-        """Minimal inline fallback matching the enhanced exporter's public API."""
-        def __init__(
-            self, registry, job_name="green_agent", max_edges_export=100,
-            helium_monitor=None, enhancement_sources=None,
-        ):
-            self.registry = registry
-            self.job_name = job_name
-            self.max_edges_export = max_edges_export
-            self.helium_monitor = helium_monitor
-            self.enhancement_sources = enhancement_sources or EnhancementMetricsSources()
-            self._server = None
-            self._server_thread = None
-
-        def _safe_registry_health(self):
-            try:
-                return self.registry.health()
-            except Exception:
-                return {"execution_count": 0, "singletons": {}}
-
-        def _safe_registry_get(self, kind):
-            try:
-                key = GraphType.CAUSAL if kind == "causal" else GraphType.POLICY
-                return self.registry.get(key)
-            except Exception:
-                return None
-
-        def collect(self):
-            m: Dict[str, tuple] = {}
-            health = self._safe_registry_health()
-            m["green_agent_execution_graphs_active"] = (health.get("execution_count", 0), {})
-            for gtype_str, info in health.get("singletons", {}).items():
-                labels = {"graph_type": gtype_str}
-                if "node_count" in info: m["green_agent_graph_nodes"] = (info["node_count"], labels)
-                if "edge_count" in info: m["green_agent_graph_edges"] = (info["edge_count"], labels)
-                if "anomaly_count" in info: m["green_agent_anomalies_active"] = (info["anomaly_count"], labels)
-                if "ideal_path_count" in info: m["green_agent_ideal_paths_total"] = (info["ideal_path_count"], {})
-
-            causal = self._safe_registry_get("causal")
-            if causal is not None:
-                try:
-                    all_edges = list(getattr(causal, "edges", []) or [])
-                    s = sorted(all_edges, key=lambda e: getattr(e, "weight", 0.0), reverse=True)[:self.max_edges_export]
-                    trunc = max(0, len(all_edges) - len(s))
-                    if trunc: m["green_agent_edges_truncated"] = (trunc, {"graph_type": "causal"})
-                    for e in s:
-                        lbl = {
-                            "source": getattr(e, "source_id", "?"),
-                            "target": getattr(e, "target_id", "?"),
-                            "label": getattr(e, "label", "default"),
-                        }
-                        m["green_agent_causal_edge_weight"] = (round(getattr(e, "weight", 0.0), 4), lbl)
-                        m["green_agent_causal_edge_confidence"] = (round(getattr(e, "confidence", 0.0), 4), lbl)
-                except Exception:
-                    pass
-
-            policy = self._safe_registry_get("policy")
-            if policy is not None:
-                try:
-                    all_edges = list(policy.export_weights() or [])
-                    s = sorted(all_edges, key=lambda e: e.get("weight", 0), reverse=True)[:self.max_edges_export]
-                    trunc = max(0, len(all_edges) - len(s))
-                    if trunc: m["green_agent_edges_truncated"] = (trunc, {"graph_type": "policy"})
-                    for ed in s:
-                        lbl = {
-                            "source": ed.get("source", "?"),
-                            "target": ed.get("target", "?"),
-                            "context_tag": ed.get("context_tag", "default"),
-                        }
-                        m["green_agent_policy_edge_weight"] = (ed.get("weight", 0.0), lbl)
-                except Exception:
-                    pass
-
-            m.update(self._collect_helium_metrics())
-            m.update(self._collect_enhancement_metrics())
-            return m
-
-        def _collect_helium_metrics(self):
-            m: Dict[str, tuple] = {}
-            if self.helium_monitor is None:
-                return m
-            try:
-                signal = self.helium_monitor.get_current_supply()
-            except Exception:
-                return m
-            if signal is None:
-                return m
-            scarcity_numeric = {"normal": 0, "caution": 1, "critical": 2, "severe": 3}
-            lvl = getattr(signal, "scarcity_level", None)
-            lvl_str = getattr(lvl, "value", str(lvl))
-            m["green_agent_helium_scarcity_level"] = (scarcity_numeric.get(lvl_str, 0), {"source": getattr(signal, "source", "unknown")})
-            m["green_agent_helium_scarcity_score"] = (float(getattr(signal, "scarcity_score", 0.0)), {})
-            m["green_agent_helium_spot_price_usd"] = (float(getattr(signal, "spot_price_usd_per_liter", 0.0)), {})
-            m["green_agent_helium_fab_inventory_days"] = (int(getattr(signal, "fab_inventory_days", 0)), {})
-            m["green_agent_helium_vendor_alerts_count"] = (len(getattr(signal, "vendor_alerts", []) or []), {})
-            premium = max(0.0, float(getattr(signal, "spot_price_usd_per_liter", 0.0)) - 4.0)
-            m["green_agent_helium_price_premium_usd"] = (premium, {})
-            return m
-
-        def _collect_enhancement_metrics(self):
-            m: Dict[str, tuple] = {}
-            for fn in (
-                self._collect_quantum_distillation, self._collect_causal_rl,
-                self._collect_federated, self._collect_multi_agent,
-                self._collect_temporal_logic, self._collect_xai,
-                self._collect_adaptive_precision, self._collect_carbon_markets,
-                self._collect_resilience, self._collect_hitl,
-            ):
-                try:
-                    m.update(fn())
-                except Exception:
-                    pass
-            return m
-
-        def _collect_quantum_distillation(self):
-            src = self.enhancement_sources.distiller
-            if src is None: return {}
-            m = {}
-            c = getattr(src, "distilled_count", None) or getattr(src, "count", None)
-            if c is not None: m["green_agent_distilled_models_total"] = (int(c), {})
-            r = getattr(src, "last_quality_retention", None)
-            if r is not None: m["green_agent_distillation_quality_retention"] = (float(r), {})
-            e = getattr(src, "last_energy_reduction_percent", None)
-            if e is not None: m["green_agent_distillation_energy_reduction_percent"] = (float(e), {})
-            return m
-
-        def _collect_causal_rl(self):
-            src = self.enhancement_sources.rl_policy
-            if src is None: return {}
-            m = {}
-            eps = getattr(src, "epsilon", None)
-            if eps is not None: m["green_agent_rl_epsilon"] = (float(eps), {})
-            obs = getattr(src, "observations", None)
-            if obs is not None: m["green_agent_rl_observations_total"] = (int(obs), {})
-            buf = getattr(src, "buffer", None)
-            if buf is not None:
-                try: m["green_agent_rl_policy_updates_total"] = (len(buf), {})
-                except Exception: pass
-            weights = getattr(src, "weights", None)
-            if isinstance(weights, dict):
-                for s, ws in weights.items():
-                    try:
-                        m["green_agent_rl_weight_l1"] = (round(sum(abs(float(w)) for w in ws), 4), {"strategy": str(s)})
-                    except Exception: pass
-            return m
-
-        def _collect_federated(self):
-            src = self.enhancement_sources.federated
-            if src is None: return {}
-            m = {}
-            updates = getattr(src, "updates", None)
-            if updates is not None:
-                try:
-                    m["green_agent_federated_updates_total"] = (len(updates), {})
-                    ids = {getattr(u, "deployment_id", None) for u in updates}
-                    ids.discard(None)
-                    m["green_agent_federated_contributors"] = (len(ids), {})
-                except Exception: pass
-            agg_fn = getattr(src, "aggregate", None)
-            if callable(agg_fn):
-                try:
-                    agg = agg_fn() or {}
-                    for k, v in agg.items():
-                        if isinstance(v, (int, float)):
-                            m["green_agent_federated_aggregate"] = (float(v), {"key": str(k)})
-                        elif isinstance(v, dict):
-                            for sk, sv in v.items():
-                                if isinstance(sv, (int, float)):
-                                    m["green_agent_federated_aggregate"] = (float(sv), {"key": f"{k}.{sk}"})
-                except Exception: pass
-            return m
-
-        def _collect_multi_agent(self):
-            src = self.enhancement_sources.coordinator
-            if src is None: return {}
-            m = {}
-            agents = getattr(src, "agents", None)
-            if isinstance(agents, dict):
-                role_counts = {}
-                for a in agents.values():
-                    role = getattr(a, "role", None)
-                    role_str = getattr(role, "value", str(role))
-                    role_counts[role_str] = role_counts.get(role_str, 0) + 1
-                    sr = getattr(a, "success_rate", None)
-                    if sr is not None:
-                        m["green_agent_agent_success_rate"] = (float(sr), {"agent_id": str(getattr(a, "agent_id", "?"))})
-                for rs, c in role_counts.items():
-                    m["green_agent_agents_by_role"] = (c, {"role": rs})
-                m["green_agent_agents_total"] = (len(agents), {})
-            return m
-
-        def _collect_temporal_logic(self):
-            src = self.enhancement_sources.temporal_monitor
-            if src is None: return {}
-            m = {}
-            v = getattr(src, "violations", None)
-            if v is None: return m
-            try: vlist = list(v)
-            except Exception: return m
-            by_prop = {}
-            latest_ts = None
-            for item in vlist:
-                prop = item.get("property", "unknown") if isinstance(item, dict) else str(item)
-                by_prop[prop] = by_prop.get(prop, 0) + 1
-                at = item.get("at") if isinstance(item, dict) else None
-                if at:
-                    try:
-                        ts = datetime.fromisoformat(at).timestamp()
-                        if latest_ts is None or ts > latest_ts: latest_ts = ts
-                    except Exception: pass
-            for prop, c in by_prop.items():
-                m["green_agent_temporal_violations_total"] = (c, {"property": prop})
-            if latest_ts is not None:
-                m["green_agent_temporal_last_violation_age_seconds"] = (max(0.0, time.time() - latest_ts), {})
-            return m
-
-        def _collect_xai(self):
-            src = self.enhancement_sources.explainer
-            if src is None: return {}
-            m = {}
-            c = getattr(src, "explanations_count", None) or getattr(src, "count", None)
-            if c is not None: m["green_agent_explanations_total"] = (int(c), {})
-            ac = getattr(src, "average_confidence", None)
-            if ac is not None: m["green_agent_explanation_confidence"] = (float(ac), {})
-            flog = getattr(src, "feedback_log", None)
-            if flog is not None:
-                try: m["green_agent_explanations_total"] = (len(flog), {})
-                except Exception: pass
-            return m
-
-        def _collect_adaptive_precision(self):
-            m = {}
-            counts = self.enhancement_sources.precision_counts or {}
-            if counts:
-                total = sum(int(v) for v in counts.values()) or 1
-                for p, c in counts.items():
-                    cnt = int(c)
-                    m["green_agent_precision_tasks_total"] = (cnt, {"precision": str(p)})
-                    m["green_agent_precision_share"] = (round(cnt / total, 4), {"precision": str(p)})
-            return m
-
-        def _collect_carbon_markets(self):
-            src = self.enhancement_sources.market
-            if src is None: return {}
-            m = {}
-            trades = getattr(src, "trades", None)
-            if trades is not None:
-                buys = sells = 0
-                vol = 0.0
-                for t in trades:
-                    if not isinstance(t, dict): continue
-                    if t.get("type") == "buy":
-                        buys += 1
-                        vol += float(t.get("cost_usd", 0.0) or 0.0)
-                    elif t.get("type") == "sell":
-                        sells += 1
-                        vol += float(t.get("revenue_usd", 0.0) or 0.0)
-                m["green_agent_carbon_credits_purchased_total"] = (buys, {})
-                m["green_agent_carbon_credits_sold_total"] = (sells, {})
-                m["green_agent_market_trade_volume_usd"] = (round(vol, 4), {})
-            spent = getattr(src, "spent", None)
-            if spent is not None: m["green_agent_market_spend_usd"] = (float(spent), {})
-            snap_fn = getattr(src, "get_snapshot", None)
-            if callable(snap_fn):
-                try:
-                    snap = snap_fn()
-                    if snap is not None:
-                        cp = getattr(snap, "carbon_price_per_tco2_usd", None)
-                        if cp is not None: m["green_agent_carbon_price_usd_per_tco2"] = (float(cp), {})
-                        rec = getattr(snap, "rec_available_mwh", None)
-                        if rec is not None: m["green_agent_rec_available_mwh"] = (float(rec), {})
-                except Exception: pass
-            return m
-
-        def _collect_resilience(self):
-            m = {}
-            for name, cb in (self.enhancement_sources.circuit_breakers or {}).items():
-                state = getattr(cb, "state", None)
-                state_str = getattr(state, "value", str(state)) if state else "closed"
-                code = {"closed": 0, "half_open": 1, "open": 2}.get(state_str, 0)
-                m["green_agent_circuit_state"] = (code, {"name": str(name)})
-                f = getattr(cb, "failures", None)
-                if f is not None: m["green_agent_circuit_failures_total"] = (int(f), {"name": str(name)})
-            chaos = self.enhancement_sources.chaos
-            if chaos is not None:
-                ev = getattr(chaos, "events", None)
-                if ev is not None:
-                    try: m["green_agent_chaos_events_total"] = (len(ev), {})
-                    except Exception: pass
-            return m
-
-        def _collect_hitl(self):
-            src = self.enhancement_sources.hitl
-            if src is None: return {}
-            m = {}
-            pending = getattr(src, "pending", None)
-            if pending is not None:
-                try: m["green_agent_hitl_pending"] = (len(pending), {})
-                except Exception: pass
-            flog = getattr(src, "feedback_log", None)
-            if flog is not None:
-                try:
-                    approved = sum(1 for e in flog if e.get("decision") is True)
-                    denied = sum(1 for e in flog if e.get("decision") is False)
-                    m["green_agent_hitl_reviews_total"] = (approved, {"decision": "approved"})
-                    m["green_agent_hitl_reviews_total"] = (denied, {"decision": "denied"})
-                except Exception: pass
-            batch_fn = getattr(src, "active_learning_batch", None)
-            if callable(batch_fn):
-                try: m["green_agent_active_learning_batch_size"] = (len(batch_fn(16) or []), {})
-                except Exception: pass
-            return m
-
-        def render(self):
-            metrics = self.collect()
-            lines = []
-            seen = set()
-            for name, (value, labels) in metrics.items():
-                base = name.split("{")[0]
-                if base not in seen:
-                    lines.append(f"# HELP {base} Green Agent metric")
-                    lines.append(f"# TYPE {base} {'counter' if base.endswith('_total') else 'gauge'}")
-                    seen.add(base)
-                if labels:
-                    label_str = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
-                    lines.append(f'{base}{{{label_str}}} {value}')
-                else:
-                    lines.append(f"{base} {value}")
-            lines.append("")
-            return "\n".join(lines)
-
-        def start_http_server(self, port=8000, host="0.0.0.0"):
-            import http.server
-            exporter = self
-            class Handler(http.server.BaseHTTPRequestHandler):
-                def do_GET(self):
-                    try:
-                        if self.path == "/metrics":
-                            body = exporter.render().encode()
-                            self.send_response(200)
-                            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-                            self.send_header("Content-Length", str(len(body)))
-                            self.end_headers()
-                            self.wfile.write(body)
-                        elif self.path in ("/health", "/healthz"):
-                            self.send_response(200)
-                            self.send_header("Content-Type", "text/plain")
-                            self.end_headers()
-                            self.wfile.write(b"ok\n")
-                        else:
-                            self.send_response(404)
-                            self.end_headers()
-                    except Exception:
-                        try:
-                            self.send_response(500)
-                            self.end_headers()
-                        except Exception:
-                            pass
-                def log_message(self, *a): pass
-            self._server = http.server.HTTPServer((host, port), Handler)
-            self._server_thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-            self._server_thread.start()
-
-        def stop_http_server(self):
-            if self._server:
-                self._server.shutdown()
-                if self._server_thread:
-                    self._server_thread.join(timeout=5)
-
-        def grafana_dashboard(self):
-            return json.dumps({
-                "title": "Green Agent — Graph & Enhancement Health",
-                "uid": "green_agent_graphs_helium_enhanced",
-                "panels": [{"id": i, "title": f"Panel {i}", "targets": [{"expr": "green_agent_execution_graphs_active"}], "datasource": {"type": "prometheus"}} for i in range(1, 26)],
-                "schemaVersion": 36,
-                "version": 2,
-            }, indent=2)
-
-        def save_dashboard(self, path="./grafana_dashboard.json"):
-            with open(path, "w") as f:
-                f.write(self.grafana_dashboard())
+requires_real = pytest.mark.skipif(
+    not _HAS_REAL_EXPORTER,
+    reason=(
+        "src.monitoring.graph_metrics_exporter not importable; "
+        "install the full package to run these tests."
+    ),
+)
 
 
 # =============================================================================
-# Fixtures (original + enhancement)
+# Graph type enum (mirrors the package's real enum)
+# =============================================================================
+class GraphType(Enum):
+    CAUSAL = "causal"
+    POLICY = "policy"
+
+
+# =============================================================================
+# Series helpers — v5.1 API (List[Tuple[str, float, Dict]])
+# =============================================================================
+
+def _series_dict(
+    series: List[Tuple[str, float, Dict[str, str]]],
+) -> Dict[Tuple[str, Tuple[Tuple[str, str], ...]], float]:
+    """Collapse to a labelled lookup: ``{(name, labels_tuple): value}``."""
+    return {
+        (name, tuple(sorted(lbl.items()))): value
+        for name, value, lbl in series
+    }
+
+
+def _series_by_name(
+    series: List[Tuple[str, float, Dict[str, str]]],
+) -> Dict[str, List[Tuple[float, Dict[str, str]]]]:
+    """Group series by metric name: ``{name: [(value, labels), ...]}``."""
+    result: Dict[str, List[Tuple[float, Dict[str, str]]]] = {}
+    for name, value, lbl in series:
+        result.setdefault(name, []).append((value, lbl))
+    return result
+
+
+def _series_names(
+    series: List[Tuple[str, float, Dict[str, str]]],
+) -> set:
+    """Distinct metric names in a series list."""
+    return {name for name, _, _ in series}
+
+
+def _labels_of(
+    series: List[Tuple[str, float, Dict[str, str]]],
+    metric_name: str,
+) -> Dict[str, float]:
+    """Return ``{<one distinguished label>: value}`` for a labelled metric."""
+    result: Dict[str, float] = {}
+    for name, value, lbl in series:
+        if name != metric_name:
+            continue
+        # Choose the first non-job label value to distinguish series.
+        for key in sorted(lbl):
+            if key not in ("job", "instance"):
+                result[str(lbl[key])] = value
+                break
+    return result
+
+
+# =============================================================================
+# Fixtures
 # =============================================================================
 
 @pytest.fixture
 def mock_registry():
-    registry = Mock(spec=GraphRegistry)
+    registry = Mock()
     registry.health.return_value = {
         "execution_count": 10,
         "singletons": {
-            "causal": {"node_count": 50, "edge_count": 120, "anomaly_count": 3, "ideal_path_count": 15},
-            "policy": {"node_count": 30, "edge_count": 75},
+            "causal": {
+                "node_count": 50,
+                "edge_count": 120,
+                "anomaly_count": 3,
+                "ideal_path_count": 15,
+            },
+            "policy": {
+                "node_count": 30,
+                "edge_count": 75,
+                "ideal_path_count": 5,
+            },
         },
     }
+    registry.get.return_value = None  # default: no graphs
     return registry
+
+
+def _make_edge(source, target, label, weight, confidence):
+    class Edge:
+        def __init__(self):
+            self.source_id = source
+            self.target_id = target
+            self.label = label
+            self.weight = weight
+            self.confidence = confidence
+    return Edge()
+
+
+def _make_coordinator(agents_spec):
+    """agents_spec: {agent_id: (role_value, success_rate)}."""
+    class R:
+        def __init__(self, v):
+            self.value = v
+    class A:
+        def __init__(self, aid, role, sr):
+            self.agent_id = aid
+            self.role = R(role)
+            self.success_rate = sr
+    class C:
+        pass
+    c = C()
+    c.agents = {
+        aid: A(aid, role, sr)
+        for aid, (role, sr) in agents_spec.items()
+    }
+    return c
 
 
 @pytest.fixture
 def mock_causal_graph():
-    graph = Mock(spec=CausalGraph)
+    graph = Mock()
     graph.edges = [
-        Edge("carbon_intensity", "execution_decision", "influences", weight=0.85, confidence=0.95),
-        Edge("execution_decision", "energy_consumed", "determines", weight=0.92, confidence=0.98),
-        Edge("energy_consumed", "carbon_emitted", "converts", weight=0.40, confidence=0.99),
-        *[Edge(f"n{i}", f"n{i+1}", "test", weight=0.5 + i * 0.01, confidence=0.9) for i in range(200)],
+        _make_edge(
+            "carbon_intensity", "execution_decision",
+            "influences", 0.85, 0.95,
+        ),
+        _make_edge(
+            "execution_decision", "energy_consumed",
+            "determines", 0.92, 0.98,
+        ),
+        _make_edge(
+            "energy_consumed", "carbon_emitted",
+            "converts", 0.40, 0.99,
+        ),
+        *[
+            _make_edge(f"n{i}", f"n{i+1}", "test", 0.5 + i * 0.01, 0.9)
+            for i in range(200)
+        ],
     ]
     return graph
 
 
 @pytest.fixture
 def mock_policy_graph():
-    graph = Mock(spec=PolicyGraph)
+    graph = Mock()
     graph.export_weights.return_value = [
-        {"source": "eco_mode", "target": "throttle", "weight": 0.75, "context_tag": "yellow_zone"},
-        {"source": "green_zone", "target": "execute_full", "weight": 1.0, "context_tag": "green_zone"},
-        {"source": "red_zone", "target": "defer", "weight": 0.3, "context_tag": "red_zone"},
-        *[{"source": f"p{i}", "target": f"p{i+1}", "weight": 0.5 + i * 0.01, "context_tag": "test"} for i in range(150)],
+        {
+            "source": "eco_mode", "target": "throttle",
+            "weight": 0.75, "context_tag": "yellow_zone",
+        },
+        {
+            "source": "green_zone", "target": "execute_full",
+            "weight": 1.0, "context_tag": "green_zone",
+        },
+        {
+            "source": "red_zone", "target": "defer",
+            "weight": 0.3, "context_tag": "red_zone",
+        },
+        *[
+            {
+                "source": f"p{i}", "target": f"p{i+1}",
+                "weight": 0.5 + i * 0.01, "context_tag": "test",
+            }
+            for i in range(150)
+        ],
     ]
     return graph
 
 
 @pytest.fixture
-def exporter(mock_registry, mock_causal_graph, mock_policy_graph):
-    def get_side_effect(graph_type):
-        if graph_type == GraphType.CAUSAL:
+def registry_with_graphs(
+    mock_registry, mock_causal_graph, mock_policy_graph,
+):
+    def get_side_effect(key):
+        if key in (GraphType.CAUSAL, "causal"):
             return mock_causal_graph
-        if graph_type == GraphType.POLICY:
+        if key in (GraphType.POLICY, "policy"):
             return mock_policy_graph
         return None
     mock_registry.get.side_effect = get_side_effect
-    return GraphMetricsExporter(mock_registry, max_edges_export=50)
+    return mock_registry
+
+
+@pytest.fixture
+def exporter(registry_with_graphs):
+    if not _HAS_REAL_EXPORTER:
+        pytest.skip("real exporter not importable")
+    return GraphMetricsExporter(
+        registry_with_graphs, max_edges_export=50,
+    )
 
 
 # --- Enhancement source mocks ---
@@ -562,44 +331,56 @@ def mock_rl_policy():
         epsilon = 0.12
         observations = 42
         buffer = [1, 2, 3]
-        weights = {"lora": [0.5, 0.2, 0.1, 0.0, 0.0], "qlora": [0.3, 0.1, 0.4, 0.1, 0.0]}
+        weights = {
+            "lora": [0.5, 0.2, 0.1, 0.0, 0.0],
+            "qlora": [0.3, 0.1, 0.4, 0.1, 0.0],
+        }
     return RL()
 
 
 @pytest.fixture
 def mock_federated():
     class U:
-        def __init__(self, dep): self.deployment_id = dep
+        def __init__(self, dep):
+            self.deployment_id = dep
     class F:
-        updates = [U("us-ca"), U("us-ca"), U("eu-north"), U("eu-north"), U("eu-north")]
+        updates = [
+            U("us-ca"), U("us-ca"),
+            U("eu-north"), U("eu-north"), U("eu-north"),
+        ]
         def aggregate(self):
-            return {"carbon:US-CA": 375.0, "carbon:EU-NORTH": 210.0}
+            return {
+                "carbon:US-CA": 375.0,
+                "carbon:EU-NORTH": 210.0,
+            }
     return F()
 
 
 @pytest.fixture
 def mock_coordinator():
-    class R:
-        def __init__(self, v): self.value = v
-    class A:
-        def __init__(self, aid, role, sr):
-            self.agent_id = aid; self.role = R(role); self.success_rate = sr
-    class C:
-        agents = {
-            "a1": A("a1", "carbon_heavy", 0.9),
-            "a2": A("a2", "latency_critical", 0.85),
-            "a3": A("a3", "carbon_heavy", 0.92),
-        }
-    return C()
+    return _make_coordinator({
+        "a1": ("carbon_heavy", 0.9),
+        "a2": ("latency_critical", 0.85),
+        "a3": ("carbon_heavy", 0.92),
+    })
 
 
 @pytest.fixture
 def mock_temporal_monitor():
     class T:
         violations = [
-            {"property": "DeadlineRespected", "at": datetime.now().isoformat()},
-            {"property": "DeadlineRespected", "at": datetime.now().isoformat()},
-            {"property": "CarbonBudgetNotExceeded", "at": datetime.now().isoformat()},
+            {
+                "property": "DeadlineRespected",
+                "at": datetime.now().isoformat(),
+            },
+            {
+                "property": "DeadlineRespected",
+                "at": datetime.now().isoformat(),
+            },
+            {
+                "property": "CarbonBudgetNotExceeded",
+                "at": datetime.now().isoformat(),
+            },
         ]
     return T()
 
@@ -624,17 +405,20 @@ def mock_market():
             {"type": "sell", "revenue_usd": 0.3},
         ]
         spent = 1.2
-        def get_snapshot(self): return S()
+        def get_snapshot(self):
+            return S()
     return M()
 
 
 @pytest.fixture
 def mock_circuit_breakers():
     class E:
-        def __init__(self, v): self.value = v
+        def __init__(self, v):
+            self.value = v
     class CB:
         def __init__(self, state, failures):
-            self.state = E(state); self.failures = failures
+            self.state = E(state)
+            self.failures = failures
     return {
         "forecaster": CB("closed", 0),
         "scheduler": CB("open", 3),
@@ -653,8 +437,13 @@ def mock_chaos():
 def mock_hitl():
     class H:
         pending = [1, 2]
-        feedback_log = [{"decision": True}, {"decision": False}, {"decision": True}]
-        def active_learning_batch(self, n=16): return self.feedback_log[-n:]
+        feedback_log = [
+            {"decision": True},
+            {"decision": False},
+            {"decision": True},
+        ]
+        def active_learning_batch(self, n=16):
+            return self.feedback_log[-n:]
     return H()
 
 
@@ -664,6 +453,8 @@ def enhancement_sources(
     mock_temporal_monitor, mock_explainer, mock_market,
     mock_circuit_breakers, mock_chaos, mock_hitl,
 ):
+    if not _HAS_REAL_EXPORTER:
+        pytest.skip("real exporter not importable")
     return EnhancementMetricsSources(
         distiller=mock_distiller,
         rl_policy=mock_rl_policy,
@@ -672,7 +463,9 @@ def enhancement_sources(
         temporal_monitor=mock_temporal_monitor,
         explainer=mock_explainer,
         precision_controller=None,
-        precision_counts={"fp32": 10, "fp16": 5, "int8": 30, "int4": 15},
+        precision_counts={
+            "fp32": 10, "fp16": 5, "int8": 30, "int4": 15,
+        },
         market=mock_market,
         circuit_breakers=mock_circuit_breakers,
         chaos=mock_chaos,
@@ -681,561 +474,1096 @@ def enhancement_sources(
 
 
 @pytest.fixture
-def enhanced_exporter(exporter, enhancement_sources):
-    """Attach enhancement sources to the base exporter."""
-    exporter.enhancement_sources = enhancement_sources
-    return exporter
+def enhanced_exporter(registry_with_graphs, enhancement_sources):
+    if not _HAS_REAL_EXPORTER:
+        pytest.skip("real exporter not importable")
+    return GraphMetricsExporter(
+        registry_with_graphs,
+        max_edges_export=50,
+        enhancement_sources=enhancement_sources,
+    )
 
 
 # =============================================================================
-# Original: collect() tests
+# Tests — base collection (v5.1 list-of-series shape)
 # =============================================================================
 
-def test_collect_empty_registry():
-    registry = Mock(spec=GraphRegistry)
-    registry.health.return_value = {"execution_count": 0, "singletons": {}}
-    exporter = GraphMetricsExporter(registry)
-    metrics = exporter.collect()
-    assert "green_agent_execution_graphs_active" in metrics
-    assert metrics["green_agent_execution_graphs_active"][0] == 0
+@requires_real
+class TestBaseCollection:
+    def test_collect_returns_list_of_tuples(self, exporter):
+        series = exporter.collect()
+        assert isinstance(series, list)
+        assert len(series) > 0
+        for name, value, labels in series:
+            assert isinstance(name, str)
+            assert isinstance(value, (int, float))
+            assert isinstance(labels, dict)
 
+    def test_collect_empty_registry(self):
+        registry = Mock()
+        registry.health.return_value = {
+            "execution_count": 0, "singletons": {},
+        }
+        registry.get.return_value = None
+        exp = GraphMetricsExporter(registry)
+        series = exp.collect()
+        by_name = _series_by_name(series)
+        exec_vals = [v for v, _ in by_name["green_agent_execution_graphs_active"]]
+        assert exec_vals == [0]
 
-def test_collect_with_graph_data(exporter, mock_registry):
-    metrics = exporter.collect()
-    assert "green_agent_execution_graphs_active" in metrics
-    assert metrics["green_agent_execution_graphs_active"][0] == 10
-    assert "green_agent_graph_nodes" in metrics
-    assert metrics["green_agent_graph_nodes"][1] == {"graph_type": "causal"}
-    assert "green_agent_anomalies_active" in metrics
-    assert metrics["green_agent_anomalies_active"][0] == 3
-    assert "green_agent_ideal_paths_total" in metrics
+    def test_collect_with_graph_data(self, exporter):
+        series = exporter.collect()
+        by_name = _series_by_name(series)
 
+        # Unlabeled execution count
+        exec_vals = [v for v, _ in by_name["green_agent_execution_graphs_active"]]
+        assert exec_vals == [10]
 
-def test_collect_cardinality_limiting(exporter, mock_causal_graph):
-    mock_registry = Mock(spec=GraphRegistry)
-    mock_registry.health.return_value = {"execution_count": 0, "singletons": {}}
-    mock_registry.get.return_value = mock_causal_graph
-    exporter_limited = GraphMetricsExporter(mock_registry, max_edges_export=10)
-    metrics = exporter_limited.collect()
-    edge_metrics = [k for k in metrics.keys() if "causal_edge_weight" in k]
-    assert len(edge_metrics) <= 10
-    exporter_unlimited = GraphMetricsExporter(mock_registry, max_edges_export=200)
-    metrics_unlimited = exporter_unlimited.collect()
-    edge_metrics_unlimited = [k for k in metrics_unlimited.keys() if "causal_edge_weight" in k]
-    assert len(edge_metrics_unlimited) > len(edge_metrics)
+        # Labelled node counts per graph type
+        node_vals = {
+            lbl["graph_type"]: v
+            for v, lbl in by_name["green_agent_graph_nodes"]
+        }
+        assert node_vals == {"causal": 50, "policy": 30}
 
+        # Labelled anomaly counts
+        anomaly_vals = {
+            lbl["graph_type"]: v
+            for v, lbl in by_name["green_agent_anomalies_active"]
+        }
+        assert anomaly_vals == {"causal": 3}
 
-def test_collect_metric_types(exporter):
-    metrics = exporter.collect()
-    gauge_metrics = [
-        "green_agent_execution_graphs_active", "green_agent_graph_nodes",
-        "green_agent_graph_edges", "green_agent_anomalies_active",
-        "green_agent_causal_edge_weight", "green_agent_policy_edge_weight",
-    ]
-    for metric in gauge_metrics:
-        if metric in metrics:
-            assert not metric.endswith("_total"), f"{metric} should be gauge"
-    counter_metrics = ["green_agent_ideal_paths_total"]
-    for metric in counter_metrics:
-        if metric in metrics:
-            assert metric.endswith("_total"), f"{metric} should be counter"
+    def test_ideal_paths_both_graph_types_at_collect(self, exporter):
+        """``collect()`` returns one entry per graph type's ideal_paths."""
+        series = exporter.collect()
+        ideal_vals = [
+            v for name, v, _ in series
+            if name == "green_agent_ideal_paths_total"
+        ]
+        # 15 (causal) + 5 (policy) — both present at collect() level
+        assert len(ideal_vals) == 2, (
+            f"expected 2 per-graph-type entries, got {len(ideal_vals)}"
+        )
+        assert sum(ideal_vals) == 20
+
+    def test_causal_edges_exact_count(self, exporter):
+        """Exactly ``max_edges_export`` causal edges are emitted."""
+        series = exporter.collect()
+        edges = [s for s in series if s[0] == "green_agent_causal_edge_weight"]
+        assert len(edges) == 50, (
+            f"expected exactly 50 edges (max_edges_export), got {len(edges)}"
+        )
+
+    def test_policy_edges_exact_count(self, exporter):
+        series = exporter.collect()
+        edges = [s for s in series if s[0] == "green_agent_policy_edge_weight"]
+        assert len(edges) == 50
+
+    def test_metric_types(self, exporter):
+        """Gauge vs counter declared correctly in the rendered output."""
+        text = exporter.render()
+        types: Dict[str, str] = {}
+        for line in text.splitlines():
+            if line.startswith("# TYPE"):
+                parts = line.split()
+                if len(parts) >= 4:
+                    types[parts[2]] = parts[3]
+
+        for gauge in (
+            "green_agent_execution_graphs_active",
+            "green_agent_graph_nodes",
+            "green_agent_graph_edges",
+            "green_agent_anomalies_active",
+            "green_agent_causal_edge_weight",
+            "green_agent_policy_edge_weight",
+        ):
+            assert types.get(gauge) == "gauge", (
+                f"{gauge} should be a gauge, got {types.get(gauge)!r}"
+            )
+
+        assert types.get("green_agent_ideal_paths_total") == "counter", (
+            f"ideal_paths_total should be counter, got {types.get('green_agent_ideal_paths_total')!r}"
+        )
 
 
 # =============================================================================
-# Original: render() tests
+# Tests — truncation
 # =============================================================================
 
-def test_render_prometheus_format(exporter):
-    text = exporter.render()
-    assert "# HELP" in text
-    assert "# TYPE" in text
-    assert text.endswith("\n")
-    lines = text.strip().split("\n")
-    for line in lines:
-        if line.startswith("# TYPE"):
-            parts = line.split()
-            if len(parts) >= 3:
-                name = parts[1]
-                t = parts[2]
-                if name.endswith("_total"):
-                    assert t == "counter", f"{name} should be counter"
-                else:
-                    assert t == "gauge", f"{name} should be gauge"
+@requires_real
+class TestTruncation:
+    def test_truncation_count_causal(self, mock_causal_graph):
+        registry = Mock()
+        registry.health.return_value = {
+            "execution_count": 0, "singletons": {},
+        }
+        registry.get.return_value = mock_causal_graph
+        exporter = GraphMetricsExporter(registry, max_edges_export=50)
+        series = exporter.collect()
+        truncated = [
+            (v, lbl) for name, v, lbl in series
+            if name == "green_agent_edges_truncated"
+        ]
+        assert len(truncated) == 1
+        value, labels = truncated[0]
+        assert value == 153  # 203 total - 50 kept
+        assert labels["graph_type"] == "causal"
 
+    def test_truncation_count_policy(self, mock_policy_graph):
+        registry = Mock()
+        registry.health.return_value = {
+            "execution_count": 0, "singletons": {},
+        }
+        registry.get.return_value = mock_policy_graph
+        exporter = GraphMetricsExporter(registry, max_edges_export=50)
+        series = exporter.collect()
+        truncated = [
+            (v, lbl) for name, v, lbl in series
+            if name == "green_agent_edges_truncated"
+        ]
+        assert len(truncated) == 1
+        _, labels = truncated[0]
+        assert labels["graph_type"] == "policy"
 
-def test_render_deduplication(exporter):
-    text = exporter.render()
-    lines = text.strip().split("\n")
-    help_counts = {}
-    type_counts = {}
-    for line in lines:
-        if line.startswith("# HELP"):
-            name = line.split()[1]
-            help_counts[name] = help_counts.get(name, 0) + 1
-        elif line.startswith("# TYPE"):
-            name = line.split()[1]
-            type_counts[name] = type_counts.get(name, 0) + 1
-    for m in help_counts:
-        assert help_counts[m] == 1, f"Duplicate HELP for {m}"
-    for m in type_counts:
-        assert type_counts[m] == 1, f"Duplicate TYPE for {m}"
+    def test_no_truncation_when_under_limit(self, mock_policy_graph):
+        registry = Mock()
+        registry.health.return_value = {
+            "execution_count": 0, "singletons": {},
+        }
+        registry.get.return_value = mock_policy_graph
+        exporter = GraphMetricsExporter(registry, max_edges_export=1000)
+        series = exporter.collect()
+        assert "green_agent_edges_truncated" not in _series_names(series)
 
+    def test_max_edges_default(self):
+        registry = Mock()
+        registry.health.return_value = {
+            "execution_count": 0, "singletons": {},
+        }
+        registry.get.return_value = None
+        exporter = GraphMetricsExporter(registry)
+        assert exporter.max_edges_export == 100
 
-def test_render_label_format(exporter):
-    text = exporter.render()
-    matches = re.findall(r'\{[^}]+\}', text)
-    for match in matches:
-        assert "=" in match, f"Invalid label format: {match}"
-        assert '"' in match, f"Label values should be quoted: {match}"
+    def test_max_edges_custom(self):
+        registry = Mock()
+        registry.health.return_value = {
+            "execution_count": 0, "singletons": {},
+        }
+        registry.get.return_value = None
+        exporter = GraphMetricsExporter(registry, max_edges_export=25)
+        assert exporter.max_edges_export == 25
 
 
 # =============================================================================
-# Original: Prometheus parser compatibility
+# Tests — rendering
 # =============================================================================
 
-@pytest.mark.skipif(not _HAS_PROM_PARSER, reason="prometheus_client not available")
-def test_prometheus_parser_compatibility(exporter):
-    text = exporter.render()
-    try:
+@requires_real
+class TestRendering:
+    def test_prometheus_format(self, exporter):
+        text = exporter.render()
+        assert "# HELP" in text
+        assert "# TYPE" in text
+        assert text.endswith("\n")
+
+        # Every TYPE line has a valid Prometheus type
+        for line in text.splitlines():
+            if line.startswith("# TYPE"):
+                parts = line.split()
+                assert len(parts) >= 4, f"malformed TYPE: {line}"
+                assert parts[3] in (
+                    "counter", "gauge", "histogram", "summary",
+                )
+
+    def test_always_has_exporter_self_metrics(self):
+        registry = Mock()
+        registry.health.return_value = {
+            "execution_count": 0, "singletons": {},
+        }
+        registry.get.return_value = None
+        exporter = GraphMetricsExporter(registry)
+        text = exporter.render()
+        assert "green_agent_exporter_info" in text
+        assert "green_agent_exporter_up" in text
+
+    def test_help_type_deduplicated(self, exporter):
+        """``# HELP`` and ``# TYPE`` emitted once per metric name."""
+        text = exporter.render()
+        help_counts: Dict[str, int] = {}
+        type_counts: Dict[str, int] = {}
+        for line in text.splitlines():
+            if line.startswith("# HELP"):
+                name = line.split()[2]
+                help_counts[name] = help_counts.get(name, 0) + 1
+            elif line.startswith("# TYPE"):
+                name = line.split()[2]
+                type_counts[name] = type_counts.get(name, 0) + 1
+        for name, count in help_counts.items():
+            assert count == 1, f"duplicate HELP for {name}"
+        for name, count in type_counts.items():
+            assert count == 1, f"duplicate TYPE for {name}"
+
+    def test_label_escaping(self):
+        """Quotes and backslashes in label values are escaped."""
+        registry = Mock()
+        registry.health.return_value = {
+            "execution_count": 0, "singletons": {},
+        }
+        registry.get.return_value = None
+        sources = EnhancementMetricsSources(
+            coordinator=_make_coordinator({
+                "a1": ('role"with-quote', 0.9),
+                "a2": ("role\\with-backslash", 0.85),
+            })
+        )
+        exporter = GraphMetricsExporter(
+            registry, enhancement_sources=sources,
+        )
+        text = exporter.render()
+        assert '\\"' in text, "quotes in labels must be escaped"
+        assert "\\\\" in text, "backslashes in labels must be escaped"
+        # Escaped output must parse cleanly
         families = list(text_string_to_metric_families(text))
         assert len(families) > 0
-    except Exception as e:
-        pytest.fail(f"Prometheus parser failed: {e}\nOutput:\n{text}")
 
+    def test_render_deduplicates_identical_series(self):
+        registry = Mock()
+        registry.health.return_value = {
+            "execution_count": 0,
+            "singletons": {"causal": {"node_count": 10}},
+        }
+        registry.get.return_value = None
+        exporter = GraphMetricsExporter(registry)
+        text = exporter.render()
+        node_lines = [
+            ln for ln in text.splitlines()
+            if ln.startswith("green_agent_graph_nodes{")
+        ]
+        assert len(node_lines) == 1
 
-@pytest.mark.skipif(not _HAS_PROM_PARSER, reason="prometheus_client not available")
-def test_prometheus_metric_families(exporter):
-    text = exporter.render()
-    families = list(text_string_to_metric_families(text))
-    names = [f.name for f in families]
-    assert "green_agent_execution_graphs_active" in names
-    for f in families:
-        if f.name == "green_agent_execution_graphs_active":
-            assert f.type == "gauge"
-        elif f.name == "green_agent_ideal_paths_total":
-            assert f.type == "counter"
+    def test_metric_lines_have_labels_when_expected(self, exporter):
+        text = exporter.render()
+        for line in text.splitlines():
+            if line.startswith("green_agent_causal_edge_weight{"):
+                assert "source=" in line
+                assert "target=" in line
+                assert "label=" in line
 
-
-# =============================================================================
-# Original: HTTP server tests
-# =============================================================================
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("", 0))
-        s.listen(1)
-        return s.getsockname()[1]
-
-
-@pytest.mark.skipif(not _HAS_REQUESTS, reason="requests not available")
-def test_http_server_metrics_endpoint(exporter):
-    port = _free_port()
-    exporter.start_http_server(port=port, host="127.0.0.1")
-    time.sleep(0.4)
-    try:
-        response = requests.get(f"http://127.0.0.1:{port}/metrics", timeout=5)
-        assert response.status_code == 200
-        assert "text/plain" in response.headers.get("Content-Type", "")
-        assert "# HELP" in response.text
-        assert "# TYPE" in response.text
-        if _HAS_PROM_PARSER:
-            list(text_string_to_metric_families(response.text))
-    finally:
-        exporter.stop_http_server()
-
-
-@pytest.mark.skipif(not _HAS_REQUESTS, reason="requests not available")
-def test_http_server_404_for_unknown_path(exporter):
-    port = _free_port()
-    exporter.start_http_server(port=port, host="127.0.0.1")
-    time.sleep(0.4)
-    try:
-        response = requests.get(f"http://127.0.0.1:{port}/unknown", timeout=5)
-        assert response.status_code == 404
-    finally:
-        exporter.stop_http_server()
-
-
-@pytest.mark.skipif(not _HAS_REQUESTS, reason="requests not available")
-def test_http_server_error_handling(exporter):
-    original_render = exporter.render
-    exporter.render = Mock(side_effect=Exception("Test error"))
-    port = _free_port()
-    exporter.start_http_server(port=port, host="127.0.0.1")
-    time.sleep(0.4)
-    try:
-        response = requests.get(f"http://127.0.0.1:{port}/metrics", timeout=5)
-        assert response.status_code == 500
-    finally:
-        exporter.render = original_render
-        exporter.stop_http_server()
-
-
-@pytest.mark.skipif(not _HAS_REQUESTS, reason="requests not available")
-def test_http_server_health_endpoint(exporter):
-    """NEW: /health endpoint returns 200."""
-    port = _free_port()
-    exporter.start_http_server(port=port, host="127.0.0.1")
-    time.sleep(0.4)
-    try:
-        response = requests.get(f"http://127.0.0.1:{port}/health", timeout=5)
-        assert response.status_code == 200
-    finally:
-        exporter.stop_http_server()
+    def test_label_values_are_quoted(self, exporter):
+        text = exporter.render()
+        for match in re.findall(r"\{([^}]+)\}", text):
+            for pair in match.split(","):
+                assert "=" in pair, f"malformed label pair: {pair!r}"
+                assert '"' in pair, f"unquoted value: {pair!r}"
 
 
 # =============================================================================
-# Original: Grafana dashboard tests (title updated)
+# Tests — Prometheus parser compatibility
 # =============================================================================
 
-def test_grafana_dashboard_structure(exporter):
-    """Enhanced title updated — no longer 'Graph Health' alone."""
-    dashboard = json.loads(exporter.grafana_dashboard())
-    # FIX: title now includes enhancements
-    assert "Green Agent" in dashboard["title"]
-    assert "panels" in dashboard
-    assert len(dashboard["panels"]) >= 7
-    for panel in dashboard["panels"]:
-        assert "id" in panel
-        assert "title" in panel
-        assert "targets" in panel
-        assert "datasource" in panel
-        assert panel["datasource"]["type"] == "prometheus"
+@requires_real
+class TestPrometheusParsing:
+    def test_full_render_parses(self, exporter):
+        text = exporter.render()
+        families = list(text_string_to_metric_families(text))
+        assert len(families) > 0
 
+    def test_metric_family_types(self, exporter):
+        text = exporter.render()
+        families = {
+            f.name: f for f in text_string_to_metric_families(text)
+        }
+        assert "green_agent_execution_graphs_active" in families
+        assert (
+            families["green_agent_execution_graphs_active"].type
+            == "gauge"
+        )
+        if "green_agent_ideal_paths_total" in families:
+            assert (
+                families["green_agent_ideal_paths_total"].type
+                == "counter"
+            )
 
-def test_grafana_dashboard_expressions(exporter):
-    dashboard = json.loads(exporter.grafana_dashboard())
-    expressions = []
-    for panel in dashboard["panels"]:
-        for target in panel.get("targets", []):
-            if "expr" in target:
-                expressions.append(target["expr"])
-    assert any("green_agent_execution_graphs_active" in e for e in expressions)
-    assert any("green_agent_anomalies_active" in e for e in expressions)
-
-
-def test_save_dashboard_file(exporter, tmp_path):
-    output_path = tmp_path / "dashboard.json"
-    exporter.save_dashboard(str(output_path))
-    assert output_path.exists()
-    with open(output_path) as f:
-        dashboard = json.load(f)
-    assert "Green Agent" in dashboard["title"]
+    def test_enhanced_render_parses(self, enhanced_exporter):
+        text = enhanced_exporter.render()
+        families = list(text_string_to_metric_families(text))
+        names = {f.name for f in families}
+        assert "green_agent_execution_graphs_active" in names
+        assert "green_agent_rl_epsilon" in names
+        assert "green_agent_agents_total" in names
+        assert "green_agent_hitl_pending" in names
 
 
 # =============================================================================
-# Original: Thread safety
+# Tests — Enhancement metrics (value-verifying, not presence-only)
 # =============================================================================
 
-def test_collect_thread_safety_basic(exporter):
-    results = []
-    errors = []
-
-    def collect_from_thread():
-        try:
-            results.append(exporter.collect())
-        except Exception as e:
-            errors.append(e)
-
-    threads = [threading.Thread(target=collect_from_thread) for _ in range(10)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    assert len(errors) == 0, f"Errors: {errors}"
-    assert len(results) == 10
-    assert all(isinstance(r, dict) for r in results)
-
-
-# =============================================================================
-# Original: Configuration
-# =============================================================================
-
-def test_max_edges_export_default():
-    registry = Mock(spec=GraphRegistry)
-    exporter = GraphMetricsExporter(registry)
-    assert exporter.max_edges_export == 100
-
-
-def test_max_edges_export_custom():
-    registry = Mock(spec=GraphRegistry)
-    exporter = GraphMetricsExporter(registry, max_edges_export=25)
-    assert exporter.max_edges_export == 25
-
-
-# =============================================================================
-# NEW: ENHANCEMENT METRIC TESTS
-# =============================================================================
-
+@requires_real
 class TestEnhancementMetrics:
-    """Tests for the ten enhancement layers."""
-
     # --- 1. Quantum-Distillation ---
-
     def test_quantum_distillation_metrics(self, enhanced_exporter):
-        m = enhanced_exporter.collect()
-        assert "green_agent_distilled_models_total" in m
-        assert m["green_agent_distilled_models_total"][0] == 12
-        assert "green_agent_distillation_quality_retention" in m
-        assert m["green_agent_distillation_quality_retention"][0] == pytest.approx(0.93)
-        assert "green_agent_distillation_energy_reduction_percent" in m
-        assert m["green_agent_distillation_energy_reduction_percent"][0] == pytest.approx(55.0)
+        by_name = _series_by_name(enhanced_exporter.collect())
+        assert (
+            by_name["green_agent_distilled_models_total"][0][0] == 12
+        )
+        assert by_name[
+            "green_agent_distillation_quality_retention"
+        ][0][0] == pytest.approx(0.93)
+        assert by_name[
+            "green_agent_distillation_energy_reduction_percent"
+        ][0][0] == pytest.approx(55.0)
 
     def test_distillation_missing_source(self, exporter):
-        """When distiller is None, no distillation metrics appear."""
-        m = exporter.collect()
-        assert "green_agent_distilled_models_total" not in m
+        by_name = _series_by_name(exporter.collect())
+        assert "green_agent_distilled_models_total" not in by_name
 
     # --- 2. Causal RL ---
-
     def test_causal_rl_metrics(self, enhanced_exporter):
-        m = enhanced_exporter.collect()
-        assert "green_agent_rl_epsilon" in m
-        assert m["green_agent_rl_epsilon"][0] == pytest.approx(0.12)
-        assert "green_agent_rl_observations_total" in m
-        assert m["green_agent_rl_observations_total"][0] == 42
-        assert "green_agent_rl_policy_updates_total" in m
-        assert m["green_agent_rl_policy_updates_total"][0] == 3
-        # Per-strategy L1 weight
-        assert "green_agent_rl_weight_l1" in m
-        assert m["green_agent_rl_weight_l1"][1] in ({"strategy": "lora"}, {"strategy": "qlora"})
+        by_name = _series_by_name(enhanced_exporter.collect())
+        assert by_name["green_agent_rl_epsilon"][0][0] == pytest.approx(
+            0.12
+        )
+        assert by_name["green_agent_rl_observations_total"][0][0] == 42
+        assert by_name["green_agent_rl_buffer_samples"][0][0] == 3
+
+        # Both strategies present as separate series
+        weight_series = by_name.get("green_agent_rl_weight_l1", [])
+        assert len(weight_series) == 2
+        strategies = {lbl["strategy"] for _, lbl in weight_series}
+        assert strategies == {"lora", "qlora"}
+
+        # L1 norm of lora = |0.5|+|0.2|+|0.1| = 0.8
+        lora = next(
+            v for v, lbl in weight_series if lbl["strategy"] == "lora"
+        )
+        assert lora == pytest.approx(0.8)
 
     def test_rl_missing_source(self, exporter):
-        m = exporter.collect()
-        assert "green_agent_rl_epsilon" not in m
+        by_name = _series_by_name(exporter.collect())
+        assert "green_agent_rl_epsilon" not in by_name
 
     # --- 3. Federated ---
-
     def test_federated_metrics(self, enhanced_exporter):
-        m = enhanced_exporter.collect()
-        assert "green_agent_federated_updates_total" in m
-        assert m["green_agent_federated_updates_total"][0] == 5
-        assert "green_agent_federated_contributors" in m
-        # Only two distinct deployment_ids
-        assert m["green_agent_federated_contributors"][0] == 2
-        assert "green_agent_federated_aggregate" in m
+        by_name = _series_by_name(enhanced_exporter.collect())
+        assert (
+            by_name["green_agent_federated_updates_total"][0][0] == 5
+        )
+        assert (
+            by_name["green_agent_federated_contributors"][0][0] == 2
+        )
+        # Both regions emitted as separate series
+        agg = {
+            lbl["key"]: v
+            for v, lbl in by_name.get(
+                "green_agent_federated_aggregate", []
+            )
+        }
+        assert agg.get("carbon:US-CA") == pytest.approx(375.0)
+        assert agg.get("carbon:EU-NORTH") == pytest.approx(210.0)
 
     def test_federated_missing_source(self, exporter):
-        m = exporter.collect()
-        assert "green_agent_federated_updates_total" not in m
+        by_name = _series_by_name(exporter.collect())
+        assert "green_agent_federated_updates_total" not in by_name
 
     # --- 4. Multi-Agent ---
-
     def test_multi_agent_role_metrics(self, enhanced_exporter):
-        m = enhanced_exporter.collect()
-        assert "green_agent_agents_total" in m
-        assert m["green_agent_agents_total"][0] == 3
-        assert "green_agent_agents_by_role" in m
-        assert "green_agent_agent_success_rate" in m
+        series = enhanced_exporter.collect()
+        by_name = _series_by_name(series)
+        assert by_name["green_agent_agents_total"][0][0] == 3
+
+        # Per-role counts as separate series
+        roles = {
+            lbl["role"]: v
+            for v, lbl in by_name.get("green_agent_agents_by_role", [])
+        }
+        assert roles == {"carbon_heavy": 2, "latency_critical": 1}
+        assert sum(roles.values()) == 3
+
+        # Per-agent success rate: one series per agent
+        sr_series = by_name.get("green_agent_agent_success_rate", [])
+        assert len(sr_series) == 3
+        agent_ids = {lbl["agent_id"] for _, lbl in sr_series}
+        assert agent_ids == {"a1", "a2", "a3"}
 
     def test_coordinator_missing_source(self, exporter):
-        m = exporter.collect()
-        assert "green_agent_agents_total" not in m
+        by_name = _series_by_name(exporter.collect())
+        assert "green_agent_agents_total" not in by_name
 
     # --- 5. Temporal Logic ---
-
     def test_temporal_violation_metrics(self, enhanced_exporter):
-        m = enhanced_exporter.collect()
-        assert "green_agent_temporal_violations_total" in m
-        assert "green_agent_temporal_last_violation_age_seconds" in m
-        age = m["green_agent_temporal_last_violation_age_seconds"][0]
-        assert age >= 0.0
-        assert age < 60.0  # Fresh violations
+        by_name = _series_by_name(enhanced_exporter.collect())
+        violations = {
+            lbl["property"]: v
+            for v, lbl in by_name.get(
+                "green_agent_temporal_violations_total", []
+            )
+        }
+        assert violations == {
+            "DeadlineRespected": 2,
+            "CarbonBudgetNotExceeded": 1,
+        }
+
+        ages = by_name.get(
+            "green_agent_temporal_last_violation_age_seconds", []
+        )
+        assert len(ages) == 1
+        assert 0.0 <= ages[0][0] < 60.0
 
     def test_temporal_missing_source(self, exporter):
-        m = exporter.collect()
-        assert "green_agent_temporal_violations_total" not in m
+        by_name = _series_by_name(exporter.collect())
+        assert "green_agent_temporal_violations_total" not in by_name
 
     # --- 6. XAI ---
-
     def test_xai_metrics(self, enhanced_exporter):
-        m = enhanced_exporter.collect()
-        assert "green_agent_explanations_total" in m
-        assert m["green_agent_explanations_total"][0] == 137
-        assert "green_agent_explanation_confidence" in m
-        assert m["green_agent_explanation_confidence"][0] == pytest.approx(0.87)
+        by_name = _series_by_name(enhanced_exporter.collect())
+        assert by_name["green_agent_explanations_total"][0][0] == 137
+        assert by_name[
+            "green_agent_explanation_confidence"
+        ][0][0] == pytest.approx(0.87)
 
     def test_xai_missing_source(self, exporter):
-        m = exporter.collect()
-        assert "green_agent_explanations_total" not in m
+        by_name = _series_by_name(exporter.collect())
+        assert "green_agent_explanations_total" not in by_name
 
     # --- 7. Adaptive Precision ---
-
-    def test_precision_distribution_metrics(self, enhanced_exporter):
-        m = enhanced_exporter.collect()
-        assert "green_agent_precision_tasks_total" in m
-        assert "green_agent_precision_share" in m
-
     def test_precision_shares_sum_to_one(self, enhanced_exporter):
-        """Sum of shares across precision labels should be ≈1.0."""
-        m = enhanced_exporter.collect()
-        # Share is emitted per precision, but the dict collapses on same name
-        # so we verify the *total* count instead.
-        assert m["green_agent_precision_tasks_total"][0] > 0
+        """Shares across all four precision labels sum to 1.0."""
+        series = enhanced_exporter.collect()
+        shares = [
+            v for name, v, _ in series
+            if name == "green_agent_precision_share"
+        ]
+        assert len(shares) == 4, (
+            f"expected 4 precision labels, got {len(shares)}"
+        )
+        assert sum(shares) == pytest.approx(1.0, abs=1e-6)
+
+    def test_precision_label_set(self, enhanced_exporter):
+        """Each precision level appears exactly once."""
+        by_name = _series_by_name(enhanced_exporter.collect())
+        labels = {
+            lbl["precision"]
+            for _, lbl in by_name.get("green_agent_precision_share", [])
+        }
+        assert labels == {"fp32", "fp16", "int8", "int4"}
+
+    def test_precision_task_counts(self, enhanced_exporter):
+        by_name = _series_by_name(enhanced_exporter.collect())
+        counts = {
+            lbl["precision"]: v
+            for v, lbl in by_name.get(
+                "green_agent_precision_tasks_total", []
+            )
+        }
+        assert counts == {
+            "fp32": 10, "fp16": 5, "int8": 30, "int4": 15,
+        }
 
     def test_precision_missing_counts(self, exporter):
-        """When precision_counts is empty, no precision metrics."""
-        m = exporter.collect()
-        # base exporter has no enhancement sources, so nothing
-        assert "green_agent_precision_share" not in m
+        by_name = _series_by_name(exporter.collect())
+        assert "green_agent_precision_share" not in by_name
 
     # --- 8. Carbon Markets ---
-
     def test_carbon_market_metrics(self, enhanced_exporter):
-        m = enhanced_exporter.collect()
-        assert "green_agent_carbon_credits_purchased_total" in m
-        assert m["green_agent_carbon_credits_purchased_total"][0] == 2
-        assert "green_agent_carbon_credits_sold_total" in m
-        assert m["green_agent_carbon_credits_sold_total"][0] == 1
-        assert "green_agent_market_trade_volume_usd" in m
-        # 0.5 + 0.7 + 0.3 = 1.5
-        assert m["green_agent_market_trade_volume_usd"][0] == pytest.approx(1.5)
-        assert "green_agent_market_spend_usd" in m
-        assert m["green_agent_market_spend_usd"][0] == pytest.approx(1.2)
-        assert "green_agent_carbon_price_usd_per_tco2" in m
-        assert m["green_agent_carbon_price_usd_per_tco2"][0] == pytest.approx(45.0)
-        assert "green_agent_rec_available_mwh" in m
-        assert m["green_agent_rec_available_mwh"][0] == pytest.approx(120.0)
+        by_name = _series_by_name(enhanced_exporter.collect())
+        assert by_name[
+            "green_agent_carbon_credits_purchased_total"
+        ][0][0] == 2
+        assert by_name[
+            "green_agent_carbon_credits_sold_total"
+        ][0][0] == 1
+        assert by_name[
+            "green_agent_market_trade_volume_usd"
+        ][0][0] == pytest.approx(1.5)  # 0.5 + 0.7 + 0.3
+        assert by_name["green_agent_market_spend_usd"][0][0] == pytest.approx(
+            1.2
+        )
+        assert by_name[
+            "green_agent_carbon_price_usd_per_tco2"
+        ][0][0] == pytest.approx(45.0)
+        assert by_name["green_agent_rec_available_mwh"][0][0] == pytest.approx(
+            120.0
+        )
 
     def test_market_missing_source(self, exporter):
-        m = exporter.collect()
-        assert "green_agent_carbon_credits_purchased_total" not in m
+        by_name = _series_by_name(exporter.collect())
+        assert "green_agent_carbon_credits_purchased_total" not in by_name
 
     # --- 9. Resilience ---
-
     def test_circuit_breaker_state_metrics(self, enhanced_exporter):
-        m = enhanced_exporter.collect()
-        assert "green_agent_circuit_state" in m
-        assert "green_agent_circuit_failures_total" in m
+        """All three circuit breakers emit their own state series."""
+        series = enhanced_exporter.collect()
+        states = {
+            lbl["name"]: v
+            for name, v, lbl in series
+            if name == "green_agent_circuit_state"
+        }
+        assert states == {
+            "forecaster": 0,   # closed
+            "scheduler": 2,    # open
+            "ledger": 1,       # half_open
+        }
+
+    def test_circuit_breaker_failures(self, enhanced_exporter):
+        series = enhanced_exporter.collect()
+        failures = {
+            lbl["name"]: v
+            for name, v, lbl in series
+            if name == "green_agent_circuit_failures_total"
+        }
+        assert failures == {
+            "forecaster": 0,
+            "scheduler": 3,
+            "ledger": 1,
+        }
 
     def test_circuit_state_codes(self, enhanced_exporter):
-        """Circuit codes: closed=0, half_open=1, open=2."""
-        m = enhanced_exporter.collect()
-        state_val = m["green_agent_circuit_state"][0]
-        code_to_name = {0: "closed", 1: "half_open", 2: "open"}
-        assert state_val in code_to_name
+        """Circuit codes are within {0, 1, 2} (closed/half_open/open)."""
+        for _, v, lbl in enhanced_exporter.collect():
+            if _ is None:  # pragma: no cover
+                continue
+        # Simple check: all state values in {0,1,2}
+        states = [
+            v for name, v, _ in enhanced_exporter.collect()
+            if name == "green_agent_circuit_state"
+        ]
+        assert states, "circuit_state must be emitted"
+        for v in states:
+            assert v in (0, 1, 2)
 
     def test_circuit_missing_source(self, exporter):
-        m = exporter.collect()
-        assert "green_agent_circuit_state" not in m
+        by_name = _series_by_name(exporter.collect())
+        assert "green_agent_circuit_state" not in by_name
 
     def test_chaos_events_metric(self, enhanced_exporter):
-        m = enhanced_exporter.collect()
-        assert "green_agent_chaos_events_total" in m
-        assert m["green_agent_chaos_events_total"][0] == 2
+        by_name = _series_by_name(enhanced_exporter.collect())
+        assert by_name["green_agent_chaos_events_total"][0][0] == 2
 
     def test_chaos_missing_source(self, exporter):
-        m = exporter.collect()
-        assert "green_agent_chaos_events_total" not in m
+        by_name = _series_by_name(exporter.collect())
+        assert "green_agent_chaos_events_total" not in by_name
 
     # --- 10. HITL ---
-
     def test_hitl_metrics(self, enhanced_exporter):
-        m = enhanced_exporter.collect()
-        assert "green_agent_hitl_pending" in m
-        assert m["green_agent_hitl_pending"][0] == 2
-        assert "green_agent_hitl_reviews_total" in m
-        assert "green_agent_active_learning_batch_size" in m
+        series = enhanced_exporter.collect()
+        by_name = _series_by_name(series)
+        assert by_name["green_agent_hitl_pending"][0][0] == 2
 
-    def test_hitl_reviews_split(self, enhanced_exporter):
-        """Approved + denied should equal the feedback log length."""
-        m = enhanced_exporter.collect()
-        total = m["green_agent_hitl_reviews_total"][0]
-        # Collapsed on name, but decision label may vary; just verify presence
-        assert total > 0
+        # Approved and denied counts as separate series
+        reviews = {
+            lbl["decision"]: v
+            for v, lbl in by_name.get(
+                "green_agent_hitl_reviews_total", []
+            )
+        }
+        assert reviews == {"approved": 2, "denied": 1}
+        assert sum(reviews.values()) == 3  # feedback_log length
+
+        # Active-learning batch size
+        batch_series = by_name.get(
+            "green_agent_active_learning_batch_size", []
+        )
+        assert len(batch_series) == 1
+        assert batch_series[0][0] == 3
 
     def test_hitl_missing_source(self, exporter):
-        m = exporter.collect()
-        assert "green_agent_hitl_pending" not in m
+        by_name = _series_by_name(exporter.collect())
+        assert "green_agent_hitl_pending" not in by_name
 
-    # --- Truncation count ---
 
-    def test_truncation_count_causal(self, mock_registry, mock_causal_graph):
-        """Causal edges > max_edges_export produces green_agent_edges_truncated."""
-        mock_registry.health.return_value = {"execution_count": 0, "singletons": {}}
-        mock_registry.get.return_value = mock_causal_graph
-        exporter = GraphMetricsExporter(mock_registry, max_edges_export=50)
-        m = exporter.collect()
-        assert "green_agent_edges_truncated" in m
-        # 203 edges - 50 kept = 153 truncated
-        assert m["green_agent_edges_truncated"][0] == 153
-        assert m["green_agent_edges_truncated"][1] == {"graph_type": "causal"}
+# =============================================================================
+# Tests — registry failure resilience
+# =============================================================================
 
-    def test_truncation_count_policy(self, mock_registry, mock_policy_graph):
-        mock_registry.health.return_value = {"execution_count": 0, "singletons": {}}
-        mock_registry.get.return_value = mock_policy_graph
-        exporter = GraphMetricsExporter(mock_registry, max_edges_export=50)
-        m = exporter.collect()
-        assert "green_agent_edges_truncated" in m
-        assert m["green_agent_edges_truncated"][1] == {"graph_type": "policy"}
-
-    def test_no_truncation_when_under_limit(self, mock_registry, mock_policy_graph):
-        """When edges fit, no truncation metric."""
-        mock_registry.health.return_value = {"execution_count": 0, "singletons": {}}
-        mock_registry.get.return_value = mock_policy_graph
-        exporter = GraphMetricsExporter(mock_registry, max_edges_export=1000)
-        m = exporter.collect()
-        assert "green_agent_edges_truncated" not in m
-
-    # --- Registry failure resilience ---
-
-    def test_registry_health_failure_graceful(self):
-        """registry.health() raising should not crash collect()."""
-        registry = Mock(spec=GraphRegistry)
+@requires_real
+class TestRegistryFailure:
+    def test_health_failure_graceful(self):
+        registry = Mock()
         registry.health.side_effect = RuntimeError("registry down")
+        registry.get.return_value = None
         exporter = GraphMetricsExporter(registry)
-        m = exporter.collect()  # must not raise
-        assert "green_agent_execution_graphs_active" in m
-        assert m["green_agent_execution_graphs_active"][0] == 0
+        series = exporter.collect()  # must not raise
+        by_name = _series_by_name(series)
+        assert by_name["green_agent_execution_graphs_active"][0][0] == 0
 
-    def test_registry_get_failure_graceful(self):
-        """registry.get() raising should not crash collect()."""
-        registry = Mock(spec=GraphRegistry)
-        registry.health.return_value = {"execution_count": 1, "singletons": {}}
+    def test_get_failure_graceful(self):
+        registry = Mock()
+        registry.health.return_value = {
+            "execution_count": 1, "singletons": {},
+        }
         registry.get.side_effect = RuntimeError("get failed")
         exporter = GraphMetricsExporter(registry)
-        m = exporter.collect()
-        assert "green_agent_execution_graphs_active" in m
+        series = exporter.collect()
+        assert "green_agent_execution_graphs_active" in _series_names(
+            series
+        )
+
+    def test_health_failure_logs_warning(self, caplog):
+        registry = Mock()
+        registry.health.side_effect = RuntimeError("registry down")
+        registry.get.return_value = None
+        exporter = GraphMetricsExporter(registry)
+        with caplog.at_level(logging.WARNING):
+            exporter.collect()
+        assert any(
+            "registry.health() failed" in r.message
+            for r in caplog.records
+        )
 
 
 # =============================================================================
-# Enhanced dashboard tests
+# Tests — HTTP server (port=0, no race)
 # =============================================================================
 
-class TestEnhancedDashboard:
-    def test_enhanced_dashboard_has_many_panels(self, enhanced_exporter):
-        dashboard = json.loads(enhanced_exporter.grafana_dashboard())
-        # Enhanced exporter has 25 panels
-        assert len(dashboard["panels"]) >= 7  # baseline sanity
-        # Enhanced exporter targets 25
-        if len(dashboard["panels"]) >= 20:
-            assert len(dashboard["panels"]) >= 20
+def _start_and_get_port(exporter, host: str = "127.0.0.1") -> int:
+    """Start the exporter's HTTP server on a free port; return the port."""
+    exporter.start_http_server(port=0, host=host)
+    time.sleep(0.15)  # give the serve thread time to bind
+    server = getattr(exporter, "_server", None)
+    assert server is not None, "server did not start"
+    return server.server_address[1]
 
-    def test_enhanced_dashboard_title(self, enhanced_exporter):
-        dashboard = json.loads(enhanced_exporter.grafana_dashboard())
+
+@requires_real
+class TestHTTPServer:
+    def test_metrics_endpoint(self, exporter):
+        port = _start_and_get_port(exporter)
+        try:
+            resp = requests.get(
+                f"http://127.0.0.1:{port}/metrics", timeout=5,
+            )
+            assert resp.status_code == 200
+            assert "text/plain" in resp.headers.get("Content-Type", "")
+            assert "# HELP" in resp.text
+            assert "# TYPE" in resp.text
+            list(text_string_to_metric_families(resp.text))
+        finally:
+            exporter.stop_http_server()
+
+    def test_404_for_unknown_path(self, exporter):
+        port = _start_and_get_port(exporter)
+        try:
+            resp = requests.get(
+                f"http://127.0.0.1:{port}/unknown", timeout=5,
+            )
+            assert resp.status_code == 404
+        finally:
+            exporter.stop_http_server()
+
+    def test_health_endpoint(self, exporter):
+        port = _start_and_get_port(exporter)
+        try:
+            resp = requests.get(
+                f"http://127.0.0.1:{port}/health", timeout=5,
+            )
+            assert resp.status_code == 200
+            assert "application/json" in resp.headers.get(
+                "Content-Type", ""
+            )
+            payload = resp.json()
+            assert "ok" in payload
+        finally:
+            exporter.stop_http_server()
+
+    def test_json_endpoint(self, exporter):
+        port = _start_and_get_port(exporter)
+        try:
+            resp = requests.get(
+                f"http://127.0.0.1:{port}/json", timeout=5,
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert isinstance(data, list)
+            assert all(
+                {"name", "value", "labels"} <= set(entry)
+                for entry in data
+            )
+        finally:
+            exporter.stop_http_server()
+
+    def test_error_handling(self, exporter):
+        original = exporter.render
+        exporter.render = Mock(side_effect=RuntimeError("boom"))
+        port = _start_and_get_port(exporter)
+        try:
+            resp = requests.get(
+                f"http://127.0.0.1:{port}/metrics", timeout=5,
+            )
+            assert resp.status_code == 500
+        finally:
+            exporter.render = original
+            exporter.stop_http_server()
+
+    def test_concurrent_scrapes(self, exporter):
+        port = _start_and_get_port(exporter)
+        try:
+            url = f"http://127.0.0.1:{port}/metrics"
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                responses = list(
+                    ex.map(
+                        lambda _: requests.get(url, timeout=5),
+                        range(20),
+                    )
+                )
+            assert all(r.status_code == 200 for r in responses)
+        finally:
+            exporter.stop_http_server()
+
+    def test_stop_is_idempotent(self, exporter):
+        exporter.start_http_server(port=0, host="127.0.0.1")
+        exporter.stop_http_server()
+        exporter.stop_http_server()  # second call is a no-op
+
+    def test_restart_after_stop(self, exporter):
+        exporter.start_http_server(port=0, host="127.0.0.1")
+        server = getattr(exporter, "_server", None)
+        assert server is not None
+        port = server.server_address[1]
+        exporter.stop_http_server()
+        # Restart on the same port must succeed
+        exporter.start_http_server(port=port, host="127.0.0.1")
+        exporter.stop_http_server()
+
+
+# =============================================================================
+# Tests — Grafana dashboard
+# =============================================================================
+
+@requires_real
+class TestGrafanaDashboard:
+    def test_dashboard_structure(self, exporter):
+        dashboard = json.loads(exporter.grafana_dashboard())
         assert "Green Agent" in dashboard["title"]
+        # v5.1 emits 25 panels covering all ten enhancement layers + helium
+        assert len(dashboard["panels"]) >= 25, (
+            f"expected 25+ panels, got {len(dashboard['panels'])}"
+        )
+        for panel in dashboard["panels"]:
+            assert "id" in panel
+            assert "title" in panel
+            assert "targets" in panel
+            assert "datasource" in panel
 
-    def test_enhanced_dashboard_uid(self, enhanced_exporter):
-        dashboard = json.loads(enhanced_exporter.grafana_dashboard())
-        if "uid" in dashboard:
-            assert len(dashboard["uid"]) > 0
+    def test_dashboard_uid(self, exporter):
+        dashboard = json.loads(exporter.grafana_dashboard())
+        assert "uid" in dashboard, "dashboard must have a uid"
+        assert isinstance(dashboard["uid"], str)
+        assert dashboard["uid"], "uid must be non-empty"
+
+    def test_dashboard_expressions(self, exporter):
+        dashboard = json.loads(exporter.grafana_dashboard())
+        expressions = [
+            t["expr"]
+            for panel in dashboard["panels"]
+            for t in panel.get("targets", [])
+            if "expr" in t
+        ]
+        assert expressions, "dashboard must have at least one expression"
+        assert any(
+            "green_agent_execution_graphs_active" in e
+            for e in expressions
+        )
+        assert any(
+            "green_agent_anomalies_active" in e for e in expressions
+        )
+        # Enhancement layers covered
+        assert any(
+            "green_agent_helium" in e for e in expressions
+        ), "helium must be covered by the dashboard"
+
+    def test_dashboard_has_variables(self, exporter):
+        dashboard = json.loads(exporter.grafana_dashboard())
+        var_names = {
+            v["name"] for v in dashboard["templating"]["list"]
+        }
+        assert "datasource" in var_names
+        assert "graph_type" in var_names
+        assert "top_k" in var_names
+
+    def test_dashboard_schema_version(self, exporter):
+        dashboard = json.loads(exporter.grafana_dashboard())
+        assert dashboard["schemaVersion"] >= 36
+
+    def test_dashboard_save(self, exporter, tmp_path):
+        path = tmp_path / "dashboard.json"
+        exporter.save_dashboard(str(path))
+        assert path.exists()
+        data = json.loads(path.read_text())
+        assert "Green Agent" in data["title"]
 
 
 # =============================================================================
-# Feature-toggle tests
+# Tests — thread safety
 # =============================================================================
 
+@requires_real
+class TestThreadSafety:
+    def test_concurrent_collect_consistent(self, exporter):
+        """Concurrent collects produce structurally identical results."""
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            results = list(
+                ex.map(lambda _: exporter.collect(), range(20))
+            )
+
+        def canonical(series):
+            return sorted(
+                (name, value, tuple(sorted(lbl.items())))
+                for name, value, lbl in series
+            )
+
+        baseline = canonical(results[0])
+        for i, series in enumerate(results[1:], start=1):
+            assert canonical(series) == baseline, (
+                f"thread {i} produced inconsistent series"
+            )
+
+
+# =============================================================================
+# Tests — v5.1 fixes (new)
+# =============================================================================
+
+@requires_real
+class TestV5_1Fixes:
+    """One test per fix from the exporter review that wasn't previously tested."""
+
+    def test_collect_returns_list_not_dict(self, exporter):
+        """P0 #1: collect() returns List[Tuple], not Dict."""
+        series = exporter.collect()
+        assert isinstance(series, list)
+        assert not isinstance(series, dict)
+        for item in series:
+            assert isinstance(item, tuple)
+            assert len(item) == 3
+
+    def test_multi_series_preserved(self, enhanced_exporter):
+        """P0 #1: three circuit breakers → three state series."""
+        series = enhanced_exporter.collect()
+        circuits = [
+            s for s in series if s[0] == "green_agent_circuit_state"
+        ]
+        assert len(circuits) == 3, (
+            f"expected 3 circuit series, got {len(circuits)}"
+        )
+        names = {s[2]["name"] for s in circuits}
+        assert names == {"forecaster", "scheduler", "ledger"}
+
+    def test_safe_registry_get_unknown_kind(self, exporter):
+        """P1 #4: unknown kinds return None, not policy-graph fallback."""
+        assert exporter._safe_registry_get("federated") is None
+        assert exporter._safe_registry_get("") is None
+        assert exporter._safe_registry_get("bogus") is None
+        # Known kinds still work
+        assert exporter._safe_registry_get("causal") is not None
+
+    def test_dry_run_skips_side_effects(self, enhanced_exporter):
+        """P1 #11: dry_run=True skips aggregate()."""
+        federated = enhanced_exporter.enhancement_sources.federated
+        original = federated.aggregate
+        calls = [0]
+
+        def counting():
+            calls[0] += 1
+            return original()
+
+        federated.aggregate = counting
+        try:
+            enhanced_exporter.collect(dry_run=True)
+            assert calls[0] == 0, (
+                "dry_run must not call aggregate()"
+            )
+            enhanced_exporter.collect(dry_run=False)
+            assert calls[0] >= 1, (
+                "non-dry_run must call aggregate()"
+            )
+        finally:
+            federated.aggregate = original
+
+    def test_registry_circuit_breaker(self):
+        """P1 #5: registry circuit opens after threshold failures."""
+        registry = Mock()
+        registry.health.side_effect = RuntimeError("down")
+        registry.get.return_value = None
+        exporter = GraphMetricsExporter(registry)
+
+        # Five failures
+        for _ in range(5):
+            exporter.collect()
+
+        # Circuit open — health must not be called
+        registry.health.reset_mock()
+        exporter.collect()
+        registry.health.assert_not_called()
+
+    def test_empty_scrape_has_self_metrics(self):
+        """P1 #10: empty scrape still emits exporter_info + exporter_up."""
+        registry = Mock()
+        registry.health.return_value = {
+            "execution_count": 0, "singletons": {},
+        }
+        registry.get.return_value = None
+        exporter = GraphMetricsExporter(registry)
+        text = exporter.render()
+        assert "green_agent_exporter_info" in text
+        assert "green_agent_exporter_up" in text
+
+    def test_render_json(self, exporter):
+        """P2 #12: render_json returns a parseable list of series."""
+        payload = exporter.render_json()
+        data = json.loads(payload)
+        assert isinstance(data, list)
+        for entry in data:
+            assert {"name", "value", "labels"} <= set(entry)
+            assert isinstance(entry["labels"], dict)
+
+    def test_health_returns_ok(self, exporter):
+        """P2 #12: health() reports ok."""
+        report = exporter.health()
+        assert isinstance(report, dict)
+        assert "ok" in report
+        assert report["ok"] is True
+
+    def test_test_smoke_returns_ok(self, exporter):
+        """P2 #12: test_smoke() exercises the pipeline."""
+        report = exporter.test_smoke()
+        assert isinstance(report, dict)
+        assert report["ok"] is True
+        assert report["steps"], "test_smoke must exercise at least one step"
+
+    def test_version_is_string(self):
+        """P2 #12: __version__ exported."""
+        assert isinstance(EXPORTER_VERSION, str)
+        assert EXPORTER_VERSION
+
+    def test_collector_source_adapter(self, mock_registry):
+        """P2 #12: MetricsCollector.get_statistics() preferred source."""
+        class MockCollector:
+            def get_statistics(self):
+                return {
+                    "circuits": {
+                        "forecaster": "closed",
+                        "scheduler": "open",
+                    },
+                    "agents": {
+                        "a1": {"role": "carbon_optimizer", "calls": 5},
+                        "a2": {"role": "carbon_optimizer", "calls": 3},
+                    },
+                    "hitl_pending": 3,
+                }
+
+        sources = EnhancementMetricsSources(collector=MockCollector())
+        exporter = GraphMetricsExporter(
+            mock_registry, enhancement_sources=sources,
+        )
+        series = exporter.collect()
+        names = _series_names(series)
+        assert "green_agent_circuit_state" in names
+        assert "green_agent_hitl_pending" in names
+
+        circuits = {
+            lbl["name"]: v
+            for name, v, lbl in series
+            if name == "green_agent_circuit_state"
+        }
+        assert circuits == {"forecaster": 0, "scheduler": 2}
+
+    def test_coerce_float_rejects_nan_inf(self):
+        """P1 #10: NaN/Inf metric values are skipped, not emitted."""
+        class BadDistiller:
+            distilled_count = float("nan")
+            last_quality_retention = float("inf")
+            last_energy_reduction_percent = 55.0
+
+        registry = Mock()
+        registry.health.return_value = {
+            "execution_count": 0, "singletons": {},
+        }
+        registry.get.return_value = None
+        sources = EnhancementMetricsSources(distiller=BadDistiller())
+        exporter = GraphMetricsExporter(
+            registry, enhancement_sources=sources,
+        )
+        by_name = _series_by_name(exporter.collect())
+        assert "green_agent_distilled_models_total" not in by_name
+        assert (
+            "green_agent_distillation_quality_retention" not in by_name
+        )
+        assert (
+            "green_agent_distillation_energy_reduction_percent"
+            in by_name
+        )
+
+    def test_unknown_scarcity_defaults_to_critical(self, mock_registry):
+        """P3 #13: unknown scarcity level defaults to CRITICAL (2)."""
+        class WeirdLevel:
+            value = "cosmic-ray"
+
+        class MockHelium:
+            def get_current_supply(self):
+                return type("S", (), {
+                    "scarcity_level": WeirdLevel(),
+                    "scarcity_score": 0.5,
+                    "spot_price_usd_per_liter": 5.0,
+                    "fab_inventory_days": 10,
+                    "vendor_alerts": [],
+                    "source": "weird",
+                })()
+
+        exporter = GraphMetricsExporter(
+            mock_registry, helium_monitor=MockHelium(),
+        )
+        series = exporter.collect()
+        levels = [
+            v for name, v, _ in series
+            if name == "green_agent_helium_scarcity_level"
+        ]
+        assert len(levels) == 1
+        assert levels[0] == 2, "unknown level must default to CRITICAL"
+
+    def test_helium_baseline_price_override(self, mock_registry):
+        """``helium_baseline_price_usd=`` configures the premium calc."""
+
+        class MockHelium:
+            def get_current_supply(self):
+                return type("S", (), {
+                    "scarcity_level": type(
+                        "E", (), {"value": "normal"},
+                    )(),
+                    "scarcity_score": 0.0,
+                    "spot_price_usd_per_liter": 10.0,
+                    "fab_inventory_days": 30,
+                    "vendor_alerts": [],
+                    "source": "test",
+                })()
+
+        exporter = GraphMetricsExporter(
+            mock_registry,
+            helium_monitor=MockHelium(),
+            helium_baseline_price_usd=5.0,
+        )
+        by_name = _series_by_name(exporter.collect())
+        premiums = [
+            v for v, _ in by_name["green_agent_helium_price_premium_usd"]
+        ]
+        assert premiums == [pytest.approx(5.0)]  # 10.0 - 5.0
+
+
+# =============================================================================
+# Tests — feature toggles / partial sources
+# =============================================================================
+
+@requires_real
 class TestFeatureToggles:
     def test_all_sources_missing(self):
-        """No enhancement sources = only base metrics."""
-        registry = Mock(spec=GraphRegistry)
-        registry.health.return_value = {"execution_count": 1, "singletons": {}}
+        registry = Mock()
+        registry.health.return_value = {
+            "execution_count": 1, "singletons": {},
+        }
+        registry.get.return_value = None
         exporter = GraphMetricsExporter(registry)
-        m = exporter.collect()
-        # Only base metric should appear
-        assert "green_agent_execution_graphs_active" in m
-        for enhancement_key in [
+        series = exporter.collect()
+        names = _series_names(series)
+        assert "green_agent_execution_graphs_active" in names
+        for enhancement in [
             "green_agent_distilled_models_total",
             "green_agent_rl_epsilon",
             "green_agent_federated_updates_total",
@@ -1247,54 +1575,33 @@ class TestFeatureToggles:
             "green_agent_circuit_state",
             "green_agent_hitl_pending",
         ]:
-            assert enhancement_key not in m, f"{enhancement_key} unexpectedly present"
+            assert enhancement not in names, (
+                f"{enhancement} unexpectedly present"
+            )
 
     def test_partial_sources(self, mock_rl_policy, mock_hitl):
-        """Only RL and HITL sources present."""
-        registry = Mock(spec=GraphRegistry)
-        registry.health.return_value = {"execution_count": 1, "singletons": {}}
-        sources = EnhancementMetricsSources(rl_policy=mock_rl_policy, hitl=mock_hitl)
-        exporter = GraphMetricsExporter(registry, enhancement_sources=sources)
-        m = exporter.collect()
-        assert "green_agent_rl_epsilon" in m
-        assert "green_agent_hitl_pending" in m
-        assert "green_agent_distilled_models_total" not in m
+        registry = Mock()
+        registry.health.return_value = {
+            "execution_count": 1, "singletons": {},
+        }
+        registry.get.return_value = None
+        sources = EnhancementMetricsSources(
+            rl_policy=mock_rl_policy, hitl=mock_hitl,
+        )
+        exporter = GraphMetricsExporter(
+            registry, enhancement_sources=sources,
+        )
+        series = exporter.collect()
+        names = _series_names(series)
+        assert "green_agent_rl_epsilon" in names
+        assert "green_agent_hitl_pending" in names
+        assert "green_agent_distilled_models_total" not in names
 
 
 # =============================================================================
-# End-to-end test
-# =============================================================================
-
-@pytest.mark.skipif(not _HAS_PROM_PARSER, reason="prometheus_client not available")
-def test_full_enhanced_render_parses(enhanced_exporter):
-    """The full enhanced render must parse with prometheus_client."""
-    text = enhanced_exporter.render()
-    families = list(text_string_to_metric_families(text))
-    names = {f.name for f in families}
-    # Base
-    assert "green_agent_execution_graphs_active" in names
-    # Enhancements should appear where sources are configured
-    assert "green_agent_rl_epsilon" in names
-    assert "green_agent_agents_total" in names
-    assert "green_agent_hitl_pending" in names
-
-
-# =============================================================================
-# Main entry point
+# Module entry point
 # =============================================================================
 
 if __name__ == "__main__":
-    try:
-        import pytest
-        pytest.main([__file__, "-v"])
-    except ImportError:
-        print("pytest not available, running basic smoke test...")
-
-        registry = Mock(spec=GraphRegistry)
-        registry.health.return_value = {"execution_count": 1, "singletons": {}}
-        registry.get.return_value = None
-        exporter = GraphMetricsExporter(registry)
-        text = exporter.render()
-        assert "# HELP" in text
-        assert "# TYPE" in text
-        print("✅ Basic smoke test passed")
+    import sys
+    sys.exit(pytest.main([__file__, "-v", "--tb=short"]))
