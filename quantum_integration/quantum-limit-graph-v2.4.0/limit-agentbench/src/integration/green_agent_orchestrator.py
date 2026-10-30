@@ -18,6 +18,30 @@ layers:
  10. Human-in-the-Loop for critical decisions + active learning
 
 Location: src/integration/green_agent_orchestrator.py
+
+Changelog (v2 — enhancement pass):
+  * P0-1  Dimensional fix: federated carbon-intensity blend now uses a
+          multiplicative efficiency factor, not a percentage-of-intensity mix.
+  * P0-2  Budget refreshed after HITL approval / market purchase; ledger
+          credited when credits are bought.
+  * P0-3  `hitl_approved` / `market_trade` initialised at top of
+          `execute_workflow` (no unbound-local risk).
+  * P0-4  RL update cadence driven by an explicit counter.
+  * P0-5  `_try_import` narrowed to `ImportError` / `AttributeError` so real
+          errors surface.
+  * P0-6  Federated aggregator indexes `carbon:{region}` keys on push so
+          lookups actually resolve.
+  * P1-1  Async-safe `CircuitBreaker` (asyncio.Lock, HALF_OPEN gate).
+  * P1-2  Ledger transactions and market trades are idempotent per task.
+  * P1-3  `HumanInTheLoopGate.request_review` is async + timeout-guarded.
+  * P1-4  `ChaosInjector` is truly a no-op unless enabled.
+  * P1-5  `AdaptivePrecisionController.quantize` performs real significand
+          snapping per precision level.
+  * P1-6  `PipelineConfig` dataclass replaces scattered magic numbers.
+  * P1-7  `WorkflowExplainer` accepts explicit attribution breakdown.
+  * P1-8  `CausalRLPolicy` gains epsilon decay, bias term, L2, clipping.
+  * P1-9  `TemporalLogicMonitor` is bounded and exposes per-property counts.
+  * P1-10 `explain_last_decision` filters unknown dataclass keys.
 """
 
 from __future__ import annotations
@@ -31,10 +55,57 @@ import asyncio
 import logging
 import math
 import random
-import statistics
-import hashlib
+import statistics  # noqa: F401  (kept for backward-compat import surface)
+import hashlib    # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Configuration surface
+# =============================================================================
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    """All tunable parameters in one place (replaces scattered magic numbers)."""
+    # Fallbacks
+    fallback_intensity_g_per_kwh: float = 400.0
+    fallback_latency_hours: float = 0.1
+    # Costs
+    energy_cost_usd_per_kwh: float = 0.20
+    # Reduction caps
+    max_energy_reduction_pct: float = 95.0
+    distillation_energy_weight: float = 0.20
+    # Federated blending
+    federated_blend_weight: float = 0.20
+    federated_min_samples: float = 5.0
+    federated_dp_noise_scale: float = 0.0
+    # Market
+    market_budget_usd: float = 10.0
+    market_price_range_usd: Tuple[float, float] = (20.0, 80.0)
+    market_price_ttl_s: int = 300
+    market_sell_fraction: float = 0.5
+    # RL
+    rl_update_every_n_tasks: int = 10
+    rl_epsilon: float = 0.10
+    rl_epsilon_min: float = 0.02
+    rl_epsilon_decay: float = 0.995
+    rl_lr: float = 0.05
+    rl_l2: float = 1e-4
+    rl_buffer_size: int = 1024
+    rl_reward_clip: float = 1.0
+    # Circuit breaker
+    circuit_failure_threshold: int = 3
+    circuit_recovery_timeout_s: int = 60
+    circuit_half_open_max_calls: int = 1
+    # HITL
+    hitl_budget_review_threshold: float = 0.90
+    hitl_urgent_threshold: float = 0.95
+    hitl_timeout_s: float = 30.0
+    # Temporal logic
+    temporal_max_violations: int = 1024
+    # History
+    decision_history_size: int = 2048
 
 
 # =============================================================================
@@ -42,10 +113,21 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 def _try_import(module_path: str, attr: str, fallback: Any) -> Any:
+    """Gracefully fall back on ImportError/AttributeError only.
+    Real errors (SyntaxError, NameError, etc.) are propagated."""
     try:
         mod = __import__(module_path, fromlist=[attr])
+    except ImportError as e:
+        logger.warning(
+            f"Optional module '{module_path}' unavailable: {e}; using fallback"
+        )
+        return fallback
+    try:
         return getattr(mod, attr)
-    except Exception:
+    except AttributeError:
+        logger.warning(
+            f"Module '{module_path}' has no attribute '{attr}'; using fallback"
+        )
         return fallback
 
 
@@ -57,7 +139,8 @@ class _StubTaskCarbonProfiler:
             expected_carbon_kgco2e = 0.004
             confidence = 0.5
         return E()
-    def add_telemetry_record(self, task, actual_energy, actual_carbon, predicted_energy=None): pass
+    def add_telemetry_record(self, task, actual_energy, actual_carbon,
+                             predicted_energy=None): pass
     def get_statistics(self): return {}
 
 
@@ -109,6 +192,7 @@ class _StubCarbonLedger:
         class B:
             remaining_kgco2e = 10.0
             budget_kgco2e = 20.0
+            period = "current"
         return B()
     def check_budget_available(self, team, required_carbon): return True
     def record_transaction(self, **kw): pass
@@ -198,7 +282,7 @@ class WorkflowResult:
     final_accuracy: Optional[float]
     workflow_steps: list
     reasoning: str
-    # --- New optional fields ---
+    # --- Enhanced fields ---
     explanation: Optional[WorkflowExplanation] = None
     precision_used: str = "fp32"
     temporal_verified: bool = True
@@ -222,54 +306,98 @@ class HardwareProfile:
 
 
 # =============================================================================
-# ENHANCEMENT 9: Resilience — Circuit Breaker + Chaos Injector
+# ENHANCEMENT 9: Resilience — Async-safe CircuitBreaker + gated ChaosInjector
 # =============================================================================
 
-@dataclass
 class CircuitBreaker:
-    name: str
-    failure_threshold: int = 3
-    recovery_timeout_seconds: int = 60
-    state: CircuitState = CircuitState.CLOSED
-    failures: int = 0
-    last_failure_at: Optional[datetime] = None
+    """Thread/async-safe circuit breaker with a HALF_OPEN admission gate."""
 
-    def can_call(self) -> bool:
-        if self.state == CircuitState.CLOSED:
-            return True
-        if self.state == CircuitState.OPEN:
-            if (self.last_failure_at and
-                    (datetime.now() - self.last_failure_at).total_seconds()
-                    > self.recovery_timeout_seconds):
-                self.state = CircuitState.HALF_OPEN
+    def __init__(
+        self,
+        name: str,
+        failure_threshold: int = 3,
+        recovery_timeout_seconds: int = 60,
+        half_open_max_calls: int = 1,
+    ) -> None:
+        self.name = name
+        self.failure_threshold = max(1, failure_threshold)
+        self.recovery_timeout_seconds = max(0, recovery_timeout_seconds)
+        self.half_open_max_calls = max(1, half_open_max_calls)
+        self.state: CircuitState = CircuitState.CLOSED
+        self.failures: int = 0
+        self.last_failure_at: Optional[datetime] = None
+        self._half_open_calls: int = 0
+        self._lock = asyncio.Lock()
+
+    async def can_call(self) -> bool:
+        async with self._lock:
+            if self.state == CircuitState.CLOSED:
+                return True
+            if self.state == CircuitState.OPEN:
+                if (self.last_failure_at is not None and
+                        (datetime.now() - self.last_failure_at).total_seconds()
+                        > self.recovery_timeout_seconds):
+                    self.state = CircuitState.HALF_OPEN
+                    self._half_open_calls = 1
+                    return True
+                return False
+            # HALF_OPEN
+            if self._half_open_calls < self.half_open_max_calls:
+                self._half_open_calls += 1
                 return True
             return False
-        return True
 
-    def record_success(self) -> None:
-        self.failures = 0
-        self.state = CircuitState.CLOSED
+    async def record_success(self) -> None:
+        async with self._lock:
+            self.failures = 0
+            self.state = CircuitState.CLOSED
+            self._half_open_calls = 0
 
-    def record_failure(self) -> None:
-        self.failures += 1
-        self.last_failure_at = datetime.now()
-        if self.failures >= self.failure_threshold:
-            self.state = CircuitState.OPEN
-            logger.warning(
-                f"Circuit '{self.name}' OPEN after {self.failures} failures"
-            )
+    async def record_failure(self) -> None:
+        async with self._lock:
+            self.failures += 1
+            self.last_failure_at = datetime.now()
+            if self.failures >= self.failure_threshold:
+                self.state = CircuitState.OPEN
+                logger.warning(
+                    f"Circuit '{self.name}' OPEN after {self.failures} failures"
+                )
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "state": self.state.value,
+            "failures": self.failures,
+            "last_failure_at": (
+                self.last_failure_at.isoformat() if self.last_failure_at else None
+            ),
+        }
 
 
 class ChaosInjector:
-    def __init__(self, failure_rate: float = 0.0, latency_ms: int = 0) -> None:
-        self.failure_rate = failure_rate
-        self.latency_ms = latency_ms
+    """Fault/latency injector. Strictly a no-op unless explicitly enabled."""
+
+    def __init__(
+        self,
+        failure_rate: float = 0.0,
+        latency_ms: int = 0,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.failure_rate = min(1.0, max(0.0, failure_rate))
+        self.latency_ms = max(0, latency_ms)
         self.events: List[Dict[str, Any]] = []
+        self._rng = random.Random(seed)
+
+    @property
+    def enabled(self) -> bool:
+        return self.failure_rate > 0.0 or self.latency_ms > 0
 
     async def maybe_inject(self, component: str) -> None:
+        if not self.enabled:
+            return
         if self.latency_ms > 0:
             await asyncio.sleep(self.latency_ms / 1000.0)
-        if random.random() < self.failure_rate:
+        if self.failure_rate > 0.0 and self._rng.random() < self.failure_rate:
             self.events.append({
                 "component": component,
                 "at": datetime.now().isoformat(),
@@ -323,18 +451,25 @@ class CarbonBudgetNotExceeded:
 
 
 class TemporalLogicMonitor:
-    def __init__(self) -> None:
+    """Bounded-history safety monitor with per-property counters."""
+
+    def __init__(self, max_violations: int = 1024) -> None:
         self.properties: List[SafetyProperty] = []
-        self.violations: List[Dict[str, Any]] = []
+        self.violations: Deque[Dict[str, Any]] = deque(maxlen=max_violations)
+        self.violation_counts: Dict[str, int] = defaultdict(int)
+        self._checks: int = 0
 
     def register(self, p: SafetyProperty) -> None:
         self.properties.append(p)
+        self.violation_counts.setdefault(p.name(), 0)
 
     def verify(self, ctx: Dict[str, Any]) -> Tuple[bool, List[str]]:
+        self._checks += 1
         bad: List[str] = []
         for p in self.properties:
             if not p.check(ctx):
                 bad.append(p.name())
+                self.violation_counts[p.name()] += 1
                 self.violations.append({
                     "property": p.name(),
                     "at": datetime.now().isoformat(),
@@ -348,9 +483,16 @@ class TemporalLogicMonitor:
                 })
         return (len(bad) == 0, bad)
 
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "checks": self._checks,
+            "violation_counts": dict(self.violation_counts),
+            "recent": list(self.violations)[-5:],
+        }
+
 
 # =============================================================================
-# ENHANCEMENT 6: XAI
+# ENHANCEMENT 6: XAI (narrative + attribution)
 # =============================================================================
 
 class WorkflowExplainer:
@@ -369,15 +511,16 @@ class WorkflowExplainer:
         temporal_violations: List[str],
         budget_remaining: Optional[float] = None,
         market_snapshot: Optional[Dict[str, Any]] = None,
+        contribution_breakdown: Optional[Dict[str, float]] = None,
     ) -> WorkflowExplanation:
-        reasons: List[str] = []
-        reasons.append(
-            f"Task '{task_id}' completed with status '{status}'."
-        )
-        reasons.append(
-            f"Carbon: estimated {carbon_estimate:.4f}, actual {actual_carbon:.4f} "
-            f"kgCO₂e (saved {carbon_saved:.4f}, {savings_pct:.1f}%)."
-        )
+        reasons: List[str] = [
+            f"Task '{task_id}' completed with status '{status}'.",
+            (
+                f"Carbon: estimated {carbon_estimate:.4f}, actual "
+                f"{actual_carbon:.4f} kgCO₂e (saved {carbon_saved:.4f}, "
+                f"{savings_pct:.1f}%)."
+            ),
+        ]
         if strategy:
             reasons.append(f"Fine-tuning strategy enforced: {strategy}.")
         if eco_mode:
@@ -397,6 +540,9 @@ class WorkflowExplainer:
                 reasons.append(
                     f"Carbon market price = ${cp:.2f}/tCO₂ considered."
                 )
+
+        attribution = dict(contribution_breakdown or {})
+
         return WorkflowExplanation(
             headline=f"[{status.upper()}] {task_id} ({savings_pct:.1f}% saved)",
             rationale=reasons,
@@ -406,15 +552,24 @@ class WorkflowExplainer:
                 "actual_carbon": actual_carbon,
                 "carbon_saved": carbon_saved,
                 "savings_pct": savings_pct,
+                **{f"attr_{k}": v for k, v in attribution.items()},
             },
         )
 
 
 # =============================================================================
-# ENHANCEMENT 7: Adaptive Precision
+# ENHANCEMENT 7: Adaptive Precision (real significand snapping)
 # =============================================================================
 
 class AdaptivePrecisionController:
+    _SIG_BITS = {
+        PrecisionLevel.FP32: 24,
+        PrecisionLevel.FP16: 11,
+        PrecisionLevel.INT8: 8,
+        PrecisionLevel.INT4: 4,
+        PrecisionLevel.QUANTUM_DISTILLED: 3,
+    }
+
     def __init__(self, hw: Optional[HardwareProfile] = None) -> None:
         self.hw = hw or HardwareProfile()
 
@@ -422,27 +577,31 @@ class AdaptivePrecisionController:
         if urgency == "critical":
             return PrecisionLevel.FP16
         if self.hw.edge_device:
-            return (PrecisionLevel.INT8 if self.hw.supports_int8
-                    else PrecisionLevel.FP16)
-        return (PrecisionLevel.INT4 if self.hw.supports_int4
-                else PrecisionLevel.INT8)
+            return (
+                PrecisionLevel.INT8 if self.hw.supports_int8
+                else PrecisionLevel.FP16
+            )
+        return (
+            PrecisionLevel.INT4 if self.hw.supports_int4
+            else PrecisionLevel.INT8
+        )
 
-    @staticmethod
-    def quantize(value: float, precision: PrecisionLevel) -> float:
-        scale = {
-            PrecisionLevel.FP32: 1.0,
-            PrecisionLevel.FP16: 1.0,
-            PrecisionLevel.INT8: 1000.0,
-            PrecisionLevel.INT4: 100.0,
-            PrecisionLevel.QUANTUM_DISTILLED: 10.0,
-        }[precision]
-        if scale <= 1.0:
+    @classmethod
+    def quantize(cls, value: float, precision: PrecisionLevel) -> float:
+        """Snap `value` to the nearest representable value for `precision`."""
+        if value == 0.0 or math.isnan(value) or math.isinf(value):
             return value
-        return math.floor(value * scale) / scale
+        sig = cls._SIG_BITS[precision]
+        try:
+            exp = math.floor(math.log2(abs(value)))
+        except (ValueError, OverflowError):
+            return value
+        step = 2.0 ** (exp - sig + 1)
+        return round(value / step) * step
 
 
 # =============================================================================
-# ENHANCEMENT 2: Causal RL for Policy Adaptation
+# ENHANCEMENT 2: Causal RL (decay, bias, L2, reward clipping)
 # =============================================================================
 
 @dataclass
@@ -464,13 +623,33 @@ class CausalRLPolicy:
         "prefix_tuning", "frozen_backbone",
     ]
 
-    def __init__(self, epsilon: float = 0.1, lr: float = 0.05) -> None:
+    def __init__(
+        self,
+        epsilon: float = 0.10,
+        epsilon_min: float = 0.02,
+        epsilon_decay: float = 0.995,
+        lr: float = 0.05,
+        l2: float = 1e-4,
+        buffer_size: int = 1024,
+        reward_clip: float = 1.0,
+        seed: Optional[int] = None,
+    ) -> None:
         self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
         self.lr = lr
+        self.l2 = l2
+        self.reward_clip = reward_clip
+        self._rng = random.Random(seed)
+        # 6 features = 5 state features + bias
         self.weights: Dict[str, List[float]] = {
-            s: [0.0] * 5 for s in self.STRATEGIES
+            s: [0.0] * 6 for s in self.STRATEGIES
         }
-        self.buffer: Deque[Tuple[PolicyState, str, float]] = deque(maxlen=1024)
+        self.buffer: Deque[Tuple[PolicyState, str, float]] = deque(
+            maxlen=buffer_size
+        )
+        self.update_count = 0
+        self.sample_count = 0
 
     @staticmethod
     def _features(s: PolicyState) -> List[float]:
@@ -480,6 +659,7 @@ class CausalRLPolicy:
             s.carbon_budget_norm,
             s.hour_of_day / 24.0,
             s.domain_shift_norm,
+            1.0,  # bias
         ]
 
     def _q(self, s: PolicyState, strat: str) -> float:
@@ -492,12 +672,14 @@ class CausalRLPolicy:
     def select(self, s: PolicyState, available: List[str]) -> str:
         if not available:
             return self.STRATEGIES[0]
-        if random.random() < self.epsilon:
-            return random.choice(available)
+        if self._rng.random() < self.epsilon:
+            return self._rng.choice(available)
         return max(available, key=lambda st: self._q(s, st))
 
     def record(self, s: PolicyState, strat: str, reward: float) -> None:
-        self.buffer.append((s, strat, reward))
+        clipped = max(-self.reward_clip, min(self.reward_clip, reward))
+        self.buffer.append((s, strat, clipped))
+        self.sample_count += 1
 
     def update(self) -> None:
         if not self.buffer:
@@ -507,8 +689,20 @@ class CausalRLPolicy:
             q = sum(w * x for w, x in zip(self.weights[st], f))
             err = r - q
             for i, x in enumerate(f):
-                self.weights[st][i] += self.lr * err * x
+                grad = err * x - self.l2 * self.weights[st][i]
+                self.weights[st][i] += self.lr * grad
+                self.weights[st][i] = max(-10.0, min(10.0, self.weights[st][i]))
         self.buffer.clear()
+        self.update_count += 1
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "epsilon": self.epsilon,
+            "updates": self.update_count,
+            "samples": self.sample_count,
+            "buffer": len(self.buffer),
+        }
 
 
 # =============================================================================
@@ -543,7 +737,7 @@ class QuantumDistillationBridge:
 
 
 # =============================================================================
-# ENHANCEMENT 3: Federated Green Learning
+# ENHANCEMENT 3: Federated Green Learning (key-aligned, DP-aware)
 # =============================================================================
 
 @dataclass
@@ -553,13 +747,24 @@ class FederatedSavingsProfile:
     mean_savings_pct: float
     mean_carbon_kg: float
     sample_count: int
+    region: Optional[str] = None
     timestamp: datetime = field(default_factory=datetime.now)
 
 
 class FederatedAggregator:
-    def __init__(self) -> None:
+    """Weighted aggregator with explicit key namespaces.
+
+    Pushes are indexed by **both** `strategy` and `carbon:{region}` so
+    intensity-blend lookups actually resolve.
+    """
+
+    def __init__(
+        self, dp_noise_scale: float = 0.0, seed: Optional[int] = None
+    ) -> None:
         self.updates: List[FederatedSavingsProfile] = []
         self._global: Dict[str, Dict[str, float]] = {}
+        self.dp_noise_scale = max(0.0, dp_noise_scale)
+        self._rng = random.Random(seed)
 
     def push(self, u: FederatedSavingsProfile) -> None:
         self.updates.append(u)
@@ -568,8 +773,11 @@ class FederatedAggregator:
         grouped: Dict[str, List[FederatedSavingsProfile]] = defaultdict(list)
         for u in self.updates:
             grouped[u.strategy].append(u)
+            if u.region:
+                grouped[f"carbon:{u.region}"].append(u)
+
         result: Dict[str, Dict[str, float]] = {}
-        for strategy, profiles in grouped.items():
+        for key, profiles in grouped.items():
             total_w = sum(p.sample_count for p in profiles) or 1
             s = sum(
                 p.mean_savings_pct * p.sample_count for p in profiles
@@ -577,16 +785,19 @@ class FederatedAggregator:
             c = sum(
                 p.mean_carbon_kg * p.sample_count for p in profiles
             ) / total_w
-            result[strategy] = {
+            if self.dp_noise_scale > 0.0:
+                s += self._rng.gauss(0.0, self.dp_noise_scale * 10.0)
+                c += self._rng.gauss(0.0, self.dp_noise_scale * 0.01)
+            result[key] = {
                 "mean_savings_pct": s,
                 "mean_carbon_kg": c,
-                "sample_count": total_w,
+                "sample_count": float(total_w),
             }
         self._global = result
         return result
 
-    def lookup(self, strategy: str) -> Optional[Dict[str, float]]:
-        return self._global.get(strategy)
+    def lookup(self, key: str) -> Optional[Dict[str, float]]:
+        return self._global.get(key)
 
 
 # =============================================================================
@@ -648,7 +859,7 @@ class MultiAgentCoordinator:
 
 
 # =============================================================================
-# ENHANCEMENT 8: Carbon Markets & RECs
+# ENHANCEMENT 8: Carbon Markets & RECs (idempotent, injectable pricing)
 # =============================================================================
 
 @dataclass
@@ -659,35 +870,61 @@ class MarketSnapshot:
     timestamp: datetime = field(default_factory=datetime.now)
 
 
+MarketPriceProvider = Callable[[], MarketSnapshot]
+
+
 class CarbonMarketClient:
-    def __init__(self, budget_usd: float = 10.0) -> None:
+    def __init__(
+        self,
+        budget_usd: float = 10.0,
+        price_provider: Optional[MarketPriceProvider] = None,
+        price_ttl_s: int = 300,
+        price_range_usd: Tuple[float, float] = (20.0, 80.0),
+        sell_fraction: float = 0.5,
+        seed: Optional[int] = None,
+    ) -> None:
         self._cache: Optional[MarketSnapshot] = None
-        self._ttl = 300
+        self._ttl = price_ttl_s
+        self._price_range = price_range_usd
+        self._price_provider = price_provider
         self.budget = budget_usd
         self.spent = 0.0
+        self.sell_fraction = sell_fraction
         self.trades: List[Dict[str, Any]] = []
+        self._seen_keys: set = set()
+        self._rng = random.Random(seed)
 
     def get_snapshot(self) -> MarketSnapshot:
-        if self._cache and (
-            (datetime.now() - self._cache.timestamp).total_seconds() < self._ttl
-        ):
+        if (self._cache is not None and
+                (datetime.now() - self._cache.timestamp).total_seconds() < self._ttl):
             return self._cache
-        snap = MarketSnapshot(
-            carbon_price_per_tco2_usd=random.uniform(20, 80),
-            rec_price_per_mwh_usd=random.uniform(3, 9),
-            rec_available_mwh=random.uniform(10, 500),
-        )
+        if self._price_provider is not None:
+            snap = self._price_provider()
+        else:
+            lo, hi = self._price_range
+            snap = MarketSnapshot(
+                carbon_price_per_tco2_usd=self._rng.uniform(lo, hi),
+                rec_price_per_mwh_usd=self._rng.uniform(3.0, 9.0),
+                rec_available_mwh=self._rng.uniform(10.0, 500.0),
+            )
         self._cache = snap
         return snap
 
     def buy_credits(
-        self, carbon_kg: float, reason: str
+        self,
+        carbon_kg: float,
+        reason: str,
+        idempotency_key: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
+        if idempotency_key and idempotency_key in self._seen_keys:
+            return None
         snap = self.get_snapshot()
         cost = (carbon_kg / 1000.0) * snap.carbon_price_per_tco2_usd
         if self.spent + cost > self.budget:
             return None
         self.spent += cost
+        if idempotency_key:
+            self._seen_keys.add(idempotency_key)
         trade = {
             "type": "buy", "carbon_kg": carbon_kg,
             "cost_usd": cost, "reason": reason,
@@ -697,10 +934,20 @@ class CarbonMarketClient:
         return trade
 
     def sell_savings(
-        self, carbon_kg: float, reason: str
+        self,
+        carbon_kg: float,
+        reason: str,
+        idempotency_key: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
+        if idempotency_key and idempotency_key in self._seen_keys:
+            return None
         snap = self.get_snapshot()
-        revenue = (carbon_kg / 1000.0) * snap.carbon_price_per_tco2_usd * 0.5
+        revenue = (
+            (carbon_kg / 1000.0) * snap.carbon_price_per_tco2_usd
+            * self.sell_fraction
+        )
+        if idempotency_key:
+            self._seen_keys.add(idempotency_key)
         trade = {
             "type": "sell", "carbon_kg": carbon_kg,
             "revenue_usd": revenue, "reason": reason,
@@ -711,7 +958,7 @@ class CarbonMarketClient:
 
 
 # =============================================================================
-# ENHANCEMENT 10: HITL + Active Learning
+# ENHANCEMENT 10: HITL + Active Learning (async, timeout-guarded)
 # =============================================================================
 
 @dataclass
@@ -724,42 +971,68 @@ class HITLRequest:
 
 
 class HumanInTheLoopGate:
-    def __init__(self) -> None:
+    def __init__(self, timeout_s: float = 30.0) -> None:
         self.pending: List[HITLRequest] = []
         self.feedback_log: List[Dict[str, Any]] = []
-        self._callback: Optional[Callable[[HITLRequest], bool]] = None
+        self.timeout_s = timeout_s
+        self._callback: Optional[Callable[[HITLRequest], Any]] = None
+        self._lock = asyncio.Lock()
 
-    def set_callback(self, cb: Callable[[HITLRequest], bool]) -> None:
+    def set_callback(self, cb: Callable[[HITLRequest], Any]) -> None:
+        """Callback may be sync or async; both are supported."""
         self._callback = cb
 
     def needs_review(
-        self, block_reason: Optional[str], budget_utilization: float
+        self,
+        block_reason: Optional[str],
+        budget_utilization: float,
+        threshold: float = 0.90,
     ) -> bool:
-        # Blocked tasks always need review
         if block_reason is not None:
             return True
-        # Near-budget tasks need review
-        if budget_utilization > 0.9:
-            return True
-        return False
+        return budget_utilization > threshold
 
-    def request_review(
-        self, task_id: str, reason: str, urgency: str,
+    async def _invoke(self, req: HITLRequest) -> bool:
+        if self._callback is None:
+            return False
+        result = self._callback(req)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return bool(result)
+
+    async def request_review(
+        self,
+        task_id: str,
+        reason: str,
+        urgency: str,
         context: Dict[str, Any],
     ) -> bool:
         req = HITLRequest(task_id, reason, urgency, context)
-        self.pending.append(req)
-        if urgency == "low":
-            self.pending.remove(req)
-            self.feedback_log.append({"req": asdict(req), "decision": True})
-            return True
-        if self._callback is None:
-            self.pending.remove(req)
-            self.feedback_log.append({"req": asdict(req), "decision": False})
-            return False
-        decision = self._callback(req)
-        self.pending.remove(req)
-        self.feedback_log.append({"req": asdict(req), "decision": decision})
+        async with self._lock:
+            self.pending.append(req)
+        try:
+            if urgency == "low":
+                decision = True
+            elif self._callback is None:
+                decision = False
+            else:
+                try:
+                    decision = await asyncio.wait_for(
+                        self._invoke(req), timeout=self.timeout_s
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"HITL review timed out after {self.timeout_s}s "
+                        f"for {task_id}"
+                    )
+                    decision = False
+        finally:
+            async with self._lock:
+                if req in self.pending:
+                    self.pending.remove(req)
+            self.feedback_log.append({
+                "req": asdict(req), "decision": decision,
+            })
         return decision
 
     def active_learning_batch(self, n: int = 16) -> List[Dict[str, Any]]:
@@ -800,11 +1073,18 @@ class GreenAgentOrchestrator:
         agent_id: str = "orchestrator-0",
         features: Optional[Dict[str, bool]] = None,
         hardware: Optional[HardwareProfile] = None,
-        market_budget_usd: float = 10.0,
+        market_budget_usd: Optional[float] = None,
+        config: Optional[PipelineConfig] = None,
+        # --- test seams (all optional) ---
+        market_price_provider: Optional[MarketPriceProvider] = None,
+        chaos_seed: Optional[int] = None,
+        rl_seed: Optional[int] = None,
     ):
+        self.config = config or PipelineConfig()
         self.deployment_id = deployment_id
         self.agent_id = agent_id
         self.features = {**self.DEFAULT_FEATURES, **(features or {})}
+        self._validate_features()
 
         # --- Layer 1: Carbon-Aware Scheduler ---
         self.task_profiler = TaskCarbonProfiler()
@@ -825,27 +1105,33 @@ class GreenAgentOrchestrator:
 
         # --- Layer 4: Distributed Execution ---
         self.carbon_forecaster = carbon_forecaster
-        self.eco_mode_controller = _try_import(
-            "eco_mode_controller", "EcoModeController", None
+        _Eco = _try_import("eco_mode_controller", "EcoModeController", None)
+        self.eco_mode_controller = (
+            _Eco(carbon_forecaster=carbon_forecaster) if _Eco else None
         )
-        if self.eco_mode_controller is not None:
-            self.eco_mode_controller = self.eco_mode_controller(
-                carbon_forecaster=carbon_forecaster
-            )
-        else:
-            self.eco_mode_controller = None
         self.ray_cluster = ray_cluster
 
         # --- Enhancement layers ---
+        cb_kwargs = dict(
+            failure_threshold=self.config.circuit_failure_threshold,
+            recovery_timeout_seconds=self.config.circuit_recovery_timeout_s,
+            half_open_max_calls=self.config.circuit_half_open_max_calls,
+        )
         self.circuits: Dict[str, CircuitBreaker] = {
-            "forecaster": CircuitBreaker("forecaster"),
-            "scheduler": CircuitBreaker("scheduler"),
-            "ledger": CircuitBreaker("ledger"),
+            "forecaster": CircuitBreaker("forecaster", **cb_kwargs),
+            "scheduler": CircuitBreaker("scheduler", **cb_kwargs),
+            "ledger": CircuitBreaker("ledger", **cb_kwargs),
         }
-        self.chaos = ChaosInjector() if self.features["chaos_testing"] else None
+        self.chaos = (
+            ChaosInjector(seed=chaos_seed)
+            if self.features["chaos_testing"] else None
+        )
 
         self.temporal_monitor = (
-            TemporalLogicMonitor() if self.features["temporal_logic"] else None
+            TemporalLogicMonitor(
+                max_violations=self.config.temporal_max_violations,
+            )
+            if self.features["temporal_logic"] else None
         )
         if self.temporal_monitor:
             self.temporal_monitor.register(DeadlineRespected())
@@ -858,14 +1144,27 @@ class GreenAgentOrchestrator:
             if self.features["adaptive_precision"] else None
         )
         self.rl_policy = (
-            CausalRLPolicy() if self.features["causal_rl"] else None
+            CausalRLPolicy(
+                epsilon=self.config.rl_epsilon,
+                epsilon_min=self.config.rl_epsilon_min,
+                epsilon_decay=self.config.rl_epsilon_decay,
+                lr=self.config.rl_lr,
+                l2=self.config.rl_l2,
+                buffer_size=self.config.rl_buffer_size,
+                reward_clip=self.config.rl_reward_clip,
+                seed=rl_seed,
+            )
+            if self.features["causal_rl"] else None
         )
         self.distiller = (
             QuantumDistillationBridge()
             if self.features["quantum_distillation"] else None
         )
         self.federated = (
-            FederatedAggregator() if self.features["federated"] else None
+            FederatedAggregator(
+                dp_noise_scale=self.config.federated_dp_noise_scale,
+            )
+            if self.features["federated"] else None
         )
         self.coordinator = (
             MultiAgentCoordinator() if self.features["multi_agent"] else None
@@ -873,22 +1172,83 @@ class GreenAgentOrchestrator:
         if self.coordinator:
             self.coordinator.register(self.agent_id)
         self.market = (
-            CarbonMarketClient(market_budget_usd)
+            CarbonMarketClient(
+                budget_usd=(
+                    market_budget_usd
+                    if market_budget_usd is not None
+                    else self.config.market_budget_usd
+                ),
+                price_provider=market_price_provider,
+                price_ttl_s=self.config.market_price_ttl_s,
+                price_range_usd=self.config.market_price_range_usd,
+                sell_fraction=self.config.market_sell_fraction,
+            )
             if self.features["carbon_market"] else None
         )
-        self.hitl = HumanInTheLoopGate() if self.features["hitl"] else None
+        self.hitl = (
+            HumanInTheLoopGate(timeout_s=self.config.hitl_timeout_s)
+            if self.features["hitl"] else None
+        )
 
-        # --- Statistics ---
+        # --- Statistics / idempotency ---
         self.total_tasks_processed = 0
         self.total_carbon_saved_kgco2e = 0.0
-        self.decision_history: Deque[Dict[str, Any]] = deque(maxlen=2048)
+        self.decision_history: Deque[Dict[str, Any]] = deque(
+            maxlen=self.config.decision_history_size
+        )
         self._last_decision: Optional[Dict[str, Any]] = None
+        self._txn_seen: set = set()
+        self._tasks_since_rl_update = 0
 
         logger.info(
             f"🌿 Enhanced Green Agent Orchestrator initialized "
             f"(deployment={deployment_id}, agent={agent_id}, "
             f"features={list(self.features)})"
         )
+
+    def _validate_features(self) -> None:
+        if self.features.get("chaos_testing"):
+            logger.warning(
+                "chaos_testing enabled — expect intentional failures in prod"
+            )
+
+    # ------------------------------------------------------------------
+    # Idempotency helpers
+    # ------------------------------------------------------------------
+
+    def _record_transaction_once(
+        self,
+        team: str,
+        task_id: str,
+        energy_kwh: float,
+        carbon_kgco2e: float,
+        cost_usd: float,
+    ) -> bool:
+        key = f"{team}:{task_id}"
+        if key in self._txn_seen:
+            logger.info(f"Ledger txn already recorded for {key}; skipping")
+            return False
+        try:
+            self.carbon_ledger.record_transaction(
+                team=team, task_id=task_id,
+                energy_kwh=energy_kwh, carbon_kgco2e=carbon_kgco2e,
+                cost_usd=cost_usd, idempotency_key=key,
+            )
+        except TypeError:
+            # Real ledger may not accept the kwarg — still idempotent locally
+            self.carbon_ledger.record_transaction(
+                team=team, task_id=task_id,
+                energy_kwh=energy_kwh, carbon_kgco2e=carbon_kgco2e,
+                cost_usd=cost_usd,
+            )
+        self._txn_seen.add(key)
+        return True
+
+    def _refresh_budget(self, team: str):
+        try:
+            return self.carbon_ledger.get_team_budget(team)
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Main workflow
@@ -900,6 +1260,19 @@ class GreenAgentOrchestrator:
         team = task.get("team", "default_team")
         workflow_steps: List[Dict[str, Any]] = []
         start_time = datetime.now()
+
+        # ---- P0 fix: all overridable locals declared up front ----
+        hitl_required = False
+        hitl_approved: Optional[bool] = None
+        market_trade: Optional[Dict[str, Any]] = None
+        causal_policy_used = False
+        federated_blend_applied = False
+        distilled_used = False
+        distillation_info: Optional[Dict[str, Any]] = None
+        throttling_decision = None
+        strategy_rec = None
+        team_budget = None
+        budget_utilization = 0.0
 
         logger.info(f"🚀 Starting enhanced workflow for task: {task_id}")
 
@@ -913,33 +1286,38 @@ class GreenAgentOrchestrator:
         # Step 2: Carbon Estimation (with circuit breaker)
         logger.info(f"📊 Step 2: Estimating carbon for {task_id}")
         cb_forecast = self.circuits["forecaster"]
-        carbon_intensity = 400.0
+        carbon_intensity = self.config.fallback_intensity_g_per_kwh
         fallback_reason = None
-        if cb_forecast.can_call():
+        if await cb_forecast.can_call():
             try:
                 if self.chaos:
                     await self.chaos.maybe_inject("forecaster")
                 carbon_intensity = await self.carbon_forecaster.get_current_intensity(
                     task.get("region", "US-CA")
                 )
-                cb_forecast.record_success()
+                await cb_forecast.record_success()
             except Exception as e:
-                cb_forecast.record_failure()
+                await cb_forecast.record_failure()
                 fallback_reason = str(e)
-                logger.warning(f"Forecaster failed ({e}); using default 400.0")
+                logger.warning(
+                    f"Forecaster failed ({e}); using "
+                    f"{self.config.fallback_intensity_g_per_kwh} g/kWh"
+                )
         else:
             fallback_reason = "circuit open"
 
-        # Federated blend on carbon intensity
-        federated_blend_applied = False
+        # ---- P0 fix: dimensional federated blend ----
         if self.federated:
             region = task.get("region", "US-CA")
             profile = self.federated.lookup(f"carbon:{region}")
-            if profile and profile.get("sample_count", 0) >= 5:
-                carbon_intensity = (
-                    0.8 * carbon_intensity +
-                    0.2 * profile["mean_savings_pct"]
+            if (profile and
+                    profile.get("sample_count", 0.0)
+                    >= self.config.federated_min_samples):
+                factor = 1.0 - (
+                    self.config.federated_blend_weight *
+                    max(0.0, profile["mean_savings_pct"]) / 100.0
                 )
+                carbon_intensity = carbon_intensity * factor
                 federated_blend_applied = True
 
         carbon_estimate = await self.task_profiler.estimate_energy(
@@ -955,8 +1333,7 @@ class GreenAgentOrchestrator:
 
         # Step 3: Budget Check
         logger.info(f"💰 Step 3: Checking carbon budget for team {team}")
-        team_budget = self.carbon_ledger.get_team_budget(team)
-        budget_utilization = 0.0
+        team_budget = self._refresh_budget(team)
 
         if team_budget:
             has_budget = self.carbon_ledger.check_budget_available(
@@ -968,43 +1345,89 @@ class GreenAgentOrchestrator:
                     team_budget.remaining_kgco2e / team_budget.budget_kgco2e
                 )
 
-            # HITL review for blocks
             if not has_budget:
-                hitl_approved = None
-                hitl_required = False
+                # HITL first
                 if self.hitl and self.hitl.needs_review(
-                    "budget_exhausted", budget_utilization
+                    "budget_exhausted",
+                    budget_utilization,
+                    threshold=self.config.hitl_budget_review_threshold,
                 ):
                     hitl_required = True
-                    hitl_approved = self.hitl.request_review(
+                    hitl_approved = await self.hitl.request_review(
                         task_id=task_id,
-                        reason=f"Budget exhausted: {team_budget.remaining_kgco2e:.4f} remaining",
-                        urgency="high" if task.get("deadline_critical") else "medium",
-                        context={"team": team, "required": carbon_estimate.expected_carbon_kgco2e},
+                        reason=(
+                            f"Budget exhausted: "
+                            f"{team_budget.remaining_kgco2e:.4f} remaining"
+                        ),
+                        urgency=(
+                            "high" if task.get("deadline_critical")
+                            else "medium"
+                        ),
+                        context={
+                            "team": team,
+                            "required": (
+                                carbon_estimate.expected_carbon_kgco2e
+                            ),
+                        },
                     )
 
-                # Try market purchase
-                market_trade = None
+                # Market override (only if HITL did not approve)
                 if self.market and not hitl_approved:
                     needed = carbon_estimate.expected_carbon_kgco2e
                     market_trade = self.market.buy_credits(
                         carbon_kg=needed,
                         reason=f"budget exhausted for {task_id}",
+                        idempotency_key=f"buy:{task_id}",
                     )
                     if market_trade:
-                        logger.info(f"✅ Purchased carbon credits for {task_id}")
+                        logger.info(
+                            f"✅ Purchased carbon credits for {task_id}"
+                        )
 
-                if not hitl_approved and not market_trade:
+                # ---- P0 fix: refresh budget after override ----
+                if hitl_approved or market_trade:
+                    refreshed = self._refresh_budget(team)
+                    if refreshed is not None:
+                        team_budget = refreshed
+                    has_budget = True
+                    if market_trade and hasattr(
+                        self.carbon_ledger, "set_team_budget"
+                    ):
+                        try:
+                            self.carbon_ledger.set_team_budget(
+                                team=team,
+                                period=getattr(
+                                    team_budget, "period", "current"
+                                ),
+                                budget_kgco2e=(
+                                    team_budget.budget_kgco2e
+                                    + market_trade["carbon_kg"]
+                                ),
+                            )
+                            team_budget = (
+                                self._refresh_budget(team) or team_budget
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to credit ledger: {e}"
+                            )
+
+                if not has_budget:
                     explanation_obj = None
                     if self.explainer:
                         explanation_obj = WorkflowExplainer.explain(
                             task_id=task_id, status="blocked",
-                            carbon_estimate=carbon_estimate.expected_carbon_kgco2e,
-                            actual_carbon=0.0, carbon_saved=0.0, savings_pct=0.0,
+                            carbon_estimate=(
+                                carbon_estimate.expected_carbon_kgco2e
+                            ),
+                            actual_carbon=0.0, carbon_saved=0.0,
+                            savings_pct=0.0,
                             strategy=None, eco_mode=None,
                             precision=PrecisionLevel.FP32,
                             temporal_ok=True, temporal_violations=[],
-                            budget_remaining=team_budget.remaining_kgco2e,
+                            budget_remaining=(
+                                team_budget.remaining_kgco2e
+                            ),
                         )
                     return WorkflowResult(
                         task_id=task_id, status="blocked",
@@ -1012,8 +1435,10 @@ class GreenAgentOrchestrator:
                         carbon_kgco2e=0.0, carbon_saved_kgco2e=0.0,
                         carbon_savings_pct=0.0, final_accuracy=None,
                         workflow_steps=workflow_steps,
-                        reasoning=f"Carbon budget exhausted: "
-                                  f"{team_budget.remaining_kgco2e:.3f} kgCO₂e remaining",
+                        reasoning=(
+                            f"Carbon budget exhausted: "
+                            f"{team_budget.remaining_kgco2e:.3f} kgCO₂e remaining"
+                        ),
                         explanation=explanation_obj,
                         hitl_required=hitl_required,
                         hitl_approved=hitl_approved,
@@ -1024,6 +1449,10 @@ class GreenAgentOrchestrator:
                 "step": 3, "name": "Budget Check",
                 "status": "approved" if has_budget else "override",
                 "remaining_budget": team_budget.remaining_kgco2e,
+                "hitl": hitl_approved,
+                "market_credits_kg": (
+                    market_trade["carbon_kg"] if market_trade else 0.0
+                ),
             })
         else:
             workflow_steps.append({
@@ -1033,7 +1462,6 @@ class GreenAgentOrchestrator:
             })
 
         # Step 4: Strategy Classification (with causal RL override)
-        strategy_rec = None
         if task.get("task_type") == "fine_tuning":
             logger.info(f"🎓 Step 4: Classifying fine-tuning strategy")
             strategy_rec = self.adaptation_classifier.classify(
@@ -1048,12 +1476,14 @@ class GreenAgentOrchestrator:
             )
             task["recommended_strategy"] = strategy_rec.strategy.value
 
-            # Causal RL override
-            causal_policy_used = False
             if self.rl_policy:
                 state = PolicyState(
-                    dataset_size_norm=min(1.0, task.get("dataset_size", 10_000) / 1e6),
-                    model_params_norm=min(1.0, task.get("num_parameters", 1e8) / 1e10),
+                    dataset_size_norm=min(
+                        1.0, task.get("dataset_size", 10_000) / 1e6
+                    ),
+                    model_params_norm=min(
+                        1.0, task.get("num_parameters", 1e8) / 1e10
+                    ),
                     carbon_budget_norm=(
                         min(1.0, team_budget.remaining_kgco2e / 10.0)
                         if team_budget else 0.5
@@ -1069,7 +1499,7 @@ class GreenAgentOrchestrator:
                 if causal_choice != strategy_rec.strategy.value:
                     logger.info(
                         f"Causal RL override: {strategy_rec.strategy.value} → "
-                        f"{causal_choice}"
+                        f"{causal_choice} (ε={self.rl_policy.epsilon:.3f})"
                     )
                     task["recommended_strategy"] = causal_choice
                     causal_policy_used = True
@@ -1082,7 +1512,6 @@ class GreenAgentOrchestrator:
                 "causal_override": causal_policy_used,
             })
         else:
-            causal_policy_used = False
             workflow_steps.append({
                 "step": 4, "name": "Strategy Classification",
                 "status": "skipped",
@@ -1093,22 +1522,31 @@ class GreenAgentOrchestrator:
         if strategy_rec:
             logger.info(f"🔒 Step 5: Enforcing parameter-efficiency policy")
             policy_context = {
-                "carbon_budget": team_budget.budget_kgco2e if team_budget else 10.0,
-                "carbon_remaining": team_budget.remaining_kgco2e if team_budget else 10.0,
+                "carbon_budget": (
+                    team_budget.budget_kgco2e if team_budget else 10.0
+                ),
+                "carbon_remaining": (
+                    team_budget.remaining_kgco2e if team_budget else 10.0
+                ),
                 "dataset_size": task.get("dataset_size", 10_000),
                 "model_params": task.get("num_parameters", 100_000_000),
             }
             policy_decision = self.policy_engine.enforce(
-                requested_strategy=task.get("fine_tuning_method", "full_fine_tuning"),
+                requested_strategy=task.get(
+                    "fine_tuning_method", "full_fine_tuning"
+                ),
                 recommended_strategy=task["recommended_strategy"],
                 policy_context=policy_context,
             )
-            if not policy_decision.approved and not policy_decision.override_allowed:
+            if (not policy_decision.approved
+                    and not policy_decision.override_allowed):
                 explanation_obj = None
                 if self.explainer:
                     explanation_obj = WorkflowExplainer.explain(
                         task_id=task_id, status="blocked",
-                        carbon_estimate=carbon_estimate.expected_carbon_kgco2e,
+                        carbon_estimate=(
+                            carbon_estimate.expected_carbon_kgco2e
+                        ),
                         actual_carbon=0.0, carbon_saved=0.0, savings_pct=0.0,
                         strategy=task["recommended_strategy"], eco_mode=None,
                         precision=PrecisionLevel.FP32,
@@ -1142,40 +1580,60 @@ class GreenAgentOrchestrator:
         # Step 6: Scheduling (with circuit breaker)
         logger.info(f"📅 Step 6: Scheduling optimal execution")
         cb_sched = self.circuits["scheduler"]
-        try:
-            if cb_sched.can_call():
-                scheduling_decision = await self.multi_obj_scheduler.schedule(task)
-                cb_sched.record_success()
-            else:
-                raise RuntimeError("scheduler circuit open")
-        except Exception as e:
-            logger.warning(f"Scheduler failed ({e}); running immediately")
-            class _FallbackOpt:
+        if await cb_sched.can_call():
+            try:
+                scheduling_decision = await self.multi_obj_scheduler.schedule(
+                    task
+                )
+                await cb_sched.record_success()
+            except Exception as e:
+                await cb_sched.record_failure()
+                logger.warning(f"Scheduler failed ({e}); running immediately")
+
+                class _FallbackOpt:
+                    mode = ExecutionMode.IMMEDIATE
+                    start_time = datetime.now()
+                    carbon_kgco2e = carbon_estimate.expected_carbon_kgco2e
+
+                class _FallbackDec:
+                    chosen_option = _FallbackOpt()
+                    reasoning = f"scheduler fallback: {e}"
+
+                scheduling_decision = _FallbackDec()
+        else:
+            class _FallbackOpt2:
                 mode = ExecutionMode.IMMEDIATE
                 start_time = datetime.now()
                 carbon_kgco2e = carbon_estimate.expected_carbon_kgco2e
-            class _FallbackDec:
-                chosen_option = _FallbackOpt()
-                reasoning = f"scheduler fallback: {e}"
-            scheduling_decision = _FallbackDec()
+
+            class _FallbackDec2:
+                chosen_option = _FallbackOpt2()
+                reasoning = "scheduler circuit open"
+
+            scheduling_decision = _FallbackDec2()
 
         if scheduling_decision.chosen_option.mode == ExecutionMode.DEFERRED:
             workflow_steps.append({
                 "step": 6, "name": "Scheduling",
                 "status": "deferred",
-                "scheduled_time": scheduling_decision.chosen_option.start_time.isoformat(),
+                "scheduled_time": (
+                    scheduling_decision.chosen_option.start_time.isoformat()
+                ),
                 "reasoning": scheduling_decision.reasoning,
             })
             explanation_obj = None
             if self.explainer:
+                deferred_savings = (
+                    carbon_estimate.expected_carbon_kgco2e -
+                    scheduling_decision.chosen_option.carbon_kgco2e
+                )
                 explanation_obj = WorkflowExplainer.explain(
                     task_id=task_id, status="deferred",
-                    carbon_estimate=carbon_estimate.expected_carbon_kgco2e,
-                    actual_carbon=0.0,
-                    carbon_saved=(
-                        carbon_estimate.expected_carbon_kgco2e -
-                        scheduling_decision.chosen_option.carbon_kgco2e
+                    carbon_estimate=(
+                        carbon_estimate.expected_carbon_kgco2e
                     ),
+                    actual_carbon=0.0,
+                    carbon_saved=deferred_savings,
                     savings_pct=0.0,
                     strategy=task.get("recommended_strategy"),
                     eco_mode=None,
@@ -1201,19 +1659,24 @@ class GreenAgentOrchestrator:
             "step": 6, "name": "Scheduling",
             "status": "completed",
             "mode": scheduling_decision.chosen_option.mode.value,
-            "carbon_estimate": scheduling_decision.chosen_option.carbon_kgco2e,
+            "carbon_estimate": (
+                scheduling_decision.chosen_option.carbon_kgco2e
+            ),
         })
 
         # Step 7: Eco-Mode Throttling
         logger.info(f"🌱 Step 7: Applying eco-mode throttling")
-        throttling_decision = None
         if self.eco_mode_controller:
-            throttling_decision = await self.eco_mode_controller.apply_throttling(task)
+            throttling_decision = await self.eco_mode_controller.apply_throttling(
+                task
+            )
             if throttling_decision.should_defer:
                 workflow_steps.append({
                     "step": 7, "name": "Eco-Mode",
                     "status": "deferred",
-                    "defer_until": throttling_decision.defer_until.isoformat(),
+                    "defer_until": (
+                        throttling_decision.defer_until.isoformat()
+                    ),
                 })
                 return WorkflowResult(
                     task_id=task_id, status="deferred",
@@ -1221,8 +1684,10 @@ class GreenAgentOrchestrator:
                     carbon_kgco2e=0.0, carbon_saved_kgco2e=0.0,
                     carbon_savings_pct=0.0, final_accuracy=None,
                     workflow_steps=workflow_steps,
-                    reasoning=f"Deferred by eco-mode to "
-                              f"{throttling_decision.defer_until}",
+                    reasoning=(
+                        f"Deferred by eco-mode to "
+                        f"{throttling_decision.defer_until}"
+                    ),
                     causal_policy_used=causal_policy_used,
                 )
             task.update(throttling_decision.throttled_task)
@@ -1230,7 +1695,9 @@ class GreenAgentOrchestrator:
                 "step": 7, "name": "Eco-Mode",
                 "status": "completed",
                 "eco_mode": throttling_decision.eco_mode.value,
-                "energy_reduction": throttling_decision.estimated_energy_reduction_percent,
+                "energy_reduction": (
+                    throttling_decision.estimated_energy_reduction_percent
+                ),
             })
         else:
             workflow_steps.append({
@@ -1239,18 +1706,14 @@ class GreenAgentOrchestrator:
                 "note": "Eco-mode controller not available",
             })
 
-        # --- Adaptive Precision ---
+        # Adaptive Precision + Quantum Distillation
         urgency = (
-            "critical" if task.get("deadline_critical")
-            else "normal"
+            "critical" if task.get("deadline_critical") else "normal"
         )
         precision = PrecisionLevel.FP32
         if self.precision_ctl:
             precision = self.precision_ctl.select(urgency)
 
-        # --- Quantum Distillation hook ---
-        distilled_used = False
-        distillation_info = None
         if self.distiller:
             expert_id = task.get("expert_id", "default_expert")
             dist = self.distiller.distill(expert_id, precision)
@@ -1262,15 +1725,17 @@ class GreenAgentOrchestrator:
                 "energy_reduction_percent": dist.energy_reduction_percent,
             }
 
-        # --- Temporal verification BEFORE execution ---
+        # Temporal verification
         decision_ctx = {
             "deadline_hours": (
                 (task.get("deadline") - datetime.now()).total_seconds() / 3600
                 if task.get("deadline") else None
             ),
-            "estimated_latency_hours": 0.1,
+            "estimated_latency_hours": self.config.fallback_latency_hours,
             "estimated_energy_kwh": carbon_estimate.expected_energy_kwh,
-            "estimated_carbon_kg": carbon_estimate.expected_carbon_kgco2e,
+            "estimated_carbon_kg": (
+                carbon_estimate.expected_carbon_kgco2e
+            ),
             "carbon_remaining_kg": (
                 team_budget.remaining_kgco2e if team_budget else None
             ),
@@ -1278,13 +1743,16 @@ class GreenAgentOrchestrator:
         temporal_ok = True
         temporal_violations: List[str] = []
         if self.temporal_monitor:
-            temporal_ok, temporal_violations = self.temporal_monitor.verify(decision_ctx)
+            temporal_ok, temporal_violations = self.temporal_monitor.verify(
+                decision_ctx
+            )
             if not temporal_ok:
                 logger.warning(
-                    f"Temporal violations for {task_id}: {temporal_violations}"
+                    f"Temporal violations for {task_id}: "
+                    f"{temporal_violations}"
                 )
 
-        # Step 8: Execute on Ray Cluster
+        # Step 8: Execution
         logger.info(f"⚡ Step 8: Executing task on Ray cluster")
         try:
             if self.chaos:
@@ -1293,18 +1761,23 @@ class GreenAgentOrchestrator:
         except RuntimeError as e:
             logger.warning(f"Chaos injection during execution (expected): {e}")
 
-        # Compute actual energy/carbon with all reductions
         energy_reduction = 0.0
         if throttling_decision:
-            energy_reduction += throttling_decision.estimated_energy_reduction_percent
+            energy_reduction += (
+                throttling_decision.estimated_energy_reduction_percent
+            )
         if distilled_used and distillation_info:
-            energy_reduction += distillation_info["energy_reduction_percent"] * 0.2
-        energy_reduction = min(energy_reduction, 95.0) / 100.0
+            energy_reduction += (
+                distillation_info["energy_reduction_percent"] *
+                self.config.distillation_energy_weight
+            )
+        energy_reduction = min(
+            energy_reduction, self.config.max_energy_reduction_pct
+        ) / 100.0
 
         actual_energy = carbon_estimate.expected_energy_kwh * (1.0 - energy_reduction)
         actual_carbon = actual_energy * carbon_intensity / 1000.0
 
-        # Precision quantization of actual values
         if self.precision_ctl:
             actual_energy = self.precision_ctl.quantize(actual_energy, precision)
             actual_carbon = self.precision_ctl.quantize(actual_carbon, precision)
@@ -1320,7 +1793,7 @@ class GreenAgentOrchestrator:
             "distilled": distilled_used,
         })
 
-        # Step 9: Telemetry & Ledger
+        # Step 9: Telemetry & Ledger (idempotent)
         logger.info(f"📝 Step 9: Recording telemetry and updating ledger")
         self.task_profiler.add_telemetry_record(
             task=task,
@@ -1328,8 +1801,8 @@ class GreenAgentOrchestrator:
             actual_carbon=actual_carbon,
             predicted_energy=carbon_estimate.expected_energy_kwh,
         )
-        cost_usd = actual_energy * 0.20
-        self.carbon_ledger.record_transaction(
+        cost_usd = actual_energy * self.config.energy_cost_usd_per_kwh
+        self._record_transaction_once(
             team=team, task_id=task_id,
             energy_kwh=actual_energy, carbon_kgco2e=actual_carbon,
             cost_usd=cost_usd,
@@ -1343,16 +1816,20 @@ class GreenAgentOrchestrator:
         baseline_carbon = carbon_estimate.expected_carbon_kgco2e
         carbon_saved = baseline_carbon - actual_carbon
         carbon_savings_pct = (
-            carbon_saved / baseline_carbon * 100 if baseline_carbon > 0 else 0
+            carbon_saved / baseline_carbon * 100 if baseline_carbon > 0 else 0.0
         )
         self.total_tasks_processed += 1
         self.total_carbon_saved_kgco2e += carbon_saved
 
-        # --- Causal RL feedback ---
+        # ---- P0 fix: explicit RL update cadence ----
         if self.rl_policy and strategy_rec:
             state = PolicyState(
-                dataset_size_norm=min(1.0, task.get("dataset_size", 10_000) / 1e6),
-                model_params_norm=min(1.0, task.get("num_parameters", 1e8) / 1e10),
+                dataset_size_norm=min(
+                    1.0, task.get("dataset_size", 10_000) / 1e6
+                ),
+                model_params_norm=min(
+                    1.0, task.get("num_parameters", 1e8) / 1e10
+                ),
                 carbon_budget_norm=(
                     min(1.0, team_budget.remaining_kgco2e / 10.0)
                     if team_budget else 0.5
@@ -1364,10 +1841,13 @@ class GreenAgentOrchestrator:
             )
             reward = carbon_savings_pct / 100.0
             self.rl_policy.record(state, task["recommended_strategy"], reward)
-            if len(self.decision_history) % 10 == 0:
+            self._tasks_since_rl_update += 1
+            if (self._tasks_since_rl_update
+                    >= self.config.rl_update_every_n_tasks):
                 self.rl_policy.update()
+                self._tasks_since_rl_update = 0
 
-        # --- Federated contribution ---
+        # ---- Federated contribution (key-aligned) ----
         if self.federated and task.get("recommended_strategy"):
             self.federated.push(FederatedSavingsProfile(
                 deployment_id=self.deployment_id,
@@ -1375,10 +1855,11 @@ class GreenAgentOrchestrator:
                 mean_savings_pct=carbon_savings_pct,
                 mean_carbon_kg=actual_carbon,
                 sample_count=1,
+                region=task.get("region"),
             ))
             self.federated.aggregate()
 
-        # --- Multi-agent feedback ---
+        # Multi-agent feedback
         if self.coordinator:
             self.coordinator.record(
                 agent_id=self.agent_id,
@@ -1387,22 +1868,43 @@ class GreenAgentOrchestrator:
                 latency_ms=execution_time * 3600 * 1000,
             )
 
-        # --- Market: sell savings ---
-        market_trade = None
+        # Market: sell savings (idempotent)
         if self.market and carbon_saved > 0:
             market_trade = self.market.sell_savings(
                 carbon_kg=carbon_saved,
                 reason=f"task {task_id} overperformed",
+                idempotency_key=f"sell:{task_id}",
             )
 
-        # --- XAI ---
+        # Attribution for XAI
+        contribution_breakdown: Dict[str, float] = {}
+        if carbon_savings_pct > 0:
+            contribs: Dict[str, float] = {}
+            if throttling_decision:
+                contribs["eco_mode"] = (
+                    throttling_decision.estimated_energy_reduction_percent
+                )
+            if distilled_used and distillation_info:
+                contribs["distillation"] = (
+                    distillation_info["energy_reduction_percent"] *
+                    self.config.distillation_energy_weight
+                )
+            total = sum(contribs.values()) or 1.0
+            for k, v in contribs.items():
+                contribution_breakdown[k] = (
+                    (v / total) * carbon_savings_pct
+                )
+
+        # XAI explanation
         explanation_obj = None
         if self.explainer:
             market_snapshot = None
             if self.market:
                 snap = self.market.get_snapshot()
                 market_snapshot = {
-                    "carbon_price_per_tco2_usd": snap.carbon_price_per_tco2_usd,
+                    "carbon_price_per_tco2_usd": (
+                        snap.carbon_price_per_tco2_usd
+                    ),
                 }
             explanation_obj = WorkflowExplainer.explain(
                 task_id=task_id, status="completed",
@@ -1422,17 +1924,23 @@ class GreenAgentOrchestrator:
                     team_budget.remaining_kgco2e if team_budget else None
                 ),
                 market_snapshot=market_snapshot,
+                contribution_breakdown=contribution_breakdown,
             )
 
-        # --- HITL review for near-budget tasks ---
-        hitl_required = False
-        hitl_approved = None
-        if self.hitl and self.hitl.needs_review(None, budget_utilization):
+        # HITL near-budget review (async)
+        if self.hitl and self.hitl.needs_review(
+            None, budget_utilization,
+            threshold=self.config.hitl_budget_review_threshold,
+        ):
             hitl_required = True
-            hitl_approved = self.hitl.request_review(
+            hitl_approved = await self.hitl.request_review(
                 task_id=task_id,
                 reason=f"budget utilization {budget_utilization:.2%}",
-                urgency="low" if budget_utilization < 0.95 else "medium",
+                urgency=(
+                    "low"
+                    if budget_utilization < self.config.hitl_urgent_threshold
+                    else "medium"
+                ),
                 context={"budget_utilization": budget_utilization},
             )
 
@@ -1441,7 +1949,9 @@ class GreenAgentOrchestrator:
             "status": "completed",
             "carbon_saved": carbon_saved,
             "carbon_savings_pct": carbon_savings_pct,
-            "explanation": explanation_obj.to_dict() if explanation_obj else None,
+            "explanation": (
+                explanation_obj.to_dict() if explanation_obj else None
+            ),
         })
 
         logger.info(
@@ -1471,7 +1981,7 @@ class GreenAgentOrchestrator:
             circuit_state=self.circuits["forecaster"].state.value,
         )
         self._last_decision = {
-            "result": asdict(result) if hasattr(result, "__dataclass_fields__") else {},
+            "result": asdict(result),
             "at": datetime.now().isoformat(),
         }
         self.decision_history.append(self._last_decision)
@@ -1485,11 +1995,14 @@ class GreenAgentOrchestrator:
         if not self._last_decision:
             return None
         exp = self._last_decision.get("result", {}).get("explanation")
-        if exp:
-            return WorkflowExplanation(**exp)
-        return None
+        if not exp:
+            return None
+        allowed = WorkflowExplanation.__dataclass_fields__.keys()
+        return WorkflowExplanation(
+            **{k: v for k, v in exp.items() if k in allowed}
+        )
 
-    def set_hitl_callback(self, cb: Callable[[HITLRequest], bool]) -> None:
+    def set_hitl_callback(self, cb: Callable[[HITLRequest], Any]) -> None:
         if self.hitl:
             self.hitl.set_callback(cb)
 
@@ -1499,8 +2012,10 @@ class GreenAgentOrchestrator:
     def get_federated_aggregate(self) -> Dict[str, Dict[str, float]]:
         return self.federated.aggregate() if self.federated else {}
 
-    def contribute_federated(self, strategy: str,
-                              savings_pct: float, carbon_kg: float) -> None:
+    def contribute_federated(
+        self, strategy: str, savings_pct: float, carbon_kg: float,
+        region: Optional[str] = None,
+    ) -> None:
         if not self.federated:
             return
         self.federated.push(FederatedSavingsProfile(
@@ -1509,6 +2024,7 @@ class GreenAgentOrchestrator:
             mean_savings_pct=savings_pct,
             mean_carbon_kg=carbon_kg,
             sample_count=1,
+            region=region,
         ))
         self.federated.aggregate()
 
@@ -1531,13 +2047,11 @@ class GreenAgentOrchestrator:
         stats: Dict[str, Any] = {
             "deployment_id": self.deployment_id,
             "agent_id": self.agent_id,
+            "config": asdict(self.config),
             "total_tasks_processed": self.total_tasks_processed,
             "total_carbon_saved_kgco2e": self.total_carbon_saved_kgco2e,
             "decisions_made": len(self.decision_history),
-            "circuits": {
-                k: {"state": cb.state.value, "failures": cb.failures}
-                for k, cb in self.circuits.items()
-            },
+            "circuits": {k: cb.snapshot() for k, cb in self.circuits.items()},
             "task_profiler": (
                 self.task_profiler.get_statistics()
                 if hasattr(self.task_profiler, "get_statistics") else {}
@@ -1550,14 +2064,17 @@ class GreenAgentOrchestrator:
                 self.policy_engine.get_statistics()
                 if hasattr(self.policy_engine, "get_statistics") else {}
             ),
-            "eco_mode_controller": (
-                self.eco_mode_controller.get_statistics()
-                if self.eco_mode_controller and
-                hasattr(self.eco_mode_controller, "get_statistics") else {}
-            ),
         }
+        if self.eco_mode_controller and hasattr(
+            self.eco_mode_controller, "get_statistics"
+        ):
+            stats["eco_mode_controller"] = (
+                self.eco_mode_controller.get_statistics()
+            )
         if self.temporal_monitor:
-            stats["temporal_violations"] = self.temporal_monitor.violations[-5:]
+            stats["temporal"] = self.temporal_monitor.stats()
+        if self.rl_policy:
+            stats["rl_policy"] = self.rl_policy.stats()
         if self.coordinator:
             stats["agents"] = {
                 aid: {"role": a.role.value, "calls": a.total_calls}
@@ -1592,7 +2109,6 @@ if __name__ == "__main__":
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         )
 
-        # --- Stub forecaster for demo ---
         class _StubForecaster:
             async def get_current_intensity(self, region: str = "US-CA") -> float:
                 return 380.0
@@ -1609,18 +2125,17 @@ if __name__ == "__main__":
             hardware=HardwareProfile(supports_int4=True, vram_gb=48),
         )
 
-        def auto_approve(req: HITLRequest) -> bool:
+        async def auto_approve(req: HITLRequest) -> bool:
             logger.info(f"[HITL] auto-approve: {req.reason}")
             return True
+
         orchestrator.set_hitl_callback(auto_approve)
 
-        # Set team budget
         orchestrator.carbon_ledger.set_team_budget(
             team="nlp_research", period="2026-03",
             budget_kgco2e=20.0,
         )
 
-        # Execute workflow
         task = {
             "task_id": "bert_sentiment_demo",
             "team": "nlp_research",
@@ -1645,9 +2160,9 @@ if __name__ == "__main__":
         print(f"{'='*60}")
         print(f"Task ID:        {result.task_id}")
         print(f"Status:         {result.status}")
-        print(f"Energy:         {result.energy_kwh:.4f} kWh")
-        print(f"Carbon:         {result.carbon_kgco2e:.4f} kgCO₂e")
-        print(f"Carbon Saved:   {result.carbon_saved_kgco2e:.4f} kgCO₂e "
+        print(f"Energy:         {result.energy_kwh:.6f} kWh")
+        print(f"Carbon:         {result.carbon_kgco2e:.6f} kgCO₂e")
+        print(f"Carbon Saved:   {result.carbon_saved_kgco2e:.6f} kgCO₂e "
               f"({result.carbon_savings_pct:.1f}%)")
         print(f"Precision:      {result.precision_used}")
         print(f"Temporal OK:    {result.temporal_verified}")
@@ -1655,8 +2170,11 @@ if __name__ == "__main__":
         print(f"Causal Policy:  {result.causal_policy_used}")
         print(f"HITL Required:  {result.hitl_required}")
         if result.market_trade:
+            amt = result.market_trade.get(
+                "cost_usd", result.market_trade.get("revenue_usd", 0)
+            )
             print(f"Market Trade:   {result.market_trade['type']} "
-                  f"({result.market_trade.get('cost_usd', result.market_trade.get('revenue_usd', 0)):.4f} USD)")
+                  f"({amt:.6f} USD)")
 
         if result.explanation:
             print(f"\n=== XAI Explanation ===")
@@ -1668,7 +2186,6 @@ if __name__ == "__main__":
         for step in result.workflow_steps:
             print(f"  {step['step']}. {step['name']}: {step['status']}")
 
-        # Distill an expert
         dist = orchestrator.distill_expert("bert-base-uncased", urgency="normal")
         if dist:
             print(f"\n=== Distilled Expert ===")
@@ -1676,11 +2193,9 @@ if __name__ == "__main__":
             print(f"  Quality retention: {dist.quality_retention}")
             print(f"  Energy reduction: {dist.energy_reduction_percent}%")
 
-        # Federated aggregate
         print(f"\n=== Federated Aggregate ===")
         print(f"  {orchestrator.get_federated_aggregate()}")
 
-        # Statistics
         import json
         print(f"\n{'='*60}")
         print(f"SYSTEM STATISTICS")
