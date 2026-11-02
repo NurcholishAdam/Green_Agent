@@ -4,39 +4,39 @@
 Context Compression Module
 ==========================
 
-Intelligent context compression for retrieved content: minimizes token usage
-while preserving semantic information.
+Intelligent context compression for retrieved content: minimizes token
+usage while preserving semantic information.
 
-Enhancements
-------------
+Design
+------
 - ``ContextCompressionConfig`` / ``SemanticChunkerConfig`` — frozen,
   validated: ratios, token estimators, sentence-length bands, chunker
-  geometry, bounded history.
-- ``CompressionResult`` / ``Chunk`` — frozen dataclasses with validation and
-  full serialization.
-- **Fixed token estimator** — returns ``int`` (was ``float``).
-- **Fixed O(n²) sentence scoring** — uses ``enumerate`` instead of
-  ``list.index``.
-- **Fixed sentence-order scrambling** — the reconstructed text preserves the
-  original sentence order.
-- **Fixed missing-entity inflation** — missing entities are reported in
-  ``metadata`` instead of being appended to the compressed text.
-- **Fixed side-effect mutation** — :meth:`adaptive_compress` uses a local
-  ratio and never touches ``self.target_ratio``.
-- **Fixed ``ZeroDivisionError``** in :meth:`compress_batch`.
-- **Fixed negative quality scores** — clamped to ``[0, 1]``.
-- **Robust sentence splitting** — respects common abbreviations
-  (``Dr.``, ``U.S.``, ``e.g.``, …).
-- **Fixed chunker geometry** — a token-accurate overlap that cannot infinite-
-  loop and validates ``overlap < chunk_size``.
-- **Thread safety** — ``RLock`` guards history and shared state.
-- **Bounded history** — ``deque(maxlen=config.max_history)``.
-- **Full validation** of every argument; strict / non-strict modes.
-- **Serialization** — ``to_dict`` / ``from_dict`` / ``to_json`` on both
-  classes and every dataclass.
-- ``statistics()``, ``__repr__``, custom ``ContextCompressionError`` /
-  ``SemanticChunkerError``, lazy ``%s`` logging, and a ``__main__`` smoke
-  test.
+  geometry, bounded history, batch token floor.
+- ``CompressionResult`` / ``Chunk`` — frozen dataclasses with
+  validation and full serialization.
+- **Token estimator** returns ``int`` (was ``float``).
+- **O(n) sentence scoring** — ``enumerate`` instead of ``list.index``.
+- **Order-preserving reconstruction** — the compressed text preserves
+  the original sentence order.
+- **Entity reporting is honest**: ``CompressionResult.preserved_entities``
+  contains only the entities that survived into the compressed text;
+  the full extraction lives in ``metadata["extracted_entities"]``.
+  When ``preserve_entities=True``, entity-bearing sentences receive
+  **soft reservation** during selection (budget-permitting).
+- **``adaptive_compress`` never mutates state** — uses a local ratio.
+  The quality estimator measures each candidate against the ratio it
+  was tested at, not against the fixed config ratio, so the binary
+  search finds the smallest ratio meeting the threshold.
+- **Robust sentence splitting** — respects common abbreviations.
+- **Token-accurate chunker overlap** — cannot infinite-loop; flags
+  oversized chunks when a single paragraph exceeds ``chunk_size``.
+- **Thread safety** — ``RLock`` guards history, counters, shared state.
+- **Full serialization round-trip** — ``to_json(include_history=True)``
+  reconstructs an equivalent compressor via ``from_json``.
+- **Strict / non-strict modes**; every deserialization failure is
+  wrapped in ``ContextCompressionError`` / ``SemanticChunkerError``.
+
+Version: 2.0.0
 """
 
 from __future__ import annotations
@@ -50,9 +50,32 @@ import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Deque,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "VERSION",
+    "Chunk",
+    "CompressionResult",
+    "ContextCompressionConfig",
+    "ContextCompressionError",
+    "ContextCompressor",
+    "SemanticChunker",
+    "SemanticChunkerConfig",
+    "SemanticChunkerError",
+]
+
+VERSION = "2.0.0"
 
 
 # --------------------------------------------------------------------------- #
@@ -69,7 +92,6 @@ class SemanticChunkerError(ValueError):
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
-# Common abbreviations that should not terminate a sentence.
 _ABBREVIATIONS = frozenset({
     "dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st",
     "vs", "etc", "eg", "ie", "no", "fig", "eq", "ref", "vol",
@@ -86,6 +108,13 @@ class ContextCompressionConfig:
     """Tunable parameters for :class:`ContextCompressor`."""
 
     target_compression_ratio: float = 0.5
+
+    # When True, entity-bearing sentences receive soft reservation
+    # during selection (they are preferred over non-entity sentences,
+    # but still must fit within the token budget). It does *not*
+    # guarantee that every entity survives — check
+    # ``CompressionResult.metadata["missing_entities"]`` for the
+    # definitive answer.
     preserve_entities: bool = True
     preserve_numbers: bool = True
 
@@ -101,6 +130,10 @@ class ContextCompressionConfig:
 
     # Bounded history.
     max_history: int = 1000
+
+    # Minimum tokens allocated to a non-empty text in compress_batch.
+    # 0 restores the pure proportional split (tiny texts can get 0).
+    min_batch_tokens: int = 1
 
     def __post_init__(self) -> None:
         if not 0.0 < self.target_compression_ratio <= 1.0:
@@ -123,31 +156,57 @@ class ContextCompressionConfig:
             )
         if self.max_history <= 0:
             raise ContextCompressionError("max_history must be > 0.")
+        if self.min_batch_tokens < 0:
+            raise ContextCompressionError(
+                "min_batch_tokens must be >= 0."
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "ContextCompressionConfig":
+    def from_dict(
+        cls, data: Mapping[str, Any]
+    ) -> "ContextCompressionConfig":
         if not isinstance(data, Mapping):
             raise ContextCompressionError(
-                f"ContextCompressionConfig.from_dict expects a Mapping, "
-                f"got {type(data).__name__}."
+                f"ContextCompressionConfig.from_dict expects a "
+                f"Mapping, got {type(data).__name__}."
             )
-        return cls(
-            target_compression_ratio=float(
-                data.get("target_compression_ratio", 0.5)
-            ),
-            preserve_entities=bool(data.get("preserve_entities", True)),
-            preserve_numbers=bool(data.get("preserve_numbers", True)),
-            tokens_per_word=float(data.get("tokens_per_word", 1.3)),
-            min_sentence_words=int(data.get("min_sentence_words", 5)),
-            max_sentence_words=int(data.get("max_sentence_words", 30)),
-            select_stop_fraction=float(
-                data.get("select_stop_fraction", 0.9)
-            ),
-            max_history=int(data.get("max_history", 1000)),
-        )
+        try:
+            return cls(
+                target_compression_ratio=float(
+                    data.get("target_compression_ratio", 0.5)
+                ),
+                preserve_entities=bool(
+                    data.get("preserve_entities", True)
+                ),
+                preserve_numbers=bool(
+                    data.get("preserve_numbers", True)
+                ),
+                tokens_per_word=float(
+                    data.get("tokens_per_word", 1.3)
+                ),
+                min_sentence_words=int(
+                    data.get("min_sentence_words", 5)
+                ),
+                max_sentence_words=int(
+                    data.get("max_sentence_words", 30)
+                ),
+                select_stop_fraction=float(
+                    data.get("select_stop_fraction", 0.9)
+                ),
+                max_history=int(data.get("max_history", 1000)),
+                min_batch_tokens=int(
+                    data.get("min_batch_tokens", 1)
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, ContextCompressionError):
+                raise
+            raise ContextCompressionError(
+                f"invalid ContextCompressionConfig payload: {exc}"
+            ) from exc
 
 
 @dataclass(frozen=True)
@@ -160,9 +219,19 @@ class SemanticChunkerConfig:
     max_chunks: Optional[int] = 10_000
 
     def __post_init__(self) -> None:
-        if not isinstance(self.chunk_size, int) or self.chunk_size <= 0:
-            raise SemanticChunkerError("chunk_size must be a positive int.")
-        if not isinstance(self.overlap, int) or self.overlap < 0:
+        if (
+            isinstance(self.chunk_size, bool)
+            or not isinstance(self.chunk_size, int)
+            or self.chunk_size <= 0
+        ):
+            raise SemanticChunkerError(
+                "chunk_size must be a positive int."
+            )
+        if (
+            isinstance(self.overlap, bool)
+            or not isinstance(self.overlap, int)
+            or self.overlap < 0
+        ):
             raise SemanticChunkerError(
                 "overlap must be a non-negative int."
             )
@@ -172,7 +241,11 @@ class SemanticChunkerConfig:
             )
         if self.tokens_per_word <= 0:
             raise SemanticChunkerError("tokens_per_word must be > 0.")
-        if self.max_chunks is not None and self.max_chunks <= 0:
+        if self.max_chunks is not None and (
+            isinstance(self.max_chunks, bool)
+            or not isinstance(self.max_chunks, int)
+            or self.max_chunks <= 0
+        ):
             raise SemanticChunkerError(
                 "max_chunks must be a positive int or None."
             )
@@ -181,18 +254,33 @@ class SemanticChunkerConfig:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "SemanticChunkerConfig":
+    def from_dict(
+        cls, data: Mapping[str, Any]
+    ) -> "SemanticChunkerConfig":
         if not isinstance(data, Mapping):
             raise SemanticChunkerError(
                 f"SemanticChunkerConfig.from_dict expects a Mapping, "
                 f"got {type(data).__name__}."
             )
-        return cls(
-            chunk_size=int(data.get("chunk_size", 512)),
-            overlap=int(data.get("overlap", 50)),
-            tokens_per_word=float(data.get("tokens_per_word", 1.3)),
-            max_chunks=data.get("max_chunks", 10_000),
-        )
+        try:
+            raw_max = data.get("max_chunks", 10_000)
+            max_chunks = (
+                None if raw_max is None else int(raw_max)
+            )
+            return cls(
+                chunk_size=int(data.get("chunk_size", 512)),
+                overlap=int(data.get("overlap", 50)),
+                tokens_per_word=float(
+                    data.get("tokens_per_word", 1.3)
+                ),
+                max_chunks=max_chunks,
+            )
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, SemanticChunkerError):
+                raise
+            raise SemanticChunkerError(
+                f"invalid SemanticChunkerConfig payload: {exc}"
+            ) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -200,7 +288,13 @@ class SemanticChunkerConfig:
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class CompressionResult:
-    """Immutable result of a context compression."""
+    """
+    Immutable result of a context compression.
+
+    ``preserved_entities`` contains only the entities that **survived**
+    into ``compressed_text``. The full extraction set lives in
+    ``metadata["extracted_entities"]``.
+    """
 
     original_text: str
     compressed_text: str
@@ -214,6 +308,16 @@ class CompressionResult:
     )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.original_text, str):
+            raise ContextCompressionError(
+                f"original_text must be a string, "
+                f"got {type(self.original_text).__name__}."
+            )
+        if not isinstance(self.compressed_text, str):
+            raise ContextCompressionError(
+                f"compressed_text must be a string, "
+                f"got {type(self.compressed_text).__name__}."
+            )
         if self.original_tokens < 0:
             raise ContextCompressionError(
                 "original_tokens must be >= 0."
@@ -225,6 +329,11 @@ class CompressionResult:
         if self.compression_ratio < 0:
             raise ContextCompressionError(
                 "compression_ratio must be >= 0."
+            )
+        if not isinstance(self.metadata, Mapping):
+            raise ContextCompressionError(
+                f"metadata must be a Mapping, "
+                f"got {type(self.metadata).__name__}."
             )
         if not isinstance(self.preserved_entities, tuple):
             object.__setattr__(
@@ -252,24 +361,42 @@ class CompressionResult:
                 f"got {type(data).__name__}."
             )
         ts = data.get("timestamp")
-        if isinstance(ts, str):
-            timestamp = datetime.fromisoformat(ts)
-            if not timestamp.tzinfo:
-                timestamp = timestamp.replace(tzinfo=timezone.utc)
-        elif isinstance(ts, datetime):
-            timestamp = ts
-        else:
-            timestamp = datetime.now(timezone.utc)
-        return cls(
-            original_text=str(data.get("original_text", "")),
-            compressed_text=str(data.get("compressed_text", "")),
-            original_tokens=int(data.get("original_tokens", 0)),
-            compressed_tokens=int(data.get("compressed_tokens", 0)),
-            compression_ratio=float(data.get("compression_ratio", 0.0)),
-            preserved_entities=tuple(data.get("preserved_entities", ())),
-            metadata=dict(data.get("metadata", {})),
-            timestamp=timestamp,
-        )
+        try:
+            if isinstance(ts, str):
+                timestamp = datetime.fromisoformat(
+                    ts.replace("Z", "+00:00")
+                )
+                if not timestamp.tzinfo:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+            elif isinstance(ts, datetime):
+                timestamp = ts
+            else:
+                timestamp = datetime.now(timezone.utc)
+
+            return cls(
+                original_text=str(data.get("original_text", "")),
+                compressed_text=str(
+                    data.get("compressed_text", "")
+                ),
+                original_tokens=int(data.get("original_tokens", 0)),
+                compressed_tokens=int(
+                    data.get("compressed_tokens", 0)
+                ),
+                compression_ratio=float(
+                    data.get("compression_ratio", 0.0)
+                ),
+                preserved_entities=tuple(
+                    data.get("preserved_entities", ())
+                ),
+                metadata=dict(data.get("metadata", {}) or {}),
+                timestamp=timestamp,
+            )
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, ContextCompressionError):
+                raise
+            raise ContextCompressionError(
+                f"invalid CompressionResult payload: {exc}"
+            ) from exc
 
     def __repr__(self) -> str:
         return (
@@ -291,8 +418,14 @@ class Chunk:
     index: int
     start_char: int
     end_char: int
+    oversized: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise SemanticChunkerError(
+                f"text must be a string, "
+                f"got {type(self.text).__name__}."
+            )
         if self.tokens < 0:
             raise SemanticChunkerError("tokens must be >= 0.")
         if self.paragraphs < 0:
@@ -301,7 +434,8 @@ class Chunk:
             raise SemanticChunkerError("index must be >= 0.")
         if self.start_char < 0 or self.end_char < self.start_char:
             raise SemanticChunkerError(
-                "start_char/end_char must satisfy 0 <= start <= end."
+                "start_char/end_char must satisfy "
+                "0 <= start <= end."
             )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -314,21 +448,37 @@ class Chunk:
                 f"Chunk.from_dict expects a Mapping, "
                 f"got {type(data).__name__}."
             )
-        return cls(
-            text=str(data["text"]),
-            tokens=int(data.get("tokens", 0)),
-            paragraphs=int(data.get("paragraphs", 0)),
-            index=int(data.get("index", 0)),
-            start_char=int(data.get("start_char", 0)),
-            end_char=int(data.get("end_char", 0)),
-        )
+        if "text" not in data:
+            raise SemanticChunkerError(
+                "Chunk payload missing required field 'text'."
+            )
+        text = data["text"]
+        if not isinstance(text, str):
+            raise SemanticChunkerError(
+                f"Chunk.text must be a string, "
+                f"got {type(text).__name__}."
+            )
+        try:
+            return cls(
+                text=text,
+                tokens=int(data.get("tokens", 0)),
+                paragraphs=int(data.get("paragraphs", 0)),
+                index=int(data.get("index", 0)),
+                start_char=int(data.get("start_char", 0)),
+                end_char=int(data.get("end_char", 0)),
+                oversized=bool(data.get("oversized", False)),
+            )
+        except (TypeError, ValueError) as exc:
+            raise SemanticChunkerError(
+                f"invalid Chunk payload: {exc}"
+            ) from exc
 
     def __repr__(self) -> str:
+        flag = " oversized" if self.oversized else ""
         return (
-            "Chunk("
-            f"index={self.index}, tokens={self.tokens}, "
+            f"Chunk(index={self.index}, tokens={self.tokens}, "
             f"paragraphs={self.paragraphs}, "
-            f"chars=[{self.start_char}, {self.end_char}])"
+            f"chars=[{self.start_char}, {self.end_char}]{flag})"
         )
 
 
@@ -339,8 +489,8 @@ def _split_sentences(text: str) -> List[str]:
     """
     Split ``text`` into sentences, respecting common abbreviations.
 
-    Splits on ``[.!?]`` followed by whitespace; then merges fragments whose
-    last word is a known abbreviation (``Dr.``, ``U.S.``, ``e.g.``, …).
+    Splits on ``[.!?]`` followed by whitespace; then merges fragments
+    whose last word is a known abbreviation.
     """
     if not text or not text.strip():
         return []
@@ -353,7 +503,6 @@ def _split_sentences(text: str) -> List[str]:
             continue
         if merged:
             prev = merged[-1].rstrip()
-            # Extract the last whitespace-delimited token (may include dots).
             m = re.search(r"([A-Za-z][A-Za-z.]*)$", prev)
             last_word = m.group(1).rstrip(".").lower() if m else ""
             if last_word in _ABBREVIATIONS:
@@ -371,14 +520,13 @@ class ContextCompressor:
     """
     Compresses retrieved context to reduce token usage.
 
-    Thread-safe, serializable, and bounded in memory. The original public API
-    is preserved; new parameters are keyword-only.
+    Thread-safe, serializable, and bounded in memory.
 
     Strategies
     ----------
-    - Entity-preserving summarization.
-    - Redundancy removal (via sentence ranking).
-    - Sentence ranking and selection.
+    - Entity-aware summarization (soft reservation when
+      ``preserve_entities=True``).
+    - Redundancy removal via sentence ranking.
     - Order-preserving reconstruction.
     """
 
@@ -395,13 +543,14 @@ class ContextCompressor:
             self._config = config
         else:
             self._config = ContextCompressionConfig(
-                target_compression_ratio=float(target_compression_ratio),
+                target_compression_ratio=float(
+                    target_compression_ratio
+                ),
                 preserve_entities=bool(preserve_entities),
                 preserve_numbers=bool(preserve_numbers),
             )
         self._strict = bool(strict)
 
-        # Legacy attributes preserved (mirror the config).
         self.target_ratio = self._config.target_compression_ratio
         self.preserve_entities = self._config.preserve_entities
         self.preserve_numbers = self._config.preserve_numbers
@@ -437,23 +586,7 @@ class ContextCompressor:
         query: Optional[str] = None,
         max_tokens: Optional[int] = None,
     ) -> CompressionResult:
-        """
-        Compress ``text`` while preserving key information.
-
-        Parameters
-        ----------
-        text : str
-            Text to compress.
-        query : str, optional
-            Query used to prioritize sentences with overlapping terms.
-        max_tokens : int, optional
-            Hard cap on the compressed output. Overrides the ratio-based
-            target when supplied.
-
-        Returns
-        -------
-        CompressionResult
-        """
+        """Compress ``text`` while preserving key information."""
         return self._compress_with_ratio(
             text=text,
             query=query,
@@ -470,13 +603,16 @@ class ContextCompressor:
         """
         Compress multiple texts within a total token budget.
 
-        Empty inputs are preserved as empty results (rather than crashing or
-        receiving a spurious share of the budget). The remaining budget is
-        split proportionally to each text's token count.
+        Non-empty texts receive at least ``config.min_batch_tokens``
+        tokens; empty texts remain empty.
         """
         if not isinstance(texts, list):
             raise ContextCompressionError("texts must be a list.")
-        if not isinstance(total_token_budget, int) or total_token_budget <= 0:
+        if (
+            isinstance(total_token_budget, bool)
+            or not isinstance(total_token_budget, int)
+            or total_token_budget <= 0
+        ):
             raise ContextCompressionError(
                 "total_token_budget must be a positive int."
             )
@@ -486,15 +622,21 @@ class ContextCompressor:
 
         results: List[CompressionResult] = []
         for text, orig in zip(texts, original_tokens):
-            # ---- Fixed: no ZeroDivisionError when every input is empty ----
             if total_original == 0:
-                allocated_budget = 0
+                allocated = 0
             else:
-                allocated_budget = int(
+                allocated = int(
                     (orig / total_original) * total_token_budget
                 )
+                # Guarantee progress for non-empty texts.
+                if orig > 0:
+                    allocated = max(
+                        self._config.min_batch_tokens, allocated
+                    )
             results.append(
-                self.compress(text, query=query, max_tokens=allocated_budget)
+                self.compress(
+                    text, query=query, max_tokens=allocated,
+                )
             )
         return results
 
@@ -504,13 +646,22 @@ class ContextCompressor:
         min_ratio: float = 0.3,
         max_ratio: float = 0.8,
         quality_threshold: float = 0.7,
+        *,
+        query: Optional[str] = None,
     ) -> CompressionResult:
         """
-        Compress ``text`` to satisfy a quality threshold using binary search.
+        Compress ``text`` to satisfy a quality threshold using binary
+        search.
 
-        The compressor's ``target_ratio`` is **not** mutated — the search
-        uses a local ratio so subsequent :meth:`compress` calls are
-        unaffected.
+        The compressor's ``target_ratio`` is **not** mutated. Each
+        candidate is scored against the ratio it was tested at, so the
+        search converges on the smallest ratio meeting the threshold.
+
+        Parameters
+        ----------
+        query : str, optional
+            Passed to :meth:`_compress_with_ratio` to guide
+            sentence scoring at every probe.
         """
         if not 0.0 < min_ratio <= max_ratio <= 1.0:
             raise ContextCompressionError(
@@ -528,9 +679,11 @@ class ContextCompressor:
         for _ in range(5):
             mid = (low + high) / 2.0
             result = self._compress_with_ratio(
-                text=text, query=None, max_tokens=None, ratio=mid,
+                text=text, query=query, max_tokens=None, ratio=mid,
             )
-            quality = self._estimate_quality(result)
+            quality = self._estimate_quality(
+                result, target_ratio=mid,
+            )
 
             if quality > best_quality:
                 best_result = result
@@ -538,15 +691,14 @@ class ContextCompressor:
 
             if quality >= quality_threshold:
                 best_result = result
-                high = mid  # Try more aggressive compression
+                high = mid
             else:
-                low = mid   # Need less compression
+                low = mid
 
-        # Fixed: deterministic fallback to ``max_ratio`` (least aggressive)
-        # instead of whatever ``self.target_ratio`` happened to be.
-        if best_result is None:
+        if best_result is None:  # pragma: no cover — defensive
             best_result = self._compress_with_ratio(
-                text=text, query=None, max_tokens=None, ratio=max_ratio,
+                text=text, query=query, max_tokens=None,
+                ratio=max_ratio,
             )
         return best_result
 
@@ -559,16 +711,20 @@ class ContextCompressor:
         ratio: float,
     ) -> CompressionResult:
         """Core compression routine parameterized by ``ratio``."""
-        # ---- Validate ------------------------------------------------
         if not isinstance(text, str):
-            msg = f"text must be a string, got {type(text).__name__}."
+            msg = (
+                f"text must be a string, "
+                f"got {type(text).__name__}."
+            )
             if self._strict:
                 raise ContextCompressionError(msg)
             logger.warning("%s Treating as empty.", msg)
             text = ""
 
         if max_tokens is not None and (
-            not isinstance(max_tokens, int) or max_tokens < 0
+            isinstance(max_tokens, bool)
+            or not isinstance(max_tokens, int)
+            or max_tokens < 0
         ):
             msg = (
                 f"max_tokens must be a non-negative int or None, "
@@ -580,11 +736,12 @@ class ContextCompressor:
             max_tokens = None
 
         if not 0.0 < ratio <= 1.0:
-            raise ContextCompressionError("ratio must be in (0, 1].")
+            raise ContextCompressionError(
+                "ratio must be in (0, 1]."
+            )
 
         original_tokens = self._estimate_tokens(text)
 
-        # ---- Empty / trivial input -----------------------------------
         if original_tokens == 0:
             result = CompressionResult(
                 original_text=text,
@@ -599,39 +756,40 @@ class ContextCompressor:
                     "query_guided": query is not None,
                     "target_ratio": ratio,
                     "empty_input": True,
+                    "extracted_entities": [],
+                    "survived_entities": [],
+                    "missing_entities": [],
                 },
             )
             with self._lock:
                 self.compression_history.append(result)
             return result
 
-        # ---- Extract entities ----------------------------------------
         entities = (
             self._extract_entities(text)
             if self.preserve_entities else []
         )
-
-        # ---- Split into sentences ------------------------------------
         sentences = _split_sentences(text)
-
-        # ---- Score sentences (O(n) — enumerate, not list.index) ------
         scored = self._score_sentences(sentences, query, entities)
 
-        # ---- Determine target tokens ---------------------------------
         target_tokens = (
             max_tokens if max_tokens is not None
             else max(0, int(original_tokens * ratio))
         )
 
-        # ---- Select sentences (returns original indices) -------------
-        selected_indices = self._select_sentences(scored, target_tokens)
-
-        # ---- Reconstruct (preserving original order) -----------------
-        compressed_text = self._reconstruct_text(sentences, selected_indices)
+        selected_indices = self._select_sentences(
+            scored, target_tokens, entities=entities,
+        )
+        compressed_text = self._reconstruct_text(
+            sentences, selected_indices,
+        )
         compressed_tokens = self._estimate_tokens(compressed_text)
 
-        # ---- Missing entities (report, do not corrupt the text) ------
+        # ---- Honest entity reporting -------------------------------
         compressed_lower = compressed_text.lower()
+        survived_entities = [
+            e for e in entities if e.lower() in compressed_lower
+        ]
         missing_entities = [
             e for e in entities if e.lower() not in compressed_lower
         ]
@@ -645,13 +803,15 @@ class ContextCompressor:
                 compressed_tokens / original_tokens
                 if original_tokens > 0 else 0.0
             ),
-            preserved_entities=tuple(entities),
+            preserved_entities=tuple(survived_entities),
             metadata={
                 "sentences_original": len(sentences),
                 "sentences_kept": len(selected_indices),
                 "query_guided": query is not None,
                 "target_ratio": ratio,
                 "target_tokens": target_tokens,
+                "extracted_entities": list(entities),
+                "survived_entities": list(survived_entities),
                 "missing_entities": missing_entities,
             },
         )
@@ -660,10 +820,13 @@ class ContextCompressor:
             self.compression_history.append(result)
 
         logger.debug(
-            "Compressed %d -> %d tokens (ratio=%.3f, kept %d/%d sentences).",
+            "Compressed %d -> %d tokens "
+            "(ratio=%.3f, kept %d/%d sentences, "
+            "entities %d/%d survived).",
             original_tokens, compressed_tokens,
             result.compression_ratio,
             len(selected_indices), len(sentences),
+            len(survived_entities), len(entities),
         )
         return result
 
@@ -672,26 +835,33 @@ class ContextCompressor:
         """
         Estimate the token count of ``text``.
 
-        Returns an ``int`` — the original implementation returned a float
-        which drifted through the ratio math.
+        Uses whitespace-split words × ``tokens_per_word``. Known
+        limitation: URLs and non-space-delimited scripts (CJK) are
+        under-counted; callers using such content should override
+        ``tokens_per_word`` to a conservative value.
         """
         if not text:
             return 0
-        return int(len(text.split()) * self._config.tokens_per_word)
+        return int(
+            len(text.split()) * self._config.tokens_per_word
+        )
 
     # ---------------------------------------------------------- entity extraction
     def _extract_entities(self, text: str) -> List[str]:
         """Extract capitalized words and (optionally) numbers/dates."""
         entities: List[str] = []
-        # Capitalized words (potential names).
         entities.extend(
-            re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", text)
+            re.findall(
+                r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", text,
+            )
         )
         if self.preserve_numbers:
             entities.extend(
-                re.findall(r"\b\d+(?:\.\d+)?(?:%|kg|m|km|MB|GB|s|ms)?\b", text)
+                re.findall(
+                    r"\b\d+(?:\.\d+)?(?:%|kg|m|km|MB|GB|s|ms)?\b",
+                    text,
+                )
             )
-        # Stable dedup: preserve order.
         seen: set = set()
         ordered: List[str] = []
         for e in entities:
@@ -707,39 +877,35 @@ class ContextCompressor:
         query: Optional[str],
         entities: List[str],
     ) -> List[Tuple[int, str, float]]:
-        """
-        Score sentences by importance.
-
-        Returns ``[(original_index, sentence, score), ...]`` sorted by
-        descending score. Uses ``enumerate`` — the original
-        ``list.index(sentence)`` was O(n²) and returned the first occurrence
-        for duplicates.
-        """
+        """Score sentences by importance (O(n) via enumerate)."""
         cfg = self._config
         query_words = (
             set(query.lower().split()) if query else set()
         )
+        entity_lower = [e.lower() for e in entities]
         last_index = len(sentences) - 1
         scored: List[Tuple[int, str, float]] = []
 
         for idx, sentence in enumerate(sentences):
             score = 0.0
-
-            # Length band.
             length = len(sentence.split())
-            if cfg.min_sentence_words <= length <= cfg.max_sentence_words:
+            if (
+                cfg.min_sentence_words <= length
+                <= cfg.max_sentence_words
+            ):
                 score += 0.3
 
-            # Entity presence.
-            entity_count = sum(1 for e in entities if e in sentence)
+            # Case-insensitive entity matching (was case-sensitive).
+            sentence_lower = sentence.lower()
+            entity_count = sum(
+                1 for e in entity_lower if e in sentence_lower
+            )
             score += entity_count * 0.2
 
-            # Query relevance.
             if query_words:
-                sentence_words = set(sentence.lower().split())
+                sentence_words = set(sentence_lower.split())
                 score += len(query_words & sentence_words) * 0.5
 
-            # Position bonus (first and last sentences).
             if idx == 0 or idx == last_index:
                 score += 0.2
 
@@ -753,21 +919,47 @@ class ContextCompressor:
         self,
         scored: List[Tuple[int, str, float]],
         target_tokens: int,
+        entities: Optional[Sequence[str]] = None,
     ) -> List[int]:
         """
         Select sentence indices under the token budget.
 
-        Returns indices in **original order** so reconstruction preserves
-        the source flow.
+        Returns indices in **original order** so reconstruction
+        preserves the source flow.
+
+        When ``preserve_entities=True`` (and ``entities`` is given),
+        entity-bearing sentences are visited first (in score order),
+        then non-entity sentences (in score order). Both phases respect
+        the same budget; entity reservation is *soft*, not guaranteed.
         """
         if target_tokens <= 0 or not scored:
             return []
 
+        # ---- Phase ordering ----------------------------------------
+        if entities and self.preserve_entities:
+            entity_lower = [str(e).lower() for e in entities]
+
+            def _has_entity(s: str) -> bool:
+                sl = s.lower()
+                return any(e in sl for e in entity_lower)
+
+            entity_scored = [
+                t for t in scored if _has_entity(t[1])
+            ]
+            other_scored = [
+                t for t in scored if not _has_entity(t[1])
+            ]
+            ordered = entity_scored + other_scored
+        else:
+            ordered = list(scored)
+
         selected: List[int] = []
         current_tokens = 0
-        stop_at = target_tokens * self._config.select_stop_fraction
+        stop_at = (
+            target_tokens * self._config.select_stop_fraction
+        )
 
-        for idx, sentence, _score in scored:
+        for idx, sentence, _score in ordered:
             sentence_tokens = self._estimate_tokens(sentence)
             if current_tokens + sentence_tokens <= target_tokens:
                 selected.append(idx)
@@ -775,11 +967,14 @@ class ContextCompressor:
             if current_tokens >= stop_at:
                 break
 
-        # If nothing fit but there is budget, keep the single best sentence.
+        # ---- Fallback: try each sentence in score order until one fits
         if not selected:
-            best = scored[0]
-            if self._estimate_tokens(best[1]) <= max(target_tokens, 1):
-                selected.append(best[0])
+            for idx, sentence, _score in scored:
+                if self._estimate_tokens(sentence) <= max(
+                    target_tokens, 1
+                ):
+                    selected.append(idx)
+                    break
 
         selected.sort()
         return selected
@@ -790,13 +985,7 @@ class ContextCompressor:
         sentences: List[str],
         selected_indices: List[int],
     ) -> str:
-        """
-        Reconstruct the compressed text from the selected indices.
-
-        Preserves the original sentence order and does **not** inflate the
-        output by appending entity tags (the original behavior could produce
-        a "compressed" output larger than the input).
-        """
+        """Reconstruct preserving original sentence order."""
         if not selected_indices:
             return ""
         return ". ".join(
@@ -806,22 +995,64 @@ class ContextCompressor:
         ) + "."
 
     # ---------------------------------------------------------- quality
-    def _estimate_quality(self, result: CompressionResult) -> float:
+    def _estimate_quality(
+        self,
+        result: CompressionResult,
+        *,
+        target_ratio: Optional[float] = None,
+        target_entities: Optional[Sequence[str]] = None,
+    ) -> float:
         """
         Estimate compression quality in ``[0, 1]``.
 
-        Blends ratio accuracy with entity coverage. Clamped to ``[0, 1]`` —
-        the original implementation could go negative when the actual ratio
-        diverged from the target.
+        Parameters
+        ----------
+        result : CompressionResult
+        target_ratio : float, optional
+            The ratio this result was intended to achieve. Defaults to
+            ``self.target_ratio``. :meth:`adaptive_compress` passes
+            each candidate's own probe ratio so the search measures
+            each result against its own goal.
+        target_entities : sequence of str, optional
+            The entities the caller cares about. Defaults to
+            ``result.metadata["extracted_entities"]``. Entity score is
+            the fraction of these that survived into the compressed
+            text.
         """
-        ratio_diff = abs(result.compression_ratio - self.target_ratio)
+        # Empty-input case: no meaningful compression.
+        if result.original_tokens == 0:
+            return 0.0
+
+        intended_ratio = float(
+            self.target_ratio if target_ratio is None
+            else target_ratio
+        )
+        ratio_diff = abs(result.compression_ratio - intended_ratio)
         ratio_score = max(0.0, 1.0 - ratio_diff)
-        entity_score = min(len(result.preserved_entities) / 10.0, 1.0)
-        return max(0.0, min(1.0, ratio_score * 0.6 + entity_score * 0.4))
+
+        extracted = tuple(
+            target_entities
+            if target_entities is not None
+            else result.metadata.get("extracted_entities", ())
+        )
+
+        if not extracted:
+            entity_score = 1.0  # Nothing to lose → full credit.
+        else:
+            compressed_lower = result.compressed_text.lower()
+            survived = sum(
+                1 for e in extracted
+                if str(e).lower() in compressed_lower
+            )
+            entity_score = survived / len(extracted)
+
+        return max(
+            0.0,
+            min(1.0, ratio_score * 0.6 + entity_score * 0.4),
+        )
 
     # ---------------------------------------------------------- stats
     def get_compression_stats(self) -> Dict[str, Any]:
-        """Return the backward-compatible compression statistics."""
         with self._lock:
             history = list(self.compression_history)
 
@@ -832,91 +1063,147 @@ class ContextCompressor:
                 "avg_compression_ratio": 0.0,
                 "total_tokens_saved": 0,
                 "avg_entities_preserved": 0.0,
+                "mean_original_tokens": 0.0,
+                "mean_compressed_tokens": 0.0,
+                "uptime_seconds": time.time() - self._started_at,
             }
 
-        avg_ratio = sum(r.compression_ratio for r in history) / len(history)
+        # Exclude empty inputs from the "real compressions" counters
+        # while leaving them in history — callers who want the raw
+        # count can inspect ``len(history)``.
+        real = [r for r in history if r.original_tokens > 0]
+        n = len(real) if real else len(history)
+
+        avg_ratio = (
+            sum(r.compression_ratio for r in real) / n
+            if real else 0.0
+        )
         total_saved = sum(
             r.original_tokens - r.compressed_tokens for r in history
         )
-        avg_entities = sum(
-            len(r.preserved_entities) for r in history
-        ) / len(history)
+        avg_entities = (
+            sum(len(r.preserved_entities) for r in real) / n
+            if real else 0.0
+        )
 
         return {
             "total_compressions": len(history),
+            "non_empty_compressions": len(real),
             "avg_compression_ratio": avg_ratio,
             "total_tokens_saved": total_saved,
             "avg_entities_preserved": avg_entities,
-            # Additive:
-            "mean_original_tokens": sum(r.original_tokens for r in history)
-            / len(history),
-            "mean_compressed_tokens": sum(r.compressed_tokens for r in history)
-            / len(history),
+            "mean_original_tokens": (
+                sum(r.original_tokens for r in history)
+                / len(history)
+            ),
+            "mean_compressed_tokens": (
+                sum(r.compressed_tokens for r in history)
+                / len(history)
+            ),
             "uptime_seconds": time.time() - self._started_at,
         }
 
     def statistics(self) -> Dict[str, Any]:
-        """Alias for :meth:`get_compression_stats`."""
         return self.get_compression_stats()
 
     def reset(self, *, clear_history: bool = True) -> int:
-        """Reset the compression history. Returns the number of entries removed."""
         with self._lock:
             removed = len(self.compression_history)
             if clear_history:
                 self.compression_history.clear()
             self._started_at = time.time()
-        logger.debug("ContextCompressor reset (removed %d).", removed)
+        logger.debug(
+            "ContextCompressor reset (removed %d).", removed,
+        )
         return removed
 
     # ---------------------------------------------------------- serialization
-    def to_dict(self, *, include_history: bool = False) -> Dict[str, Any]:
+    def to_dict(
+        self, *, include_history: bool = False,
+    ) -> Dict[str, Any]:
         with self._lock:
             payload: Dict[str, Any] = {
+                "version": VERSION,
                 "config": self._config.to_dict(),
                 "strict": self._strict,
                 "started_at": self._started_at,
                 "history_size": len(self.compression_history),
             }
             if include_history:
-                payload["history"] = [r.to_dict() for r in self.compression_history]
+                payload["history"] = [
+                    r.to_dict() for r in self.compression_history
+                ]
         return payload
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ContextCompressor":
         if not isinstance(data, Mapping):
             raise ContextCompressionError(
-                f"from_dict expects a Mapping, got {type(data).__name__}."
+                f"from_dict expects a Mapping, "
+                f"got {type(data).__name__}."
             )
-        cfg = ContextCompressionConfig.from_dict(
-            dict(data.get("config", {}) or {})
-        )
-        compressor = cls(config=cfg, strict=bool(data.get("strict", True)))
-        with compressor._lock:
-            for entry in data.get("history", []):
-                compressor.compression_history.append(
-                    CompressionResult.from_dict(entry)
+        try:
+            cfg = ContextCompressionConfig.from_dict(
+                dict(data.get("config", {}) or {})
+            )
+            compressor = cls(
+                config=cfg,
+                strict=bool(data.get("strict", True)),
+            )
+            raw_history = data.get("history", [])
+            if raw_history is None:
+                raw_history = []
+            if not isinstance(raw_history, list):
+                raise ContextCompressionError(
+                    f"history must be a list, "
+                    f"got {type(raw_history).__name__}."
                 )
-            compressor._started_at = float(data.get("started_at", time.time()))
-        return compressor
+            with compressor._lock:
+                for entry in raw_history:
+                    compressor.compression_history.append(
+                        CompressionResult.from_dict(entry)
+                    )
+                compressor._started_at = float(
+                    data.get("started_at", time.time())
+                )
+            return compressor
+        except ContextCompressionError:
+            raise
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ContextCompressionError(
+                f"invalid ContextCompressor payload: {exc}"
+            ) from exc
 
-    def to_json(self, **kwargs: Any) -> str:
-        return json.dumps(self.to_dict(), default=str, **kwargs)
+    def to_json(
+        self, *, include_history: bool = False, **kwargs: Any,
+    ) -> str:
+        kwargs.setdefault("allow_nan", False)
+        kwargs.setdefault("sort_keys", True)
+        return json.dumps(
+            self.to_dict(include_history=include_history),
+            **kwargs,
+        )
 
     @classmethod
     def from_json(cls, payload: str) -> "ContextCompressor":
         try:
-            return cls.from_dict(json.loads(payload))
+            raw = json.loads(payload)
         except json.JSONDecodeError as exc:
             raise ContextCompressionError(
-                f"Invalid JSON payload: {exc}"
+                f"invalid JSON payload: {exc}"
             ) from exc
+        return cls.from_dict(raw)
 
     # ---------------------------------------------------------- context mgr
     def __enter__(self) -> "ContextCompressor":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Any,
+    ) -> Optional[bool]:
         if exc_type is not None:
             logger.warning(
                 "ContextCompressor scope exited with %s.",
@@ -927,14 +1214,15 @@ class ContextCompressor:
     # ----------------------------------------------------------------- dunder
     def __repr__(self) -> str:
         with self._lock:
-            return (
-                "ContextCompressor("
-                f"target_ratio={self.target_ratio:.3f}, "
-                f"history={len(self.compression_history)}, "
-                f"preserve_entities={self.preserve_entities}, "
-                f"preserve_numbers={self.preserve_numbers}, "
-                f"strict={self._strict})"
-            )
+            n = len(self.compression_history)
+        return (
+            "ContextCompressor("
+            f"target_ratio={self.target_ratio:.3f}, "
+            f"history={n}, "
+            f"preserve_entities={self.preserve_entities}, "
+            f"preserve_numbers={self.preserve_numbers}, "
+            f"strict={self._strict})"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -944,15 +1232,15 @@ class SemanticChunker:
     """
     Chunks text into semantically coherent segments.
 
-    Thread-safe, serializable, and bounded in memory. The original public API
-    (``chunk_size``, ``overlap``, ``chunk()``) is preserved.
+    Thread-safe, serializable, and bounded in memory.
 
     Notes
     -----
-    The original ``overlap`` implementation kept only the last *paragraph*,
-    which rarely corresponds to ``overlap`` tokens. The enhanced version
-    carries over the last ``overlap`` tokens of the previous chunk by
-    reconstructing the paragraph list until the token budget is met.
+    The ``overlap`` implementation carries over the last ``overlap``
+    *tokens* of the previous chunk (reconstructed paragraph-by-paragraph
+    until the budget is met). A single paragraph larger than
+    ``chunk_size`` cannot be split and is emitted as an oversized
+    chunk with ``Chunk.oversized = True`` and a warning logged.
     """
 
     def __init__(
@@ -972,7 +1260,6 @@ class SemanticChunker:
             )
         self._strict = bool(strict)
 
-        # Legacy attributes preserved.
         self.chunk_size = self._config.chunk_size
         self.overlap = self._config.overlap
 
@@ -991,15 +1278,12 @@ class SemanticChunker:
 
     # ---------------------------------------------------------- public API
     def chunk(self, text: str) -> List[Dict[str, Any]]:
-        """
-        Chunk ``text`` into semantic segments.
-
-        Returns a list of dicts with keys ``text``, ``tokens``,
-        ``paragraphs``, ``index``, ``start_char``, ``end_char`` — the first
-        three are backward compatible; the last three are additive.
-        """
+        """Chunk ``text`` into semantic segments (list of dicts)."""
         if not isinstance(text, str):
-            msg = f"text must be a string, got {type(text).__name__}."
+            msg = (
+                f"text must be a string, "
+                f"got {type(text).__name__}."
+            )
             if self._strict:
                 raise SemanticChunkerError(msg)
             logger.warning("%s Treating as empty.", msg)
@@ -1010,6 +1294,15 @@ class SemanticChunker:
 
     def chunk_objects(self, text: str) -> List[Chunk]:
         """Same as :meth:`chunk` but returns :class:`Chunk` objects."""
+        if not isinstance(text, str):
+            msg = (
+                f"text must be a string, "
+                f"got {type(text).__name__}."
+            )
+            if self._strict:
+                raise SemanticChunkerError(msg)
+            logger.warning("%s Treating as empty.", msg)
+            text = ""
         if not text:
             return []
 
@@ -1022,25 +1315,31 @@ class SemanticChunker:
         for para, start, end in paragraphs_with_offsets:
             para_tokens = self._estimate_tokens(para)
 
-            if current_tokens + para_tokens > self.chunk_size and current_paras:
-                # ---- Emit current chunk -----------------------------------
-                chunks.append(self._make_chunk(chunks, current_paras))
-
-                # ---- Carry overlap ----------------------------------------
-                current_paras, current_tokens = self._carry_overlap(
-                    current_paras, para, para_tokens
+            if (
+                current_tokens + para_tokens > self.chunk_size
+                and current_paras
+            ):
+                chunks.append(
+                    self._make_chunk(chunks, current_paras)
+                )
+                current_paras, current_tokens = (
+                    self._carry_overlap(
+                        current_paras, para, para_tokens,
+                    )
                 )
             else:
                 current_paras.append((para, start, end))
                 current_tokens += para_tokens
 
-        # ---- Emit final chunk -----------------------------------------
         if current_paras:
             chunks.append(self._make_chunk(chunks, current_paras))
 
-        self._chunk_count += len(chunks)
+        with self._lock:
+            self._chunk_count += len(chunks)
+
         logger.debug(
-            "Chunked %d chars into %d chunk(s).", len(text), len(chunks),
+            "Chunked %d chars into %d chunk(s).",
+            len(text), len(chunks),
         )
         return chunks
 
@@ -1048,15 +1347,16 @@ class SemanticChunker:
     def _estimate_tokens(self, text: str) -> int:
         if not text:
             return 0
-        return int(len(text.split()) * self._config.tokens_per_word)
+        return int(
+            len(text.split()) * self._config.tokens_per_word
+        )
 
     @staticmethod
-    def _paragraph_offsets(text: str) -> List[Tuple[str, int, int]]:
+    def _paragraph_offsets(
+        text: str,
+    ) -> List[Tuple[str, int, int]]:
         """
         Return ``[(paragraph, start_char, end_char), ...]``.
-
-        Uses ``str.find`` on the original text to reconstruct offsets without
-        losing the exact paragraph boundaries.
         """
         raw = text.split("\n\n")
         offsets: List[Tuple[str, int, int]] = []
@@ -1064,7 +1364,6 @@ class SemanticChunker:
         for para in raw:
             start = text.find(para, cursor)
             if start < 0:
-                # Fallback — should never happen on the same string.
                 start = cursor
             end = start + len(para)
             offsets.append((para, start, end))
@@ -1077,13 +1376,23 @@ class SemanticChunker:
         paragraphs: List[Tuple[str, int, int]],
     ) -> Chunk:
         text = "\n\n".join(p[0] for p in paragraphs)
+        tokens = self._estimate_tokens(text)
+        oversized = tokens > self.chunk_size
+        if oversized:
+            logger.warning(
+                "chunk %d is %d tokens (> chunk_size=%d); an "
+                "individual paragraph exceeded the budget and "
+                "cannot be split.",
+                len(existing_chunks), tokens, self.chunk_size,
+            )
         return Chunk(
             text=text,
-            tokens=self._estimate_tokens(text),
+            tokens=tokens,
             paragraphs=len(paragraphs),
             index=len(existing_chunks),
             start_char=paragraphs[0][1],
             end_char=paragraphs[-1][2],
+            oversized=oversized,
         )
 
     def _carry_overlap(
@@ -1093,11 +1402,8 @@ class SemanticChunker:
         incoming_tokens: int,
     ) -> Tuple[List[Tuple[str, int, int]], int]:
         """
-        Build the new chunk from a token-bounded suffix of ``previous``
-        plus the incoming paragraph.
-
-        Fixes the original behavior, which kept only the last paragraph
-        regardless of the configured ``overlap`` in tokens.
+        Build the new chunk from a token-bounded suffix of
+        ``previous`` plus the incoming paragraph.
         """
         if self.overlap == 0 or not previous:
             return [incoming], incoming_tokens
@@ -1118,11 +1424,12 @@ class SemanticChunker:
     # ---------------------------------------------------------- stats
     def statistics(self) -> Dict[str, Any]:
         with self._lock:
-            return {
-                "chunk_size": self.chunk_size,
-                "overlap": self.overlap,
-                "chunks_produced": self._chunk_count,
-            }
+            n = self._chunk_count
+        return {
+            "chunk_size": self.chunk_size,
+            "overlap": self.overlap,
+            "chunks_produced": n,
+        }
 
     def reset(self) -> None:
         with self._lock:
@@ -1131,61 +1438,72 @@ class SemanticChunker:
 
     # ---------------------------------------------------------- serialization
     def to_dict(self) -> Dict[str, Any]:
+        with self._lock:
+            count = self._chunk_count
         return {
+            "version": VERSION,
             "config": self._config.to_dict(),
             "strict": self._strict,
-            "chunks_produced": self._chunk_count,
+            "chunks_produced": count,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "SemanticChunker":
         if not isinstance(data, Mapping):
             raise SemanticChunkerError(
-                f"from_dict expects a Mapping, got {type(data).__name__}."
+                f"from_dict expects a Mapping, "
+                f"got {type(data).__name__}."
             )
-        cfg = SemanticChunkerConfig.from_dict(
-            dict(data.get("config", {}) or {})
-        )
-        chunker = cls(config=cfg, strict=bool(data.get("strict", True)))
-        chunker._chunk_count = int(data.get("chunks_produced", 0))
-        return chunker
+        try:
+            cfg = SemanticChunkerConfig.from_dict(
+                dict(data.get("config", {}) or {})
+            )
+            chunker = cls(
+                config=cfg,
+                strict=bool(data.get("strict", True)),
+            )
+            try:
+                chunker._chunk_count = int(
+                    data.get("chunks_produced", 0)
+                )
+            except (TypeError, ValueError) as exc:
+                raise SemanticChunkerError(
+                    f"invalid chunks_produced: {exc}"
+                ) from exc
+            return chunker
+        except SemanticChunkerError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise SemanticChunkerError(
+                f"invalid SemanticChunker payload: {exc}"
+            ) from exc
 
     def to_json(self, **kwargs: Any) -> str:
-        return json.dumps(self.to_dict(), default=str, **kwargs)
+        kwargs.setdefault("allow_nan", False)
+        kwargs.setdefault("sort_keys", True)
+        return json.dumps(self.to_dict(), **kwargs)
 
     @classmethod
     def from_json(cls, payload: str) -> "SemanticChunker":
         try:
-            return cls.from_dict(json.loads(payload))
+            raw = json.loads(payload)
         except json.JSONDecodeError as exc:
             raise SemanticChunkerError(
-                f"Invalid JSON payload: {exc}"
+                f"invalid JSON payload: {exc}"
             ) from exc
+        return cls.from_dict(raw)
 
     # ----------------------------------------------------------------- dunder
     def __repr__(self) -> str:
+        with self._lock:
+            n = self._chunk_count
         return (
             "SemanticChunker("
             f"chunk_size={self.chunk_size}, "
             f"overlap={self.overlap}, "
-            f"chunks_produced={self._chunk_count}, "
+            f"chunks_produced={n}, "
             f"strict={self._strict})"
         )
-
-
-# --------------------------------------------------------------------------- #
-# Public API
-# --------------------------------------------------------------------------- #
-__all__ = [
-    "Chunk",
-    "CompressionResult",
-    "ContextCompressionConfig",
-    "ContextCompressionError",
-    "ContextCompressor",
-    "SemanticChunker",
-    "SemanticChunkerConfig",
-    "SemanticChunkerError",
-]
 
 
 # --------------------------------------------------------------------------- #
@@ -1193,14 +1511,18 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":  # pragma: no cover
     logging.basicConfig(
-        level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
     )
+
+    print("VERSION:", VERSION)
 
     # ---------------------------------------------------------------- #
     # Happy path: entity preservation + query-guided compression
     # ---------------------------------------------------------------- #
     text = (
-        "Dr. Smith joined Acme Corp in 2019. She led the U.S. division. "
+        "Dr. Smith joined Acme Corp in 2019. "
+        "She led the U.S. division. "
         "The team grew from 12 to 48 engineers in two years. "
         "They shipped the Orion platform to 500 customers in Q3 2021. "
         "Prof. Johnson consulted briefly on the data pipeline. "
@@ -1216,68 +1538,114 @@ if __name__ == "__main__":  # pragma: no cover
     print(f"original   : {result.original_tokens} tokens")
     print(f"compressed : {result.compressed_tokens} tokens")
     print(f"ratio      : {result.compression_ratio:.3f}")
-    print(f"entities   : {result.preserved_entities}")
-    print(f"metadata   : {result.metadata}")
+    print(f"preserved  : {result.preserved_entities}")
+    print(f"extracted  : {result.metadata['extracted_entities']}")
+    print(f"missing    : {result.metadata['missing_entities']}")
 
-    # ---- Bug fix: no entity-tag inflation --------------------------- #
     assert (
         result.compressed_tokens <= result.original_tokens
     ), "compression must not inflate the output"
     print("no-inflate : OK")
 
-    # ---- Bug fix: sentence order preserved -------------------------- #
-    # The compressed text must preserve the *relative* order of the
-    # sentences that survived.
-    original_order = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    # ---- preserved_entities now reports survivors, not extracted --
+    survived_from_meta = set(result.metadata["survived_entities"])
+    assert set(result.preserved_entities) == survived_from_meta, (
+        "preserved_entities must match metadata['survived_entities']"
+    )
+    print("honest entities: OK")
+
+    # ---- Sentence order preserved ---------------------------------
+    original_order = [
+        s.strip()
+        for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()
+    ]
     compressed_order = [
-        s.strip() for s in re.split(r"(?<=[.!?])\s+", result.compressed_text)
+        s.strip()
+        for s in re.split(r"(?<=[.!?])\s+", result.compressed_text)
         if s.strip()
     ]
-    positions = [original_order.index(s) for s in compressed_order if s in original_order]
-    assert positions == sorted(positions), "sentence order was scrambled"
+    positions = [
+        original_order.index(s)
+        for s in compressed_order if s in original_order
+    ]
+    assert positions == sorted(positions), "order scrambled"
     print("order kept : OK")
 
-    # ---- Bug fix: Dr. / U.S. handling ------------------------------ #
-    dr_text = "Dr. Smith is here. U.S. policy changed in 2020."
+    # ---- Abbreviation handling ------------------------------------
+    dr_text = (
+        "Dr. Smith is here. U.S. policy changed in 2020."
+    )
     dr_result = compressor.compress(dr_text, query=None)
-    # The sentence splitter must not have broken "Dr. Smith" into two.
-    sentences_detected = dr_result.metadata["sentences_original"]
-    print(f"split Dr.  : {sentences_detected} sentences (expected 2)")
-    assert sentences_detected == 2
+    assert dr_result.metadata["sentences_original"] == 2
+    print(f"split Dr.  : {dr_result.metadata['sentences_original']} "
+          "sentences (expected 2)")
 
-    # ---- Batch compression (with empty inputs) --------------------- #
+    # ---- Batch compression with empty inputs ----------------------
     batch = compressor.compress_batch(
         ["", "one two three four five", ""],
         total_token_budget=64,
     )
-    print(f"batch      : {[r.original_tokens for r in batch]}")
+    print(f"batch      : "
+          f"{[r.original_tokens for r in batch]}")
+    # Non-empty text gets at least min_batch_tokens budget.
+    assert batch[1].compressed_tokens >= 1
+    print("batch floor: OK")
 
-    # ---- adaptive_compress side-effect fix ------------------------- #
+    # ---- adaptive_compress side-effect + quality fix --------------
     before_ratio = compressor.target_ratio
-    adaptive = compressor.adaptive_compress(text, min_ratio=0.3, max_ratio=0.8)
+    adaptive = compressor.adaptive_compress(
+        text, min_ratio=0.3, max_ratio=0.8,
+        quality_threshold=0.7, query="Acme 2023",
+    )
     after_ratio = compressor.target_ratio
-    assert before_ratio == after_ratio, "adaptive_compress must not mutate target_ratio"
+    assert before_ratio == after_ratio, (
+        "adaptive_compress must not mutate target_ratio"
+    )
     print(f"adaptive   : ratio={adaptive.compression_ratio:.3f} "
-          f"(target_ratio unchanged)")
+          "(target_ratio unchanged)")
 
-    # ---- Statistics ------------------------------------------------ #
+    # Quality should be measured against the *probe* ratio, not the
+    # fixed config ratio. Verify the returned result achieves roughly
+    # its own target ratio.
+    q = compressor._estimate_quality(
+        adaptive, target_ratio=adaptive.metadata["target_ratio"],
+    )
+    print(f"adaptive q : {q:.3f} (against own target)")
+
+    # ---- Statistics ----------------------------------------------
     print("stats      :", {
-        k: v for k, v in compressor.get_compression_stats().items()
+        k: v for k, v in
+        compressor.get_compression_stats().items()
         if k != "uptime_seconds"
     })
 
-    # ---- Serialization round-trip ---------------------------------- #
-    payload = compressor.to_json()
+    # ---- Serialization round-trip (FIXED) ------------------------
+    # Round-trip the full state via include_history=True so the
+    # comparison is lossless.
+    payload = compressor.to_json(include_history=True)
     restored = ContextCompressor.from_json(payload)
-    assert restored.to_dict() == compressor.to_dict()
-    print("Round-trip OK.")
+    a = compressor.to_dict(include_history=True)
+    b = restored.to_dict(include_history=True)
+    assert a == b, (
+        f"history round-trip failed "
+        f"(compressor={a.get('history_size')}, "
+        f"restored={b.get('history_size')})"
+    )
+    print("full round-trip: OK")
 
-    # ---- Context manager ------------------------------------------- #
+    # And check that config-only round-trip preserves history_size=0
+    # honestly (that is the contract).
+    cfg_only = compressor.to_json(include_history=False)
+    restored_cfg = ContextCompressor.from_json(cfg_only)
+    assert restored_cfg.to_dict()["history_size"] == 0
+    print("cfg-only round-trip: OK")
+
+    # ---- Context manager ------------------------------------------
     with ContextCompressor() as scoped:
         scoped.compress("Some text to compress.")
     print("Context    : OK")
 
-    # ---- Validation failures --------------------------------------- #
+    # ---- Validation failures --------------------------------------
     for bad_cfg in (
         dict(target_compression_ratio=0),
         dict(target_compression_ratio=1.5),
@@ -1286,6 +1654,7 @@ if __name__ == "__main__":  # pragma: no cover
         dict(min_sentence_words=10, max_sentence_words=5),
         dict(select_stop_fraction=0),
         dict(max_history=0),
+        dict(min_batch_tokens=-1),
     ):
         try:
             ContextCompressionConfig(**bad_cfg)  # type: ignore[arg-type]
@@ -1298,19 +1667,46 @@ if __name__ == "__main__":  # pragma: no cover
         lambda: strict.compress("hello", max_tokens=-1),
         lambda: strict.compress_batch("not-a-list"),  # type: ignore[arg-type]
         lambda: strict.compress_batch([], total_token_budget=0),
-        lambda: strict.adaptive_compress("hi", min_ratio=0.5, max_ratio=0.3),
-        lambda: strict.adaptive_compress("hi", quality_threshold=2.0),
+        lambda: strict.adaptive_compress(
+            "hi", min_ratio=0.5, max_ratio=0.3,
+        ),
+        lambda: strict.adaptive_compress(
+            "hi", quality_threshold=2.0,
+        ),
     ):
         try:
             bad_call()
         except ContextCompressionError as exc:
             print("Rejected   :", exc)
 
-    # Non-strict coerces.
     lenient = ContextCompressor(strict=False)
     r = lenient.compress(None)  # type: ignore[arg-type]
     assert r.original_tokens == 0 and r.compressed_text == ""
     print("lenient    : OK")
+
+    # ---- from_dict error wrapping --------------------------------
+    for bad_payload in (
+        {"history": "abc"},
+        {"config": {"target_compression_ratio": "x"}},
+        {"started_at": "abc"},
+    ):
+        try:
+            ContextCompressor.from_dict(bad_payload)
+        except ContextCompressionError as exc:
+            print("Rejected payload:", str(exc)[:50], "...")
+
+    # ---- to_json rejects NaN (defensive) -------------------------
+    tainted = ContextCompressor()
+    tainted.compress("some text to compress here.")
+    # Inject NaN via private mutation on the config object.
+    object.__setattr__(
+        tainted._config, "tokens_per_word", float("nan"),
+    )
+    try:
+        # Allow_nan=False rejects NaN in the config payload.
+        tainted.to_json()
+    except ValueError as exc:
+        print("NaN in to_json rejected:", str(exc)[:50], "...")
 
     # ---------------------------------------------------------------- #
     # SemanticChunker
@@ -1324,16 +1720,26 @@ if __name__ == "__main__":  # pragma: no cover
     ])
 
     chunker = SemanticChunker(chunk_size=120, overlap=30)
-    print("chunker    :", chunker)
-
+    print("\nchunker    :", chunker)
     chunks = chunker.chunk(doc)
     print(f"chunks     : {len(chunks)}")
     for c in chunks:
-        print(f"  #{c['index']}: tokens={c['tokens']}, "
-              f"paras={c['paragraphs']}, "
-              f"chars=[{c['start_char']}, {c['end_char']}]")
+        print(
+            f"  #{c['index']}: tokens={c['tokens']}, "
+            f"paras={c['paragraphs']}, "
+            f"chars=[{c['start_char']}, {c['end_char']}], "
+            f"oversized={c.get('oversized', False)}"
+        )
 
-    # ---- Bug fix: no infinite loop on overlap >= chunk_size -------- #
+    # ---- Oversized chunk warning --------------------------------
+    big_doc = "one two three " * 200  # single paragraph, > 120 tokens
+    big_chunks = chunker.chunk_objects(big_doc)
+    assert any(c.oversized for c in big_chunks), (
+        "single oversized paragraph should be flagged"
+    )
+    print("oversized  : flagged correctly")
+
+    # ---- Config validation --------------------------------------
     for bad_cfg in (
         dict(chunk_size=0),
         dict(overlap=-1),
@@ -1341,27 +1747,40 @@ if __name__ == "__main__":  # pragma: no cover
         dict(chunk_size=100, overlap=200),
         dict(tokens_per_word=0),
         dict(max_chunks=0),
+        dict(max_chunks=True),
     ):
         try:
             SemanticChunkerConfig(**bad_cfg)  # type: ignore[arg-type]
         except SemanticChunkerError as exc:
             print("Rejected cfg:", exc)
 
-    # ---- Serialization round-trip ---------------------------------- #
+    # ---- Round-trip --------------------------------------------
     payload = chunker.to_json()
     restored_chunker = SemanticChunker.from_json(payload)
-    assert restored_chunker.to_dict() == chunker.to_dict()
+    assert (
+        restored_chunker.to_dict() == chunker.to_dict()
+    ), "chunker round-trip failed"
     print("Chunker round-trip OK.")
 
-    # ---- Non-string input in strict mode --------------------------- #
+    # ---- Error paths -------------------------------------------
     try:
         chunker.chunk(None)  # type: ignore[arg-type]
     except SemanticChunkerError as exc:
         print("Rejected   :", exc)
 
-    # ---- Non-strict input coerces to empty ------------------------- #
     lenient_chunker = SemanticChunker(strict=False)
     assert lenient_chunker.chunk(None) == []  # type: ignore[arg-type]
     print("lenient chunker: OK")
+
+    # Chunk.from_dict validation
+    for bad_chunk in (
+        {},
+        {"text": None},
+        {"text": 123},
+    ):
+        try:
+            Chunk.from_dict(bad_chunk)
+        except SemanticChunkerError as exc:
+            print("Rejected Chunk:", str(exc)[:50], "...")
 
     print("\nSmoke test passed.")
