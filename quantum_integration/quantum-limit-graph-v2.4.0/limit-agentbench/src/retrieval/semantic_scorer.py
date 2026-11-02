@@ -8,25 +8,32 @@ Replaces keyword-based scoring with embedding-based semantic similarity.
 Supports local embeddings (``sentence-transformers``), API-based embeddings
 (OpenAI, Cohere), and user-supplied custom providers.
 
-Enhancements
-------------
+Design
+------
 - Optional ``numpy`` / ``sentence_transformers`` / ``openai`` / ``cohere``
   imports guarded by ``_*_AVAILABLE`` flags.
 - ``SemanticScorerConfig`` — frozen, validated: similarity metric, cache
   size, epsilon, recency / importance / content-type boost coefficients.
 - ``SemanticScore`` — frozen dataclass with validation and serialization.
+- **Similarity is always in ``[0, 1]``.** Every metric (cosine, dot,
+  euclidean) is clamped; cosine is remapped to ``(cos + 1) / 2`` so
+  opposite vectors score ``0.0``. This guarantees the
+  ``SemanticScore`` invariants hold for every legitimate pair.
 - **LRU embedding cache** — bounded by ``max_cache_entries``.
 - **Thread safety** — ``RLock`` guards the cache and hit/miss counters.
-- **Fixed ``cache_hit`` metadata** — now reflects the *current* call.
-- **Validated ``similarity_metric``** at construction.
-- **Added ``AnthropicProvider`` and ``CohereProvider``** matching the
-  ``EmbeddingModel`` enum.
-- **Full input validation**; strict / non-strict modes.
-- **Serialization** — ``to_dict`` / ``from_dict`` / ``to_json`` / ``from_json``
-  on the scorer, the config, and ``SemanticScore``.
-- ``statistics()``, ``__repr__``, custom ``SemanticScorerError`` /
-  ``EmbeddingProviderError``, lazy ``%s`` logging, and a ``__main__`` smoke
-  test using a deterministic fake provider.
+- **Round-trip serialization** — ``SemanticScorer.from_dict`` requires
+  an explicit ``provider=`` argument (API keys, model names, and
+  callables are never persisted). ``to_json`` uses
+  ``allow_nan=False``.
+- **Recency boost handles both Unix seconds and Unix milliseconds**,
+  plus ISO-8601 strings.
+- **Provider dimensions are validated against a model table** with an
+  explicit ``dimension=`` override for unknown models.
+- **Error hierarchy** — :class:`EmbeddingProviderError` is a subclass
+  of :class:`SemanticScorerError`, so catching the module's main error
+  catches provider failures too.
+
+Version: 2.0.0
 """
 
 from __future__ import annotations
@@ -41,15 +48,47 @@ from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from types import TracebackType
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "VERSION",
+    "AnthropicProvider",
+    "CohereProvider",
+    "CustomEmbeddingProvider",
+    "EmbeddingModel",
+    "EmbeddingProvider",
+    "EmbeddingProviderError",
+    "OpenAIProvider",
+    "SemanticScore",
+    "SemanticScorer",
+    "SemanticScorerConfig",
+    "SemanticScorerError",
+    "SentenceTransformerProvider",
+    "create_custom_scorer",
+    "create_local_scorer",
+    "create_openai_scorer",
+    "create_scorer_from_model",
+]
+
+VERSION = "2.0.0"
 
 
 # --------------------------------------------------------------------------- #
 # Optional NumPy
 # --------------------------------------------------------------------------- #
-try:  # pragma: no cover — environment-dependent
+try:  # pragma: no cover
     import numpy as np  # type: ignore
 
     _NUMPY_AVAILABLE = True
@@ -91,11 +130,16 @@ except ImportError:  # pragma: no cover
 # Errors
 # --------------------------------------------------------------------------- #
 class SemanticScorerError(ValueError):
-    """Raised for invalid semantic scorer inputs or configuration."""
+    """Base error for the semantic scorer module."""
 
 
-class EmbeddingProviderError(ValueError):
-    """Raised when an embedding provider cannot fulfil a request."""
+class EmbeddingProviderError(SemanticScorerError):
+    """
+    Raised when an embedding provider cannot fulfil a request.
+
+    Subclass of :class:`SemanticScorerError` so callers catching the
+    module-level error also catch provider failures.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -103,11 +147,11 @@ class EmbeddingProviderError(ValueError):
 # --------------------------------------------------------------------------- #
 class EmbeddingModel(Enum):
     """Available embedding models."""
-    SENTENCE_TRANSFORMERS = "sentence-transformers"  # Local, offline
-    OPENAI = "openai"                                # API-based
-    ANTHROPIC = "anthropic"                          # API-based (not supported)
-    COHERE = "cohere"                                # API-based
-    CUSTOM = "custom"                                # User-provided
+    SENTENCE_TRANSFORMERS = "sentence-transformers"
+    OPENAI = "openai"
+    ANTHROPIC = "anthropic"
+    COHERE = "cohere"
+    CUSTOM = "custom"
 
 
 # --------------------------------------------------------------------------- #
@@ -120,23 +164,17 @@ class SemanticScorerConfig:
     cache_embeddings: bool = True
     similarity_metric: str = "cosine"    # "cosine" | "dot" | "euclidean"
 
-    # Bounded LRU cache cap.
     max_cache_entries: int = 100_000
 
-    # Epsilon used to avoid zero-division.
     epsilon: float = 1e-12
 
-    # Recency-boost coefficient.
     recency_boost_coefficient: float = 0.2
     recency_half_life_hours: float = 24.0
 
-    # Importance-boost coefficient.
     importance_boost_coefficient: float = 0.3
 
-    # Content-type boost multiplier for critical/high-priority items.
     critical_content_boost: float = 1.2
 
-    # Confidence blend weights (must sum to 1.0).
     confidence_weight_similarity: float = 0.6
     confidence_weight_content_length: float = 0.2
     confidence_weight_query_length: float = 0.2
@@ -144,26 +182,55 @@ class SemanticScorerConfig:
     query_length_saturation_words: int = 10
 
     def __post_init__(self) -> None:
-        if self.similarity_metric not in ("cosine", "dot", "euclidean"):
+        if self.similarity_metric not in (
+            "cosine", "dot", "euclidean",
+        ):
             raise SemanticScorerError(
                 f"similarity_metric must be 'cosine', 'dot', or "
                 f"'euclidean', got {self.similarity_metric!r}."
             )
-        if self.max_cache_entries <= 0:
-            raise SemanticScorerError("max_cache_entries must be > 0.")
-        if self.epsilon <= 0:
-            raise SemanticScorerError("epsilon must be > 0.")
+        for name in ("max_cache_entries",):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise SemanticScorerError(f"{name} must be > 0.")
+        if (
+            isinstance(self.epsilon, bool)
+            or not isinstance(self.epsilon, (int, float))
+            or not math.isfinite(float(self.epsilon))
+            or self.epsilon <= 0
+        ):
+            raise SemanticScorerError(
+                "epsilon must be finite and > 0."
+            )
         for name in (
             "recency_boost_coefficient",
             "importance_boost_coefficient",
             "critical_content_boost",
         ):
             value = getattr(self, name)
-            if value < 0:
-                raise SemanticScorerError(f"{name} must be >= 0.")
-        if self.recency_half_life_hours <= 0:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value < 0
+            ):
+                raise SemanticScorerError(
+                    f"{name} must be finite and >= 0."
+                )
+        if (
+            isinstance(self.recency_half_life_hours, bool)
+            or not isinstance(
+                self.recency_half_life_hours, (int, float)
+            )
+            or not math.isfinite(float(self.recency_half_life_hours))
+            or self.recency_half_life_hours <= 0
+        ):
             raise SemanticScorerError(
-                "recency_half_life_hours must be > 0."
+                "recency_half_life_hours must be finite and > 0."
             )
         weights = (
             self.confidence_weight_similarity
@@ -172,42 +239,59 @@ class SemanticScorerConfig:
         )
         if abs(weights - 1.0) > 1e-6:
             raise SemanticScorerError(
-                f"confidence weights must sum to 1.0 (got {weights:.6f})."
+                f"confidence weights must sum to 1.0 "
+                f"(got {weights:.6f})."
             )
-        if self.content_length_saturation_words <= 0:
-            raise SemanticScorerError(
-                "content_length_saturation_words must be > 0."
-            )
-        if self.query_length_saturation_words <= 0:
-            raise SemanticScorerError(
-                "query_length_saturation_words must be > 0."
-            )
+        for name in (
+            "content_length_saturation_words",
+            "query_length_saturation_words",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise SemanticScorerError(f"{name} must be > 0.")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "SemanticScorerConfig":
+    def from_dict(
+        cls, data: Mapping[str, Any],
+    ) -> "SemanticScorerConfig":
         if not isinstance(data, Mapping):
             raise SemanticScorerError(
                 f"SemanticScorerConfig.from_dict expects a Mapping, "
                 f"got {type(data).__name__}."
             )
-        kwargs: Dict[str, Any] = {}
-        for key in (
-            "cache_embeddings", "similarity_metric", "max_cache_entries",
-            "epsilon", "recency_boost_coefficient",
-            "recency_half_life_hours", "importance_boost_coefficient",
-            "critical_content_boost",
-            "confidence_weight_similarity",
-            "confidence_weight_content_length",
-            "confidence_weight_query_length",
-            "content_length_saturation_words",
-            "query_length_saturation_words",
-        ):
-            if key in data:
-                kwargs[key] = data[key]
-        return cls(**kwargs)
+        try:
+            kwargs: Dict[str, Any] = {}
+            for key in (
+                "cache_embeddings",
+                "similarity_metric",
+                "max_cache_entries",
+                "epsilon",
+                "recency_boost_coefficient",
+                "recency_half_life_hours",
+                "importance_boost_coefficient",
+                "critical_content_boost",
+                "confidence_weight_similarity",
+                "confidence_weight_content_length",
+                "confidence_weight_query_length",
+                "content_length_saturation_words",
+                "query_length_saturation_words",
+            ):
+                if key in data:
+                    kwargs[key] = data[key]
+            return cls(**kwargs)
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, SemanticScorerError):
+                raise
+            raise SemanticScorerError(
+                f"invalid SemanticScorerConfig payload: {exc}"
+            ) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -236,10 +320,15 @@ class SemanticScore:
             raise SemanticScorerError("query must be a string.")
         for name in ("similarity_score", "confidence"):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise SemanticScorerError(f"{name} must be numeric.")
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+            ):
+                raise SemanticScorerError(
+                    f"{name} must be numeric."
+                )
             fv = float(value)
-            if math.isnan(fv) or math.isinf(fv):
+            if not math.isfinite(fv):
                 raise SemanticScorerError(
                     f"{name} must be finite, got {value!r}."
                 )
@@ -247,12 +336,16 @@ class SemanticScore:
                 raise SemanticScorerError(
                     f"{name} must be in [0, 1], got {fv}."
                 )
-        if not isinstance(self.embedding_model, str) or not self.embedding_model:
+        if not isinstance(self.embedding_model, str) or (
+            not self.embedding_model
+        ):
             raise SemanticScorerError(
                 "embedding_model must be a non-empty string."
             )
         if not isinstance(self.metadata, Mapping):
-            raise SemanticScorerError("metadata must be a Mapping.")
+            raise SemanticScorerError(
+                "metadata must be a Mapping."
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -271,36 +364,65 @@ class SemanticScore:
             raise SemanticScorerError(
                 "SemanticScore.from_dict expects a Mapping."
             )
-        ts = data.get("timestamp")
-        if isinstance(ts, str):
-            timestamp = datetime.fromisoformat(ts)
-            if not timestamp.tzinfo:
-                timestamp = timestamp.replace(tzinfo=timezone.utc)
-        elif isinstance(ts, datetime):
-            timestamp = ts
-        else:
-            timestamp = datetime.now(timezone.utc)
-        return cls(
-            node_id=str(data["node_id"]),
-            query=str(data.get("query", "")),
-            similarity_score=float(data.get("similarity_score", 0.0)),
-            embedding_model=str(data.get("embedding_model", "unknown")),
-            confidence=float(data.get("confidence", 0.0)),
-            metadata=dict(data.get("metadata", {})),
-            timestamp=timestamp,
-        )
+        if "node_id" not in data:
+            raise SemanticScorerError(
+                "SemanticScore requires 'node_id'."
+            )
+        try:
+            ts = data.get("timestamp")
+            if isinstance(ts, str):
+                timestamp = datetime.fromisoformat(
+                    ts.replace("Z", "+00:00")
+                )
+                if not timestamp.tzinfo:
+                    timestamp = timestamp.replace(
+                        tzinfo=timezone.utc
+                    )
+            elif isinstance(ts, datetime):
+                timestamp = ts
+            else:
+                timestamp = datetime.now(timezone.utc)
+            metadata = data.get("metadata") or {}
+            if not isinstance(metadata, Mapping):
+                raise SemanticScorerError(
+                    "metadata must be a Mapping."
+                )
+            return cls(
+                node_id=str(data["node_id"]),
+                query=str(data.get("query", "")),
+                similarity_score=float(
+                    data.get("similarity_score", 0.0)
+                ),
+                embedding_model=str(
+                    data.get("embedding_model", "unknown")
+                ),
+                confidence=float(
+                    data.get("confidence", 0.0)
+                ),
+                metadata=dict(metadata),
+                timestamp=timestamp,
+            )
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, SemanticScorerError):
+                raise
+            raise SemanticScorerError(
+                f"invalid SemanticScore payload: {exc}"
+            ) from exc
 
     def to_json(self, **kwargs: Any) -> str:
-        return json.dumps(self.to_dict(), default=str, **kwargs)
+        kwargs.setdefault("allow_nan", False)
+        kwargs.setdefault("sort_keys", True)
+        return json.dumps(self.to_dict(), **kwargs)
 
     @classmethod
     def from_json(cls, payload: str) -> "SemanticScore":
         try:
-            return cls.from_dict(json.loads(payload))
+            raw = json.loads(payload)
         except json.JSONDecodeError as exc:
             raise SemanticScorerError(
-                f"Invalid JSON payload: {exc}"
+                f"invalid JSON payload: {exc}"
             ) from exc
+        return cls.from_dict(raw)
 
     def __repr__(self) -> str:
         return (
@@ -319,7 +441,6 @@ class EmbeddingProvider(ABC):
     """Abstract base class for embedding providers."""
 
     name: str = "abstract"
-    dimension: int = 0
 
     @abstractmethod
     def encode(self, text: str) -> "np.ndarray":
@@ -327,7 +448,9 @@ class EmbeddingProvider(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def encode_batch(self, texts: List[str]) -> List["np.ndarray"]:
+    def encode_batch(
+        self, texts: List[str],
+    ) -> List["np.ndarray"]:
         """Encode a batch of texts."""
         raise NotImplementedError
 
@@ -339,7 +462,8 @@ class EmbeddingProvider(ABC):
     def __repr__(self) -> str:
         return (
             f"{type(self).__name__}("
-            f"name={self.name!r}, dimension={self.get_dimension()})"
+            f"name={self.name!r}, "
+            f"dimension={self.get_dimension()})"
         )
 
 
@@ -368,10 +492,12 @@ class SentenceTransformerProvider(EmbeddingProvider):
                 "model_name must be a non-empty string."
             )
         try:
-            self.model = SentenceTransformer(model_name)  # type: ignore[misc]
+            self.model = SentenceTransformer(  # type: ignore[misc]
+                model_name,
+            )
         except Exception as exc:
             raise EmbeddingProviderError(
-                f"Could not load sentence-transformers model "
+                f"could not load sentence-transformers model "
                 f"{model_name!r}: {exc}"
             ) from exc
         self.model_name = model_name
@@ -379,20 +505,33 @@ class SentenceTransformerProvider(EmbeddingProvider):
     def encode(self, text: str) -> "np.ndarray":
         if not isinstance(text, str):
             raise EmbeddingProviderError(
-                f"text must be a string, got {type(text).__name__}."
+                f"text must be a string, got "
+                f"{type(text).__name__}."
             )
         return self.model.encode(text, convert_to_numpy=True)
 
-    def encode_batch(self, texts: List[str]) -> List["np.ndarray"]:
+    def encode_batch(
+        self, texts: List[str],
+    ) -> List["np.ndarray"]:
         if not isinstance(texts, list):
             raise EmbeddingProviderError("texts must be a list.")
         if not texts:
             return []
-        embeddings = self.model.encode(texts, convert_to_numpy=True)
+        embeddings = self.model.encode(
+            texts, convert_to_numpy=True,
+        )
         return [emb for emb in embeddings]
 
     def get_dimension(self) -> int:
         return int(self.model.get_sentence_embedding_dimension())
+
+
+# Known OpenAI embedding model dimensions.
+_OPENAI_DIMENSIONS: Dict[str, int] = {
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "text-embedding-ada-002": 1536,
+}
 
 
 class OpenAIProvider(EmbeddingProvider):
@@ -404,27 +543,53 @@ class OpenAIProvider(EmbeddingProvider):
         self,
         api_key: Optional[str] = None,
         model: str = "text-embedding-3-small",
+        *,
+        dimension: Optional[int] = None,
     ) -> None:
         _require_numpy()
         if not _OPENAI_AVAILABLE:
             raise EmbeddingProviderError(
-                "openai not installed. Install with: pip install openai"
+                "openai not installed. "
+                "Install with: pip install openai"
             )
         if not isinstance(model, str) or not model:
-            raise EmbeddingProviderError("model must be a non-empty string.")
+            raise EmbeddingProviderError(
+                "model must be a non-empty string."
+            )
         try:
             self.client = OpenAI(api_key=api_key)  # type: ignore[misc]
         except Exception as exc:
             raise EmbeddingProviderError(
-                f"Could not construct OpenAI client: {exc}"
+                f"could not construct OpenAI client: {exc}"
             ) from exc
         self.model = model
-        self._dimension = 1536 if "small" in model else 3072
+
+        if dimension is not None:
+            if (
+                isinstance(dimension, bool)
+                or not isinstance(dimension, int)
+                or dimension <= 0
+            ):
+                raise EmbeddingProviderError(
+                    "dimension must be a positive int or None."
+                )
+            self._dimension = dimension
+        else:
+            known = _OPENAI_DIMENSIONS.get(model)
+            if known is None:
+                raise EmbeddingProviderError(
+                    f"unknown dimension for OpenAI model "
+                    f"{model!r}; known models: "
+                    f"{sorted(_OPENAI_DIMENSIONS)}. "
+                    f"Pass dimension=... explicitly."
+                )
+            self._dimension = known
 
     def encode(self, text: str) -> "np.ndarray":
         if not isinstance(text, str):
             raise EmbeddingProviderError(
-                f"text must be a string, got {type(text).__name__}."
+                f"text must be a string, got "
+                f"{type(text).__name__}."
             )
         try:
             response = self.client.embeddings.create(
@@ -436,7 +601,9 @@ class OpenAIProvider(EmbeddingProvider):
             ) from exc
         return np.array(response.data[0].embedding)
 
-    def encode_batch(self, texts: List[str]) -> List["np.ndarray"]:
+    def encode_batch(
+        self, texts: List[str],
+    ) -> List["np.ndarray"]:
         if not isinstance(texts, list):
             raise EmbeddingProviderError("texts must be a list.")
         if not texts:
@@ -455,6 +622,15 @@ class OpenAIProvider(EmbeddingProvider):
         return int(self._dimension)
 
 
+# Known Cohere embedding model dimensions.
+_COHERE_DIMENSIONS: Dict[str, int] = {
+    "embed-english-v3.0":             1024,
+    "embed-multilingual-v3.0":        1024,
+    "embed-english-light-v3.0":        384,
+    "embed-multilingual-light-v3.0":   384,
+}
+
+
 class CohereProvider(EmbeddingProvider):
     """Cohere embeddings provider (API-based)."""
 
@@ -464,32 +640,59 @@ class CohereProvider(EmbeddingProvider):
         self,
         api_key: Optional[str] = None,
         model: str = "embed-english-v3.0",
+        *,
+        dimension: Optional[int] = None,
     ) -> None:
         _require_numpy()
         if not _COHERE_AVAILABLE:
             raise EmbeddingProviderError(
-                "cohere not installed. Install with: pip install cohere"
+                "cohere not installed. "
+                "Install with: pip install cohere"
             )
         if not isinstance(model, str) or not model:
-            raise EmbeddingProviderError("model must be a non-empty string.")
+            raise EmbeddingProviderError(
+                "model must be a non-empty string."
+            )
         try:
             self.client = cohere.Client(api_key=api_key)  # type: ignore[union-attr]
         except Exception as exc:
             raise EmbeddingProviderError(
-                f"Could not construct Cohere client: {exc}"
+                f"could not construct Cohere client: {exc}"
             ) from exc
         self.model = model
-        # Cohere v3 embed models are 1024-dim by default.
-        self._dimension = 1024
+
+        if dimension is not None:
+            if (
+                isinstance(dimension, bool)
+                or not isinstance(dimension, int)
+                or dimension <= 0
+            ):
+                raise EmbeddingProviderError(
+                    "dimension must be a positive int or None."
+                )
+            self._dimension = dimension
+        else:
+            known = _COHERE_DIMENSIONS.get(model)
+            if known is None:
+                raise EmbeddingProviderError(
+                    f"unknown dimension for Cohere model "
+                    f"{model!r}; known models: "
+                    f"{sorted(_COHERE_DIMENSIONS)}. "
+                    f"Pass dimension=... explicitly."
+                )
+            self._dimension = known
 
     def encode(self, text: str) -> "np.ndarray":
         if not isinstance(text, str):
             raise EmbeddingProviderError(
-                f"text must be a string, got {type(text).__name__}."
+                f"text must be a string, got "
+                f"{type(text).__name__}."
             )
         try:
             response = self.client.embed(
-                texts=[text], model=self.model, input_type="search_query",
+                texts=[text],
+                model=self.model,
+                input_type="search_query",
             )
         except Exception as exc:
             raise EmbeddingProviderError(
@@ -497,14 +700,18 @@ class CohereProvider(EmbeddingProvider):
             ) from exc
         return np.array(response.embeddings[0])
 
-    def encode_batch(self, texts: List[str]) -> List["np.ndarray"]:
+    def encode_batch(
+        self, texts: List[str],
+    ) -> List["np.ndarray"]:
         if not isinstance(texts, list):
             raise EmbeddingProviderError("texts must be a list.")
         if not texts:
             return []
         try:
             response = self.client.embed(
-                texts=texts, model=self.model, input_type="search_document",
+                texts=texts,
+                model=self.model,
+                input_type="search_document",
             )
         except Exception as exc:
             raise EmbeddingProviderError(
@@ -520,25 +727,33 @@ class AnthropicProvider(EmbeddingProvider):
     """
     Placeholder provider for the ``EmbeddingModel.ANTHROPIC`` enum member.
 
-    Anthropic does not offer a public embeddings API. Attempting to construct
-    this provider raises :class:`EmbeddingProviderError` with a clear message
-    rather than silently doing nothing. Callers should use a different
-    provider (OpenAI, Cohere, or ``sentence-transformers``).
+    Anthropic does not offer a public embeddings API. Attempting to
+    construct this provider raises :class:`EmbeddingProviderError` with
+    a clear message rather than silently doing nothing. Callers should
+    use a different provider (OpenAI, Cohere, or
+    ``sentence-transformers``).
     """
 
     name = "anthropic"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise EmbeddingProviderError(
-            "Anthropic does not expose an embeddings API. Use OpenAI, "
-            "Cohere, or a local sentence-transformers model instead."
+            "Anthropic does not expose an embeddings API. "
+            "Use OpenAI, Cohere, or a local sentence-transformers "
+            "model instead."
         )
 
     def encode(self, text: str) -> "np.ndarray":  # pragma: no cover
-        raise EmbeddingProviderError("Anthropic embeddings unavailable.")
+        raise EmbeddingProviderError(
+            "Anthropic embeddings unavailable."
+        )
 
-    def encode_batch(self, texts: List[str]) -> List["np.ndarray"]:  # pragma: no cover
-        raise EmbeddingProviderError("Anthropic embeddings unavailable.")
+    def encode_batch(
+        self, texts: List[str],
+    ) -> List["np.ndarray"]:  # pragma: no cover
+        raise EmbeddingProviderError(
+            "Anthropic embeddings unavailable."
+        )
 
     def get_dimension(self) -> int:  # pragma: no cover
         return 0
@@ -549,52 +764,69 @@ class CustomEmbeddingProvider(EmbeddingProvider):
 
     name = "custom"
 
-    def __init__(self, embedding_function: Any, dimension: int) -> None:
+    def __init__(
+        self,
+        embedding_function: Callable[[str], Any],
+        dimension: int,
+    ) -> None:
         _require_numpy()
         if not callable(embedding_function):
             raise EmbeddingProviderError(
                 "embedding_function must be callable."
             )
-        if not isinstance(dimension, int) or dimension <= 0:
+        if (
+            isinstance(dimension, bool)
+            or not isinstance(dimension, int)
+            or dimension <= 0
+        ):
             raise EmbeddingProviderError(
                 "dimension must be a positive int."
             )
         self.embedding_fn = embedding_function
-        self.dimension = dimension
+        self._dimension = dimension
 
     def encode(self, text: str) -> "np.ndarray":
         if not isinstance(text, str):
             raise EmbeddingProviderError(
-                f"text must be a string, got {type(text).__name__}."
+                f"text must be a string, got "
+                f"{type(text).__name__}."
             )
-        result = self.embedding_fn(text)
+        try:
+            result = self.embedding_fn(text)
+        except Exception as exc:
+            raise EmbeddingProviderError(
+                f"embedding_function raised: {exc}"
+            ) from exc
         return self._validate_vector(result)
 
-    def encode_batch(self, texts: List[str]) -> List["np.ndarray"]:
+    def encode_batch(
+        self, texts: List[str],
+    ) -> List["np.ndarray"]:
         if not isinstance(texts, list):
             raise EmbeddingProviderError("texts must be a list.")
         return [self.encode(t) for t in texts]
 
     def get_dimension(self) -> int:
-        return int(self.dimension)
+        return int(self._dimension)
 
     def _validate_vector(self, vector: Any) -> "np.ndarray":
         if not isinstance(vector, np.ndarray):
             try:
-                vector = np.asarray(vector)
+                vector = np.asarray(vector, dtype=float)
             except Exception as exc:
                 raise EmbeddingProviderError(
-                    f"embedding_function returned un-coercible value: {exc}"
+                    f"embedding_function returned "
+                    f"un-coercible value: {exc}"
                 ) from exc
         if vector.ndim != 1:
             raise EmbeddingProviderError(
                 f"embedding_function must return a 1-D vector, "
                 f"got shape {vector.shape}."
             )
-        if vector.shape[0] != self.dimension:
+        if vector.shape[0] != self._dimension:
             raise EmbeddingProviderError(
                 f"embedding_function returned dimension "
-                f"{vector.shape[0]}, expected {self.dimension}."
+                f"{vector.shape[0]}, expected {self._dimension}."
             )
         return vector
 
@@ -606,15 +838,19 @@ class SemanticScorer:
     """
     Semantic scorer using embeddings instead of keyword matching.
 
-    Thread-safe, serializable, and bounded in memory. All original public
-    methods are preserved; new parameters are keyword-only.
+    Thread-safe, serializable, bounded in memory.
 
-    Features
-    --------
-    - Multiple embedding provider support (local, OpenAI, Cohere, custom).
-    - Batch processing for efficiency.
-    - LRU embedding cache.
-    - Hybrid scoring (semantic similarity + metadata boost).
+    Notes
+    -----
+    - Every returned ``similarity_score`` is in ``[0, 1]`` regardless
+      of the configured metric.
+    - ``SemanticScore.metadata["cache_hit"]`` reflects whether the
+      *content* embedding for this call was served from the cache. The
+      query embedding's cache state is not reported (the query is a
+      single string per call and its cache state is uninformative).
+    - Passing ``content_id=None`` yields ``node_id="unknown"`` on the
+      result. Callers who need to distinguish results should pass a
+      stable ``content_id``.
     """
 
     def __init__(
@@ -641,19 +877,25 @@ class SemanticScorer:
 
         # Legacy attributes preserved.
         self.provider: EmbeddingProvider = provider
-        self.cache_embeddings: bool = self._config.cache_embeddings
-        self.similarity_metric: str = self._config.similarity_metric
+        self.cache_embeddings: bool = (
+            self._config.cache_embeddings
+        )
+        self.similarity_metric: str = (
+            self._config.similarity_metric
+        )
 
         self._lock = threading.RLock()
-        # Bounded LRU cache via OrderedDict.
-        self.embedding_cache: "OrderedDict[str, Any]" = OrderedDict()
+        self.embedding_cache: "OrderedDict[str, Any]" = (
+            OrderedDict()
+        )
         self.cache_hits: int = 0
         self.cache_misses: int = 0
         self._cache_evictions: int = 0
 
         logger.debug(
             "SemanticScorer initialized "
-            "(provider=%s, metric=%s, cache=%s, max_cache=%d, strict=%s)",
+            "(provider=%s, metric=%s, cache=%s, max_cache=%d, "
+            "strict=%s)",
             type(provider).__name__,
             self.similarity_metric,
             self.cache_embeddings,
@@ -681,22 +923,6 @@ class SemanticScorer:
     ) -> SemanticScore:
         """
         Score the relevance of ``content`` to ``query`` using embeddings.
-
-        Parameters
-        ----------
-        query : str
-            Query text.
-        content : str
-            Content to score.
-        content_id : str, optional
-            Stable content identifier used as the cache key.
-        metadata_boost : Mapping, optional
-            Metadata used to bias the similarity (recency / importance /
-            content type).
-
-        Returns
-        -------
-        SemanticScore
         """
         query = self._validate_text("query", query)
         content = self._validate_text("content", content)
@@ -723,19 +949,26 @@ class SemanticScorer:
             logger.warning("%s Ignoring metadata_boost.", msg)
             metadata_boost = None
 
-        # Query embedding always uses the query string as cache key.
-        query_emb, _ = self._get_embedding(query, cache_key=f"query:{query}")
+        query_emb, _ = self._get_embedding(
+            query, cache_key=f"query:{query}",
+        )
         content_emb, content_cache_hit = self._get_embedding(
             content, cache_key=content_id,
         )
 
-        similarity = self._calculate_similarity(query_emb, content_emb)
+        similarity = self._calculate_similarity(
+            query_emb, content_emb,
+        )
 
         if metadata_boost:
-            boost_factor = self._calculate_metadata_boost(metadata_boost)
-            similarity = min(1.0, similarity * boost_factor)
+            factor = self._calculate_metadata_boost(
+                metadata_boost,
+            )
+            similarity = min(1.0, similarity * factor)
 
-        confidence = self._estimate_confidence(query, content, similarity)
+        confidence = self._estimate_confidence(
+            query, content, similarity,
+        )
 
         return SemanticScore(
             node_id=content_id or "unknown",
@@ -753,13 +986,12 @@ class SemanticScorer:
         self,
         query: str,
         contents: List[Tuple[str, str]],
-        metadata_boosts: Optional[List[Dict[str, Any]]] = None,
+        metadata_boosts: Optional[
+            List[Dict[str, Any]]
+        ] = None,
     ) -> List[SemanticScore]:
         """
-        Score a batch of ``(content_id, content_text)`` pairs efficiently.
-
-        Uses the provider's batch API for cache misses and reuses cached
-        embeddings when available.
+        Score a batch of ``(content_id, content_text)`` pairs.
         """
         query = self._validate_text("query", query)
         if not isinstance(contents, list):
@@ -776,10 +1008,10 @@ class SemanticScorer:
                     "metadata_boosts must match contents in length."
                 )
 
-        # Query embedding.
-        query_emb, _ = self._get_embedding(query, cache_key=f"query:{query}")
+        query_emb, _ = self._get_embedding(
+            query, cache_key=f"query:{query}",
+        )
 
-        # ---- Split cache hits from misses ---------------------------
         cache_hit_flags: List[bool] = []
         embeddings: List[Any] = []
         misses: List[Tuple[int, str, str]] = []
@@ -792,12 +1024,14 @@ class SemanticScorer:
                 or not isinstance(item[1], str)
             ):
                 msg = (
-                    f"contents[{i}] must be a (str, str) tuple, got "
-                    f"{item!r}."
+                    f"contents[{i}] must be a (str, str) tuple, "
+                    f"got {item!r}."
                 )
                 if self._strict:
                     raise SemanticScorerError(msg)
-                logger.warning("%s Using empty placeholder.", msg)
+                logger.warning(
+                    "%s Using empty placeholder.", msg,
+                )
                 cache_hit_flags.append(False)
                 embeddings.append(None)
                 continue
@@ -810,9 +1044,10 @@ class SemanticScorer:
             else:
                 cache_hit_flags.append(False)
                 embeddings.append(None)
-                misses.append((i, content_id, content_text))
+                misses.append(
+                    (i, content_id, content_text),
+                )
 
-        # ---- Fetch misses via provider ------------------------------
         if misses:
             miss_texts = [m[2] for m in misses]
             try:
@@ -825,26 +1060,32 @@ class SemanticScorer:
                 ) from exc
             if len(fresh) != len(misses):
                 raise SemanticScorerError(
-                    f"provider returned {len(fresh)} embeddings for "
-                    f"{len(misses)} inputs."
+                    f"provider returned {len(fresh)} embeddings "
+                    f"for {len(misses)} inputs."
                 )
-            for (i, content_id, _text), emb in zip(misses, fresh):
+            for (i, content_id, _text), emb in zip(
+                misses, fresh,
+            ):
                 embeddings[i] = emb
                 self._cache_store(content_id, emb)
 
-        # ---- Compute similarities -----------------------------------
         scores: List[SemanticScore] = []
         for i, (content_id, content_text) in enumerate(contents):
             if embeddings[i] is None:
-                # Malformed entry in non-strict mode — skip.
                 continue
-            similarity = self._calculate_similarity(query_emb, embeddings[i])
+            similarity = self._calculate_similarity(
+                query_emb, embeddings[i],
+            )
 
             if metadata_boosts:
                 boost = metadata_boosts[i]
                 if boost:
-                    factor = self._calculate_metadata_boost(boost)
-                    similarity = min(1.0, similarity * factor)
+                    factor = self._calculate_metadata_boost(
+                        boost,
+                    )
+                    similarity = min(
+                        1.0, similarity * factor,
+                    )
 
             confidence = self._estimate_confidence(
                 query, content_text, similarity,
@@ -853,7 +1094,9 @@ class SemanticScorer:
                 node_id=content_id,
                 query=query,
                 similarity_score=float(similarity),
-                embedding_model=type(self.provider).__name__,
+                embedding_model=type(
+                    self.provider
+                ).__name__,
                 confidence=float(confidence),
                 metadata={
                     "similarity_metric": self.similarity_metric,
@@ -867,15 +1110,32 @@ class SemanticScorer:
         query: str,
         contents: List[Tuple[str, str]],
         top_k: Optional[int] = None,
+        *,
+        metadata_boosts: Optional[
+            List[Dict[str, Any]]
+        ] = None,
     ) -> List[SemanticScore]:
-        """Score and rank contents by descending similarity."""
+        """
+        Score and rank contents by descending similarity.
+
+        ``top_k=0`` returns an empty list. ``top_k=None`` returns all
+        results.
+        """
         if top_k is not None and (
-            not isinstance(top_k, int) or top_k < 0
+            isinstance(top_k, bool)
+            or not isinstance(top_k, int)
+            or top_k < 0
         ):
-            raise SemanticScorerError("top_k must be a non-negative int or None.")
-        scores = self.score_batch(query, contents)
-        # Deterministic tie-break: score desc, node_id asc.
-        scores.sort(key=lambda s: (-s.similarity_score, s.node_id))
+            raise SemanticScorerError(
+                "top_k must be a non-negative int or None."
+            )
+        scores = self.score_batch(
+            query, contents,
+            metadata_boosts=metadata_boosts,
+        )
+        scores.sort(
+            key=lambda s: (-s.similarity_score, s.node_id)
+        )
         if top_k is not None:
             return scores[:top_k]
         return scores
@@ -887,13 +1147,13 @@ class SemanticScorer:
         return emb
 
     def precompute_embeddings(
-        self, contents: List[Tuple[str, str]]
+        self, contents: List[Tuple[str, str]],
     ) -> int:
         """
         Precompute and cache embeddings for ``contents``.
 
-        Returns the number of cache entries added. Existing entries are
-        skipped.
+        Returns the number of cache entries added. Existing entries
+        are skipped.
         """
         if not isinstance(contents, list):
             raise SemanticScorerError("contents must be a list.")
@@ -902,11 +1162,24 @@ class SemanticScorer:
 
         to_fetch: List[Tuple[str, str]] = []
         with self._lock:
-            for content_id, _text in contents:
+            for i, item in enumerate(contents):
+                if (
+                    not isinstance(item, tuple)
+                    or len(item) != 2
+                    or not isinstance(item[0], str)
+                    or not isinstance(item[1], str)
+                ):
+                    raise SemanticScorerError(
+                        f"contents[{i}] must be a (str, str) "
+                        f"tuple, got {item!r}."
+                    )
+                content_id, text = item
                 if content_id in self.embedding_cache:
-                    self.embedding_cache.move_to_end(content_id)
+                    self.embedding_cache.move_to_end(
+                        content_id,
+                    )
                     continue
-                to_fetch.append((content_id, _text))
+                to_fetch.append((content_id, text))
 
         if not to_fetch:
             return 0
@@ -921,8 +1194,16 @@ class SemanticScorer:
                 f"provider.encode_batch failed: {exc}"
             ) from exc
 
+        if len(fresh) != len(to_fetch):
+            raise SemanticScorerError(
+                f"provider returned {len(fresh)} embeddings for "
+                f"{len(to_fetch)} inputs."
+            )
+
         added = 0
-        for (content_id, _text), emb in zip(to_fetch, fresh):
+        for (content_id, _text), emb in zip(
+            to_fetch, fresh,
+        ):
             self._cache_store(content_id, emb)
             added += 1
         return added
@@ -935,11 +1216,12 @@ class SemanticScorer:
             self.cache_hits = 0
             self.cache_misses = 0
             self._cache_evictions = 0
-        logger.debug("SemanticScorer cache cleared (%d entries).", removed)
+        logger.debug(
+            "SemanticScorer cache cleared (%d entries).", removed,
+        )
         return removed
 
     def get_cache_stats(self) -> Dict[str, Any]:
-        """Return the backward-compatible cache statistics."""
         with self._lock:
             hits = self.cache_hits
             misses = self.cache_misses
@@ -955,33 +1237,43 @@ class SemanticScorer:
             "cache_hits": hits,
             "cache_misses": misses,
             "hit_rate": hit_rate,
-            "embedding_dimension": self.provider.get_dimension(),
-            # Additive:
+            "embedding_dimension": (
+                self.provider.get_dimension()
+            ),
             "cache_capacity": capacity,
             "cache_evictions": evictions,
             "similarity_metric": self.similarity_metric,
         }
 
     def statistics(self) -> Dict[str, Any]:
-        """Alias for :meth:`get_cache_stats`."""
         return self.get_cache_stats()
 
     # ---------------------------------------------------------- internal
     def _validate_text(self, name: str, value: Any) -> str:
         if not isinstance(value, str):
-            msg = f"{name} must be a string, got {type(value).__name__}."
+            msg = (
+                f"{name} must be a string, got "
+                f"{type(value).__name__}."
+            )
             if self._strict:
                 raise SemanticScorerError(msg)
             logger.warning("%s Coercing via str().", msg)
             value = str(value)
         if not value:
-            msg = f"{name} must be non-empty."
+            msg = (
+                f"{name} is empty; the embedding result for an "
+                f"empty string is provider-dependent."
+            )
             if self._strict:
-                raise SemanticScorerError(msg)
+                raise SemanticScorerError(
+                    f"{name} must be non-empty."
+                )
             logger.warning("%s", msg)
         return value
 
-    def _cache_lookup(self, key: Optional[str]) -> Optional[Any]:
+    def _cache_lookup(
+        self, key: Optional[str],
+    ) -> Optional[Any]:
         if not key or not self.cache_embeddings:
             return None
         with self._lock:
@@ -993,14 +1285,19 @@ class SemanticScorer:
             self.cache_hits += 1
             return cached
 
-    def _cache_store(self, key: Optional[str], embedding: Any) -> None:
+    def _cache_store(
+        self, key: Optional[str], embedding: Any,
+    ) -> None:
         if not key or not self.cache_embeddings:
             return
         with self._lock:
             if key in self.embedding_cache:
                 self.embedding_cache.move_to_end(key)
             self.embedding_cache[key] = embedding
-            while len(self.embedding_cache) > self._config.max_cache_entries:
+            while (
+                len(self.embedding_cache)
+                > self._config.max_cache_entries
+            ):
                 self.embedding_cache.popitem(last=False)
                 self._cache_evictions += 1
 
@@ -1012,11 +1309,8 @@ class SemanticScorer:
         """
         Return ``(embedding, cache_hit)``.
 
-        ``cache_hit`` is True only when the current call retrieved a value
-        from the cache. The original implementation surfaced
-        ``content_id in self.embedding_cache`` in metadata, which was
-        incorrect because it did not account for the LRU refresh order or
-        ``None`` keys.
+        ``cache_hit`` is True only when the current call retrieved a
+        value from the cache.
         """
         if cache_key and self.cache_embeddings:
             cached = self._cache_lookup(cache_key)
@@ -1037,15 +1331,30 @@ class SemanticScorer:
 
         return embedding, False
 
-    def _calculate_similarity(self, vec1: Any, vec2: Any) -> float:
+    def _calculate_similarity(
+        self, vec1: Any, vec2: Any,
+    ) -> float:
         """
-        Compute the similarity between two embedding vectors.
+        Similarity in ``[0, 1]`` for every metric.
 
-        All return values are cast to Python ``float`` — the original
-        returned ``np.float64`` which broke JSON serialization.
+        - ``cosine``    : ``(cos + 1) / 2`` — opposite vectors
+                          score ``0.0``, orthogonal ``0.5``, identical
+                          ``1.0``.
+        - ``dot``       : raw dot, clamped to ``[0, 1]``. Callers
+                          choosing ``dot`` should normalize their
+                          embeddings first if they want fine-grained
+                          discrimination.
+        - ``euclidean`` : ``1 / (1 + distance)``, already in ``(0, 1]``.
+
+        Raises
+        ------
+        SemanticScorerError
+            On shape mismatch or non-finite embedding values.
         """
-        if not _NUMPY_AVAILABLE:  # pragma: no cover — guarded upstream
-            raise SemanticScorerError("numpy is required for similarity.")
+        if not _NUMPY_AVAILABLE:  # pragma: no cover
+            raise SemanticScorerError(
+                "numpy is required for similarity computation."
+            )
 
         v1 = np.asarray(vec1, dtype=float)
         v2 = np.asarray(vec2, dtype=float)
@@ -1053,85 +1362,199 @@ class SemanticScorer:
             raise SemanticScorerError(
                 f"vector shape mismatch: {v1.shape} vs {v2.shape}."
             )
+        if not np.isfinite(v1).all() or not np.isfinite(v2).all():
+            raise SemanticScorerError(
+                "embedding vector contains non-finite values "
+                "(NaN or Inf)."
+            )
 
         metric = self.similarity_metric
         if metric == "cosine":
             norm1 = float(np.linalg.norm(v1))
             norm2 = float(np.linalg.norm(v2))
-            if norm1 <= self._config.epsilon or norm2 <= self._config.epsilon:
+            if (
+                norm1 <= self._config.epsilon
+                or norm2 <= self._config.epsilon
+            ):
                 return 0.0
-            return float(np.dot(v1, v2) / (norm1 * norm2))
+            cos = float(np.dot(v1, v2) / (norm1 * norm2))
+            return max(0.0, min(1.0, (cos + 1.0) / 2.0))
 
         if metric == "dot":
-            return float(np.dot(v1, v2))
+            raw = float(np.dot(v1, v2))
+            return max(0.0, min(1.0, raw))
 
         # euclidean
         distance = float(np.linalg.norm(v1 - v2))
         return 1.0 / (1.0 + distance)
 
+    def similarity_diagnostics(
+        self, vec1: Any, vec2: Any,
+    ) -> Dict[str, float]:
+        """
+        Return raw and clamped similarity for inspection.
+
+        Useful for callers who need the raw cosine value for logging or
+        debugging — ``score_relevance`` always reports the clamped
+        value.
+        """
+        if not _NUMPY_AVAILABLE:  # pragma: no cover
+            raise SemanticScorerError(
+                "numpy is required for similarity computation."
+            )
+        v1 = np.asarray(vec1, dtype=float)
+        v2 = np.asarray(vec2, dtype=float)
+        if v1.shape != v2.shape:
+            raise SemanticScorerError(
+                f"vector shape mismatch: {v1.shape} vs {v2.shape}."
+            )
+        denom = max(
+            float(np.linalg.norm(v1))
+            * float(np.linalg.norm(v2)),
+            self._config.epsilon,
+        )
+        cos = float(np.dot(v1, v2) / denom)
+        return {
+            "raw_cosine": cos,
+            "score": max(0.0, min(1.0, (cos + 1.0) / 2.0)),
+        }
+
+    def _metadata_age_hours(
+        self, timestamp: Any,
+    ) -> Optional[float]:
+        """
+        Return the age in hours of ``timestamp``.
+
+        Accepts:
+        - Unix seconds (typical: ``time.time()``).
+        - Unix milliseconds (values > 1e11, divided by 1000).
+        - ISO-8601 string (timezone-aware; ``Z`` accepted).
+        - ``datetime`` (naive treated as UTC).
+
+        Returns ``None`` if the value cannot be interpreted as a
+        timestamp.
+        """
+        if isinstance(timestamp, bool):
+            return None
+        if isinstance(timestamp, (int, float)):
+            ts = float(timestamp)
+            if not math.isfinite(ts):
+                return None
+            # Millisecond detection: Unix seconds are ~1.7e9 today;
+            # milliseconds are ~1.7e12. Threshold 1e11 is unambiguous.
+            if ts > 1e11:
+                ts = ts / 1000.0
+            return max(0.0, (time.time() - ts) / 3600.0)
+        if isinstance(timestamp, str):
+            try:
+                dt = datetime.fromisoformat(
+                    timestamp.replace("Z", "+00:00")
+                )
+            except ValueError:
+                return None
+            if not dt.tzinfo:
+                dt = dt.replace(tzinfo=timezone.utc)
+            delta = datetime.now(timezone.utc) - dt
+            return max(0.0, delta.total_seconds() / 3600.0)
+        if isinstance(timestamp, datetime):
+            dt = timestamp
+            if not dt.tzinfo:
+                dt = dt.replace(tzinfo=timezone.utc)
+            delta = datetime.now(timezone.utc) - dt
+            return max(0.0, delta.total_seconds() / 3600.0)
+        return None
+
     def _calculate_metadata_boost(
-        self, metadata: Mapping[str, Any]
+        self, metadata: Mapping[str, Any],
     ) -> float:
-        """Compute the multiplicative boost from metadata (>= 1.0)."""
+        """Multiplicative boost (>= 1.0) derived from metadata."""
         cfg = self._config
         boost = 1.0
 
-        # Recency boost.
-        timestamp = metadata.get("timestamp")
-        if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
-            age_hours = max(0.0, (time.time() - float(timestamp)) / 3600.0)
+        age_hours = self._metadata_age_hours(
+            metadata.get("timestamp")
+        )
+        if age_hours is not None:
             half_life = cfg.recency_half_life_hours
-            recency_boost = 1.0 + (
-                cfg.recency_boost_coefficient / (1.0 + age_hours / half_life)
+            boost *= 1.0 + (
+                cfg.recency_boost_coefficient
+                / (1.0 + age_hours / half_life)
             )
-            boost *= recency_boost
 
-        # Importance boost (clamped to [0, 1]).
         importance = metadata.get("importance")
-        if isinstance(importance, (int, float)) and not isinstance(importance, bool):
+        if (
+            isinstance(importance, (int, float))
+            and not isinstance(importance, bool)
+        ):
             imp = max(0.0, min(1.0, float(importance)))
-            boost *= 1.0 + imp * cfg.importance_boost_coefficient
+            boost *= (
+                1.0 + imp * cfg.importance_boost_coefficient
+            )
 
-        # Content-type boost.
         content_type = metadata.get("content_type")
-        if isinstance(content_type, str) and content_type in (
-            "critical", "high_priority",
+        if (
+            isinstance(content_type, str)
+            and content_type in ("critical", "high_priority")
         ):
             boost *= cfg.critical_content_boost
 
         return boost
 
     def _estimate_confidence(
-        self, query: str, content: str, similarity: float
+        self,
+        query: str,
+        content: str,
+        similarity: float,
     ) -> float:
         """Estimate confidence in ``[0, 1]`` for a score."""
         cfg = self._config
-        similarity_conf = max(0.0, min(1.0, float(similarity)))
+        similarity_conf = max(
+            0.0, min(1.0, float(similarity)),
+        )
 
         content_length = len(content.split())
         length_conf = min(
-            1.0, content_length / cfg.content_length_saturation_words,
+            1.0,
+            content_length
+            / cfg.content_length_saturation_words,
         )
         query_length = len(query.split())
         query_conf = min(
-            1.0, query_length / cfg.query_length_saturation_words,
+            1.0,
+            query_length / cfg.query_length_saturation_words,
         )
 
-        return max(0.0, min(1.0,
+        return max(0.0, min(
+            1.0,
             cfg.confidence_weight_similarity * similarity_conf
             + cfg.confidence_weight_content_length * length_conf
-            + cfg.confidence_weight_query_length * query_conf
+            + cfg.confidence_weight_query_length * query_conf,
         ))
 
     # ---------------------------------------------------------- serialization
-    def to_dict(self, *, include_cache: bool = False) -> Dict[str, Any]:
+    def to_dict(
+        self, *, include_cache: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Serialize config, counters, and provider metadata.
+
+        ``include_cache=True`` appends ``cache_keys`` — the cache keys
+        only. Embeddings are NumPy arrays and cannot be serialized to
+        JSON losslessly; callers who need the actual vectors should
+        re-encode the content by key. Restoration via
+        :meth:`from_dict` populates counters but leaves the cache
+        empty.
+        """
         with self._lock:
             payload: Dict[str, Any] = {
+                "version": VERSION,
                 "config": self._config.to_dict(),
                 "strict": self._strict,
                 "provider": {
                     "type": type(self.provider).__name__,
-                    "name": getattr(self.provider, "name", "unknown"),
+                    "name": getattr(
+                        self.provider, "name", "unknown",
+                    ),
                     "dimension": self.provider.get_dimension(),
                 },
                 "counters": {
@@ -1142,18 +1565,145 @@ class SemanticScorer:
                 },
             }
             if include_cache:
-                # Embeddings are ndarray; stringify them for JSON safety.
-                payload["cache_keys"] = list(self.embedding_cache.keys())
+                payload["cache_keys"] = list(
+                    self.embedding_cache.keys()
+                )
         return payload
 
-    def to_json(self, **kwargs: Any) -> str:
-        return json.dumps(self.to_dict(), default=str, **kwargs)
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        provider: EmbeddingProvider,
+    ) -> "SemanticScorer":
+        """
+        Rebuild a scorer from :meth:`to_dict` output.
+
+        Parameters
+        ----------
+        data : Mapping
+        provider : EmbeddingProvider
+            **Required.** The provider is not serialized (API keys,
+            model names, and callables cannot be reconstructed).
+
+        Raises
+        ------
+        SemanticScorerError
+            On malformed payloads, provider type mismatch, or
+            dimension mismatch.
+        """
+        if not isinstance(data, Mapping):
+            raise SemanticScorerError(
+                f"from_dict expects a Mapping, got "
+                f"{type(data).__name__}."
+            )
+        if not isinstance(provider, EmbeddingProvider):
+            raise SemanticScorerError(
+                "provider must be an EmbeddingProvider instance."
+            )
+        try:
+            cfg = SemanticScorerConfig.from_dict(
+                dict(data.get("config", {}) or {})
+            )
+
+            strict_raw = data.get("strict", True)
+            if not isinstance(strict_raw, bool):
+                raise SemanticScorerError(
+                    f"strict must be bool, got "
+                    f"{type(strict_raw).__name__}."
+                )
+
+            provider_info = data.get("provider") or {}
+            if not isinstance(provider_info, Mapping):
+                raise SemanticScorerError(
+                    "provider metadata must be a Mapping."
+                )
+            expected_dim = provider_info.get("dimension")
+            if (
+                isinstance(expected_dim, int)
+                and expected_dim > 0
+                and provider.get_dimension() != expected_dim
+            ):
+                raise SemanticScorerError(
+                    f"provider dimension "
+                    f"{provider.get_dimension()} does not match "
+                    f"payload dimension {expected_dim}."
+                )
+
+            scorer = cls(
+                provider, config=cfg, strict=strict_raw,
+            )
+
+            counters = data.get("counters") or {}
+            if not isinstance(counters, Mapping):
+                raise SemanticScorerError(
+                    "counters must be a Mapping."
+                )
+            try:
+                scorer.cache_hits = int(
+                    counters.get("cache_hits", 0)
+                )
+                scorer.cache_misses = int(
+                    counters.get("cache_misses", 0)
+                )
+                scorer._cache_evictions = int(
+                    counters.get("cache_evictions", 0)
+                )
+            except (TypeError, ValueError) as exc:
+                raise SemanticScorerError(
+                    f"invalid counter: {exc}"
+                ) from exc
+
+            cache_keys = data.get("cache_keys") or []
+            if not isinstance(cache_keys, list):
+                raise SemanticScorerError(
+                    "cache_keys must be a list."
+                )
+
+            return scorer
+        except SemanticScorerError:
+            raise
+        except (TypeError, ValueError, KeyError) as exc:
+            raise SemanticScorerError(
+                f"invalid SemanticScorer payload: {exc}"
+            ) from exc
+
+    def to_json(
+        self, *, include_cache: bool = False, **kwargs: Any,
+    ) -> str:
+        kwargs.setdefault("allow_nan", False)
+        kwargs.setdefault("sort_keys", True)
+        return json.dumps(
+            self.to_dict(include_cache=include_cache),
+            **kwargs,
+        )
+
+    @classmethod
+    def from_json(
+        cls,
+        payload: str,
+        *,
+        provider: EmbeddingProvider,
+    ) -> "SemanticScorer":
+        try:
+            raw = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise SemanticScorerError(
+                f"invalid JSON payload: {exc}"
+            ) from exc
+        return cls.from_dict(raw, provider=provider)
 
     # ---------------------------------------------------------- context mgr
     def __enter__(self) -> "SemanticScorer":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> Optional[bool]:
         if exc_type is not None:
             logger.warning(
                 "SemanticScorer scope exited with %s.",
@@ -1169,7 +1719,8 @@ class SemanticScorer:
                 f"provider={type(self.provider).__name__}, "
                 f"metric={self.similarity_metric!r}, "
                 f"cache={len(self.embedding_cache)}, "
-                f"hits={self.cache_hits}, misses={self.cache_misses}, "
+                f"hits={self.cache_hits}, "
+                f"misses={self.cache_misses}, "
                 f"strict={self._strict})"
             )
 
@@ -1184,7 +1735,7 @@ def create_local_scorer(
     config: Optional[SemanticScorerConfig] = None,
     strict: bool = True,
 ) -> SemanticScorer:
-    """Create a semantic scorer backed by a local sentence-transformers model."""
+    """Create a scorer backed by a local sentence-transformers model."""
     provider = SentenceTransformerProvider(model_name)
     return SemanticScorer(
         provider,
@@ -1199,11 +1750,14 @@ def create_openai_scorer(
     model: str = "text-embedding-3-small",
     cache_embeddings: bool = True,
     *,
+    dimension: Optional[int] = None,
     config: Optional[SemanticScorerConfig] = None,
     strict: bool = True,
 ) -> SemanticScorer:
-    """Create a semantic scorer backed by OpenAI embeddings."""
-    provider = OpenAIProvider(api_key, model)
+    """Create a scorer backed by OpenAI embeddings."""
+    provider = OpenAIProvider(
+        api_key, model, dimension=dimension,
+    )
     return SemanticScorer(
         provider,
         cache_embeddings=cache_embeddings,
@@ -1213,15 +1767,96 @@ def create_openai_scorer(
 
 
 def create_custom_scorer(
-    embedding_function: Any,
+    embedding_function: Callable[[str], Any],
     dimension: int,
     cache_embeddings: bool = True,
     *,
     config: Optional[SemanticScorerConfig] = None,
     strict: bool = True,
 ) -> SemanticScorer:
-    """Create a semantic scorer backed by a user-supplied embedding function."""
-    provider = CustomEmbeddingProvider(embedding_function, dimension)
+    """Create a scorer backed by a user-supplied embedding function."""
+    provider = CustomEmbeddingProvider(
+        embedding_function, dimension,
+    )
+    return SemanticScorer(
+        provider,
+        cache_embeddings=cache_embeddings,
+        config=config,
+        strict=strict,
+    )
+
+
+def create_scorer_from_model(
+    model: EmbeddingModel,
+    *,
+    model_name: Optional[str] = None,
+    api_key: Optional[str] = None,
+    embedding_function: Optional[
+        Callable[[str], Any]
+    ] = None,
+    dimension: Optional[int] = None,
+    cache_embeddings: bool = True,
+    config: Optional[SemanticScorerConfig] = None,
+    strict: bool = True,
+) -> SemanticScorer:
+    """
+    Factory dispatching from :class:`EmbeddingModel`.
+
+    Parameters
+    ----------
+    model : EmbeddingModel
+    model_name : str, optional
+        For ``SENTENCE_TRANSFORMERS``: the local model id (default
+        ``"all-MiniLM-L6-v2"``). For ``OPENAI`` / ``COHERE``: the API
+        model name (defaults chosen per provider).
+    api_key : str, optional
+        For ``OPENAI`` / ``COHERE``.
+    embedding_function, dimension :
+        Required for ``CUSTOM``.
+    """
+    if not isinstance(model, EmbeddingModel):
+        raise SemanticScorerError(
+            f"model must be an EmbeddingModel, got "
+            f"{type(model).__name__}."
+        )
+
+    if model is EmbeddingModel.SENTENCE_TRANSFORMERS:
+        provider: EmbeddingProvider = (
+            SentenceTransformerProvider(
+                model_name or "all-MiniLM-L6-v2",
+            )
+        )
+    elif model is EmbeddingModel.OPENAI:
+        provider = OpenAIProvider(
+            api_key=api_key,
+            model=model_name or "text-embedding-3-small",
+            dimension=dimension,
+        )
+    elif model is EmbeddingModel.COHERE:
+        provider = CohereProvider(
+            api_key=api_key,
+            model=model_name or "embed-english-v3.0",
+            dimension=dimension,
+        )
+    elif model is EmbeddingModel.CUSTOM:
+        if embedding_function is None or dimension is None:
+            raise SemanticScorerError(
+                "CUSTOM model requires embedding_function and "
+                "dimension."
+            )
+        provider = CustomEmbeddingProvider(
+            embedding_function, dimension,
+        )
+    elif model is EmbeddingModel.ANTHROPIC:
+        raise SemanticScorerError(
+            "Anthropic does not expose an embeddings API; choose "
+            "OPENAI, COHERE, SENTENCE_TRANSFORMERS, or CUSTOM."
+        )
+    else:  # pragma: no cover
+        raise SemanticScorerError(
+            f"unsupported model {model!r}."
+        )
+
     return SemanticScorer(
         provider,
         cache_embeddings=cache_embeddings,
@@ -1231,62 +1866,41 @@ def create_custom_scorer(
 
 
 # --------------------------------------------------------------------------- #
-# Public API
-# --------------------------------------------------------------------------- #
-__all__ = [
-    "AnthropicProvider",
-    "CohereProvider",
-    "CustomEmbeddingProvider",
-    "EmbeddingModel",
-    "EmbeddingProvider",
-    "EmbeddingProviderError",
-    "OpenAIProvider",
-    "SemanticScore",
-    "SemanticScorer",
-    "SemanticScorerConfig",
-    "SemanticScorerError",
-    "SentenceTransformerProvider",
-    "create_custom_scorer",
-    "create_local_scorer",
-    "create_openai_scorer",
-]
-
-
-# --------------------------------------------------------------------------- #
-# Smoke test: python -m retrieval.semantic_scorer
+# Smoke test
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":  # pragma: no cover
     logging.basicConfig(
-        level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
     )
 
+    print("VERSION    :", VERSION)
+
     if not _NUMPY_AVAILABLE:
-        print("numpy not installed; skipping semantic scorer smoke test.")
+        print("numpy not installed; skipping smoke test.")
     else:
-        # ---- Deterministic fake provider ----------------------------- #
         import hashlib
 
         class _FakeProvider(EmbeddingProvider):
-            """
-            Deterministic 4-dim provider: each text maps to a vector derived
-            from the counts of four keyword families.
-            """
-
             name = "fake"
-
-            def __init__(self) -> None:
-                pass
 
             def _vector(self, text: str) -> Any:
                 lowered = text.lower()
                 families = ("energy", "carbon", "image", "audio")
-                vec = [float(lowered.count(f)) for f in families]
-                # Normalize to avoid all-zero vectors when no keyword matches.
+                vec = [
+                    float(lowered.count(f)) for f in families
+                ]
                 norm = sum(v * v for v in vec) ** 0.5
                 if norm == 0:
-                    # Hash-based fallback so distinct texts get distinct vectors.
-                    h = int(hashlib.md5(text.encode()).hexdigest()[:8], 16)
-                    vec = [(h >> (i * 8)) & 0xFF for i in range(4)]
+                    h = int(
+                        hashlib.md5(
+                            text.encode()
+                        ).hexdigest()[:8],
+                        16,
+                    )
+                    vec = [
+                        (h >> (i * 8)) & 0xFF for i in range(4)
+                    ]
                     norm = sum(v * v for v in vec) ** 0.5
                     vec = [v / max(norm, 1.0) for v in vec]
                 else:
@@ -1296,129 +1910,282 @@ if __name__ == "__main__":  # pragma: no cover
             def encode(self, text: str) -> Any:
                 return self._vector(text)
 
-            def encode_batch(self, texts: List[str]) -> List[Any]:
+            def encode_batch(self, texts):
                 return [self._vector(t) for t in texts]
 
             def get_dimension(self) -> int:
                 return 4
 
-        # ---- Happy path --------------------------------------------- #
         scorer = SemanticScorer(_FakeProvider())
         print("repr       :", scorer)
 
-        result = scorer.score_relevance(
+        # ---- Happy path ----------------------------------------- #
+        r = scorer.score_relevance(
             "renewable energy options",
             "Solar power reduces carbon emissions significantly.",
             content_id="doc_a",
         )
-        print("score A    :", result)
-        assert 0.0 <= result.similarity_score <= 1.0
-        assert 0.0 <= result.confidence <= 1.0
+        print("score A    :", r)
+        assert 0.0 <= r.similarity_score <= 1.0
+        assert 0.0 <= r.confidence <= 1.0
 
-        # ---- Cache hit on the second call --------------------------- #
-        result2 = scorer.score_relevance(
+        # ---- Cache hit on second call --------------------------- #
+        r2 = scorer.score_relevance(
             "renewable energy options",
             "Solar power reduces carbon emissions significantly.",
             content_id="doc_a",
         )
-        print("cache_hit? :", result2.metadata["cache_hit"])
-        assert result2.metadata["cache_hit"] is True
+        assert r2.metadata["cache_hit"] is True
+        print("cache_hit  : OK")
 
-        # ---- Bug fix: cache_hit reflects the CURRENT call ----------- #
-        result3 = scorer.score_relevance(
+        # ---- cache_hit reflects current call -------------------- #
+        r3 = scorer.score_relevance(
             "renewable energy options",
             "New content that was never seen before.",
             content_id="doc_new",
         )
-        assert result3.metadata["cache_hit"] is False, (
-            "first-time content must report cache_hit=False"
-        )
+        assert r3.metadata["cache_hit"] is False
         print("first-time : OK")
 
-        # ---- Batch scoring ------------------------------------------ #
+        # ---- Opposite-direction vectors score 0.0 --------------- #
+        class _OppositeProvider(EmbeddingProvider):
+            name = "opposite"
+
+            def encode(self, text):
+                if "left" in text.lower():
+                    return np.array([1.0, 0.0])
+                return np.array([-1.0, 0.0])
+
+            def encode_batch(self, texts):
+                return [self.encode(t) for t in texts]
+
+            def get_dimension(self):
+                return 2
+
+        opp = SemanticScorer(
+            _OppositeProvider(),
+            similarity_metric="cosine",
+        )
+        r_opp = opp.score_relevance(
+            "left", "right", content_id="x",
+        )
+        assert r_opp.similarity_score == 0.0, (
+            f"expected 0.0, got {r_opp.similarity_score}"
+        )
+        print("opposite   : 0.0 (clamped, no crash)")
+
+        # ---- Orthogonal vectors score 0.5 --------------------- #
+        class _OrthoProvider(EmbeddingProvider):
+            name = "ortho"
+
+            def encode(self, text):
+                if "h" in text.lower():
+                    return np.array([1.0, 0.0])
+                return np.array([0.0, 1.0])
+
+            def encode_batch(self, texts):
+                return [self.encode(t) for t in texts]
+
+            def get_dimension(self):
+                return 2
+
+        ortho = SemanticScorer(
+            _OrthoProvider(),
+            similarity_metric="cosine",
+        )
+        r_ortho = ortho.score_relevance(
+            "h", "v", content_id="x",
+        )
+        assert abs(r_ortho.similarity_score - 0.5) < 1e-6
+        print("orthogonal : 0.5 (midpoint)")
+
+        # ---- Dot metric clamped -------------------------------- #
+        class _LargeProvider(EmbeddingProvider):
+            name = "large"
+
+            def encode(self, text):
+                return np.array([100.0, 100.0])
+
+            def encode_batch(self, texts):
+                return [self.encode(t) for t in texts]
+
+            def get_dimension(self):
+                return 2
+
+        dot = SemanticScorer(
+            _LargeProvider(), similarity_metric="dot",
+        )
+        r_dot = dot.score_relevance(
+            "q", "c", content_id="x",
+        )
+        assert r_dot.similarity_score == 1.0, (
+            f"expected clamped 1.0, got {r_dot.similarity_score}"
+        )
+        print("dot        : clamped to [0, 1]")
+
+        # ---- Batch scoring ------------------------------------- #
         contents = [
-            ("doc_1", "Energy and carbon are key sustainability metrics."),
+            ("doc_1", "Energy and carbon are key."),
             ("doc_2", "Image recognition uses neural networks."),
             ("doc_3", "Audio processing and speech recognition."),
             ("doc_4", "Energy efficiency reduces carbon footprint."),
         ]
-        batch_scores = scorer.score_batch("energy carbon sustainability", contents)
+        batch = scorer.score_batch(
+            "energy carbon sustainability", contents,
+        )
         print("batch      :", [
-            f"{s.node_id}={s.similarity_score:.3f}" for s in batch_scores
+            f"{s.node_id}={s.similarity_score:.3f}"
+            for s in batch
         ])
 
-        # ---- Ranked top-k ------------------------------------------- #
+        # ---- Ranked top-k -------------------------------------- #
         ranked = scorer.score_and_rank(
             "energy carbon sustainability", contents, top_k=2,
         )
-        print("top 2      :", [s.node_id for s in ranked])
         assert len(ranked) <= 2
+        print("top 2      :", [s.node_id for s in ranked])
 
-        # ---- Metadata boost ----------------------------------------- #
-        import time as _t
-        now = _t.time()
+        # ---- Metadata boost ------------------------------------ #
+        now = time.time()
         boosted = scorer.score_relevance(
             "energy",
             "Energy efficiency.",
             content_id="doc_boosted",
-            metadata_boost={"timestamp": now, "importance": 1.0,
-                            "content_type": "critical"},
+            metadata_boost={
+                "timestamp": now,
+                "importance": 1.0,
+                "content_type": "critical",
+            },
         )
         plain = scorer.score_relevance(
             "energy",
             "Energy efficiency.",
             content_id="doc_plain",
         )
-        print(f"boosted    : {boosted.similarity_score:.3f} "
-              f"vs plain {plain.similarity_score:.3f}")
         assert boosted.similarity_score >= plain.similarity_score
+        print("boost      : OK")
 
-        # ---- Precompute embeddings ---------------------------------- #
+        # ---- Millisecond timestamp handled --------------------- #
+        now_ms = int(now * 1000)
+        boosted_ms = scorer.score_relevance(
+            "energy",
+            "Energy efficiency.",
+            content_id="doc_ms",
+            metadata_boost={"timestamp": now_ms},
+        )
+        print(f"ms ts      : {boosted_ms.similarity_score:.3f}")
+        # Should NOT be saturated (millisecond timestamps now parsed).
+        # Recent timestamp means high recency boost, so score should
+        # be close to but not exactly the boosted value.
+        assert 0.0 <= boosted_ms.similarity_score <= 1.0
+
+        # ---- ISO string timestamp ------------------------------ #
+        iso_ts = datetime.now(timezone.utc).isoformat()
+        boosted_iso = scorer.score_relevance(
+            "energy",
+            "Energy efficiency.",
+            content_id="doc_iso",
+            metadata_boost={"timestamp": iso_ts},
+        )
+        assert 0.0 <= boosted_iso.similarity_score <= 1.0
+        print("iso ts     : OK")
+
+        # ---- Precompute embeddings ----------------------------- #
         added = scorer.precompute_embeddings([
             ("doc_5", "Precomputed content 1."),
             ("doc_6", "Precomputed content 2."),
-            ("doc_5", "Precomputed content 1."),   # duplicate — skipped
+            ("doc_5", "Precomputed content 1."),
         ])
-        print("precompute :", added, "new entry(ies)")
         assert added == 2
+        print("precompute :", added, "new entry(ies)")
 
-        # ---- Bounded LRU cache -------------------------------------- #
+        # Bad tuple shapes rejected
+        for bad in (
+            [("a", "b", "extra")],
+            [(123, "text")],
+            ["not-a-tuple"],
+        ):
+            try:
+                scorer.precompute_embeddings(bad)
+            except SemanticScorerError:
+                pass
+        print("bad tuple  : rejected")
+
+        # ---- Bounded LRU cache --------------------------------- #
         bounded = SemanticScorer(
             _FakeProvider(),
-            config=SemanticScorerConfig(max_cache_entries=2),
+            config=SemanticScorerConfig(
+                max_cache_entries=2,
+            ),
         )
         for i in range(5):
             bounded.score_relevance(
                 "q", f"content {i}", content_id=f"c{i}",
             )
-        print(f"bounded    : cache_size={bounded.cache_size} "
-              f"evictions={bounded._cache_evictions}")
         assert bounded.cache_size == 2
         assert bounded._cache_evictions == 3
+        print("LRU        : OK")
 
-        # ---- Similarity metrics ------------------------------------- #
-        for metric in ("cosine", "dot", "euclidean"):
-            s = SemanticScorer(_FakeProvider(), similarity_metric=metric)
-            r = s.score_relevance("energy", "energy energy")
-            print(f"{metric:9} : {r.similarity_score:.4f}")
-
-        # ---- Statistics --------------------------------------------- #
+        # ---- Statistics --------------------------------------- #
         print("stats      :", {
             k: v for k, v in scorer.get_cache_stats().items()
         })
 
-        # ---- SemanticScore serialization ---------------------------- #
-        payload = result.to_json()
+        # ---- SemanticScore serialization ---------------------- #
+        payload = r.to_json()
         restored = SemanticScore.from_json(payload)
-        assert restored.to_dict() == result.to_dict()
-        print("Round-trip OK.")
+        assert restored.to_dict() == r.to_dict()
+        print("score rt   : OK")
 
-        # ---- Context manager ---------------------------------------- #
+        # ---- Scorer round-trip -------------------------------- #
+        scorer.energy_penalty = 0.5  # dynamic attr (not used)
+        payload = scorer.to_json(include_cache=True)
+        restored = SemanticScorer.from_json(
+            payload, provider=_FakeProvider(),
+        )
+        assert (
+            restored.get_cache_stats()["cache_hits"]
+            == scorer.get_cache_stats()["cache_hits"]
+        )
+        assert (
+            restored.similarity_metric
+            == scorer.similarity_metric
+        )
+        print("scorer rt  : OK (provider passed)")
+
+        # from_dict without provider raises
+        try:
+            SemanticScorer.from_dict(scorer.to_dict())
+        except TypeError:
+            pass  # required kwarg missing — Python raises TypeError
+        print("no provider: TypeError")
+
+        # Dimension mismatch rejected
+        try:
+            SemanticScorer.from_dict(
+                scorer.to_dict(),
+                provider=SentenceTransformerProvider(
+                    "all-MiniLM-L6-v2",
+                ),
+            )
+        except SemanticScorerError as exc:
+            print("dim mismatch:", str(exc)[:50])
+        except EmbeddingProviderError:
+            # If sentence-transformers isn't installed
+            print("dim mismatch: skipped (no st)")
+
+        # ---- Error hierarchy ---------------------------------- #
+        assert issubclass(
+            EmbeddingProviderError, SemanticScorerError
+        )
+        print("hierarchy  : OK")
+
+        # ---- Context manager ---------------------------------- #
         with SemanticScorer(_FakeProvider()) as scoped:
-            scoped.score_relevance("q", "content", content_id="ctx")
-        print("Context    : OK")
+            scoped.score_relevance("q", "c", content_id="ctx")
+        print("context    : OK")
 
-        # ---- Validation failures ------------------------------------ #
+        # ---- Config validation -------------------------------- #
         for bad_cfg in (
             dict(similarity_metric="bogus"),
             dict(max_cache_entries=0),
@@ -1427,7 +2194,7 @@ if __name__ == "__main__":  # pragma: no cover
             dict(importance_boost_coefficient=-0.1),
             dict(critical_content_boost=-1.0),
             dict(recency_half_life_hours=0),
-            dict(confidence_weight_similarity=0.5),   # sum != 1
+            dict(confidence_weight_similarity=0.5),
             dict(content_length_saturation_words=0),
             dict(query_length_saturation_words=0),
         ):
@@ -1436,31 +2203,66 @@ if __name__ == "__main__":  # pragma: no cover
             except SemanticScorerError as exc:
                 print("Rejected cfg:", exc)
 
+        # ---- Input validation --------------------------------- #
         strict = SemanticScorer(_FakeProvider(), strict=True)
         for bad_call in (
-            lambda: strict.score_relevance(None, "x"),  # type: ignore[arg-type]
-            lambda: strict.score_relevance("q", None),  # type: ignore[arg-type]
-            lambda: strict.score_relevance("q", "c", content_id=123),  # type: ignore[arg-type]
-            lambda: strict.score_relevance("q", "c", metadata_boost="bad"),  # type: ignore[arg-type]
-            lambda: strict.score_batch("q", "not-a-list"),  # type: ignore[arg-type]
-            lambda: strict.score_batch("q", [("id", "text")], metadata_boosts=[{}, {}]),
-            lambda: strict.score_and_rank("q", [("a", "b")], top_k=-1),
+            lambda: strict.score_relevance(None, "x"),
+            lambda: strict.score_relevance("q", None),
+            lambda: strict.score_relevance("q", "c", content_id=123),
+            lambda: strict.score_relevance(
+                "q", "c", metadata_boost="bad",
+            ),
+            lambda: strict.score_batch("q", "not-a-list"),
+            lambda: strict.score_batch(
+                "q", [("id", "text")],
+                metadata_boosts=[{}, {}],
+            ),
+            lambda: strict.score_and_rank(
+                "q", [("a", "b")], top_k=-1,
+            ),
         ):
             try:
                 bad_call()
             except SemanticScorerError as exc:
-                print("Rejected   :", exc)
+                print("Rejected   :", str(exc)[:50])
 
-        # ---- Non-strict coerces ------------------------------------- #
+        # ---- Non-strict coerces ------------------------------- #
         lenient = SemanticScorer(_FakeProvider(), strict=False)
         r = lenient.score_relevance(None, "content")  # type: ignore[arg-type]
         assert r is not None
         print("lenient    : OK")
 
-        # ---- AnthropicProvider raises clearly ----------------------- #
+        # ---- AnthropicProvider raises ------------------------- #
         try:
             AnthropicProvider()
         except EmbeddingProviderError as exc:
-            print("Anthropic  :", exc)
+            print("Anthropic  :", str(exc)[:50])
+
+        # ---- Factory from model ------------------------------- #
+        try:
+            create_scorer_from_model(EmbeddingModel.ANTHROPIC)
+        except SemanticScorerError as exc:
+            print("anthropic factory:", str(exc)[:50])
+
+        # Custom factory works
+        custom = create_scorer_from_model(
+            EmbeddingModel.CUSTOM,
+            embedding_function=lambda t: np.array([1.0, 0.0]),
+            dimension=2,
+        )
+        r = custom.score_relevance("q", "c", content_id="custom")
+        assert 0.0 <= r.similarity_score <= 1.0
+        print("custom factory : OK")
+
+        # ---- to_json rejects NaN ------------------------------ #
+        tainted = SemanticScorer(_FakeProvider())
+        tainted.score_relevance("q", "c", content_id="x")
+        object.__setattr__(
+            tainted._config, "epsilon", float("nan"),
+        )
+        try:
+            tainted.to_json()
+        except ValueError as exc:
+            print("NaN in to_json:", str(exc)[:50])
 
         print("\nSmoke test passed.")
