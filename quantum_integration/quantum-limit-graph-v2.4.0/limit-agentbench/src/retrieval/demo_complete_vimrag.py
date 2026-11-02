@@ -1,4 +1,5 @@
-# -*- coding: utf-8 -*-
+# src/retrieval/demo_vimrag_complete.py
+
 """
 Complete VimRAG Demo
 ====================
@@ -10,23 +11,30 @@ Demonstrates all enhanced VimRAG capabilities:
 3. NetworkX graph operations.
 4. VimRAG integration orchestrator.
 
-Enhancements
-------------
-- Wrapped in ``main()`` with an ``if __name__ == "__main__"`` guard so the
-  module is importable without executing the demos.
-- Package-relative imports with defensive fallbacks (identical to the
-  convention used across the ``retrieval`` package).
-- ``DemoConfig`` — frozen, validated: model name, budgets, grid intensity,
-  output verbosity, ANSI-color toggle.
+Design
+------
+- Wrapped in ``main()`` with ``if __name__ == "__main__"`` guard.
+- Package-relative imports with defensive flat fallbacks; the
+  diagnostic message from :func:`_import_attr` is surfaced when the
+  caller passes ``--verbose``.
+- ``DemoConfig`` — frozen, validated: model name, budgets, grid
+  intensity, verbosity, colour, Demo 4 pipeline selection.
 - Each demo is a self-contained ``run_demo_N(cfg, out) -> DemoOutcome``
-  function that returns a structured record (status, duration, error).
-- CLI argument parsing: ``--only``, ``--skip``, ``--json``, ``--quiet``,
-  ``--no-color``, ``--embedding-model``, ``--grid-intensity``.
-- Diagnostics go through :mod:`logging`; the printed output (the demo's
-  deliverable) goes through a small ``_Printer`` helper that honors
-  ``--quiet`` and ``--no-color``.
-- ``--json`` emits a machine-readable summary of every demo's outcome.
-- Fully typed, with ``__all__`` and a comprehensive docstring.
+  function returning a structured record.
+- **Colour-aware printing** — ``_Printer`` emits ANSI escape codes
+  unless ``--no-color`` or ``NO_COLOR`` is set.
+- **Pre-flight report** — the required optional dependencies are
+  checked before any demo runs, so the caller can abort early.
+- **Exit codes distinguish the three outcomes**:
+    * ``0`` — every demo completed with status ``"ok"`` (or was
+      skipped via ``--skip``).
+    * ``1`` — at least one demo returned ``"error"``.
+    * ``2`` — at least one demo was skipped because a dependency is
+      missing.
+- ``--json`` emits a machine-readable summary; ``allow_nan=False`` and
+  a strict ``_safe_json_default`` prevent silent type coercion.
+
+Version: 2.0.0
 """
 
 from __future__ import annotations
@@ -34,13 +42,41 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from datetime import datetime, timezone
+from enum import Enum
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "VERSION",
+    "DemoConfig",
+    "DemoOutcome",
+    "DemoStatus",
+    "main",
+    "run_all_demos",
+    "run_demo_1",
+    "run_demo_2",
+    "run_demo_3",
+    "run_demo_4",
+]
+
+VERSION = "2.0.0"
+
+DemoStatus = Literal["ok", "skipped", "error"]
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -49,6 +85,35 @@ _DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 _DEFAULT_GRID_INTENSITY = 180.0
 _DEMO_SEPARATOR = "=" * 80
 _DEMO_SUBSEPARATOR = "-" * 80
+
+# Physically-plausible upper bound on grid carbon intensity.
+# 1000 g/kWh is roughly a coal-only grid.
+_MAX_PLAUSIBLE_GRID_INTENSITY = 1000.0
+
+_USER_SKIP_REASON = "user requested skip"
+
+
+# --------------------------------------------------------------------------- #
+# JSON helper
+# --------------------------------------------------------------------------- #
+def _safe_json_default(obj: Any) -> Any:
+    """
+    Strict JSON default for ``json.dumps``.
+
+    Handles ``datetime``, ``Enum``, and objects with ``to_dict()``;
+    raises :class:`TypeError` for anything else so future demo
+    additions fail loudly rather than silently stringifying.
+    """
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, Enum):
+        return obj.value
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        return obj.to_dict()
+    raise TypeError(
+        f"cannot serialize object of type "
+        f"{type(obj).__name__} to JSON."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -73,96 +138,235 @@ class DemoConfig:
     green_energy_budget_wh: float = 0.003
     balanced_energy_budget_wh: float = 0.010
 
+    # Demo 4 pipeline selection. ``None`` runs all modes.
+    demo4_pipelines: Optional[Tuple[str, ...]] = None
+
     # Output options.
     quiet: bool = False
     no_color: bool = False
     verbose: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.embedding_model, str) or not self.embedding_model:
-            raise ValueError("embedding_model must be a non-empty string.")
-        if self.grid_intensity_g_kwh < 0:
-            raise ValueError("grid_intensity_g_kwh must be >= 0.")
-        if not isinstance(self.topology_total_budget, int) or self.topology_total_budget <= 0:
-            raise ValueError("topology_total_budget must be a positive int.")
         if (
-            not isinstance(self.topology_base_tokens_per_node, int)
-            or self.topology_base_tokens_per_node <= 0
+            not isinstance(self.embedding_model, str)
+            or not self.embedding_model
         ):
             raise ValueError(
-                "topology_base_tokens_per_node must be a positive int."
+                "embedding_model must be a non-empty string."
             )
-        if not isinstance(self.semantic_top_k, int) or self.semantic_top_k <= 0:
-            raise ValueError("semantic_top_k must be a positive int.")
+        if (
+            isinstance(self.grid_intensity_g_kwh, bool)
+            or not isinstance(self.grid_intensity_g_kwh, (int, float))
+            or self.grid_intensity_g_kwh < 0
+        ):
+            raise ValueError(
+                "grid_intensity_g_kwh must be numeric and >= 0."
+            )
+        if self.grid_intensity_g_kwh > _MAX_PLAUSIBLE_GRID_INTENSITY:
+            logger.warning(
+                "grid_intensity_g_kwh=%.1f exceeds %.0f g/kWh; "
+                "carbon accounting reflects an unrealistically dirty "
+                "grid.",
+                self.grid_intensity_g_kwh,
+                _MAX_PLAUSIBLE_GRID_INTENSITY,
+            )
+        for name in (
+            "topology_total_budget",
+            "topology_base_tokens_per_node",
+            "semantic_top_k",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise ValueError(
+                    f"{name} must be a positive int."
+                )
         for name in (
             "fast_energy_budget_wh",
             "green_energy_budget_wh",
             "balanced_energy_budget_wh",
         ):
             value = getattr(self, name)
-            if value <= 0:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or value <= 0
+            ):
                 raise ValueError(f"{name} must be > 0.")
+
+        # The demo's "GREEN saves energy" comparison assumes the
+        # budgets satisfy green <= fast <= balanced.
+        if not (
+            self.green_energy_budget_wh
+            <= self.fast_energy_budget_wh
+            <= self.balanced_energy_budget_wh
+        ):
+            raise ValueError(
+                "energy budgets must satisfy "
+                "green <= fast <= balanced; the GREEN-vs-FAST "
+                "comparison depends on this ordering."
+            )
+
+        if self.demo4_pipelines is not None:
+            allowed = {"fast", "green", "balanced"}
+            for p in self.demo4_pipelines:
+                if not isinstance(p, str) or p not in allowed:
+                    raise ValueError(
+                        f"demo4_pipelines entries must be one of "
+                        f"{sorted(allowed)}, got {p!r}."
+                    )
 
 
 # --------------------------------------------------------------------------- #
 # Outcome record
 # --------------------------------------------------------------------------- #
-@dataclass
+@dataclass(frozen=True)
 class DemoOutcome:
     """Result of running one demo."""
 
     demo_id: str
-    status: str                # "ok" | "skipped" | "error"
+    status: DemoStatus
     duration_ms: float
     reason: Optional[str] = None
     details: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.status not in ("ok", "skipped", "error"):
+            raise ValueError(
+                f"status must be 'ok', 'skipped', or 'error', "
+                f"got {self.status!r}."
+            )
+        if not isinstance(self.demo_id, str) or not self.demo_id:
+            raise ValueError(
+                "demo_id must be a non-empty string."
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
 # --------------------------------------------------------------------------- #
-# Printer (honors quiet / no-color)
+# Printer (colour + quiet)
 # --------------------------------------------------------------------------- #
 class _Printer:
-    """Small print helper that respects ``--quiet`` and ``--no-color``."""
+    """
+    Print helper that honours ``--quiet`` and ``--no-color`` (and the
+    standard ``NO_COLOR`` environment variable).
+    """
 
-    def __init__(self, *, quiet: bool = False, no_color: bool = False) -> None:
+    _ANSI = {
+        "reset": "\x1b[0m",
+        "bold": "\x1b[1m",
+        "dim": "\x1b[2m",
+        "green": "\x1b[32m",
+        "yellow": "\x1b[33m",
+        "red": "\x1b[31m",
+        "cyan": "\x1b[36m",
+    }
+
+    def __init__(
+        self,
+        *,
+        quiet: bool = False,
+        no_color: bool = False,
+    ) -> None:
         self.quiet = quiet
-        self.no_color = no_color
+        # Honour the flag *and* the conventional NO_COLOR env var.
+        self.no_color = no_color or bool(
+            os.environ.get("NO_COLOR")
+        )
 
+    def _colorize(self, text: str, color: str) -> str:
+        if self.no_color:
+            return text
+        return (
+            f"{self._ANSI[color]}{text}"
+            f"{self._ANSI['reset']}"
+        )
+
+    # ---- raw prints ------------------------------------------------
     def line(self, text: str = "") -> None:
         if not self.quiet:
             print(text)
 
+    def ok(self, text: str) -> None:
+        self.line(self._colorize(text, "green"))
+
+    def warn(self, text: str) -> None:
+        self.line(self._colorize(text, "yellow"))
+
+    def error(self, text: str) -> None:
+        self.line(self._colorize(text, "red"))
+
+    def dim(self, text: str) -> None:
+        self.line(self._colorize(text, "dim"))
+
+    # ---- structural helpers ----------------------------------------
     def section(self, title: str) -> None:
         self.line()
-        self.line(_DEMO_SEPARATOR)
-        self.line(title)
-        self.line(_DEMO_SEPARATOR)
+        self.line(self._colorize(_DEMO_SEPARATOR, "cyan"))
+        self.line(self._colorize(title, "bold"))
+        self.line(self._colorize(_DEMO_SEPARATOR, "cyan"))
 
     def rule(self) -> None:
-        self.line(_DEMO_SUBSEPARATOR)
+        self.line(self._colorize(_DEMO_SUBSEPARATOR, "dim"))
 
 
 # --------------------------------------------------------------------------- #
 # Import helpers
 # --------------------------------------------------------------------------- #
-def _import_attr(module_name: str, attr: str) -> Any:
+def _import_attr(
+    module_name: str, attr: str,
+) -> Tuple[Optional[Any], Optional[str]]:
     """
     Import ``attr`` from ``retrieval.<module_name>`` with a flat-module
-    fallback. Returns ``None`` when neither resolves.
+    fallback.
+
+    Returns ``(value, error_reason)``. On success, ``error_reason`` is
+    ``None``. On failure, ``value`` is ``None`` and ``error_reason``
+    is a short diagnostic the caller can surface with
+    ``--verbose``.
     """
-    try:
-        module = __import__(
-            f"{__name__.rsplit('.', 1)[0]}.{module_name}", fromlist=[attr]
-        )
-    except Exception:
+    pkg = __name__.rsplit(".", 1)[0] if "." in __name__ else ""
+    candidates = (
+        [f"{pkg}.{module_name}", module_name]
+        if pkg else [module_name]
+    )
+    errors: List[str] = []
+    for path in candidates:
         try:
-            module = __import__(module_name, fromlist=[attr])
+            module = __import__(path, fromlist=[attr])
+        except Exception as exc:
+            errors.append(
+                f"{path}: {type(exc).__name__}: {exc}"
+            )
+            continue
+        if not hasattr(module, attr):
+            errors.append(
+                f"{path}: missing attribute {attr!r}"
+            )
+            continue
+        return getattr(module, attr), None
+    reason = "; ".join(errors) if errors else "unknown import error"
+    return None, reason
+
+
+def _preflight_dependencies() -> Dict[str, str]:
+    """
+    Return ``{dependency: "installed" | "missing"}`` for every
+    optional runtime dependency the demos may need.
+    """
+    report: Dict[str, str] = {}
+    for name in ("numpy", "networkx", "sentence_transformers"):
+        try:
+            __import__(name)
+            report[name] = "installed"
         except Exception:
-            return None
-    return getattr(module, attr, None)
+            report[name] = "missing"
+    return report
 
 
 # --------------------------------------------------------------------------- #
@@ -174,11 +378,19 @@ def run_demo_1(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
 
     out.line("📊 DEMO 1: Topological Token Allocation")
 
-    Allocator = _import_attr("topological_allocator", "TopologicalTokenAllocator")
-    Metric = _import_attr("topological_allocator", "ImportanceMetric")
+    Allocator, allocator_err = _import_attr(
+        "topological_allocator", "TopologicalTokenAllocator",
+    )
+    Metric, metric_err = _import_attr(
+        "topological_allocator", "ImportanceMetric",
+    )
     if Allocator is None or Metric is None:
-        reason = "topological_allocator module not available"
-        out.line(f"⚠️  Skipping demo: {reason}")
+        reason = (
+            f"topological_allocator unavailable: "
+            f"{allocator_err or metric_err}"
+        )
+        logger.debug("Demo 1 skipped — %s", reason)
+        out.warn(f"⚠️  Skipping demo: {allocator_err or metric_err}")
         return DemoOutcome(
             demo_id="topological_allocation",
             status="skipped",
@@ -190,7 +402,8 @@ def run_demo_1(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
         import networkx as nx
     except ImportError as exc:
         reason = f"networkx not installed: {exc}"
-        out.line(f"⚠️  Skipping demo: {reason}")
+        logger.debug("Demo 1 skipped — %s", reason)
+        out.warn(f"⚠️  Skipping demo: {reason}")
         return DemoOutcome(
             demo_id="topological_allocation",
             status="skipped",
@@ -198,23 +411,38 @@ def run_demo_1(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
             reason=reason,
         )
 
-    # ---- Build the medical knowledge graph ---------------------------
     G = nx.DiGraph()
-
     nodes = {
-        "symptom_fever": {"type": "symptom", "importance": "high"},
-        "symptom_cough": {"type": "symptom", "importance": "high"},
-        "symptom_fatigue": {"type": "symptom", "importance": "medium"},
-        "condition_pneumonia": {"type": "condition", "importance": "critical"},
-        "condition_flu": {"type": "condition", "importance": "high"},
-        "condition_cold": {"type": "condition", "importance": "medium"},
-        "treatment_antibiotics": {"type": "treatment", "importance": "high"},
-        "treatment_rest": {"type": "treatment", "importance": "low"},
-        "general_health": {"type": "general", "importance": "low"},
+        "symptom_fever": {
+            "type": "symptom", "importance": "high",
+        },
+        "symptom_cough": {
+            "type": "symptom", "importance": "high",
+        },
+        "symptom_fatigue": {
+            "type": "symptom", "importance": "medium",
+        },
+        "condition_pneumonia": {
+            "type": "condition", "importance": "critical",
+        },
+        "condition_flu": {
+            "type": "condition", "importance": "high",
+        },
+        "condition_cold": {
+            "type": "condition", "importance": "medium",
+        },
+        "treatment_antibiotics": {
+            "type": "treatment", "importance": "high",
+        },
+        "treatment_rest": {
+            "type": "treatment", "importance": "low",
+        },
+        "general_health": {
+            "type": "general", "importance": "low",
+        },
     }
     for node_id, attrs in nodes.items():
         G.add_node(node_id, **attrs)
-
     edges = [
         ("symptom_fever", "condition_pneumonia", 0.9),
         ("symptom_cough", "condition_pneumonia", 0.8),
@@ -230,7 +458,6 @@ def run_demo_1(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
     for source, target, weight in edges:
         G.add_edge(source, target, weight=weight)
 
-    # ---- Run the allocator -------------------------------------------
     try:
         allocator = Allocator(
             importance_metric=Metric.COMBINED,
@@ -242,11 +469,13 @@ def run_demo_1(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
         allocations = allocator.allocate_tokens(
             graph=G,
             total_token_budget=cfg.topology_total_budget,
-            base_tokens_per_node=cfg.topology_base_tokens_per_node,
+            base_tokens_per_node=(
+                cfg.topology_base_tokens_per_node
+            ),
         )
     except Exception as exc:
         logger.exception("Demo 1 failed: %s", exc)
-        out.line(f"❌ Demo 1 failed: {exc}")
+        out.error(f"❌ Demo 1 failed: {exc}")
         return DemoOutcome(
             demo_id="topological_allocation",
             status="error",
@@ -254,17 +483,16 @@ def run_demo_1(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
             reason=str(exc),
         )
 
-    # ---- Display results --------------------------------------------
     out.line()
     out.line(
         f"📈 Token Allocation Results "
         f"(Total Budget: {cfg.topology_total_budget} tokens)"
     )
     out.line(
-        f"{'Node':<30} {'Resolution':<12} {'Tokens':<8} {'Importance':<12}"
+        f"{'Node':<30} {'Resolution':<12} {'Tokens':<8} "
+        f"{'Importance':<12}"
     )
-    out.line(_DEMO_SUBSEPARATOR.replace("-", "-", 1)[:70])
-
+    out.line("=" * 70)
     for node_id in sorted(
         allocations.keys(),
         key=lambda x: allocations[x].allocated_tokens,
@@ -273,15 +501,22 @@ def run_demo_1(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
         alloc = allocations[node_id]
         out.line(
             f"{node_id:<30} {alloc.resolution_level.value:<12} "
-            f"{alloc.allocated_tokens:<8} {alloc.importance_score:.3f}"
+            f"{alloc.allocated_tokens:<8} "
+            f"{alloc.importance_score:.3f}"
         )
 
     summary = allocator.get_allocation_summary(allocations)
     out.line()
     out.line("📊 Allocation Summary:")
     out.line(f"  Total nodes: {summary['total_nodes']}")
-    out.line(f"  Total tokens allocated: {summary['total_tokens_allocated']}")
-    out.line(f"  Average tokens/node: {summary['avg_tokens_per_node']:.1f}")
+    out.line(
+        f"  Total tokens allocated: "
+        f"{summary['total_tokens_allocated']}"
+    )
+    out.line(
+        f"  Average tokens/node: "
+        f"{summary['avg_tokens_per_node']:.1f}"
+    )
     out.line()
     out.line("  Distribution by resolution:")
     for level, count in summary["nodes_by_resolution"].items():
@@ -289,7 +524,7 @@ def run_demo_1(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
         out.line(f"    {level}: {count} nodes ({tokens} tokens)")
 
     out.line()
-    out.line("✅ Topological allocation complete!")
+    out.ok("✅ Topological allocation complete!")
 
     return DemoOutcome(
         demo_id="topological_allocation",
@@ -297,8 +532,12 @@ def run_demo_1(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
         duration_ms=(time.perf_counter() - start) * 1000.0,
         details={
             "total_nodes": summary["total_nodes"],
-            "total_tokens_allocated": summary["total_tokens_allocated"],
-            "nodes_by_resolution": summary["nodes_by_resolution"],
+            "total_tokens_allocated": (
+                summary["total_tokens_allocated"]
+            ),
+            "nodes_by_resolution": (
+                summary["nodes_by_resolution"]
+            ),
         },
     )
 
@@ -312,10 +551,13 @@ def run_demo_2(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
 
     out.line("🧠 DEMO 2: Semantic Scoring with Embeddings")
 
-    create_local_scorer = _import_attr("semantic_scorer", "create_local_scorer")
+    create_local_scorer, import_err = _import_attr(
+        "semantic_scorer", "create_local_scorer",
+    )
     if create_local_scorer is None:
-        reason = "semantic_scorer module not available"
-        out.line(f"⚠️  Skipping demo: {reason}")
+        reason = f"semantic_scorer unavailable: {import_err}"
+        logger.debug("Demo 2 skipped — %s", reason)
+        out.warn(f"⚠️  Skipping demo: {import_err}")
         return DemoOutcome(
             demo_id="semantic_scoring",
             status="skipped",
@@ -323,16 +565,23 @@ def run_demo_2(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
             reason=reason,
         )
 
-    # ---- Load the model ---------------------------------------------
-    out.line(f"Loading embedding model ({cfg.embedding_model})...")
+    out.line(
+        f"Loading embedding model ({cfg.embedding_model}) — "
+        f"first run may download ~90 MB from HuggingFace..."
+    )
     try:
         scorer = create_local_scorer(
             model_name=cfg.embedding_model,
             cache_embeddings=True,
         )
     except Exception as exc:
-        logger.exception("Demo 2 failed to construct scorer: %s", exc)
-        out.line(f"⚠️  Skipping demo (install sentence-transformers): {exc}")
+        logger.exception(
+            "Demo 2 failed to construct scorer: %s", exc,
+        )
+        out.warn(
+            f"⚠️  Skipping demo "
+            f"(install sentence-transformers): {exc}"
+        )
         return DemoOutcome(
             demo_id="semantic_scoring",
             status="skipped",
@@ -340,14 +589,29 @@ def run_demo_2(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
             reason=str(exc),
         )
 
-    # ---- Sample documents ------------------------------------------
     documents = [
-        ("doc_1", "Pneumonia is a lung infection causing fever and cough"),
-        ("doc_2", "Common cold symptoms include runny nose and sneezing"),
-        ("doc_3", "Antibiotics are used to treat bacterial infections"),
-        ("doc_4", "Machine learning models require large datasets"),
-        ("doc_5", "Climate change affects global temperatures"),
+        (
+            "doc_1",
+            "Pneumonia is a lung infection causing fever and cough",
+        ),
+        (
+            "doc_2",
+            "Common cold symptoms include runny nose and sneezing",
+        ),
+        (
+            "doc_3",
+            "Antibiotics are used to treat bacterial infections",
+        ),
+        (
+            "doc_4",
+            "Machine learning models require large datasets",
+        ),
+        (
+            "doc_5",
+            "Climate change affects global temperatures",
+        ),
     ]
+    doc_lookup = dict(documents)
     query = "How to treat lung infection with fever?"
 
     out.line()
@@ -363,7 +627,7 @@ def run_demo_2(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
         )
     except Exception as exc:
         logger.exception("Demo 2 scoring failed: %s", exc)
-        out.line(f"❌ Demo 2 failed: {exc}")
+        out.error(f"❌ Demo 2 failed: {exc}")
         return DemoOutcome(
             demo_id="semantic_scoring",
             status="error",
@@ -378,12 +642,15 @@ def run_demo_2(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
         f"{'Confidence':<12} {'Content':<50}"
     )
     out.line("-" * 90)
-
     for i, score in enumerate(scores, 1):
-        doc_content = next(c for d, c in documents if d == score.node_id)
+        doc_content = doc_lookup.get(
+            score.node_id, "<unavailable>",
+        )
         out.line(
-            f"{i:<6} {score.node_id:<10} {score.similarity_score:.4f}       "
-            f"{score.confidence:.4f}       {doc_content[:47]}..."
+            f"{i:<6} {score.node_id:<10} "
+            f"{score.similarity_score:.4f}       "
+            f"{score.confidence:.4f}       "
+            f"{doc_content[:47]}..."
         )
 
     try:
@@ -394,16 +661,23 @@ def run_demo_2(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
     if cache_stats:
         out.line()
         out.line("💾 Cache Statistics:")
-        out.line(f"  Cache size: {cache_stats.get('cache_size', 0)} embeddings")
-        out.line(f"  Cache hits: {cache_stats.get('cache_hits', 0)}")
-        out.line(f"  Hit rate: {cache_stats.get('hit_rate', 0.0):.1%}")
+        out.line(
+            f"  Cache size: "
+            f"{cache_stats.get('cache_size', 0)} embeddings"
+        )
+        out.line(
+            f"  Cache hits: {cache_stats.get('cache_hits', 0)}"
+        )
+        out.line(
+            f"  Hit rate: {cache_stats.get('hit_rate', 0.0):.1%}"
+        )
         out.line(
             f"  Embedding dimension: "
             f"{cache_stats.get('embedding_dimension', 0)}"
         )
 
     out.line()
-    out.line("✅ Semantic scoring complete!")
+    out.ok("✅ Semantic scoring complete!")
 
     return DemoOutcome(
         demo_id="semantic_scoring",
@@ -412,7 +686,9 @@ def run_demo_2(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
         details={
             "query": query,
             "top_k": len(scores),
-            "top_result_id": scores[0].node_id if scores else None,
+            "top_result_id": (
+                scores[0].node_id if scores else None
+            ),
             "top_result_similarity": (
                 scores[0].similarity_score if scores else None
             ),
@@ -424,18 +700,27 @@ def run_demo_2(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
 # Demo 3 — enhanced graph traversal
 # --------------------------------------------------------------------------- #
 def run_demo_3(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
-    """Enhanced NetworkX-backed graph traversal with community detection."""
+    """Enhanced NetworkX-backed graph traversal."""
     start = time.perf_counter()
 
-    out.line("🗺️  DEMO 3: Enhanced Graph Traversal with NetworkX")
-
-    Optimizer = _import_attr(
-        "enhanced_graph_traversal", "EnhancedGraphTraversalOptimizer"
+    out.line(
+        "🗺️  DEMO 3: Enhanced Graph Traversal with NetworkX"
     )
-    Strategy = _import_attr("enhanced_graph_traversal", "TraversalStrategy")
+
+    Optimizer, opt_err = _import_attr(
+        "enhanced_graph_traversal",
+        "EnhancedGraphTraversalOptimizer",
+    )
+    Strategy, strat_err = _import_attr(
+        "enhanced_graph_traversal", "TraversalStrategy",
+    )
     if Optimizer is None or Strategy is None:
-        reason = "enhanced_graph_traversal module not available"
-        out.line(f"⚠️  Skipping demo: {reason}")
+        reason = (
+            f"enhanced_graph_traversal unavailable: "
+            f"{opt_err or strat_err}"
+        )
+        logger.debug("Demo 3 skipped — %s", reason)
+        out.warn(f"⚠️  Skipping demo: {opt_err or strat_err}")
         return DemoOutcome(
             demo_id="graph_traversal",
             status="skipped",
@@ -451,8 +736,10 @@ def run_demo_3(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
             enable_communities=True,
         )
     except Exception as exc:
-        logger.exception("Demo 3 failed to construct optimizer: %s", exc)
-        out.line(f"❌ Demo 3 failed: {exc}")
+        logger.exception(
+            "Demo 3 failed to construct optimizer: %s", exc,
+        )
+        out.error(f"❌ Demo 3 failed: {exc}")
         return DemoOutcome(
             demo_id="graph_traversal",
             status="error",
@@ -460,9 +747,7 @@ def run_demo_3(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
             reason=str(exc),
         )
 
-    # ---- Build the medical graph ----------------------------------
     out.line("Building medical knowledge graph...")
-
     medical_nodes = {
         "symptoms": (0.05, 0.8),
         "fever": (0.1, 0.9),
@@ -474,7 +759,9 @@ def run_demo_3(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
         "recovery": (0.1, 0.7),
     }
     for node_id, (cost, relevance) in medical_nodes.items():
-        optimizer.add_node(node_id, cost=cost, relevance=relevance)
+        optimizer.add_node(
+            node_id, cost=cost, relevance=relevance,
+        )
 
     medical_edges = [
         ("symptoms", "fever", 0.8),
@@ -489,10 +776,11 @@ def run_demo_3(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
     for source, target, weight in medical_edges:
         optimizer.add_edge(source, target, weight=weight)
 
-    # ---- Community detection --------------------------------------
     out.line("Detecting communities...")
     try:
-        communities = optimizer.detect_communities(algorithm="louvain")
+        communities = optimizer.detect_communities(
+            algorithm="louvain",
+        )
     except Exception as exc:
         logger.exception("Community detection failed: %s", exc)
         communities = []
@@ -500,18 +788,19 @@ def run_demo_3(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
     out.line()
     out.line(f"🏘️  Found {len(communities)} communities:")
     for i, comm in enumerate(communities, 1):
-        out.line(f"  Community {i}: {', '.join(sorted(comm))}")
+        out.line(
+            f"  Community {i}: {', '.join(sorted(comm))}"
+        )
 
-    # ---- Path finding ---------------------------------------------
     out.line()
-    out.line("🛤️  Finding paths from 'symptoms' to 'recovery':")
-
+    out.line(
+        "🛤️  Finding paths from 'symptoms' to 'recovery':"
+    )
     strategies = [
         Strategy.ENERGY_OPTIMAL,
         Strategy.RELEVANCE_GUIDED,
         Strategy.COMMUNITY_AWARE,
     ]
-
     paths_found: Dict[str, Any] = {}
     for strategy in strategies:
         try:
@@ -523,28 +812,35 @@ def run_demo_3(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
             )
         except Exception as exc:
             logger.warning(
-                "Pathfinding failed for %s: %s", strategy.value, exc
+                "Pathfinding failed for %s: %s",
+                strategy.value, exc,
             )
             continue
-
         if path:
             paths_found[strategy.value] = {
                 "nodes": list(path.nodes),
                 "energy_cost": path.energy_cost,
                 "relevance_score": path.relevance_score,
-                "unique_communities": path.metadata.get("unique_communities"),
+                "unique_communities": path.metadata.get(
+                    "unique_communities"
+                ),
             }
             out.line()
             out.line(f"  {strategy.value}:")
-            out.line(f"    Path: {' → '.join(path.nodes)}")
-            out.line(f"    Energy cost: {path.energy_cost:.4f} Wh")
-            out.line(f"    Relevance: {path.relevance_score:.3f}")
+            out.line(
+                f"    Path: {' → '.join(path.nodes)}"
+            )
+            out.line(
+                f"    Energy cost: {path.energy_cost:.4f} Wh"
+            )
+            out.line(
+                f"    Relevance: {path.relevance_score:.3f}"
+            )
             out.line(
                 f"    Communities: "
                 f"{path.metadata.get('unique_communities')}"
             )
 
-    # ---- Graph statistics -----------------------------------------
     try:
         stats = optimizer.get_graph_statistics()
         out.line()
@@ -554,14 +850,13 @@ def run_demo_3(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
         out.line(f"  Density: {stats.density:.3f}")
         out.line(f"  Communities: {stats.num_communities}")
         out.line(f"  Connected: {stats.is_connected}")
-
         stats_payload = stats.to_dict()
     except Exception as exc:
         logger.exception("Graph statistics failed: %s", exc)
         stats_payload = {}
 
     out.line()
-    out.line("✅ Graph traversal complete!")
+    out.ok("✅ Graph traversal complete!")
 
     return DemoOutcome(
         demo_id="graph_traversal",
@@ -584,11 +879,19 @@ def run_demo_4(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
 
     out.line("🚀 DEMO 4: Complete VimRAG Integration")
 
-    Integration = _import_attr("vimrag_integration", "VimRAGIntegration")
-    Pipeline = _import_attr("vimrag_integration", "RetrievalPipeline")
+    Integration, int_err = _import_attr(
+        "vimrag_integration", "VimRAGIntegration",
+    )
+    Pipeline, pipe_err = _import_attr(
+        "vimrag_integration", "RetrievalPipeline",
+    )
     if Integration is None or Pipeline is None:
-        reason = "vimrag_integration module not available"
-        out.line(f"⚠️  Skipping demo: {reason}")
+        reason = (
+            f"vimrag_integration unavailable: "
+            f"{int_err or pipe_err}"
+        )
+        logger.debug("Demo 4 skipped — %s", reason)
+        out.warn(f"⚠️  Skipping demo: {int_err or pipe_err}")
         return DemoOutcome(
             demo_id="vimrag_integration",
             status="skipped",
@@ -596,7 +899,6 @@ def run_demo_4(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
             reason=reason,
         )
 
-    # ---- Construct pipeline ---------------------------------------
     out.line("Initializing VimRAG integration...")
     try:
         vimrag = Integration(
@@ -607,8 +909,10 @@ def run_demo_4(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
             enable_serendipity=True,
         )
     except Exception as exc:
-        logger.exception("Demo 4 failed to construct integration: %s", exc)
-        out.line(f"❌ Demo 4 failed: {exc}")
+        logger.exception(
+            "Demo 4 failed to construct integration: %s", exc,
+        )
+        out.error(f"❌ Demo 4 failed: {exc}")
         return DemoOutcome(
             demo_id="vimrag_integration",
             status="error",
@@ -616,53 +920,62 @@ def run_demo_4(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
             reason=str(exc),
         )
 
-    # ---- Add documents --------------------------------------------
     out.line()
     out.line("📚 Adding medical documents to memory graph...")
-
     documents = [
         {
             "content": (
-                "Pneumonia symptoms include high fever, productive cough, "
-                "and chest pain. Requires immediate medical attention."
+                "Pneumonia symptoms include high fever, "
+                "productive cough, and chest pain. Requires "
+                "immediate medical attention."
             ),
             "type": "text",
-            "metadata": {"category": "diagnosis", "importance": 1.0},
+            "metadata": {
+                "category": "diagnosis", "importance": 1.0,
+            },
         },
         {
             "content": (
-                "Treatment for bacterial pneumonia typically involves "
-                "antibiotics like azithromycin or amoxicillin."
+                "Treatment for bacterial pneumonia typically "
+                "involves antibiotics like azithromycin or "
+                "amoxicillin."
             ),
             "type": "text",
-            "metadata": {"category": "treatment", "importance": 0.9},
+            "metadata": {
+                "category": "treatment", "importance": 0.9,
+            },
         },
         {
             "content": (
-                "X-ray imaging shows infiltrates in lower right lung lobe "
-                "consistent with pneumonia."
+                "X-ray imaging shows infiltrates in lower "
+                "right lung lobe consistent with pneumonia."
             ),
             "type": "visual",
-            "metadata": {"category": "imaging", "importance": 0.95},
+            "metadata": {
+                "category": "imaging", "importance": 0.95,
+            },
         },
         {
             "content": (
-                "Patient recovery timeline: antibiotics for 7-10 days, "
-                "rest, and fluid intake."
+                "Patient recovery timeline: antibiotics for "
+                "7-10 days, rest, and fluid intake."
             ),
             "type": "text",
-            "metadata": {"category": "treatment", "importance": 0.7},
+            "metadata": {
+                "category": "treatment", "importance": 0.7,
+            },
         },
         {
             "content": (
-                "Common cold is usually viral and resolves without "
-                "antibiotics."
+                "Common cold is usually viral and resolves "
+                "without antibiotics."
             ),
             "type": "text",
-            "metadata": {"category": "diagnosis", "importance": 0.5},
+            "metadata": {
+                "category": "diagnosis", "importance": 0.5,
+            },
         },
     ]
-
     node_ids: List[str] = []
     for doc in documents:
         try:
@@ -675,31 +988,52 @@ def run_demo_4(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
             logger.exception("add_document failed: %s", exc)
             continue
         node_ids.append(node_id)
-        out.line(f"  Added: {node_id[:16]}... ({doc['type']})")
+        out.line(
+            f"  Added: {node_id[:16]}... ({doc['type']})"
+        )
 
-    # ---- Connect documents ----------------------------------------
     if len(node_ids) >= 4:
         try:
-            vimrag.connect_documents(node_ids[0], node_ids[1], weight=0.9)
-            vimrag.connect_documents(node_ids[0], node_ids[2], weight=0.85)
-            vimrag.connect_documents(node_ids[1], node_ids[3], weight=0.8)
+            vimrag.connect_documents(
+                node_ids[0], node_ids[1], weight=0.9,
+            )
+            vimrag.connect_documents(
+                node_ids[0], node_ids[2], weight=0.85,
+            )
+            vimrag.connect_documents(
+                node_ids[1], node_ids[3], weight=0.8,
+            )
         except Exception as exc:
-            logger.warning("connect_documents failed: %s", exc)
+            logger.warning(
+                "connect_documents failed: %s", exc,
+            )
 
-    # ---- Simulate a clean grid ------------------------------------
     try:
-        vimrag.update_grid_intensity(cfg.grid_intensity_g_kwh)
+        vimrag.update_grid_intensity(
+            cfg.grid_intensity_g_kwh,
+        )
     except Exception as exc:
-        logger.warning("update_grid_intensity failed: %s", exc)
+        logger.warning(
+            "update_grid_intensity failed: %s", exc,
+        )
 
-    # ---- Run each pipeline mode -----------------------------------
-    query = "How to diagnose and treat pneumonia?"
-    pipelines: List[Tuple[Any, float]] = [
-        (Pipeline.FAST, cfg.fast_energy_budget_wh),
-        (Pipeline.GREEN, cfg.green_energy_budget_wh),
-        (Pipeline.BALANCED, cfg.balanced_energy_budget_wh),
+    # ---- Pipeline selection -------------------------------------
+    all_pipelines = [
+        ("fast", Pipeline.FAST, cfg.fast_energy_budget_wh),
+        ("green", Pipeline.GREEN, cfg.green_energy_budget_wh),
+        (
+            "balanced", Pipeline.BALANCED,
+            cfg.balanced_energy_budget_wh,
+        ),
+    ]
+    selected_pipelines = [
+        (name, mode, budget)
+        for name, mode, budget in all_pipelines
+        if cfg.demo4_pipelines is None
+        or name in cfg.demo4_pipelines
     ]
 
+    query = "How to diagnose and treat pneumonia?"
     out.line()
     out.line(f"🔍 Query: '{query}'")
     out.line()
@@ -707,15 +1041,17 @@ def run_demo_4(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
     out.line()
 
     pipeline_results: Dict[str, Any] = {}
-    for pipeline, energy_budget in pipelines:
+    for name, pipeline_mode, energy_budget in (
+        selected_pipelines
+    ):
         out.line(
-            f"  {pipeline.value.upper()} mode "
+            f"  {pipeline_mode.value.upper()} mode "
             f"(budget: {energy_budget * 1000:.1f} mWh)"
         )
         try:
             result = vimrag.retrieve(
                 query=query,
-                pipeline=pipeline,
+                pipeline=pipeline_mode,
                 max_results=3,
                 energy_budget_wh=energy_budget,
                 include_visual=True,
@@ -723,30 +1059,38 @@ def run_demo_4(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
             )
         except Exception as exc:
             logger.exception(
-                "Retrieve failed for %s: %s", pipeline.value, exc,
+                "Retrieve failed for %s: %s",
+                pipeline_mode.value, exc,
             )
-            out.line(f"    ❌ Retrieval failed: {exc}")
+            out.error(f"    ❌ Retrieval failed: {exc}")
             out.line()
             continue
 
-        out.line(f"    Retrieved: {len(result.retrieved_nodes)} nodes")
-        out.line(f"    Energy: {result.total_energy_wh * 1000:.3f} mWh")
         out.line(
-            f"    Carbon: {result.total_carbon_kg * 1000:.3f} g CO2"
+            f"    Retrieved: "
+            f"{len(result.retrieved_nodes)} nodes"
+        )
+        out.line(
+            f"    Energy: "
+            f"{result.total_energy_wh * 1000:.3f} mWh"
+        )
+        out.line(
+            f"    Carbon: "
+            f"{result.total_carbon_kg * 1000:.3f} g CO2"
         )
         out.line(f"    Mode: {result.retrieval_mode}")
         out.line(f"    Time: {result.total_time_ms:.1f} ms")
-
         if result.serendipity_events:
             out.line(
-                f"    💡 Efficiency gain: {result.efficiency_gains:.1%}"
+                f"    💡 Efficiency gain: "
+                f"{result.efficiency_gains:.1%}"
             )
             out.line(
                 f"    💚 Carbon saved: "
                 f"{result.carbon_savings_kg * 1000:.3f} g CO2"
             )
 
-        pipeline_results[pipeline.value] = {
+        pipeline_results[pipeline_mode.value] = {
             "retrieved_nodes": len(result.retrieved_nodes),
             "total_energy_wh": result.total_energy_wh,
             "total_carbon_kg": result.total_carbon_kg,
@@ -757,35 +1101,59 @@ def run_demo_4(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
         }
         out.line()
 
-    # ---- Integration stats ----------------------------------------
+    # ---- Direct comparison --------------------------------------
+    if (
+        "fast" in pipeline_results
+        and "green" in pipeline_results
+    ):
+        fast_e = pipeline_results["fast"]["total_energy_wh"]
+        green_e = pipeline_results["green"]["total_energy_wh"]
+        if fast_e > 0:
+            savings = (fast_e - green_e) / fast_e
+            out.line(
+                f"💡 GREEN saved {savings:.1%} energy vs FAST "
+                f"({fast_e * 1000:.3f} mWh → "
+                f"{green_e * 1000:.3f} mWh)"
+            )
+            out.line()
+
     try:
         stats = vimrag.get_integration_stats()
     except Exception as exc:
-        logger.warning("get_integration_stats failed: %s", exc)
+        logger.warning(
+            "get_integration_stats failed: %s", exc,
+        )
         stats = {}
 
     if stats:
         out.line("📊 Integration Statistics:")
-        out.line(f"  Total retrievals: {stats.get('total_retrievals', 0)}")
+        out.line(
+            f"  Total retrievals: "
+            f"{stats.get('total_retrievals', 0)}"
+        )
         out.line(
             f"  Total energy consumed: "
-            f"{stats.get('total_energy_consumed_wh', 0.0) * 1000:.2f} mWh"
+            f"{stats.get('total_energy_consumed_wh', 0.0) * 1000:.2f} "
+            f"mWh"
         )
         out.line(
             f"  Total carbon emitted: "
-            f"{stats.get('total_carbon_emitted_kg', 0.0) * 1000:.2f} g CO2"
+            f"{stats.get('total_carbon_emitted_kg', 0.0) * 1000:.2f} "
+            f"g CO2"
         )
         out.line(
             f"  Total carbon saved: "
-            f"{stats.get('total_carbon_saved_kg', 0.0) * 1000:.2f} g CO2"
+            f"{stats.get('total_carbon_saved_kg', 0.0) * 1000:.2f} "
+            f"g CO2"
         )
         out.line(
-            f"  Memory graph: {stats.get('memory_graph_nodes', 0)} nodes, "
+            f"  Memory graph: "
+            f"{stats.get('memory_graph_nodes', 0)} nodes, "
             f"{stats.get('memory_graph_edges', 0)} edges"
         )
 
     out.line()
-    out.line("✅ VimRAG integration complete!")
+    out.ok("✅ VimRAG integration complete!")
 
     return DemoOutcome(
         demo_id="vimrag_integration",
@@ -795,7 +1163,8 @@ def run_demo_4(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
             "documents_added": len(node_ids),
             "pipelines": pipeline_results,
             "integration_stats": {
-                k: v for k, v in stats.items() if isinstance(v, (int, float, str))
+                k: v for k, v in stats.items()
+                if isinstance(v, (int, float, str))
             } if stats else {},
         },
     )
@@ -804,7 +1173,10 @@ def run_demo_4(cfg: DemoConfig, out: _Printer) -> DemoOutcome:
 # --------------------------------------------------------------------------- #
 # Orchestrator
 # --------------------------------------------------------------------------- #
-_DEMOS: Tuple[Tuple[str, Callable[[DemoConfig, _Printer], DemoOutcome]], ...] = (
+_DEMOS: Tuple[
+    Tuple[str, Callable[[DemoConfig, _Printer], DemoOutcome]],
+    ...,
+] = (
     ("topological", run_demo_1),
     ("semantic", run_demo_2),
     ("graph", run_demo_3),
@@ -818,26 +1190,44 @@ def run_all_demos(
     only: Optional[Sequence[str]] = None,
     skip: Optional[Sequence[str]] = None,
 ) -> List[DemoOutcome]:
-    """
-    Run the selected demos and return their outcomes.
-
-    Parameters
-    ----------
-    cfg : DemoConfig, optional
-        Configuration for the run. Defaults to ``DemoConfig()``.
-    only : sequence of str, optional
-        If provided, run only these demo IDs (aliases:
-        ``"topological"``, ``"semantic"``, ``"graph"``, ``"integration"``).
-    skip : sequence of str, optional
-        Demo IDs to skip.
-    """
+    """Run the selected demos and return their outcomes."""
     cfg = cfg or DemoConfig()
     only_set = set(only) if only else None
     skip_set = set(skip) if skip else set()
 
-    printer = _Printer(quiet=cfg.quiet, no_color=cfg.no_color)
+    printer = _Printer(
+        quiet=cfg.quiet, no_color=cfg.no_color,
+    )
 
-    printer.section("VimRAG Enhanced Retrieval System - Complete Demo")
+    printer.section(
+        "VimRAG Enhanced Retrieval System - Complete Demo"
+    )
+    printer.line(
+        f"Version: {VERSION} | "
+        f"Model: {cfg.embedding_model} | "
+        f"Grid: {cfg.grid_intensity_g_kwh:.1f} g/kWh"
+    )
+    printer.line()
+
+    # ---- Pre-flight dependency report --------------------------
+    preflight = _preflight_dependencies()
+    printer.line("Pre-flight dependency check:")
+    for dep_name, status in preflight.items():
+        if status == "installed":
+            printer.ok(f"  ✓ {dep_name:<24} installed")
+        else:
+            printer.warn(f"  ✗ {dep_name:<24} missing")
+    if preflight.get("sentence_transformers") == "missing":
+        printer.warn(
+            "    ↳ Demo 2 will be skipped. "
+            "Install: pip install sentence-transformers"
+        )
+    if preflight.get("networkx") == "missing":
+        printer.warn(
+            "    ↳ Demos 1, 3, 4 will run in reduced mode "
+            "or be skipped. Install: pip install networkx"
+        )
+    printer.line()
 
     outcomes: List[DemoOutcome] = []
     for demo_id, fn in _DEMOS:
@@ -848,15 +1238,17 @@ def run_all_demos(
                 demo_id=demo_id,
                 status="skipped",
                 duration_ms=0.0,
-                reason="user requested skip",
+                reason=_USER_SKIP_REASON,
             ))
             continue
 
         printer.line()
         try:
             outcome = fn(cfg, printer)
-        except Exception as exc:  # pragma: no cover — last-resort safety net
-            logger.exception("Demo %s crashed: %s", demo_id, exc)
+        except Exception as exc:  # pragma: no cover
+            logger.exception(
+                "Demo %s crashed: %s", demo_id, exc,
+            )
             outcome = DemoOutcome(
                 demo_id=demo_id,
                 status="error",
@@ -866,38 +1258,87 @@ def run_all_demos(
         outcomes.append(outcome)
         printer.line()
 
-    # ---- Summary --------------------------------------------------
-    printer.section("✨ All VimRAG Enhancement Demos Complete!")
+        # Verbose: dump structured details per outcome.
+        if cfg.verbose and outcome.details:
+            printer.dim(
+                f"    [verbose] details: "
+                f"{json.dumps(outcome.details, default=_safe_json_default)}"
+            )
+        if cfg.verbose and outcome.reason:
+            printer.dim(
+                f"    [verbose] reason: {outcome.reason}"
+            )
+
+    # ---- Conditional closing section ---------------------------
+    total = len(outcomes)
+    ok_count = sum(1 for o in outcomes if o.status == "ok")
+    error_count = sum(
+        1 for o in outcomes if o.status == "error"
+    )
+    skipped_count = sum(
+        1 for o in outcomes if o.status == "skipped"
+    )
+
+    if error_count > 0:
+        printer.section(
+            f"⚠️  Demo Run Complete — {error_count} error(s), "
+            f"{ok_count} ok, {skipped_count} skipped"
+        )
+    elif skipped_count > 0:
+        printer.section(
+            f"✅ Demo Run Complete — {ok_count} ok, "
+            f"{skipped_count} skipped (missing dependencies)"
+        )
+    else:
+        printer.section(
+            "✨ All VimRAG Enhancement Demos Complete!"
+        )
+
     printer.line("Key Features Demonstrated:")
     printer.line(
-        "  ✅ Topological token allocation (importance-based budgeting)"
+        "  ✅ Topological token allocation "
+        "(importance-based budgeting)"
     )
     printer.line(
-        "  ✅ Semantic scoring with embeddings (vs keyword matching)"
+        "  ✅ Semantic scoring with embeddings "
+        "(vs keyword matching)"
     )
     printer.line(
-        "  ✅ NetworkX graph operations (communities, optimal paths)"
+        "  ✅ NetworkX graph operations "
+        "(communities, optimal paths)"
     )
     printer.line(
-        "  ✅ Complete VimRAG integration (all modules coordinated)"
+        "  ✅ Complete VimRAG integration "
+        "(all modules coordinated)"
     )
     printer.line()
     printer.line("Sustainability Impact:")
-    printer.line("  🌱 Carbon-adaptive retrieval based on grid intensity")
+    printer.line(
+        "  🌱 Carbon-adaptive retrieval based on grid intensity"
+    )
     printer.line("  🌱 Energy-optimal graph traversal")
-    printer.line("  🌱 Token-aware filtering and compression")
-    printer.line("  🌱 Serendipity logging for efficiency discovery")
+    printer.line(
+        "  🌱 Token-aware filtering and compression"
+    )
+    printer.line(
+        "  🌱 Serendipity logging for efficiency discovery"
+    )
     printer.line()
     printer.line("Next Steps:")
     printer.line(
         "  1. Install missing dependencies: "
         "pip install sentence-transformers networkx"
     )
-    printer.line("  2. Test with your own documents and queries")
     printer.line(
-        "  3. Integrate with Level 4 (NSN) and Level 5 (MetaAgent)"
+        "  2. Test with your own documents and queries"
     )
-    printer.line("  4. Deploy to Green Agent benchmarking platform")
+    printer.line(
+        "  3. Integrate with Level 4 (NSN) and Level 5 "
+        "(MetaAgent)"
+    )
+    printer.line(
+        "  4. Deploy to Green Agent benchmarking platform"
+    )
     printer.line()
     printer.line(_DEMO_SEPARATOR)
 
@@ -924,9 +1365,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Skip these demo IDs.",
     )
     parser.add_argument(
+        "--pipeline",
+        nargs="+",
+        choices=["fast", "green", "balanced"],
+        help="Restrict Demo 4 to these pipeline modes.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
-        help="Emit a JSON summary of demo outcomes instead of text.",
+        help="Emit a JSON summary of demo outcomes.",
     )
     parser.add_argument(
         "--quiet",
@@ -936,12 +1383,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-color",
         action="store_true",
-        help="Disable ANSI colors in future versions.",
+        help=(
+            "Disable ANSI colors in the terminal output. "
+            "The NO_COLOR environment variable has the same effect."
+        ),
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Enable DEBUG-level logging.",
+        help=(
+            "Enable DEBUG-level logging and per-outcome "
+            "detail dumps."
+        ),
     )
     parser.add_argument(
         "--embedding-model",
@@ -954,13 +1407,36 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=_DEFAULT_GRID_INTENSITY,
         help="Carbon intensity (gCO2/kWh) used in the demos.",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """CLI entry point. Returns the process exit code."""
+    """
+    CLI entry point.
+
+    Exit codes
+    ----------
+    - 0: every selected demo completed with status ``"ok"`` (or was
+         skipped via ``--skip``).
+    - 1: at least one demo returned ``"error"``.
+    - 2: at least one demo was skipped because a dependency is
+         missing (i.e., not because of ``--skip``).
+    """
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
+
+    if args.only and args.skip:
+        overlap = set(args.only) & set(args.skip)
+        if overlap:
+            parser.error(
+                f"--only and --skip overlap on "
+                f"{sorted(overlap)}; use one flag or the other."
+            )
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -971,6 +1447,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cfg = DemoConfig(
             embedding_model=args.embedding_model,
             grid_intensity_g_kwh=args.grid_intensity,
+            demo4_pipelines=(
+                tuple(args.pipeline) if args.pipeline else None
+            ),
             quiet=args.quiet,
             no_color=args.no_color,
             verbose=args.verbose,
@@ -979,42 +1458,61 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error(str(exc))
         return 2  # pragma: no cover
 
-    outcomes = run_all_demos(cfg, only=args.only, skip=args.skip)
+    outcomes = run_all_demos(
+        cfg, only=args.only, skip=args.skip,
+    )
 
     if args.json:
         summary = {
+            "version": VERSION,
             "config": {
                 "embedding_model": cfg.embedding_model,
-                "grid_intensity_g_kwh": cfg.grid_intensity_g_kwh,
+                "grid_intensity_g_kwh": (
+                    cfg.grid_intensity_g_kwh
+                ),
+                "demo4_pipelines": (
+                    list(cfg.demo4_pipelines)
+                    if cfg.demo4_pipelines else None
+                ),
             },
             "demos": [o.to_dict() for o in outcomes],
             "overall": {
                 "total": len(outcomes),
-                "ok": sum(1 for o in outcomes if o.status == "ok"),
-                "skipped": sum(1 for o in outcomes if o.status == "skipped"),
-                "errors": sum(1 for o in outcomes if o.status == "error"),
+                "ok": sum(
+                    1 for o in outcomes if o.status == "ok"
+                ),
+                "skipped": sum(
+                    1
+                    for o in outcomes
+                    if o.status == "skipped"
+                ),
+                "errors": sum(
+                    1
+                    for o in outcomes if o.status == "error"
+                ),
             },
         }
-        # JSON goes to stdout regardless of --quiet so it can be piped.
-        print(json.dumps(summary, indent=2, default=str))
+        print(json.dumps(
+            summary,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+            default=_safe_json_default,
+        ))
 
-    # Non-zero exit code only on hard errors.
-    return 0 if all(o.status != "error" for o in outcomes) else 1
-
-
-# --------------------------------------------------------------------------- #
-# Public API
-# --------------------------------------------------------------------------- #
-__all__ = [
-    "DemoConfig",
-    "DemoOutcome",
-    "main",
-    "run_all_demos",
-    "run_demo_1",
-    "run_demo_2",
-    "run_demo_3",
-    "run_demo_4",
-]
+    # ---- Exit code --------------------------------------------
+    if any(o.status == "error" for o in outcomes):
+        return 1
+    # Distinguish "skipped because user asked" from "skipped
+    # because a dependency is missing".
+    unintended_skips = [
+        o for o in outcomes
+        if o.status == "skipped"
+        and o.reason != _USER_SKIP_REASON
+    ]
+    if unintended_skips:
+        return 2
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
