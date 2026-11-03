@@ -1,211 +1,166 @@
-# src/rlhf/__init__.py
-
-"""
-RLHF modules for Green_Agent
-============================
-
-Reward shaping and policy evaluation for carbon-aware RLHF.
-
-Components
-----------
-- :class:`RewardShaper` — scenario-dependent reward functions.
-- :class:`ExecutionMode` — eco / fast / accuracy / balanced / custom.
-- :class:`RewardConfig` — frozen, validated configuration for a mode.
-- :class:`PolicyEvaluationEnvironment` — evaluates an agent policy across
-  tasks and modes.
-- :func:`apply_green_penalty` — lightweight reward-shaping function.
-
-Enhancements
-------------
-- Registry pattern (``RLHF_REGISTRY`` + ``register_rlhf_component`` /
-  ``get_rlhf_component`` / ``list_rlhf_components``) consistent with the
-  rest of the upgraded ``src/`` tree.
-- Availability manifest (``RLHF_AVAILABILITY``).
-- ``apply_green_penalty`` is now re-exported at the package root.
-- Optional import-time validation via ``GREEN_AGENT_VALIDATE_RLHF=1``.
-- ``__version__`` constant.
-"""
-
 from __future__ import annotations
 
+import importlib
+import inspect
 import logging
-import os as _os
-from typing import Any, Dict, Type
+import os
+import threading
+from types import MappingProxyType
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Type, Union
 
 logger = logging.getLogger(__name__)
-
 __version__ = "2.4.0"
 
 # --------------------------------------------------------------------------- #
-# Guarded sub-module imports
+# Read-only public views over mutable internals
 # --------------------------------------------------------------------------- #
-RLHF_AVAILABILITY: Dict[str, bool] = {}
+_availability: Dict[str, bool] = {}
+RLHF_AVAILABILITY: Mapping[str, bool] = MappingProxyType(_availability)
 
-# ---- green_reward ----------------------------------------------------------
-try:
-    from .green_reward import (
-        GreenRewardConfig,
-        GreenRewardError,
-        apply_green_penalty,
-        apply_green_penalty_detailed,
-    )
-
-    RLHF_AVAILABILITY["green_reward"] = True
-except ImportError as exc:  # pragma: no cover — defensive
-    logger.warning("green_reward unavailable: %s", exc)
-    GreenRewardConfig = None  # type: ignore[assignment,misc]
-    GreenRewardError = None  # type: ignore[assignment,misc]
-    apply_green_penalty = None  # type: ignore[assignment,misc]
-    apply_green_penalty_detailed = None  # type: ignore[assignment,misc]
-    RLHF_AVAILABILITY["green_reward"] = False
+_registry: Dict[str, Union[Type[Any], Callable[..., Any]]] = {}
+RLHF_REGISTRY: Mapping[str, Any] = MappingProxyType(_registry)
+_registry_lock = threading.RLock()
 
 
-# ---- reward_shaper ---------------------------------------------------------
-try:
-    from .reward_shaper import (
-        ExecutionMode,
-        RewardConfig,
-        RewardShaper,
-        RewardShaperError,
-    )
+class _MissingComponent:
+    """Placeholder for an optional component that failed to import."""
+    def __init__(self, name: str, reason: BaseException) -> None:
+        self._name, self._reason = name, reason
 
-    RLHF_AVAILABILITY["reward_shaper"] = True
-except ImportError as exc:  # pragma: no cover
-    logger.warning("reward_shaper unavailable: %s", exc)
-    ExecutionMode = None  # type: ignore[assignment,misc]
-    RewardConfig = None  # type: ignore[assignment,misc]
-    RewardShaper = None  # type: ignore[assignment,misc]
-    RewardShaperError = None  # type: ignore[assignment,misc]
-    RLHF_AVAILABILITY["reward_shaper"] = False
+    def _fail(self) -> None:
+        raise ImportError(
+            f"RLHF component '{self._name}' is unavailable: {self._reason}"
+        ) from self._reason
+
+    def __call__(self, *a: Any, **kw: Any) -> Any: self._fail()
+    def __getattr__(self, item: str) -> Any: self._fail()
+    def __repr__(self) -> str:
+        return f"<unavailable RLHF component {self._name!r}>"
 
 
-# ---- policy_evaluator ------------------------------------------------------
-try:
-    from .policy_evaluator import (
-        PolicyEvaluationConfig,
-        PolicyEvaluationEnvironment,
-        PolicyEvaluatorError,
-        PolicyEvaluationRecord,
-    )
+# --------------------------------------------------------------------------- #
+# Guarded import helper
+# --------------------------------------------------------------------------- #
+def _load(
+    module: str, names: Tuple[str, ...]
+) -> Dict[str, Any]:
+    try:
+        mod = importlib.import_module(f".{module}", package=__package__)
+        _availability[module] = True
+        return {n: getattr(mod, n) for n in names}
+    except ImportError as exc:
+        logger.info("%s unavailable: %s", module, exc)
+        _availability[module] = False
+        return {n: _MissingComponent(n, exc) for n in names}
 
-    RLHF_AVAILABILITY["policy_evaluator"] = True
-except ImportError as exc:  # pragma: no cover
-    logger.warning("policy_evaluator unavailable: %s", exc)
-    PolicyEvaluationConfig = None  # type: ignore[assignment,misc]
-    PolicyEvaluationEnvironment = None  # type: ignore[assignment,misc]
-    PolicyEvaluatorError = None  # type: ignore[assignment,misc]
-    PolicyEvaluationRecord = None  # type: ignore[assignment,misc]
-    RLHF_AVAILABILITY["policy_evaluator"] = False
+
+globals().update(_load(
+    "green_reward",
+    ("GreenRewardConfig", "GreenRewardError",
+     "apply_green_penalty", "apply_green_penalty_detailed"),
+))
+globals().update(_load(
+    "reward_shaper",
+    ("ExecutionMode", "RewardConfig", "RewardShaper", "RewardShaperError",
+     "RewardResult", "RewardComponents", "RewardPenalties",
+     "NUMPY_AVAILABLE"),
+))
+globals().update(_load(
+    "policy_evaluator",
+    ("PolicyEvaluationConfig", "PolicyEvaluationEnvironment",
+     "PolicyEvaluatorError", "PolicyEvaluationRecord"),
+))
+
+# --------------------------------------------------------------------------- #
+# Registry
+# --------------------------------------------------------------------------- #
+def register_rlhf_component(
+    name: str, obj: Union[Type[Any], Callable[..., Any]]
+) -> None:
+    if not isinstance(name, str) or not name:
+        raise ValueError("Component name must be a non-empty string.")
+    if not callable(obj):
+        raise TypeError(f"Expected a callable/class, got {type(obj).__name__}.")
+    with _registry_lock:
+        existing = _registry.get(name)
+        if existing is not None and existing is not obj:
+            raise ValueError(
+                f"RLHF component '{name}' already registered to {existing!r}."
+            )
+        _registry[name] = obj
+        logger.debug("Registered RLHF component '%s' -> %r", name, obj)
+
+
+def _register_default(name: str, obj: Any) -> None:
+    if not isinstance(obj, _MissingComponent) and callable(obj):
+        try:
+            register_rlhf_component(name, obj)
+        except ValueError:
+            # Already present at import time — unlikely, but don't crash import.
+            logger.debug("Default registration of '%s' skipped.", name)
+
+
+_register_default("shaper", RewardShaper)
+_register_default("environment", PolicyEvaluationEnvironment)
+_register_default("config", RewardConfig)
+_register_default("mode", ExecutionMode)
+
+
+def get_rlhf_component(name: str) -> Any:
+    try:
+        return _registry[name]
+    except KeyError as exc:
+        raise KeyError(
+            f"Unknown RLHF component '{name}'. Available: {sorted(_registry)}"
+        ) from exc
+
+
+def list_rlhf_components() -> Dict[str, str]:
+    return {
+        n: getattr(c, "__name__", type(c).__name__)
+        for n, c in _registry.items()
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Optional import-time validation (now actually meaningful)
+# --------------------------------------------------------------------------- #
+if os.environ.get("GREEN_AGENT_VALIDATE_RLHF") == "1":
+    for _module, _ok in _availability.items():
+        _level = logging.INFO if _ok else logging.WARNING
+        logger.log(_level, "RLHF submodule %-20s : %s",
+                   _module, "available" if _ok else "MISSING")
+
+    for _name, _obj in _registry.items():
+        if not inspect.isclass(_obj):
+            logger.warning(
+                "RLHF component '%s' (%r) is not a class; skipping class checks.",
+                _name, _obj,
+            )
+            continue
+        if not (_obj.__doc__ or "").strip():
+            logger.warning("RLHF component '%s' has no docstring.", _name)
 
 
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
-__all__ = [
+__all__ = (
     "__version__",
     # reward shaping
-    "ExecutionMode",
-    "RewardConfig",
-    "RewardShaper",
-    "RewardShaperError",
+    "ExecutionMode", "RewardConfig", "RewardShaper", "RewardShaperError",
+    "RewardResult", "RewardComponents", "RewardPenalties", "NUMPY_AVAILABLE",
     # green penalty
-    "apply_green_penalty",
-    "apply_green_penalty_detailed",
-    "GreenRewardConfig",
-    "GreenRewardError",
+    "apply_green_penalty", "apply_green_penalty_detailed",
+    "GreenRewardConfig", "GreenRewardError",
     # policy evaluation
-    "PolicyEvaluationEnvironment",
-    "PolicyEvaluationConfig",
-    "PolicyEvaluationRecord",
-    "PolicyEvaluatorError",
+    "PolicyEvaluationEnvironment", "PolicyEvaluationConfig",
+    "PolicyEvaluationRecord", "PolicyEvaluatorError",
     # registry
-    "RLHF_REGISTRY",
-    "RLHF_AVAILABILITY",
-    "get_rlhf_component",
-    "list_rlhf_components",
-    "register_rlhf_component",
-]
+    "RLHF_REGISTRY", "RLHF_AVAILABILITY",
+    "get_rlhf_component", "list_rlhf_components", "register_rlhf_component",
+)
 
 
-# --------------------------------------------------------------------------- #
-# Component registry
-# --------------------------------------------------------------------------- #
-RLHF_REGISTRY: Dict[str, Type[Any]] = {}
-
-
-def _register_if_available(name: str, cls: Any) -> None:
-    if cls is not None and isinstance(cls, type):
-        RLHF_REGISTRY[name] = cls
-
-
-_register_if_available("shaper", RewardShaper)
-_register_if_available("environment", PolicyEvaluationEnvironment)
-_register_if_available("mode", ExecutionMode)
-_register_if_available("config", RewardConfig)
-
-
-def register_rlhf_component(name: str, cls: Type[Any]) -> None:
-    """
-    Register an RLHF component class under ``name``.
-
-    Raises
-    ------
-    ValueError
-        If ``name`` is empty or already registered to a different class.
-    TypeError
-        If ``cls`` is not a class.
-    """
-    if not isinstance(name, str) or not name:
-        raise ValueError("Component name must be a non-empty string.")
-    if not isinstance(cls, type):
-        raise TypeError(f"Expected a class, got {type(cls).__name__}.")
-    existing = RLHF_REGISTRY.get(name)
-    if existing is not None and existing is not cls:
-        raise ValueError(
-            f"RLHF component '{name}' already registered to "
-            f"{existing.__name__}."
-        )
-    RLHF_REGISTRY[name] = cls
-    logger.debug("Registered RLHF component '%s' -> %s", name, cls.__name__)
-
-
-def get_rlhf_component(name: str) -> Type[Any]:
-    """Return the RLHF component class registered under ``name``."""
-    try:
-        return RLHF_REGISTRY[name]
-    except KeyError as exc:
-        raise KeyError(
-            f"Unknown RLHF component '{name}'. "
-            f"Available: {sorted(RLHF_REGISTRY)}"
-        ) from exc
-
-
-def list_rlhf_components() -> Dict[str, str]:
-    """Return a mapping of registered name -> class name."""
-    return {n: c.__name__ for n, c in RLHF_REGISTRY.items()}
-
-
-# --------------------------------------------------------------------------- #
-# Optional import-time validation
-# --------------------------------------------------------------------------- #
-if _os.environ.get("GREEN_AGENT_VALIDATE_RLHF") == "1":
-    _missing = [k for k, ok in RLHF_AVAILABILITY.items() if not ok]
-    if _missing:
-        logger.warning(
-            "RLHF sub-modules unavailable at import time: %s",
-            sorted(_missing),
-        )
-    for _name, _cls in list(RLHF_REGISTRY.items()):
-        try:
-            if not callable(_cls):
-                raise TypeError(f"{_cls!r} is not callable.")
-            logger.debug(
-                "RLHF component '%s' (%s) OK.",
-                _name, _cls.__name__,
-            )
-        except Exception:  # pragma: no cover — CI-only diagnostic
-            logger.exception(
-                "RLHF component '%s' (%s) failed validation.",
-                _name, _cls.__name__,
-            )
-            raise
+def __dir__() -> list[str]:
+    return sorted(__all__)
