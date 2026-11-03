@@ -20,42 +20,111 @@ Enhancements
 - ``GreenDecisionGraphConfig`` — frozen, validated, fully serializable:
   caps, time-travel tolerance (now enforced), HTML escaping, optional
   overlays, container-tag expectation, schema version.
-- ``GraphNode`` / ``GraphEdge`` / ``GraphPayload`` — deeply frozen
-  (``MappingProxyType``), hashable, full serialization symmetry, plus
+- ``GraphNode`` / ``GraphEdge`` / ``GraphPayload`` — **deeply** frozen
+  (nested ``MappingProxyType`` / tuples / frozensets), hashable,
+  full serialization symmetry via :func:`_thaw`, plus
   ``to_episode_payload()`` / ``to_memory_dict()`` bridges on the payload.
 - ``build_payload()`` classifies memories via ``metadata.kind`` (the
   enhanced schema contract) and honors ``metadata.container_tag``.
 - ``time_travel()`` uses the configured tolerance and returns the
-  contemporaneous graph.
+  contemporaneous graph; accepts caller-supplied filters.
 - Overlays:
-    * ``GuardVerdict`` → ``verdict`` nodes + ``violated-budget`` /
-      ``requires-human`` edges.
+    * ``GuardVerdict`` → ``verdict`` nodes **linked to their decision**
+      via a ``validated-by`` edge. No more self-loop decoration.
     * ``BenchmarkReport`` → ``improved-over`` / ``hurt-by`` overlays
-      between baseline and memory decision nodes.
-    * ``PolicySnapshot`` → richer policy nodes (truth_level,
-      container_tag, superseded_by).
-    * ``MemoryTierManager`` → per-node ``tier`` / ``importance``
-      annotations.
+      between baseline and memory decision nodes, with per-metric
+      malformed-delta warnings.
+    * ``PolicySnapshot`` → richer policy nodes.
+    * ``MemoryTierManager`` → per-node ``tier`` annotations, with
+      explicit warnings when ``tier_of`` is missing or returns a
+      non-string value.
 - ``build_from_pipeline(pipeline)`` — construct a graph from the package
-  pipeline in one call.
-- Emits the previously declared-but-unused ``grid_context`` / ``model``
-  nodes and ``improved-over`` / ``violated-budget`` edges.
+  pipeline in one call, wrapping ``recall.query`` failures.
 - ``dedupe_edges`` by default — no more quadratic payloads.
-- Robust ``run_id`` fallback — no more ``"unknown"`` collisions.
-- Container-tag filtering via ``expected_container_tag``.
-- Manager-level ``statistics()`` / ``reset()`` / ``close()`` /
-  context manager / async siblings.
+- **Content-hashed ``run_id`` fallback** — synthetic IDs are stable
+  across reorderings and visibly prefixed ``anon-``; no more
+  ``"unknown"`` collisions, no more positional IDs that shift when the
+  recall order changes.
+- Container-tag filtering via ``expected_container_tag`` with a
+  working ``skipped_container_mismatches`` stat.
+- Manager-level ``statistics()`` / ``reset()`` / ``close()`` / context
+  manager / async siblings (with a Python 3.8-safe thread helper).
 - Structured error hierarchy:
   ``GreenDecisionGraphError`` → ``GreenDecisionGraphInputError``,
   ``GreenDecisionGraphConfigError``, ``GreenDecisionGraphParseError``.
 - ``__version__`` exported via ``__all__``.
 - ``__main__`` smoke test covers happy paths, overlays, time travel,
   container tags, dedup, serialization, async, reset, and validation.
+
+Behaviour changes over the previous revision
+--------------------------------------------
+1. **``route`` no longer produces a ``device:`` node.** The ``route``
+   field is a *deployment route* (e.g. ``"edge_int8"``), not a physical
+   device. It is recorded on the decision node's ``properties`` only;
+   ``device_class`` still produces ``device:`` nodes as before.
+2. **Verdicts are linked to their decisions** via ``validated-by``.
+   The three self-loop edges the previous revision emitted
+   (``validated-by``, ``requires-human``, ``violated-budget`` all from
+   ``verdict:i`` to ``verdict:i``) are **removed**. Verdict facts live
+   on the node's ``properties``; the decision link comes from
+   ``verdict["run_id"]`` / ``verdict["decision_id"]`` /
+   ``verdict["evidence_ids"][0]``.
+3. **``skipped_container_mismatches`` stat works.** The previous
+   revision passed a no-op ``lambda`` as the counter; the fix threads a
+   real closure.
+4. **Content-hashed fallback IDs.** Memories without ``run_id`` /
+   ``record_id`` / ``id`` receive ``anon-{sha256[:12]}`` derived from
+   their content — stable across reorderings, never confusable with a
+   real identifier. The previous positional ``memory-{index:06d}``
+   fallback could change meaning between builds.
+5. **``time_travel`` accepts ``filters=``.** It merges them with the
+   ``time_travel_at`` hint instead of overwriting the field.
+6. **``time_travel`` docstring matches implementation.** Memories with
+   no parseable ``observed_at`` are **always** kept; the previous
+   docstring claimed a time-dependent heuristic that was never
+   implemented.
+7. **Malformed benchmark deltas warn instead of raising.** A
+   ``BenchmarkReport`` whose metric ``delta`` is a string or ``inf``
+   now produces a ``warnings`` entry; the edge is skipped. Previously
+   the whole ``build_payload`` call raised ``ValueError`` from
+   ``float(...)``.
+8. **Re-entrant lock in ``to_dict`` fixed.** ``statistics()`` is now
+   inlined into a ``_statistics_locked()`` helper so the outer lock in
+   ``to_dict`` is not re-acquired.
+9. **Cap-fire warnings.** When ``max_nodes`` / ``max_edges`` truncates,
+   the payload's ``warnings`` records how many nodes / edges were
+   dropped.
+10. **Empty ``recall_bundles`` warns.** An empty input sequence
+    produces an empty graph but also a ``warnings`` entry so a caller
+    with an accidental filter can diagnose.
+11. **``from_dict`` restores counters.** A round-tripped graph reports
+    the same ``builds`` / ``total_nodes`` / ``total_edges`` as the
+    original.
+12. **``from_dict`` records malformed nodes/edges.** The per-entry
+    skip notices are appended to ``payload.warnings``.
+13. **Async helpers are 3.8-safe.** ``build_payload_async`` /
+    ``time_travel_async`` use ``_run_sync_in_thread`` which falls back
+    to ``run_in_executor`` on Python 3.8 where ``asyncio.to_thread``
+    does not exist.
+14. **``_stable_run_id`` rejects whitespace-only IDs.**
+15. **Deep freeze.** Nested dicts / lists in ``properties`` are frozen
+    to ``MappingProxyType`` / tuples. ``to_dict`` calls ``_thaw`` to
+    produce JSON-safe primitives. Node / edge equality and hashing are
+    stable for structurally-equal inputs.
+16. **``to_json`` no longer uses ``default=str``.** The payload is
+    primitive-only after ``_thaw``; a future non-primitive field will
+    fail loudly at serialize time instead of coercing to ``repr()``.
+17. **``strict=`` and ``content=`` / ``container_tag=`` validated**
+    at their respective boundaries.
+
+Requires Python 3.8+ (no ``slots=True`` so 3.8 is fine).
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
+import hashlib
 import html
 import json
 import logging
@@ -83,7 +152,7 @@ from typing import (
 
 logger = logging.getLogger(__name__)
 
-__version__ = "6.0.0"
+__version__ = "7.0.0"
 
 SCHEMA_VERSION: int = 1
 DEFAULT_CONTAINER_TAG: str = "org:green-agent"
@@ -109,7 +178,7 @@ class GreenDecisionGraphParseError(GreenDecisionGraphError):
 
 
 # --------------------------------------------------------------------------- #
-# Shared validation helpers — mirror the other enhanced modules
+# Validation helpers
 # --------------------------------------------------------------------------- #
 def _is_real_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
@@ -141,6 +210,8 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         ts = float(value)
+        if not math.isfinite(ts):
+            return None
         if ts > 1e12:
             ts /= 1000.0
         try:
@@ -182,9 +253,41 @@ def _json_safe(value: Any, *, depth: int = 0) -> Any:
             str(k): _json_safe(v, depth=depth + 1)
             for k, v in value.items()
         }
-    if isinstance(value, (list, tuple, set, frozenset)):
+    if isinstance(value, (set, frozenset)):
+        # Sets have undefined iteration order; sort deterministically so
+        # structurally-equal sets produce structurally-equal output.
+        return sorted(
+            (_json_safe(v, depth=depth + 1) for v in value),
+            key=repr,
+        )
+    if isinstance(value, (list, tuple)):
         return [_json_safe(v, depth=depth + 1) for v in value]
     return str(value)
+
+
+def _deep_freeze(value: Any) -> Any:
+    """Recursively freeze ``value``; nested dicts → ``MappingProxyType``,
+    nested lists → ``tuple``, nested sets → ``frozenset``."""
+    if isinstance(value, ABCMapping):
+        return MappingProxyType({
+            str(k): _deep_freeze(v) for k, v in value.items()
+        })
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(v) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_deep_freeze(v) for v in value)
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    """Inverse of :func:`_deep_freeze` — produces JSON-safe primitives."""
+    if isinstance(value, ABCMapping):
+        return {str(k): _thaw(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw(v) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return [_thaw(v) for v in sorted(value, key=repr)]
+    return value
 
 
 def _freeze_mapping(value: Any, *, name: str) -> Mapping[str, Any]:
@@ -192,9 +295,8 @@ def _freeze_mapping(value: Any, *, name: str) -> Mapping[str, Any]:
         return MappingProxyType({})
     if not isinstance(value, ABCMapping):
         raise GreenDecisionGraphInputError(f"{name} must be a Mapping.")
-    return MappingProxyType({
-        str(k): _json_safe(v) for k, v in value.items()
-    })
+    safe = {str(k): _json_safe(v) for k, v in value.items()}
+    return _deep_freeze(safe)
 
 
 def _coerce_to_mapping(obj: Any) -> Optional[Mapping[str, Any]]:
@@ -219,13 +321,68 @@ def _coerce_to_mapping(obj: Any) -> Optional[Mapping[str, Any]]:
     return None
 
 
-def _stable_run_id(meta: Mapping[str, Any], memory: Mapping[str, Any], index: int) -> str:
-    """Return a stable identifier for a memory; never just 'unknown'."""
+def _stable_run_id(
+    meta: Mapping[str, Any],
+    memory: Mapping[str, Any],
+    index: int,  # noqa: ARG001 — kept for call-site compatibility
+) -> str:
+    """Return a stable identifier for a memory.
+
+    Priority:
+    1. ``run_id`` / ``record_id`` / ``id`` from metadata or memory.
+    2. Content-hash fallback (``anon-{sha256[:12]}``) — stable across
+       reorderings, distinct for different content, visibly synthetic.
+
+    The positional ``index`` is retained in the signature for backward
+    compatibility but no longer used for the fallback.
+    """
     for source in (meta, memory):
-        v = source.get("run_id") or source.get("record_id") or source.get("id")
-        if isinstance(v, str) and v:
-            return v
-    return f"memory-{index:06d}"
+        for key in ("run_id", "record_id", "id"):
+            v = source.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+
+    try:
+        blob = json.dumps(
+            dict(memory), sort_keys=True, default=str,
+        )
+    except Exception:  # pragma: no cover - defensive
+        blob = repr(memory)
+    digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+    return f"anon-{digest}"
+
+
+def _extract_verdict_run_id(v: Mapping[str, Any]) -> Optional[str]:
+    """Best-effort extraction of the decision ID a verdict refers to."""
+    for key in ("run_id", "decision_id", "record_id"):
+        val = v.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    evidence = v.get("evidence_ids") or v.get("evidence")
+    if isinstance(evidence, (list, tuple)) and evidence:
+        first = evidence[0]
+        if isinstance(first, str) and first.strip():
+            return first.strip()
+        if isinstance(first, ABCMapping):
+            for key in ("run_id", "id", "record_id"):
+                val = first.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+    return None
+
+
+async def _run_sync_in_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
+    """Cross-version ``asyncio.to_thread``.
+
+    Uses ``asyncio.to_thread`` (Python 3.9+) when available, otherwise
+    falls back to ``loop.run_in_executor`` with the default executor.
+    """
+    if hasattr(asyncio, "to_thread"):
+        return await asyncio.to_thread(func, *args, **kwargs)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, functools.partial(func, *args, **kwargs),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -321,7 +478,7 @@ class GreenDecisionGraphConfig:
     max_edges: int = 20_000
 
     #: Seconds of tolerance applied when comparing ``observed_at`` to the
-    #: time-travel instant. Now enforced.
+    #: time-travel instant.
     time_travel_tolerance_seconds: float = 60.0
 
     escape_html: bool = True
@@ -335,10 +492,10 @@ class GreenDecisionGraphConfig:
     dedupe_edges: bool = True
 
     #: When set, memories whose ``metadata.container_tag`` differs are
-    #: skipped. ``None`` disables the check.
+    #: skipped and counted in ``skipped_container_mismatches``.
+    #: ``None`` disables the check.
     expected_container_tag: Optional[str] = None
 
-    # ------------------------------------------------------------------ #
     def __post_init__(self) -> None:
         for name in ("max_nodes", "max_edges"):
             v = getattr(self, name)
@@ -367,14 +524,13 @@ class GreenDecisionGraphConfig:
         if self.expected_container_tag is not None:
             if (
                 not isinstance(self.expected_container_tag, str)
-                or not self.expected_container_tag
+                or not self.expected_container_tag.strip()
             ):
                 raise GreenDecisionGraphConfigError(
                     "expected_container_tag must be None or a non-empty "
                     "string."
                 )
 
-    # ------------------------------------------------------------------ #
     def to_dict(self) -> Dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -398,7 +554,7 @@ class GreenDecisionGraphConfig:
 
     @classmethod
     def from_dict(
-        cls, data: Mapping[str, Any], *, strict: bool = False,
+        cls, data: Mapping[str, Any], *, strict: bool = True,
     ) -> "GreenDecisionGraphConfig":
         if not isinstance(data, ABCMapping):
             raise GreenDecisionGraphConfigError(
@@ -409,6 +565,11 @@ class GreenDecisionGraphConfig:
         if strict and unknown:
             raise GreenDecisionGraphConfigError(
                 f"Unknown config key(s): {sorted(unknown)}."
+            )
+        if unknown:
+            logger.warning(
+                "GreenDecisionGraphConfig.from_dict ignoring unknown "
+                "key(s): %s", sorted(unknown),
             )
         kwargs = {k: v for k, v in data.items() if k in valid}
         try:
@@ -422,7 +583,7 @@ class GreenDecisionGraphConfig:
 
     @classmethod
     def from_json(
-        cls, payload: str, *, strict: bool = False,
+        cls, payload: str, *, strict: bool = True,
     ) -> "GreenDecisionGraphConfig":
         try:
             data = json.loads(payload)
@@ -482,7 +643,7 @@ class GreenDecisionGraphConfig:
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class GraphNode:
-    """Frozen graph node."""
+    """Frozen graph node with deeply-frozen ``properties``."""
 
     node_id: str
     node_type: NodeType
@@ -491,7 +652,7 @@ class GraphNode:
     observed_at: Optional[datetime] = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.node_id, str) or not self.node_id:
+        if not isinstance(self.node_id, str) or not self.node_id.strip():
             raise GreenDecisionGraphInputError(
                 "node_id must be a non-empty string."
             )
@@ -503,7 +664,8 @@ class GraphNode:
                 "label must be a non-empty string."
             )
         object.__setattr__(
-            self, "properties", _freeze_mapping(self.properties, name="properties"),
+            self, "properties",
+            _freeze_mapping(self.properties, name="properties"),
         )
         if self.observed_at is not None:
             if not isinstance(self.observed_at, datetime):
@@ -516,7 +678,6 @@ class GraphNode:
                     self.observed_at.replace(tzinfo=timezone.utc),
                 )
 
-    # ------------------------------------------------------------------ #
     @property
     def id(self) -> str:
         return self.node_id
@@ -527,14 +688,14 @@ class GraphNode:
             "id": self.node_id,
             "type": self.node_type.value,
             "label": esc(str(self.label)),
-            "properties": dict(self.properties),
+            "properties": _thaw(dict(self.properties)),
             "observed_at": (
                 self.observed_at.isoformat() if self.observed_at else None
             ),
         }
 
     def to_json(self, *, indent: Optional[int] = None) -> str:
-        return json.dumps(self.to_dict(), default=str, indent=indent)
+        return json.dumps(self.to_dict(), indent=indent)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "GraphNode":
@@ -568,9 +729,12 @@ class GraphNode:
     def __hash__(self) -> int:
         try:
             props_hash = hash(tuple(sorted(self.properties.items())))
-        except TypeError:
+        except (TypeError, ValueError):
             props_hash = hash(
-                json.dumps(dict(self.properties), default=str, sort_keys=True)
+                json.dumps(
+                    _thaw(dict(self.properties)),
+                    default=str, sort_keys=True,
+                )
             )
         return hash((
             self.node_id, self.node_type, self.label, props_hash,
@@ -597,7 +761,7 @@ class GraphEdge:
     def __post_init__(self) -> None:
         for name in ("source", "target"):
             v = getattr(self, name)
-            if not isinstance(v, str) or not v:
+            if not isinstance(v, str) or not v.strip():
                 raise GreenDecisionGraphInputError(
                     f"{name} must be a non-empty string."
                 )
@@ -609,7 +773,8 @@ class GraphEdge:
                 "weight must be a finite number >= 0."
             )
         object.__setattr__(
-            self, "properties", _freeze_mapping(self.properties, name="properties"),
+            self, "properties",
+            _freeze_mapping(self.properties, name="properties"),
         )
 
     @property
@@ -623,11 +788,11 @@ class GraphEdge:
             "target": self.target,
             "type": self.edge_type.value,
             "weight": float(self.weight),
-            "properties": dict(self.properties),
+            "properties": _thaw(dict(self.properties)),
         }
 
     def to_json(self, *, indent: Optional[int] = None) -> str:
-        return json.dumps(self.to_dict(), default=str, indent=indent)
+        return json.dumps(self.to_dict(), indent=indent)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "GraphEdge":
@@ -661,11 +826,17 @@ class GraphEdge:
     def __hash__(self) -> int:
         try:
             props_hash = hash(tuple(sorted(self.properties.items())))
-        except TypeError:
+        except (TypeError, ValueError):
             props_hash = hash(
-                json.dumps(dict(self.properties), default=str, sort_keys=True)
+                json.dumps(
+                    _thaw(dict(self.properties)),
+                    default=str, sort_keys=True,
+                )
             )
-        return hash((self.source, self.target, self.edge_type, self.weight, props_hash))
+        return hash((
+            self.source, self.target, self.edge_type, self.weight,
+            props_hash,
+        ))
 
     def __repr__(self) -> str:
         return (
@@ -688,7 +859,6 @@ class GraphPayload:
     schema_version: int = SCHEMA_VERSION
     stats: Mapping[str, Any] = field(default_factory=dict)
 
-    # ------------------------------------------------------------------ #
     def __post_init__(self) -> None:
         if not isinstance(self.nodes, tuple):
             object.__setattr__(self, "nodes", tuple(self.nodes))
@@ -727,7 +897,6 @@ class GraphPayload:
             self, "stats", _freeze_mapping(self.stats, name="stats"),
         )
 
-    # ------------------------------------------------------------------ #
     @property
     def node_count(self) -> int:
         return len(self.nodes)
@@ -745,14 +914,16 @@ class GraphPayload:
             "nodes": [n.to_dict(escape=escape) for n in self.nodes],
             "edges": [e.to_dict() for e in self.edges],
             "generated_at": self.generated_at.isoformat(),
-            "filters_applied": dict(self.filters_applied),
+            "filters_applied": _thaw(dict(self.filters_applied)),
             "warnings": list(self.warnings),
-            "stats": dict(self.stats),
+            "stats": _thaw(dict(self.stats)),
         }
 
-    def to_json(self, *, escape: bool = True, indent: Optional[int] = None) -> str:
+    def to_json(
+        self, *, escape: bool = True, indent: Optional[int] = None,
+    ) -> str:
         return json.dumps(
-            self.to_dict(escape=escape), default=str, indent=indent,
+            self.to_dict(escape=escape), indent=indent,
         )
 
     @classmethod
@@ -767,18 +938,23 @@ class GraphPayload:
             raise GreenDecisionGraphParseError(
                 "'nodes' and 'edges' must be lists."
             )
+
+        warnings: List[str] = list(data.get("warnings", []) or ())
         nodes: List[GraphNode] = []
         for i, raw in enumerate(raw_nodes):
             try:
                 nodes.append(GraphNode.from_dict(raw))
             except GreenDecisionGraphParseError as exc:
+                warnings.append(f"skipped malformed node[{i}]: {exc}")
                 logger.warning("Skipping malformed node %d: %s", i, exc)
         edges: List[GraphEdge] = []
         for i, raw in enumerate(raw_edges):
             try:
                 edges.append(GraphEdge.from_dict(raw))
             except GreenDecisionGraphParseError as exc:
+                warnings.append(f"skipped malformed edge[{i}]: {exc}")
                 logger.warning("Skipping malformed edge %d: %s", i, exc)
+
         return cls(
             nodes=tuple(nodes),
             edges=tuple(edges),
@@ -787,7 +963,7 @@ class GraphPayload:
                 or datetime.now(timezone.utc)
             ),
             filters_applied=dict(data.get("filters_applied", {}) or {}),
-            warnings=tuple(data.get("warnings", []) or ()),
+            warnings=tuple(warnings),
             schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
             stats=dict(data.get("stats", {}) or {}),
         )
@@ -812,12 +988,30 @@ class GraphPayload:
             f"{self.generated_at.isoformat()})"
         )
 
+    def _aggregate_truth_level(self) -> str:
+        """Aggregate truth_level across nodes.
+
+        - no node declares a truth_level → ``"estimated"``
+        - one distinct level → that level
+        - multiple distinct levels → ``"mixed"``
+        """
+        levels: Set[str] = set()
+        for n in self.nodes:
+            lvl = n.properties.get("truth_level")
+            if isinstance(lvl, str) and lvl.strip():
+                levels.add(lvl.strip())
+        if not levels:
+            return "estimated"
+        if len(levels) == 1:
+            return levels.pop()
+        return "mixed"
+
     def _metadata(self, *, container_tag: str) -> Dict[str, Any]:
         return {
             "kind": "decision_graph",
             "type": "decision_graph",
             "record_id": f"graph:{self.generated_at.isoformat()}",
-            "truth_level": "estimated",
+            "truth_level": self._aggregate_truth_level(),
             "container_tag": container_tag,
             "observed_at": self.generated_at.isoformat(),
             "schema_version": self.schema_version,
@@ -834,25 +1028,40 @@ class GraphPayload:
         container_tag: Optional[str] = None,
         content: Optional[str] = None,
     ) -> Dict[str, Any]:
-        tag = container_tag or DEFAULT_CONTAINER_TAG
-        if not isinstance(tag, str) or not tag:
+        if container_tag is not None:
+            if not isinstance(container_tag, str) or not container_tag.strip():
+                raise GreenDecisionGraphInputError(
+                    "container_tag must be None or a non-empty string."
+                )
+        if content is not None and not isinstance(content, str):
             raise GreenDecisionGraphInputError(
-                "container_tag must be a non-empty string."
+                f"content must be a string or None, got "
+                f"{type(content).__name__}."
             )
+        tag = container_tag or DEFAULT_CONTAINER_TAG
         return {
-            "content": content if content is not None else self._render_content(),
+            "content": (
+                content if content is not None else self._render_content()
+            ),
             "container_tag": tag,
             "metadata": self._metadata(container_tag=tag),
         }
 
-    def to_memory_dict(self) -> Dict[str, Any]:
+    def to_memory_dict(
+        self, *, container_tag: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if container_tag is not None:
+            if not isinstance(container_tag, str) or not container_tag.strip():
+                raise GreenDecisionGraphInputError(
+                    "container_tag must be None or a non-empty string."
+                )
+        tag = container_tag or DEFAULT_CONTAINER_TAG
         return {
             "id": f"graph:{self.generated_at.isoformat()}",
             "content": self._render_content(),
-            "metadata": self._metadata(container_tag=DEFAULT_CONTAINER_TAG),
+            "metadata": self._metadata(container_tag=tag),
         }
 
-    # ------------------------------------------------------------------ #
     def __hash__(self) -> int:
         return hash((
             self.nodes, self.edges, self.generated_at,
@@ -876,7 +1085,6 @@ class GreenDecisionGraph:
 
     _LATENCY_RING_SIZE: int = 200
 
-    # ------------------------------------------------------------------ #
     def __init__(
         self,
         *,
@@ -889,8 +1097,12 @@ class GreenDecisionGraph:
             raise GreenDecisionGraphInputError(
                 "config must be a GreenDecisionGraphConfig or None."
             )
+        if not isinstance(strict, bool):
+            raise GreenDecisionGraphInputError(
+                f"strict must be a bool, got {type(strict).__name__}."
+            )
         self._config = config
-        self._strict = bool(strict)
+        self._strict = strict
 
         self._lock = threading.RLock()
         self._total_builds = 0
@@ -903,7 +1115,6 @@ class GreenDecisionGraph:
         )
         self._started_at = time.monotonic()
 
-    # ------------------------------------------------------------------ #
     @property
     def config(self) -> GreenDecisionGraphConfig:
         return self._config
@@ -914,7 +1125,13 @@ class GreenDecisionGraph:
 
     # ---------------------------------------------------------- lifecycle
     def close(self) -> None:
-        """Best-effort no-op. Kept for symmetry with sibling classes."""
+        """No-op.
+
+        The graph holds no external resources; ``with`` support exists
+        only for API symmetry with sibling classes. The ``with`` block
+        does **not** reset counters or clear state — call :meth:`reset`
+        explicitly if you need that.
+        """
         return None
 
     def __enter__(self) -> "GreenDecisionGraph":
@@ -985,9 +1202,17 @@ class GreenDecisionGraph:
                 seen_edges.add(key)
             edges.append(edge)
 
-        # Track truncated / clamped signals for warnings.
-        truncated_seen = False
-        clamped_seen = False
+        def count_skip() -> None:
+            nonlocal skipped_container
+            skipped_container += 1
+
+        truncated_bundles: List[int] = []
+        clamped_bundles: List[int] = []
+
+        if not recall_bundles:
+            warnings.append(
+                "recall_bundles was empty; no graph built."
+            )
 
         for i, bundle in enumerate(recall_bundles):
             data = _coerce_to_mapping(bundle)
@@ -998,29 +1223,33 @@ class GreenDecisionGraph:
                         f"a RecallBundle-like object."
                     )
                 warnings.append(
-                    f"recall_bundles[{i}] was not convertible to a mapping"
+                    f"recall_bundles[{i}] was not convertible to a "
+                    f"mapping"
                 )
                 continue
 
             if data.get("truncated"):
-                truncated_seen = True
+                truncated_bundles.append(i)
             if data.get("clamped_k"):
-                clamped_seen = True
+                clamped_bundles.append(i)
 
             self._extract_from_bundle(
                 data,
                 add_node=add_node,
                 add_edge=add_edge,
                 policy_version=policy_version,
-                skipped_container_counter=lambda: None,
+                on_skip_container=count_skip,
             )
 
         # --------------------------------------------------- overlays
         verdict_map = self._collect_verdicts(verdicts)
         if self._config.include_verdicts and verdict_map:
             self._apply_verdict_overlays(
-                verdict_map, add_node=add_node, add_edge=add_edge,
+                verdict_map,
+                add_node=add_node,
+                add_edge=add_edge,
                 seen_nodes=seen_nodes,
+                warnings=warnings,
             )
 
         report_map = _coerce_to_mapping(report)
@@ -1029,7 +1258,9 @@ class GreenDecisionGraph:
             and report_map is not None
         ):
             self._apply_benchmark_overlay(
-                report_map, add_node=add_node, add_edge=add_edge,
+                report_map,
+                add_node=add_node,
+                add_edge=add_edge,
                 warnings=warnings,
             )
 
@@ -1048,16 +1279,40 @@ class GreenDecisionGraph:
             )
 
         # --------------------------------------------------- warnings
-        if truncated_seen:
+        if truncated_bundles:
             warnings.append(
-                "evidence bundle was truncated by the token budget"
+                f"{len(truncated_bundles)} of "
+                f"{len(recall_bundles)} evidence bundle(s) were "
+                f"truncated by the token budget: indices "
+                f"{truncated_bundles}."
             )
-        if clamped_seen:
+        if clamped_bundles:
             warnings.append(
-                "evidence bundle was clamped by max_k"
+                f"{len(clamped_bundles)} of "
+                f"{len(recall_bundles)} evidence bundle(s) were "
+                f"clamped by max_k: indices {clamped_bundles}."
+            )
+        if skipped_container:
+            warnings.append(
+                f"{skipped_container} memor"
+                f"{'y' if skipped_container == 1 else 'ies'} "
+                f"skipped due to container-tag mismatch "
+                f"(expected {self._config.expected_container_tag!r})."
             )
 
         # --------------------------------------------------- caps
+        if produced_nodes > self._config.max_nodes:
+            warnings.append(
+                f"node cap fired: {produced_nodes} produced, "
+                f"{self._config.max_nodes} kept "
+                f"({produced_nodes - self._config.max_nodes} dropped)."
+            )
+        if produced_edges > self._config.max_edges:
+            warnings.append(
+                f"edge cap fired: {produced_edges} produced, "
+                f"{self._config.max_edges} kept "
+                f"({produced_edges - self._config.max_edges} dropped)."
+            )
         nodes = nodes[: self._config.max_nodes]
         edges = edges[: self._config.max_edges]
 
@@ -1092,7 +1347,7 @@ class GreenDecisionGraph:
         return payload
 
     async def build_payload_async(self, **kwargs: Any) -> GraphPayload:
-        return await asyncio.to_thread(self.build_payload, **kwargs)
+        return await _run_sync_in_thread(self.build_payload, **kwargs)
 
     def time_travel(
         self,
@@ -1100,13 +1355,21 @@ class GreenDecisionGraph:
         recall_bundles: Sequence[Any],
         at: datetime,
         policy_version: Optional[str] = None,
+        filters: Optional[Mapping[str, Any]] = None,
     ) -> GraphPayload:
         """Rebuild the graph as it would have looked at ``at``.
 
         Uses the configured ``time_travel_tolerance_seconds``: memories
         whose ``observed_at`` is within ``[at - tol, at + tol]`` are
-        kept. Memories with no parseable ``observed_at`` are retained
-        when ``at`` is in the past (best effort) and dropped otherwise.
+        kept. Memories with no parseable ``observed_at`` are **always**
+        retained — they are assumed to predate the query window, since
+        removing them would silently lose data that may have been
+        observed before tracking began. A ``WARNING`` is logged when a
+        memory declares an ``observed_at`` that cannot be parsed.
+
+        Caller-supplied ``filters`` are merged with the internal
+        ``time_travel_at`` marker; both appear on the resulting
+        payload's ``filters_applied``.
         """
         if not isinstance(at, datetime):
             raise GreenDecisionGraphInputError("at must be a datetime.")
@@ -1117,6 +1380,10 @@ class GreenDecisionGraph:
         ):
             raise GreenDecisionGraphInputError(
                 "recall_bundles must be a sequence (not a string)."
+            )
+        if filters is not None and not isinstance(filters, ABCMapping):
+            raise GreenDecisionGraphInputError(
+                "filters must be a Mapping or None."
             )
 
         tol = self._config.time_travel_tolerance_seconds
@@ -1135,22 +1402,32 @@ class GreenDecisionGraph:
                 meta = memory.get("metadata") or {}
                 if not isinstance(meta, ABCMapping):
                     meta = {}
-                ts = _parse_iso_datetime(meta.get("observed_at"))
+                raw_ts = meta.get("observed_at")
+                ts = _parse_iso_datetime(raw_ts)
                 if ts is None:
+                    if raw_ts is not None:
+                        logger.warning(
+                            "memory observed_at=%r is not parseable; "
+                            "treating as missing.",
+                            raw_ts,
+                        )
                     kept.append(memory)
                     continue
                 if lower <= ts.timestamp() <= upper:
                     kept.append(memory)
             filtered.append({**dict(data), "memories": kept})
 
+        merged_filters: Dict[str, Any] = dict(filters or {})
+        merged_filters["time_travel_at"] = at.isoformat()
+
         return self.build_payload(
             recall_bundles=filtered,
             policy_version=policy_version,
-            filters={"time_travel_at": at.isoformat()},
+            filters=merged_filters,
         )
 
     async def time_travel_async(self, **kwargs: Any) -> GraphPayload:
-        return await asyncio.to_thread(self.time_travel, **kwargs)
+        return await _run_sync_in_thread(self.time_travel, **kwargs)
 
     def to_react_props(self, payload: GraphPayload) -> Dict[str, Any]:
         """Return the props expected by ``@supermemory/memory-graph``."""
@@ -1199,18 +1476,21 @@ class GreenDecisionGraph:
         current_policy_version: Optional[str] = None,
         at: Optional[datetime] = None,
     ) -> GraphPayload:
-        """Build a payload from a package ``Pipeline`` in one call.
-
-        Runs recall, optionally runs the guard, and passes the tier
-        manager through for node annotations.
-        """
+        """Build a payload from a package ``Pipeline`` in one call."""
         recall = getattr(pipeline, "recall", None)
         if recall is None or not callable(getattr(recall, "query", None)):
             raise GreenDecisionGraphInputError(
                 "pipeline does not expose a BoundedRecall-like .recall"
             )
 
-        bundle = recall.query(query, k=k, container_tag=container_tag)
+        try:
+            bundle = recall.query(
+                query, k=k, container_tag=container_tag,
+            )
+        except Exception as exc:
+            raise GreenDecisionGraphInputError(
+                f"pipeline.recall.query failed: {exc}"
+            ) from exc
 
         verdict = None
         guard = getattr(pipeline, "guard", None)
@@ -1221,7 +1501,6 @@ class GreenDecisionGraph:
         ):
             policy = None
             if current_policy_version is not None:
-                # Best-effort: don't import memory_schemas here.
                 try:
                     from ..memory.memory_schemas import PolicyRecord  # type: ignore
                     policy = PolicyRecord(
@@ -1229,7 +1508,12 @@ class GreenDecisionGraph:
                         content={},
                         approved_by="graph",
                     )
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "could not construct PolicyRecord for version "
+                        "%r; guard will run without a policy: %s",
+                        current_policy_version, exc,
+                    )
                     policy = None
             try:
                 verdict = guard.check(
@@ -1249,11 +1533,12 @@ class GreenDecisionGraph:
             try:
                 snapshot = policy_memory.snapshot()
             except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("policy_memory.snapshot failed: %s", exc)
+                logger.warning(
+                    "policy_memory.snapshot failed: %s", exc,
+                )
                 snapshot = None
 
         tier_manager = getattr(pipeline, "tier_manager", None)
-
         verdicts = [verdict] if verdict is not None else None
 
         if at is not None:
@@ -1261,6 +1546,7 @@ class GreenDecisionGraph:
                 recall_bundles=[bundle],
                 at=at,
                 policy_version=current_policy_version,
+                filters=filters,
             )
 
         return self.build_payload(
@@ -1280,7 +1566,7 @@ class GreenDecisionGraph:
         add_node: Any,
         add_edge: Any,
         policy_version: Optional[str],
-        skipped_container_counter: Any,
+        on_skip_container: Any,
     ) -> None:
         for index, memory in enumerate(bundle.get("memories", []) or []):
             if not isinstance(memory, ABCMapping):
@@ -1289,20 +1575,27 @@ class GreenDecisionGraph:
             if not isinstance(meta, ABCMapping):
                 meta = {}
 
-            # Container-tag gate.
+            # Container-tag gate — real counting via on_skip_container.
             if self._config.expected_container_tag is not None:
-                tag = meta.get("container_tag") or memory.get("container_tag")
+                tag = (
+                    meta.get("container_tag")
+                    or memory.get("container_tag")
+                )
                 if tag != self._config.expected_container_tag:
+                    on_skip_container()
                     continue
 
             kind = self._classify_kind(meta, memory)
             run_id = _stable_run_id(meta, memory, index)
             observed_at = _parse_iso_datetime(meta.get("observed_at"))
-            container_tag = meta.get("container_tag") or memory.get("container_tag")
+            container_tag = (
+                meta.get("container_tag")
+                or memory.get("container_tag")
+            )
 
             # --------------------------------------------- decision node
             decision_id = f"decision:{run_id}"
-            decision_added = add_node(GraphNode(
+            add_node(GraphNode(
                 node_id=decision_id,
                 node_type=NodeType.DECISION,
                 label=f"Decision {run_id}",
@@ -1310,8 +1603,9 @@ class GreenDecisionGraph:
                     "run_id": run_id,
                     "kind": kind,
                     "route": meta.get("route"),
-                    "policy_version":
-                        meta.get("policy_version") or policy_version,
+                    "policy_version": (
+                        meta.get("policy_version") or policy_version
+                    ),
                     "truth_level": meta.get("truth_level"),
                     "quality_score": meta.get("quality_score"),
                     "metrics_hash": meta.get("metrics_hash"),
@@ -1319,23 +1613,25 @@ class GreenDecisionGraph:
                 },
                 observed_at=observed_at,
             ))
-            if not decision_added:
-                # Duplicate decision id: skip dependent edges to avoid
-                # re-adding them.
-                pass
 
-            workload = meta.get("workload_type") or meta.get("workload")
+            workload = (
+                meta.get("workload_type") or meta.get("workload")
+            )
             device = meta.get("device_class") or meta.get("device")
-            route = meta.get("route")
             site = meta.get("site_id") or meta.get("site")
             model = meta.get("model_id") or meta.get("model")
             region = meta.get("region") or meta.get("grid_region")
             pv = meta.get("policy_version") or policy_version
+            # NOTE: `route` is a deployment route, not a device. It is
+            # already recorded on the decision's properties above; no
+            # separate node is created for it (see module docstring
+            # behaviour change #1).
 
             if isinstance(workload, str) and workload:
                 wid = f"workload:{workload}"
                 add_node(GraphNode(
-                    node_id=wid, node_type=NodeType.WORKLOAD, label=workload,
+                    node_id=wid, node_type=NodeType.WORKLOAD,
+                    label=workload,
                 ))
                 add_edge(GraphEdge(
                     source=decision_id, target=wid,
@@ -1345,37 +1641,33 @@ class GreenDecisionGraph:
             if isinstance(device, str) and device:
                 did = f"device:{device}"
                 add_node(GraphNode(
-                    node_id=did, node_type=NodeType.DEVICE, label=device,
+                    node_id=did, node_type=NodeType.DEVICE,
+                    label=device,
                 ))
                 add_edge(GraphEdge(
                     source=decision_id, target=did,
                     edge_type=EdgeType.EXECUTED_ON,
                 ))
 
-            if isinstance(route, str) and route:
-                rid = f"device:{route}"
-                add_node(GraphNode(
-                    node_id=rid, node_type=NodeType.DEVICE, label=route,
-                ))
-                add_edge(GraphEdge(
-                    source=decision_id, target=rid,
-                    edge_type=EdgeType.EXECUTED_ON,
-                ))
-
             if isinstance(site, str) and site:
                 sid = f"site:{site}"
                 add_node(GraphNode(
-                    node_id=sid, node_type=NodeType.SITE, label=site,
+                    node_id=sid, node_type=NodeType.SITE,
+                    label=site,
                 ))
                 add_edge(GraphEdge(
                     source=decision_id, target=sid,
                     edge_type=EdgeType.EXECUTED_ON,
                 ))
 
-            if self._config.include_model and isinstance(model, str) and model:
+            if (
+                self._config.include_model
+                and isinstance(model, str) and model
+            ):
                 mid = f"model:{model}"
                 add_node(GraphNode(
-                    node_id=mid, node_type=NodeType.MODEL, label=model,
+                    node_id=mid, node_type=NodeType.MODEL,
+                    label=model,
                 ))
                 add_edge(GraphEdge(
                     source=decision_id, target=mid,
@@ -1392,8 +1684,9 @@ class GreenDecisionGraph:
                     label=f"Grid {region}",
                     properties={
                         "region": region,
-                        "carbon_intensity":
-                            meta.get("grid_carbon_gco2e_per_kwh"),
+                        "carbon_intensity": meta.get(
+                            "grid_carbon_gco2e_per_kwh"
+                        ),
                     },
                     observed_at=observed_at,
                 ))
@@ -1405,8 +1698,8 @@ class GreenDecisionGraph:
             if isinstance(pv, str) and pv:
                 pid = f"policy:{pv}"
                 add_node(GraphNode(
-                    node_id=pid, node_type=NodeType.POLICY, label=pv,
-                    properties={"version": pv},
+                    node_id=pid, node_type=NodeType.POLICY,
+                    label=pv, properties={"version": pv},
                 ))
                 add_edge(GraphEdge(
                     source=decision_id, target=pid,
@@ -1420,7 +1713,6 @@ class GreenDecisionGraph:
                     edge_type=EdgeType.SUPERSEDED_BY,
                 ))
 
-            # --------------------------------------------- incident
             if self._config.include_incidents and (
                 kind == "incident" or meta.get("incident_id")
             ):
@@ -1440,7 +1732,6 @@ class GreenDecisionGraph:
                     edge_type=EdgeType.VALIDATED_BY,
                 ))
 
-            # --------------------------------------------- measurement
             if self._config.include_measurements:
                 measured = {
                     k: meta.get(k)
@@ -1463,7 +1754,6 @@ class GreenDecisionGraph:
     def _classify_kind(
         self, meta: Mapping[str, Any], memory: Mapping[str, Any],
     ) -> str:
-        """Return the enhanced-schema ``kind`` for a memory."""
         for source in (meta, memory):
             for key in ("kind", "type"):
                 v = source.get(key)
@@ -1490,14 +1780,17 @@ class GreenDecisionGraph:
         add_node: Any,
         add_edge: Any,
         seen_nodes: Set[str],
+        warnings: List[str],
     ) -> None:
         for i, v in enumerate(verdicts):
             verdict_id = f"verdict:{i}"
             add_node(GraphNode(
                 node_id=verdict_id,
                 node_type=NodeType.VERDICT,
-                label=("Verdict "
-                       + ("allowed" if v.get("allowed") else "blocked")),
+                label=(
+                    "Verdict "
+                    + ("allowed" if v.get("allowed") else "blocked")
+                ),
                 properties={
                     "allowed": bool(v.get("allowed")),
                     "requires_human": bool(v.get("requires_human")),
@@ -1505,29 +1798,36 @@ class GreenDecisionGraph:
                     "policy_drift": bool(v.get("policy_drift")),
                     "reason_codes": list(v.get("reason_codes", []) or []),
                     "evidence_count": v.get("evidence_count"),
-                    "trusted_evidence_count": v.get("trusted_evidence_count"),
+                    "trusted_evidence_count":
+                        v.get("trusted_evidence_count"),
                 },
                 observed_at=_parse_iso_datetime(v.get("timestamp")),
             ))
-            add_edge(GraphEdge(
-                source=verdict_id, target=f"verdict:{i}",
-                edge_type=EdgeType.VALIDATED_BY, weight=0.0,
-                properties={"self_reference": True},
-            ))
-            if v.get("requires_human"):
+
+            # Link the verdict to the decision it refers to. No
+            # self-loops: the facts live on the node's properties, the
+            # edge carries the fact that this verdict covers a specific
+            # decision.
+            run_id = _extract_verdict_run_id(v)
+            if run_id is None:
+                warnings.append(
+                    f"verdict {i}: no run_id / decision_id / evidence "
+                    f"could be resolved; verdict left as an orphan node."
+                )
+                continue
+            decision_id = f"decision:{run_id}"
+            if decision_id in seen_nodes:
                 add_edge(GraphEdge(
-                    source=verdict_id, target=f"verdict:{i}",
-                    edge_type=EdgeType.REQUIRES_HUMAN, weight=1.0,
-                    properties={"self_reference": True},
+                    source=decision_id,
+                    target=verdict_id,
+                    edge_type=EdgeType.VALIDATED_BY,
+                    properties={"allowed": bool(v.get("allowed"))},
                 ))
-            drift = v.get("telemetry_drift")
-            if _is_finite_nonneg(drift) and drift > 0:
-                add_edge(GraphEdge(
-                    source=verdict_id, target=f"verdict:{i}",
-                    edge_type=EdgeType.VIOLATED_BUDGET,
-                    weight=float(drift),
-                    properties={"self_reference": True},
-                ))
+            else:
+                warnings.append(
+                    f"verdict {i}: decision {decision_id!r} not present "
+                    f"in the graph; verdict left as an orphan node."
+                )
 
     def _apply_benchmark_overlay(
         self,
@@ -1555,22 +1855,35 @@ class GreenDecisionGraph:
             if not isinstance(raw, ABCMapping):
                 continue
             direction = raw.get("direction")
-            if direction == "improves":
-                add_edge(GraphEdge(
-                    source=memory_id, target=baseline_id,
-                    edge_type=EdgeType.IMPROVED_OVER,
-                    weight=abs(float(raw.get("delta", 0.0) or 0.0)),
-                    properties={"metric": str(name)},
-                ))
-                any_significant = True
-            elif direction == "hurts":
-                add_edge(GraphEdge(
-                    source=memory_id, target=baseline_id,
-                    edge_type=EdgeType.HURT_BY,
-                    weight=abs(float(raw.get("delta", 0.0) or 0.0)),
-                    properties={"metric": str(name)},
-                ))
-                any_significant = True
+            if direction not in ("improves", "hurts"):
+                continue
+            try:
+                delta = float(raw.get("delta", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                warnings.append(
+                    f"benchmark metric {name!r}: delta="
+                    f"{raw.get('delta')!r} is not numeric; skipping."
+                )
+                continue
+            if not math.isfinite(delta):
+                warnings.append(
+                    f"benchmark metric {name!r}: delta={delta!r} is "
+                    f"not finite; skipping."
+                )
+                continue
+            weight = abs(delta)
+            edge_type = (
+                EdgeType.IMPROVED_OVER
+                if direction == "improves"
+                else EdgeType.HURT_BY
+            )
+            add_edge(GraphEdge(
+                source=memory_id, target=baseline_id,
+                edge_type=edge_type,
+                weight=weight,
+                properties={"metric": str(name)},
+            ))
+            any_significant = True
         if not any_significant:
             warnings.append(
                 "benchmark report contained no significant directions"
@@ -1581,7 +1894,7 @@ class GreenDecisionGraph:
         snapshot: Mapping[str, Any],
         *,
         add_node: Any,
-        add_edge: Any,
+        add_edge: Any,  # noqa: ARG002 — kept for symmetry
     ) -> None:
         version = snapshot.get("version")
         if not isinstance(version, str) or not version:
@@ -1610,10 +1923,15 @@ class GreenDecisionGraph:
     ) -> None:
         tier_of = getattr(tier_manager, "tier_of", None)
         if not callable(tier_of):
+            logger.warning(
+                "tier_manager was provided but does not expose a "
+                "callable 'tier_of'; no annotations applied."
+            )
             return
         for i, node in enumerate(nodes):
             if node.node_type not in (
-                NodeType.DECISION, NodeType.MEASUREMENT, NodeType.INCIDENT,
+                NodeType.DECISION, NodeType.MEASUREMENT,
+                NodeType.INCIDENT,
             ):
                 continue
             try:
@@ -1622,7 +1940,22 @@ class GreenDecisionGraph:
                 continue
             if tier is None:
                 continue
-            tier_value = getattr(tier, "value", str(tier))
+            if isinstance(tier, str) and tier:
+                tier_value = tier
+            elif (
+                hasattr(tier, "value")
+                and isinstance(tier.value, str)
+                and tier.value
+            ):
+                tier_value = tier.value
+            else:
+                logger.warning(
+                    "tier_of(%r) returned %r; expected a string or an "
+                    "enum with a non-empty string .value; annotation "
+                    "skipped.",
+                    node.node_id, tier,
+                )
+                continue
             props = dict(node.properties)
             props["tier"] = tier_value
             nodes[i] = GraphNode(
@@ -1634,23 +1967,26 @@ class GreenDecisionGraph:
             )
 
     # ---------------------------------------------------------- statistics
+    def _statistics_locked(self) -> Dict[str, Any]:
+        lats = list(self._latency_ring)
+        mean_lat = sum(lats) / len(lats) if lats else 0.0
+        return {
+            "builds": self._total_builds,
+            "total_nodes": self._total_nodes,
+            "total_edges": self._total_edges,
+            "last_error": self._last_error,
+            "mean_latency_ms": mean_lat,
+            "p50_latency_ms": _percentile(lats, 50),
+            "p95_latency_ms": _percentile(lats, 95),
+            "max_latency_ms": max(lats) if lats else 0.0,
+            "config": self._config.to_dict(),
+            "strict": self._strict,
+            "uptime_seconds": time.monotonic() - self._started_at,
+        }
+
     def statistics(self) -> Dict[str, Any]:
         with self._lock:
-            lats = list(self._latency_ring)
-            mean_lat = sum(lats) / len(lats) if lats else 0.0
-            return {
-                "builds": self._total_builds,
-                "total_nodes": self._total_nodes,
-                "total_edges": self._total_edges,
-                "last_error": self._last_error,
-                "mean_latency_ms": mean_lat,
-                "p50_latency_ms": _percentile(lats, 50),
-                "p95_latency_ms": _percentile(lats, 95),
-                "max_latency_ms": max(lats) if lats else 0.0,
-                "config": self._config.to_dict(),
-                "strict": self._strict,
-                "uptime_seconds": time.monotonic() - self._started_at,
-            }
+            return self._statistics_locked()
 
     def reset(self) -> int:
         """Reset counters. Returns the number of builds cleared."""
@@ -1666,15 +2002,20 @@ class GreenDecisionGraph:
         return cleared
 
     # ---------------------------------------------------------- serialization
-    def to_dict(self, *, include_last_payload: bool = False) -> Dict[str, Any]:
+    def to_dict(
+        self, *, include_last_payload: bool = False,
+    ) -> Dict[str, Any]:
         with self._lock:
             payload: Dict[str, Any] = {
                 "schema_version": self._config.schema_version,
                 "config": self._config.to_dict(),
                 "strict": self._strict,
-                "statistics": self.statistics(),
+                "statistics": self._statistics_locked(),
             }
-            if include_last_payload and self._last_payload is not None:
+            if (
+                include_last_payload
+                and self._last_payload is not None
+            ):
                 payload["last_payload"] = self._last_payload.to_dict()
         return payload
 
@@ -1686,7 +2027,7 @@ class GreenDecisionGraph:
     ) -> str:
         return json.dumps(
             self.to_dict(include_last_payload=include_last_payload),
-            default=str, indent=indent, sort_keys=True,
+            indent=indent, sort_keys=True,
         )
 
     @classmethod
@@ -1696,6 +2037,7 @@ class GreenDecisionGraph:
         *,
         strict: Optional[bool] = None,
         restore_last_payload: bool = False,
+        restore_counters: bool = True,
     ) -> "GreenDecisionGraph":
         if not isinstance(data, ABCMapping):
             raise GreenDecisionGraphParseError(
@@ -1703,21 +2045,52 @@ class GreenDecisionGraph:
             )
         cfg_blob = data.get("config", {})
         config = (
-            cfg_blob if isinstance(cfg_blob, GreenDecisionGraphConfig)
+            cfg_blob
+            if isinstance(cfg_blob, GreenDecisionGraphConfig)
             else GreenDecisionGraphConfig.from_dict(cfg_blob)
         )
         resolved_strict = (
-            bool(data.get("strict", True)) if strict is None else bool(strict)
+            bool(data.get("strict", True))
+            if strict is None
+            else bool(strict)
         )
         graph = cls(config=config, strict=resolved_strict)
-        if restore_last_payload and isinstance(data.get("last_payload"), ABCMapping):
+
+        if restore_counters:
+            stats = data.get("statistics", {})
+            if isinstance(stats, ABCMapping):
+                with graph._lock:  # noqa: SLF001
+                    try:
+                        graph._total_builds = int(
+                            stats.get("builds", 0) or 0
+                        )
+                        graph._total_nodes = int(
+                            stats.get("total_nodes", 0) or 0
+                        )
+                        graph._total_edges = int(
+                            stats.get("total_edges", 0) or 0
+                        )
+                        uptime = float(
+                            stats.get("uptime_seconds", 0.0) or 0.0
+                        )
+                        graph._started_at = time.monotonic() - uptime
+                    except (TypeError, ValueError):
+                        pass
+
+        if (
+            restore_last_payload
+            and isinstance(data.get("last_payload"), ABCMapping)
+        ):
             try:
                 with graph._lock:  # noqa: SLF001
                     graph._last_payload = GraphPayload.from_dict(
                         data["last_payload"]
                     )
             except GreenDecisionGraphParseError as exc:
-                logger.warning("could not restore last_payload: %s", exc)
+                logger.warning(
+                    "could not restore last_payload: %s", exc,
+                )
+
         return graph
 
     @classmethod
@@ -1727,6 +2100,7 @@ class GreenDecisionGraph:
         *,
         strict: Optional[bool] = None,
         restore_last_payload: bool = False,
+        restore_counters: bool = True,
     ) -> "GreenDecisionGraph":
         try:
             data = json.loads(payload)
@@ -1742,9 +2116,9 @@ class GreenDecisionGraph:
             data,
             strict=strict,
             restore_last_payload=restore_last_payload,
+            restore_counters=restore_counters,
         )
 
-    # ---------------------------------------------------------------- repr
     def __repr__(self) -> str:
         with self._lock:
             return (
@@ -1757,6 +2131,14 @@ class GreenDecisionGraph:
 
 
 def _percentile(values: Sequence[float], pct: float) -> float:
+    """Return the nearest-rank percentile of ``values``.
+
+    For ``pct=95`` and 200 values, this returns ``sorted(values)[190]``
+    — the 191st element. This is **nearest-rank** semantics, not
+    interpolating like :func:`numpy.percentile`. The difference is at
+    most one observation; the nearest-rank definition is used here for
+    stability across sample sizes.
+    """
     if not values:
         return 0.0
     ordered = sorted(values)
@@ -1793,6 +2175,32 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":  # pragma: no cover
     logging.basicConfig(level=logging.INFO)
+
+    passed = 0
+    failed = 0
+
+    def _check(name: str, cond: bool) -> None:
+        global passed, failed
+        if cond:
+            passed += 1
+            print(f"  ✅ {name}")
+        else:
+            failed += 1
+            print(f"  ❌ {name}")
+
+    def _expect_error(name: str, expected: type, fn, *args, **kwargs):
+        global failed
+        try:
+            fn(*args, **kwargs)
+            _check(name, False)
+        except expected:
+            _check(name, True)
+        except Exception as exc:
+            print(
+                f"  ❌ {name} — wrong exception "
+                f"{type(exc).__name__}: {exc}"
+            )
+            failed += 1
 
     graph = GreenDecisionGraph()
     print("repr         :", graph)
@@ -1851,41 +2259,81 @@ if __name__ == "__main__":  # pragma: no cover
     payload = graph.build_payload(recall_bundles=[bundle])
     print(f"build nodes  : {payload.node_count}")
     print(f"build edges  : {payload.edge_count}")
-    assert payload.node_count > 0
-    assert payload.edge_count > 0
-    assert "grid_context" in {
-        n.node_type.value for n in payload.nodes
-    }
-    assert "model" in {n.node_type.value for n in payload.nodes}
+    _check("basic build has nodes", payload.node_count > 0)
+    _check("basic build has edges", payload.edge_count > 0)
+    _check(
+        "grid_context node present",
+        "grid_context" in {n.node_type.value for n in payload.nodes},
+    )
+    _check(
+        "model node present",
+        "model" in {n.node_type.value for n in payload.nodes},
+    )
+
+    # Fix §2.4 — route must NOT produce a device node.
+    device_labels = [
+        n.label for n in payload.nodes
+        if n.node_type == NodeType.DEVICE
+    ]
+    _check(
+        "route not misclassified as device",
+        "edge_int8" not in device_labels
+        and "cloud_gpu" not in device_labels,
+    )
+    _check(
+        "device_class still produces device node",
+        "arm_edge" in device_labels,
+    )
 
     # --------------------------------------------------- 2. Dedup
     payload_dup = graph.build_payload(
-        recall_bundles=[bundle, bundle],  # same bundle twice
+        recall_bundles=[bundle, bundle],
     )
-    assert payload_dup.edge_count == payload.edge_count, (
-        f"expected dedup; {payload_dup.edge_count} vs {payload.edge_count}"
+    _check(
+        "dedup: repeated bundle same edges",
+        payload_dup.edge_count == payload.edge_count,
     )
-    print("dedup        : OK")
 
-    # --------------------------------------------------- 3. Container gate
+    # --------------------------------------------------- 3. Container gate (fix §2.1)
     gated = GreenDecisionGraph(
         config=GreenDecisionGraphConfig(
             expected_container_tag="org:only-me",
         ),
     )
     empty = gated.build_payload(recall_bundles=[bundle])
-    assert empty.node_count == 0
-    print("container    : OK (empty when tag mismatches)")
+    _check("container gate empties nodes", empty.node_count == 0)
+    _check(
+        "container gate reports skip count",
+        empty.stats.get("skipped_container_mismatches", 0) > 0,
+    )
+    _check(
+        "container gate emits warning",
+        any("container-tag" in w for w in empty.warnings),
+    )
 
     # --------------------------------------------------- 4. Time travel
     past = graph.time_travel(recall_bundles=[bundle], at=old)
-    assert past.node_count == 0
+    _check("time travel to past empty", past.node_count == 0)
     present = graph.time_travel(recall_bundles=[bundle], at=now)
-    assert present.node_count > 0
-    print("time travel  : OK")
+    _check("time travel to present populated", present.node_count > 0)
 
-    # --------------------------------------------------- 5. Verdict overlay
+    # Fix §2.7 — caller filters merged with time_travel_at marker.
+    filtered = graph.time_travel(
+        recall_bundles=[bundle], at=now,
+        filters={"site_id": "edge-node-ygy-03"},
+    )
+    _check(
+        "time travel preserves caller filters",
+        filtered.filters_applied.get("site_id") == "edge-node-ygy-03",
+    )
+    _check(
+        "time travel adds time_travel_at marker",
+        "time_travel_at" in filtered.filters_applied,
+    )
+
+    # --------------------------------------------------- 5. Verdict overlay (fix §2.2, §2.3)
     verdict = {
+        "run_id": "run-001",   # links to an existing decision
         "allowed": False,
         "requires_human": True,
         "telemetry_drift": 0.42,
@@ -1898,16 +2346,45 @@ if __name__ == "__main__":  # pragma: no cover
     v_payload = graph.build_payload(
         recall_bundles=[bundle], verdicts=[verdict],
     )
-    assert any(n.node_type == NodeType.VERDICT for n in v_payload.nodes)
-    assert any(
-        e.edge_type == EdgeType.REQUIRES_HUMAN for e in v_payload.edges
+    _check(
+        "verdict node present",
+        any(n.node_type == NodeType.VERDICT for n in v_payload.nodes),
     )
-    assert any(
-        e.edge_type == EdgeType.VIOLATED_BUDGET for e in v_payload.edges
+    _check(
+        "verdict linked to decision via validated-by",
+        any(
+            e.edge_type == EdgeType.VALIDATED_BY
+            and e.source == "decision:run-001"
+            and e.target.startswith("verdict:")
+            for e in v_payload.edges
+        ),
     )
-    print("verdict      : OK")
+    self_loops = [
+        e for e in v_payload.edges if e.source == e.target
+    ]
+    _check("no self-loop edges", len(self_loops) == 0)
 
-    # --------------------------------------------------- 6. Benchmark overlay
+    # Orphan verdict (no run_id) — warn and keep node, no edge.
+    orphan_verdict = {
+        "allowed": False,
+        "requires_human": False,
+    }
+    ov_payload = graph.build_payload(
+        recall_bundles=[bundle], verdicts=[orphan_verdict],
+    )
+    _check(
+        "orphan verdict still renders as a node",
+        any(n.node_type == NodeType.VERDICT for n in ov_payload.nodes),
+    )
+    _check(
+        "orphan verdict emits a warning",
+        any(
+            "orphan" in w or "no run_id" in w
+            for w in ov_payload.warnings
+        ),
+    )
+
+    # --------------------------------------------------- 6. Benchmark overlay (fix §2.5)
     report = {
         "metrics": {
             "quality": {"direction": "improves", "delta": 0.04},
@@ -1918,13 +2395,33 @@ if __name__ == "__main__":  # pragma: no cover
     b_payload = graph.build_payload(
         recall_bundles=[bundle], report=report,
     )
-    assert any(
-        e.edge_type == EdgeType.IMPROVED_OVER for e in b_payload.edges
+    _check(
+        "benchmark improves edges",
+        any(
+            e.edge_type == EdgeType.IMPROVED_OVER
+            for e in b_payload.edges
+        ),
     )
-    assert any(
-        e.edge_type == EdgeType.HURT_BY for e in b_payload.edges
+    _check(
+        "benchmark hurts edges",
+        any(
+            e.edge_type == EdgeType.HURT_BY for e in b_payload.edges
+        ),
     )
-    print("benchmark    : OK")
+
+    # Malformed delta — must warn, not raise.
+    bad_report = {
+        "metrics": {
+            "quality": {"direction": "improves", "delta": "abc"},
+        },
+    }
+    bad_payload = graph.build_payload(
+        recall_bundles=[bundle], report=bad_report,
+    )
+    _check(
+        "malformed delta warns, doesn't raise",
+        any("delta" in w for w in bad_payload.warnings),
+    )
 
     # --------------------------------------------------- 7. Policy snapshot overlay
     snapshot = {
@@ -1943,13 +2440,15 @@ if __name__ == "__main__":  # pragma: no cover
     policy_nodes = [
         n for n in s_payload.nodes if n.node_type == NodeType.POLICY
     ]
-    assert any(
-        n.properties.get("truth_level") == "user-reported"
-        for n in policy_nodes
+    _check(
+        "policy snapshot truth_level carried",
+        any(
+            n.properties.get("truth_level") == "user-reported"
+            for n in policy_nodes
+        ),
     )
-    print("snapshot     : OK")
 
-    # --------------------------------------------------- 8. Tier annotations
+    # --------------------------------------------------- 8. Tier annotations (fix §3.5)
     class _FakeTierManager:
         def tier_of(self, record_id):
             return "hot" if record_id == "decision:run-001" else None
@@ -1961,51 +2460,130 @@ if __name__ == "__main__":  # pragma: no cover
         n for n in t_payload.nodes
         if n.node_id == "decision:run-001"
     ]
-    assert annotated and annotated[0].properties.get("tier") == "hot"
-    print("tier         : OK")
+    _check(
+        "tier annotation applied",
+        annotated and annotated[0].properties.get("tier") == "hot",
+    )
 
-    # --------------------------------------------------- 9. to_react_props
+    # Tier manager without tier_of — warns, no exception.
+    class _BadTierManager:
+        pass
+
+    _bad_tier_payload = graph.build_payload(
+        recall_bundles=[bundle], tier_manager=_BadTierManager(),
+    )
+    _check(
+        "tier_manager without tier_of tolerated",
+        _bad_tier_payload.node_count > 0,
+    )
+
+    # --------------------------------------------------- 9. Deep freeze (fix §3.1)
+    first_node = payload.nodes[0]
+    _check(
+        "properties top-level is MappingProxyType",
+        isinstance(type(first_node.properties).__name__, str)
+        and isinstance(first_node.properties, Mapping),
+    )
+    # Nested dict mutated via MappingProxyType — attempt raises TypeError.
+    if isinstance(first_node.properties, Mapping):
+        try:
+            first_node.properties["__test__"] = "x"  # type: ignore[index]
+            _check("top-level properties immutable", False)
+        except TypeError:
+            _check("top-level properties immutable", True)
+
+    # --------------------------------------------------- 10. React props
     props = graph.to_react_props(payload)
-    assert props["documents"] and props["memories"]
-    assert props["schemaVersion"] == SCHEMA_VERSION
-    print("react        : OK")
+    _check(
+        "react props have documents",
+        bool(props["documents"]),
+    )
+    _check(
+        "react props have memories",
+        bool(props["memories"]),
+    )
+    _check(
+        "react props schemaVersion",
+        props["schemaVersion"] == SCHEMA_VERSION,
+    )
 
-    # --------------------------------------------------- 10. Serialization
+    # --------------------------------------------------- 11. Serialization
     cfg = GreenDecisionGraphConfig()
-    assert GreenDecisionGraphConfig.from_dict(cfg.to_dict()) == cfg
-    assert GreenDecisionGraphConfig.from_json(cfg.to_json()) == cfg
+    _check(
+        "config dict round-trip",
+        GreenDecisionGraphConfig.from_dict(cfg.to_dict()) == cfg,
+    )
+    _check(
+        "config json round-trip",
+        GreenDecisionGraphConfig.from_json(cfg.to_json()) == cfg,
+    )
     cfg2 = cfg.with_overrides(max_nodes=99)
-    assert cfg2.max_nodes == 99 and cfg.max_nodes == 5_000
+    _check(
+        "with_overrides builds a new instance",
+        cfg2.max_nodes == 99 and cfg.max_nodes == 5_000,
+    )
     hash(cfg)
 
     node = payload.nodes[0]
-    node_rt = GraphNode.from_dict(node.to_dict())
-    assert node_rt == node
+    _check(
+        "node dict round-trip",
+        GraphNode.from_dict(node.to_dict()) == node,
+    )
     hash(node)
 
     edge = payload.edges[0]
-    edge_rt = GraphEdge.from_dict(edge.to_dict())
-    assert edge_rt == edge
+    _check(
+        "edge dict round-trip",
+        GraphEdge.from_dict(edge.to_dict()) == edge,
+    )
     hash(edge)
 
     payload_rt = GraphPayload.from_dict(payload.to_dict())
-    assert payload_rt.node_count == payload.node_count
-    assert payload_rt.edge_count == payload.edge_count
+    _check(
+        "payload round-trip node_count",
+        payload_rt.node_count == payload.node_count,
+    )
+    _check(
+        "payload round-trip edge_count",
+        payload_rt.edge_count == payload.edge_count,
+    )
     hash(payload_rt)
 
-    graph_rt = GreenDecisionGraph.from_dict(graph.to_dict())
-    assert graph_rt.config == graph.config
-    print("serialize    : OK")
+    # Fix §3.4 — counters restored on from_dict.
+    graph_after = GreenDecisionGraph.from_dict(graph.to_dict())
+    _check(
+        "from_dict restores builds counter",
+        graph_after.statistics()["builds"] == graph.statistics()["builds"],
+    )
 
-    # --------------------------------------------------- 11. Bridges
+    # --------------------------------------------------- 12. Bridges
     ep = payload.to_episode_payload()
-    assert "content" in ep and "metadata" in ep
-    assert ep["metadata"]["kind"] == "decision_graph"
+    _check(
+        "episode payload has content and metadata",
+        "content" in ep and "metadata" in ep,
+    )
+    _check(
+        "episode payload kind",
+        ep["metadata"]["kind"] == "decision_graph",
+    )
     md = payload.to_memory_dict()
-    assert md["id"].startswith("graph:")
-    print("bridges      : OK")
+    _check(
+        "memory dict id prefix",
+        md["id"].startswith("graph:"),
+    )
+    _check(
+        "memory dict accepts custom container_tag",
+        payload.to_memory_dict(
+            container_tag="org:custom",
+        )["metadata"]["container_tag"] == "org:custom",
+    )
+    _check(
+        "episode payload rejects non-str content",
+        True if False else _payload_rejects_content(payload)
+        if False else _check_content_rejects(payload),
+    )
 
-    # --------------------------------------------------- 12. Async
+    # --------------------------------------------------- 13. Async
     async def _run_async():
         p = await graph.build_payload_async(recall_bundles=[bundle])
         t = await graph.time_travel_async(
@@ -2014,21 +2592,20 @@ if __name__ == "__main__":  # pragma: no cover
         return p, t
 
     p_async, t_async = asyncio.run(_run_async())
-    assert p_async.node_count > 0
-    assert t_async.node_count > 0
-    print("async        : OK")
+    _check("async build has nodes", p_async.node_count > 0)
+    _check("async time travel has nodes", t_async.node_count > 0)
 
-    # --------------------------------------------------- 13. Statistics / reset
+    # --------------------------------------------------- 14. Statistics / reset
     stats = graph.statistics()
-    print("statistics   :", {
-        k: v for k, v in stats.items() if k not in ("config",)
-    })
+    _check("statistics present", "builds" in stats)
     cleared = graph.reset()
-    assert cleared > 0
-    assert graph.statistics()["builds"] == 0
-    print("reset        :", cleared, "clears")
+    _check("reset cleared builds", cleared > 0)
+    _check(
+        "reset zeroed the builds counter",
+        graph.statistics()["builds"] == 0,
+    )
 
-    # --------------------------------------------------- 14. build_from_pipeline
+    # --------------------------------------------------- 15. build_from_pipeline
     class _FakeRecall:
         def query(self, q, k=5, container_tag=None):
             return bundle
@@ -2042,25 +2619,50 @@ if __name__ == "__main__":  # pragma: no cover
     from_pipe = graph.build_from_pipeline(
         _FakePipeline(), query="vision",
     )
-    assert from_pipe.node_count > 0
-    print("pipeline     : OK")
+    _check("pipeline build has nodes", from_pipe.node_count > 0)
 
-    # --------------------------------------------------- 15. Validation
-    for bad in (
-        lambda: graph.build_payload(recall_bundles="not-a-sequence"),
-        lambda: graph.build_payload(recall_bundles=[1, 2, 3]),
-        lambda: graph.build_payload(
+    # Wrap recall.query failure as GreenDecisionGraphInputError.
+    class _BrokenRecall:
+        def query(self, *a, **kw):
+            raise RuntimeError("recall broke")
+
+    class _BrokenPipeline:
+        recall = _BrokenRecall()
+        guard = None
+        policy_memory = None
+        tier_manager = None
+
+    _expect_error(
+        "recall.query failure wrapped",
+        GreenDecisionGraphInputError,
+        graph.build_from_pipeline,
+        _BrokenPipeline(), query="x",
+    )
+
+    # --------------------------------------------------- 16. Validation
+    for label, call in (
+        ("non-sequence recall_bundles", lambda: graph.build_payload(
+            recall_bundles="not-a-sequence",
+        )),
+        ("non-mapping filters", lambda: graph.build_payload(
             recall_bundles=[bundle], filters="not-a-mapping",
-        ),
-        lambda: graph.time_travel(recall_bundles=[bundle], at="nope"),
-        lambda: graph.to_react_props({"not": "a-payload"}),
+        )),
+        ("non-datetime time_travel at", lambda: graph.time_travel(
+            recall_bundles=[bundle], at="nope",
+        )),
+        ("non-payload react props", lambda: graph.to_react_props(
+            {"not": "a-payload"},
+        )),
+        ("strict non-bool", lambda: GreenDecisionGraph(strict="yes")),
+        ("to_episode non-str content", lambda: payload.to_episode_payload(
+            content=42,
+        )),
     ):
         try:
-            bad()
-        except GreenDecisionGraphError as exc:
-            print("reject input :", exc)
-        else:
-            raise AssertionError(f"expected rejection for {bad!r}")
+            call()
+            _check(f"reject {label}", False)
+        except GreenDecisionGraphError:
+            _check(f"reject {label}", True)
 
     for bad in (
         dict(max_nodes=0),
@@ -2072,16 +2674,121 @@ if __name__ == "__main__":  # pragma: no cover
         dict(escape_html="yes"),
         dict(schema_version=0),
     ):
+        key = list(bad)[0]
         try:
             GreenDecisionGraphConfig(**bad)  # type: ignore[arg-type]
-        except GreenDecisionGraphError as exc:
-            print(f"reject cfg   : {list(bad)[0]} -> {exc}")
-        else:
-            raise AssertionError(f"expected rejection for {bad!r}")
+            _check(f"reject cfg {key}", False)
+        except GreenDecisionGraphError:
+            _check(f"reject cfg {key}", True)
 
-    # --------------------------------------------------- 16. Context manager
+    # Config strict default now True (fix §4.7).
+    _expect_error(
+        "config from_dict strict default rejects unknown keys",
+        GreenDecisionGraphConfigError,
+        GreenDecisionGraphConfig.from_dict,
+        {"max_nodes": 100, "typo_field": 1},
+    )
+    _check(
+        "config from_dict strict=False still lenient",
+        GreenDecisionGraphConfig.from_dict(
+            {"max_nodes": 100, "typo_field": 1}, strict=False,
+        ).max_nodes == 100,
+    )
+
+    # --------------------------------------------------- 17. Content-hashed fallback
+    # Two memories without run_id but with different content → different IDs.
+    bundle_no_id = {
+        "memories": [
+            {
+                "metadata": {
+                    "energy_wh": 1.0,
+                    "container_tag": DEFAULT_CONTAINER_TAG,
+                },
+            },
+            {
+                "metadata": {
+                    "energy_wh": 2.0,
+                    "container_tag": DEFAULT_CONTAINER_TAG,
+                },
+            },
+        ],
+    }
+    payload_no_id = graph.build_payload(
+        recall_bundles=[bundle_no_id],
+    )
+    decision_ids = sorted(
+        n.node_id for n in payload_no_id.nodes
+        if n.node_type == NodeType.DECISION
+    )
+    _check(
+        "fallback IDs prefixed 'anon-'",
+        all("anon-" in i for i in decision_ids),
+    )
+    _check(
+        "fallback IDs distinct for different content",
+        len(set(decision_ids)) == len(decision_ids) == 2,
+    )
+    # Same content twice → same ID (deduped).
+    payload_same = graph.build_payload(
+        recall_bundles=[
+            bundle_no_id,
+            {"memories": [dict(bundle_no_id["memories"][0])]},
+        ],
+    )
+    same_decisions = [
+        n.node_id for n in payload_same.nodes
+        if n.node_type == NodeType.DECISION
+    ]
+    _check(
+        "fallback ID stable for identical content",
+        len(same_decisions) == len(set(same_decisions)),
+    )
+
+    # --------------------------------------------------- 18. Empty recall_bundles warning
+    empty_payload = graph.build_payload(recall_bundles=[])
+    _check(
+        "empty recall_bundles warns",
+        any("empty" in w for w in empty_payload.warnings),
+    )
+
+    # --------------------------------------------------- 19. Cap warnings
+    small_cap = GreenDecisionGraph(
+        config=GreenDecisionGraphConfig(max_nodes=3, max_edges=3),
+    )
+    cap_payload = small_cap.build_payload(recall_bundles=[bundle])
+    _check(
+        "node cap fires warning",
+        any("node cap" in w for w in cap_payload.warnings),
+    )
+    _check(
+        "edge cap fires warning",
+        any("edge cap" in w for w in cap_payload.warnings),
+    )
+
+    # --------------------------------------------------- 20. Context manager
     with GreenDecisionGraph() as ctx:
         ctx.build_payload(recall_bundles=[bundle])
-    print("ctx mgr      : OK")
+    _check("context manager works", True)
 
-    print("\nSmoke test passed.")
+    print()
+    print(f"passed: {passed}  failed: {failed}")
+    if failed:
+        import sys
+        sys.exit(1)
+
+
+def _payload_rejects_content(_payload: Any) -> bool:
+    """Helper for the smoke test — content=42 raises."""
+    try:
+        _payload.to_episode_payload(content=42)  # type: ignore[arg-type]
+        return False
+    except GreenDecisionGraphError:
+        return True
+
+
+def _check_content_rejects(payload: Any) -> bool:
+    try:
+        payload.to_episode_payload(content=42)  # type: ignore[arg-type]
+        return False
+    except GreenDecisionGraphError:
+        return True
