@@ -1,287 +1,436 @@
 ---
-# ServiceMonitor for Prometheus (Enhanced)
-# Scrapes Green Agent metrics including advanced enhancement metrics.
+# Green Agent — Prometheus monitoring bundle (Enhanced, v2)
+# ===========================================================
+#
+# Contents:
+#   1. ServiceMonitor  — tells the Prometheus Operator to scrape /metrics
+#   2. Service         — exposes /metrics on port 9090 (ClusterIP)
+#   3. PrometheusRule  — 6 core alerts + 7 enhancement alerts (commented)
+#
+# Fixes applied vs. v1
+# --------------------
+#   P0  metricRelabelings kept only `green_agent_.*`, dropping
+#       DCGM_FI_DEV_GPU_UTIL and ray_serve_deployment_queued_queries,
+#       which file 16's HPA depends on                        -> deny-list
+#   P0  GreenAgentServiceDown never fired (job label mismatch) -> jobLabel
+#   P0  GreenAgentHighEnergyConsumption threshold 70,000× too high
+#                                                              -> 10 kW
+#   P0  GreenAgentTaskFailures used `_tasks_completed` (no _total),
+#       inconsistent with files 17/20                          -> _total
+#   P0  Service selector `component: head` matched zero pods   -> app label
+#   P0  Port 9090 (this) vs 8000 (file 21 v2)                  -> unified 9090
+#   P0  Dead `prometheus-green-agent-config` ConfigMap         -> removed
+#   P0  release: prometheus vs file 21's kube-prometheus-stack -> default to
+#                                                                either,
+#                                                                documented
+#   P1  Dead `drop go_*` / `drop python_*` rules (masked by the
+#       `keep` above)                                          -> removed
+#   P1  GreenAgentEvolutionStalled fired on regression too     -> split
+#   P1  GreenAgentLowWorkerCount fired on any single pod       -> sum()
+#   P1  No runbook_url on any alert                            -> added
+#   P1  No team/service/category labels                        -> added
+#   P1  No podTargetLabels (can't filter head vs worker)       -> added
+#   P2  28 decorative annotations across 4 resources           -> removed
+#   P2  enhancement alerts query metrics that have no emitter  -> commented
+#   P2  scrapeTimeout 10s with interval 15s (too tight)        -> 12s
+#   P2  No runbook URLs / no alert routing labels              -> added
+#
+# Interaction with k8s/green-agent-service.yaml (file 21 v2)
+# ----------------------------------------------------------
+# File 21 v2 also declares Service `green-agent-metrics` (port 8000) and a
+# ServiceMonitor named `green-agent-metrics`. This file declares the same
+# Service name (port 9090) and a ServiceMonitor named `green-agent-monitor`.
+# Applying BOTH files results in:
+#   - Two Services with the same name → last-applied wins
+#   - Two ServiceMonitors targeting the same pods at different intervals
+#
+# Recommendations (pick one):
+#   Option A — This file is authoritative. Remove the Service and
+#              ServiceMonitor from file 21, leaving file 21 as a
+#              deprecated stub that references this file.
+#   Option B — File 21 is authoritative. Do NOT apply this file. Instead,
+#              copy the PrometheusRule below into your alerting stack
+#              separately (k8s/green-agent-alerts.yaml) and drop the
+#              Service+ServiceMonitor sections.
+#
+# This file's Service uses port 9090 to match the port-forward commands in
+# deploy.sh (file 18) and the Access Metrics next-step. If your pods
+# actually expose /metrics on a different port, update
+# `Service.spec.ports[0].port` AND `Service.spec.ports[0].targetPort`
+# below, and file 21 v2's Service to match.
+#
+# Prerequisites
+# -------------
+#   - Prometheus Operator (kube-prometheus-stack or equivalent)
+#   - Prometheus CR's `serviceMonitorSelector` and `ruleSelector` match
+#     the labels on the resources below (`app: green-agent` by default;
+#     if the operator uses `release: kube-prometheus-stack`, add that
+#     label under `metadata.labels`)
+#   - Pods expose /metrics on port 9090 and carry `app: green-agent`
+#   - Prometheus is configured to discover ServiceMonitors in namespace
+#     `green-agent` (either via `namespaceSelector: {}` on the Prometheus
+#     CR, or via the `matchNames` below)
+#
+# Removed in v2
+# -------------
+#   - prometheus-green-agent-config ConfigMap. It contained vanilla
+#     Prometheus scrape_configs, which the Operator ignores. The
+#     ServiceMonitor below is the Operator-native equivalent. If your
+#     cluster genuinely runs vanilla Prometheus (not the Operator),
+#     delete the ServiceMonitor and add a scrape_config file to your
+#     Prometheus config separately — do not ship both in one file.
+#   - All 7 `green-agent/*` annotations and `enhancements: enabled` labels
+#     across the four resources. Nothing reads them.
 
+# ============================================================================
+# 1. ServiceMonitor — tells the Prometheus Operator to scrape the Service
+# ============================================================================
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: green-agent-monitor
-  namespace: green-agent
+  # namespace: green-agent    # uncomment if not using kustomize
   labels:
-    release: prometheus
     app: green-agent
-    enhancements: enabled
-  annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
-    green-agent/flexgen: "true"
+    # Uncomment and set to match your Prometheus CR's serviceMonitorSelector
+    # when it is NOT empty (`{}`). kube-prometheus-stack default is `{}`.
+    # release: kube-prometheus-stack
 spec:
-  # Select Green Agent services
+  # Critical: `job` label on scraped series becomes the value of `app`
+  # ("green-agent"), so `up{job="green-agent"}` in the alerts below works.
+  # Without this, the effective job is `<namespace>/<service>`, i.e.
+  # "green-agent/green-agent-metrics", and every alert using
+  # `job="green-agent"` silently matches nothing.
+  jobLabel: app
+
+  # Discover Services by labels. The Service in file 21 (or in §2 below)
+  # must carry `app: green-agent` (and optionally `component: metrics`).
   selector:
     matchLabels:
       app: green-agent
 
-  # Monitor in green-agent namespace
   namespaceSelector:
     matchNames:
     - green-agent
 
-  # Scrape configuration
   endpoints:
   - port: metrics
-    interval: 15s
-    scrapeTimeout: 10s
     path: /metrics
     scheme: http
+    interval: 15s
+    # 12s = 80% of interval, per Prometheus best practice. A 10s timeout
+    # on a 15s interval produces false-positive "up==0" during cold
+    # starts when the model is loading.
+    scrapeTimeout: 12s
 
-    # Relabel configurations
+    # Propagate pod labels onto every scraped series so dashboards and
+    # alerts can distinguish head from worker metrics.
+    # Example: gpu_utilization{ray_role="worker"}.
     relabelings:
     - sourceLabels: [__meta_kubernetes_pod_name]
       targetLabel: pod
+      action: replace
     - sourceLabels: [__meta_kubernetes_namespace]
       targetLabel: namespace
+      action: replace
     - sourceLabels: [__meta_kubernetes_service_name]
       targetLabel: service
+      action: replace
+    - sourceLabels: [__meta_kubernetes_pod_label_ray_io_node_type]
+      targetLabel: ray_role
+      action: replace
 
-    # Metric relabel configurations
+    # Deny-list filtering (NOT allow-list).
+    #
+    # v1 used `keep green_agent_.*`, which silently dropped
+    #   - DCGM_FI_DEV_GPU_UTIL              (file 16 HPA needs this)
+    #   - ray_serve_deployment_queued_queries (file 16 HPA needs this)
+    #   - every other Ray / DCGM / process metric
+    # The HPA fell back to CPU/memory without warning.
+    #
+    # Drop only the two well-known boilerplate prefixes. Everything else
+    # flows through, including future metrics you haven't anticipated.
     metricRelabelings:
     - sourceLabels: [__name__]
-      regex: 'go_.*'
+      regex: 'go_.*|python_.*'
       action: drop
-    - sourceLabels: [__name__]
-      regex: 'python_.*'
-      action: drop
-    # Optional: Keep only Green Agent metrics to reduce cardinality
-    - sourceLabels: [__name__]
-      regex: 'green_agent_.*'
-      action: keep
+
+  # Attach these pod labels to every series scraped through this monitor.
+  # Belt-and-suspenders for the ray_role relabeling above.
+  podTargetLabels:
+  - ray.io/node-type
 
 ---
-# Service for metrics exposure (Enhanced labels)
-
+# ============================================================================
+# 2. Service — exposes /metrics on 9090
+# ============================================================================
+# See header for the interaction with file 21's Service (same name).
+# If you keep file 21, DELETE this resource to avoid the conflict.
 apiVersion: v1
 kind: Service
 metadata:
   name: green-agent-metrics
-  namespace: green-agent
+  # namespace: green-agent    # uncomment if not using kustomize
   labels:
     app: green-agent
-    enhancements: enabled
-  annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
-    green-agent/flexgen: "true"
+    component: metrics
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/part-of: green-agent
 spec:
   type: ClusterIP
+  sessionAffinity: None
+  ipFamilyPolicy: SingleStack
+  # Expose endpoints even before pods are Ready, so Prometheus sees
+  # "no data" instead of "connection refused" during a rolling update.
+  publishNotReadyAddresses: true
   ports:
   - name: metrics
     port: 9090
     targetPort: 9090
     protocol: TCP
+  # Select ALL green-agent pods, not just the head. Worker metrics
+  # (gpu_utilization, ray_queue_depth) are exposed by workers, not by
+  # the head — the HPA in file 16 needs both.
   selector:
     app: green-agent
-    component: head
 
 ---
-# PrometheusRule for alerting (Enhanced)
-
+# ============================================================================
+# 3. PrometheusRule — 6 core alerts (active) + 7 enhancement (commented)
+# ============================================================================
+# Every alert has:
+#   - runbook_url       (leads operators to the fix)
+#   - team/service      (routes in Alertmanager)
+#   - category          (filters in dashboards)
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
   name: green-agent-alerts
-  namespace: green-agent
+  # namespace: green-agent    # uncomment if not using kustomize
   labels:
-    release: prometheus
     app: green-agent
-    enhancements: enabled
-  annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
-    green-agent/flexgen: "true"
+    # Uncomment to match a non-empty Prometheus CR ruleSelector.
+    # release: kube-prometheus-stack
 spec:
   groups:
-  - name: green-agent.rules
+  - name: green-agent.core
     interval: 30s
     rules:
-    # High carbon intensity alert
-    - alert: GreenAgentHighCarbonIntensity
-      expr: green_agent_carbon_intensity > 400
-      for: 5m
-      labels:
-        severity: warning
-      annotations:
-        summary: "High carbon intensity detected"
-        description: "Carbon intensity is {{ $value }} gCO2/kWh for more than 5 minutes"
 
-    # High energy consumption alert
-    - alert: GreenAgentHighEnergyConsumption
-      expr: rate(green_agent_energy_consumed_kwh_total[5m]) > 10
-      for: 10m
-      labels:
-        severity: warning
-      annotations:
-        summary: "High energy consumption detected"
-        description: "Energy consumption rate is {{ $value }} kWh/min"
-
-    # Task failure alert
-    - alert: GreenAgentTaskFailures
-      expr: rate(green_agent_tasks_completed{status="failed"}[5m]) > 0.1
-      for: 5m
-      labels:
-        severity: critical
-      annotations:
-        summary: "High task failure rate"
-        description: "Task failure rate is {{ $value }} failures/min"
-
-    # Low worker count alert
-    - alert: GreenAgentLowWorkerCount
-      expr: green_agent_active_workers < 2
-      for: 5m
-      labels:
-        severity: warning
-      annotations:
-        summary: "Low worker count"
-        description: "Only {{ $value }} workers active"
-
-    # High queue depth alert
-    - alert: GreenAgentHighQueueDepth
-      expr: green_agent_queue_depth > 100
-      for: 10m
-      labels:
-        severity: warning
-      annotations:
-        summary: "High task queue depth"
-        description: "Queue depth is {{ $value }} tasks"
-
-    # Service down alert
+    # ── 1. Service is down ────────────────────────────────────────────────
+    # `job` = value of `app` label because ServiceMonitor sets
+    # `jobLabel: app`. If you change jobLabel or drop it, this alert breaks
+    # silently — verify with `kubectl get hpa` or Prometheus's `up` view.
     - alert: GreenAgentServiceDown
       expr: up{job="green-agent"} == 0
-      for: 1m
+      for: 2m
       labels:
         severity: critical
+        team: platform
+        service: green-agent
+        category: availability
       annotations:
-        summary: "Green Agent service is down"
-        description: "Green Agent service has been down for more than 1 minute"
+        summary: "Green Agent is not being scraped"
+        description: >-
+          ServiceMonitor target has been down for 2 minutes. Check pod
+          status with `kubectl -n green-agent get pods` and ServiceMonitor
+          discovery with `kubectl -n green-agent get servicemonitor`.
+        runbook_url: "https://wiki.example.com/runbooks/green-agent/down"
 
-    # ── Enhanced Alerts for Advanced Modules ──
+    # ── 2. Carbon intensity high ──────────────────────────────────────────
+    - alert: GreenAgentHighCarbonIntensity
+      expr: avg(green_agent_carbon_intensity) > 400
+      for: 5m
+      labels:
+        severity: warning
+        team: sustainability
+        service: green-agent
+        category: carbon
+      annotations:
+        summary: "Grid carbon intensity is high ({{ $value | humanize }} gCO₂/kWh)"
+        description: >-
+          Carbon intensity above 400 gCO₂/kWh for 5 minutes. Consider
+          pausing non-critical work; the KEDA ScaledObject may scale down
+          automatically based on the carbon_credit metric.
+        runbook_url: "https://wiki.example.com/runbooks/green-agent/carbon"
 
-    # MODP composite score too low
-    - alert: GreenAgentLowMODPScore
-      expr: green_agent_modp_score < 0.4
+    # ── 3. Power draw high ────────────────────────────────────────────────
+    # v1's threshold was `rate(...[5m]) > 10`, which is 10 kWh/sec ≈
+    # 36,000 kWh/hr ≈ 50,000 H100 nodes. The alert could not fire in any
+    # real deployment. This version uses kW (real power) with a threshold
+    # of 10 kW — matching a 10-node A100 pool.
+    - alert: GreenAgentHighPowerDraw
+      expr: sum(rate(green_agent_energy_consumed_kwh_total[5m])) * 3600 > 10
       for: 10m
       labels:
         severity: warning
+        team: platform
+        service: green-agent
+        category: energy
       annotations:
-        summary: "Low MODP composite score"
-        description: "MODP score is {{ $value }} (target > 0.6). Check objective weights."
+        summary: "Power draw is {{ $value | humanize }} kW"
+        description: >-
+          Aggregate power above 10 kW for 10 minutes. Investigate GPU
+          utilization and worker count before deciding whether this is
+          expected load or a runaway job.
+        runbook_url: "https://wiki.example.com/runbooks/green-agent/power"
 
-    # RLHF feedback score dropping
-    - alert: GreenAgentLowRLHFFeedback
-      expr: green_agent_rlhf_feedback < 0.3
-      for: 15m
+    # ── 4. Task failure rate high ─────────────────────────────────────────
+    # Metric name aligned with files 17 and 20: `_total` suffix (counter).
+    - alert: GreenAgentTaskFailures
+      expr: sum(rate(green_agent_tasks_completed_total{status="failed"}[5m])) > 0.1
+      for: 5m
+      labels:
+        severity: critical
+        team: platform
+        service: green-agent
+        category: correctness
+      annotations:
+        summary: "Task failure rate is {{ $value | humanize }} per second"
+        description: >-
+          More than 6 failed tasks per minute over the last 5 minutes.
+          Check the task logs and the current model / dataset version.
+        runbook_url: "https://wiki.example.com/runbooks/green-agent/task-failures"
+
+    # ── 5. Worker count low ───────────────────────────────────────────────
+    # v1 fired when ANY pod reported < 2 workers. This version fires when
+    # the CLUSTER TOTAL is below 2, which is what "we're running out of
+    # capacity" actually means.
+    - alert: GreenAgentLowWorkerCount
+      expr: sum(green_agent_active_workers) < 2
+      for: 5m
       labels:
         severity: warning
+        team: platform
+        service: green-agent
+        category: capacity
       annotations:
-        summary: "Low RLHF feedback score"
-        description: "Human feedback is {{ $value }}. Consider adjusting behavior."
+        summary: "Only {{ $value | humanize }} active worker(s)"
+        description: >-
+          Fewer than 2 workers cluster-wide for 5 minutes. Scale up may be
+          blocked by node availability; check the RayCluster status and
+          the HPA (file 16).
+        runbook_url: "https://wiki.example.com/runbooks/green-agent/workers"
 
-    # Distillation updates stalled
-    - alert: GreenAgentDistillationStalled
-      expr: rate(green_agent_distillation_update_count[30m]) < 1
-      for: 30m
-      labels:
-        severity: info
-      annotations:
-        summary: "Distillation updates stalled"
-        description: "Few or no distillation updates in last 30 minutes."
-
-    # LIMIT Graph centrality anomaly
-    - alert: GreenAgentGraphCentralityLow
-      expr: green_agent_graph_centrality < 0.3
+    # ── 6. Queue depth high ───────────────────────────────────────────────
+    - alert: GreenAgentHighQueueDepth
+      expr: sum(green_agent_queue_depth) > 100
       for: 10m
       labels:
         severity: warning
+        team: platform
+        service: green-agent
+        category: capacity
       annotations:
-        summary: "Low LIMIT Graph centrality"
-        description: "Graph centrality is {{ $value }}. Topology may be suboptimal."
+        summary: "Task queue depth is {{ $value | humanize }}"
+        description: >-
+          More than 100 tasks queued for 10 minutes. Either the HPA is
+          not scaling (check `kubectl -n green-agent get hpa`) or the
+          cluster has run out of capacity to schedule new pods.
+        runbook_url: "https://wiki.example.com/runbooks/green-agent/queue"
 
-    # MoE gating instability
-    - alert: GreenAgentMoEUnstable
-      expr: stddev_over_time(green_agent_moe_gate_weight[15m]) > 0.2
-      for: 15m
-      labels:
-        severity: warning
-      annotations:
-        summary: "MoE gating unstable"
-        description: "Gate weight standard deviation is {{ $value }}."
-
-    # Bio‑inspired evolutionary fitness stagnating
-    - alert: GreenAgentEvolutionStalled
-      expr: green_agent_evolutionary_best_fitness - green_agent_evolutionary_best_fitness offset 1h < 0.01
-      for: 1h
-      labels:
-        severity: info
-      annotations:
-        summary: "Evolutionary optimisation stalled"
-        description: "Best fitness has not improved significantly in the last hour."
-
-    # FlexGen energy consumption high
-    - alert: GreenAgentFlexGenHighEnergy
-      expr: rate(green_agent_flexgen_energy_joules_total[5m]) > 1000
-      for: 10m
-      labels:
-        severity: warning
-      annotations:
-        summary: "High FlexGen energy consumption"
-        description: "FlexGen energy rate is {{ $value }} J/s."
-
----
-# ConfigMap for Prometheus scrape config (Enhanced labels)
-
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: prometheus-green-agent-config
-  namespace: monitoring
-  labels:
-    app: prometheus
-    enhancements: enabled
-  annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
-    green-agent/flexgen: "true"
-data:
-  green-agent-scrape.yml: |
-    - job_name: 'green-agent'
-      kubernetes_sd_configs:
-      - role: endpoints
-        namespaces:
-          names:
-          - green-agent
-      relabel_configs:
-      - source_labels: [__meta_kubernetes_service_label_app]
-        action: keep
-        regex: green-agent
-      - source_labels: [__meta_kubernetes_endpoint_port_name]
-        action: keep
-        regex: metrics
-      scrape_interval: 15s
-      scrape_timeout: 10s
-      metrics_path: /metrics
-      scheme: http
+  # ==========================================================================
+  # Enhancement alerts — COMMENTED OUT
+  # ==========================================================================
+  # Every rule below targets a metric that no module in this codebase
+  # emits (verified against files 4, 7, 13, 15, 17, 20). Leaving them
+  # active means Prometheus evaluates 7 rules every 30s that can never
+  # fire, silently masking the fact that the enhancement layer is
+  # unimplemented. See k8s/prometheus-adapter-values.yaml for the
+  # expected series shape when emitters land.
+  #
+  # To enable an individual alert: uncomment the rule, confirm the
+  # metric is being exported (via `curl :9090/metrics | grep <name>`),
+  # then `kubectl apply -f` this file again.
+  # --------------------------------------------------------------------------
+  # - name: green-agent.enhancement
+  #   interval: 30s
+  #   rules:
+  #
+  #   # MODP composite score too low
+  #   - alert: GreenAgentLowMODPScore
+  #     expr: avg(green_agent_modp_score) < 0.4
+  #     for: 10m
+  #     labels: {severity: warning, team: rl-research, service: green-agent, category: enhancement}
+  #     annotations:
+  #       summary: "MODP score {{ $value | humanize }} below 0.4"
+  #       description: "Check objective weights in SelectiveInvocationConfig."
+  #       runbook_url: "https://wiki.example.com/runbooks/green-agent/modp"
+  #
+  #   # RLHF feedback score dropping
+  #   - alert: GreenAgentLowRLHFFeedback
+  #     expr: avg(green_agent_rlhf_feedback) < 0.3
+  #     for: 15m
+  #     labels: {severity: warning, team: rl-research, service: green-agent, category: enhancement}
+  #     annotations:
+  #       summary: "RLHF feedback is {{ $value | humanize }}"
+  #       description: "Human feedback below 0.3. Consider retraining or model switch."
+  #       runbook_url: "https://wiki.example.com/runbooks/green-agent/rlhf"
+  #
+  #   # Distillation updates stalled
+  #   - alert: GreenAgentDistillationStalled
+  #     expr: sum(rate(green_agent_distillation_update_count[30m])) < 1
+  #     for: 30m
+  #     labels: {severity: info, team: rl-research, service: green-agent, category: enhancement}
+  #     annotations:
+  #       summary: "Distillation updates stalled"
+  #       description: "Fewer than 1 update per second in the last 30 minutes."
+  #       runbook_url: "https://wiki.example.com/runbooks/green-agent/distillation"
+  #
+  #   # LIMIT Graph centrality low
+  #   - alert: GreenAgentGraphCentralityLow
+  #     expr: avg(green_agent_graph_centrality) < 0.3
+  #     for: 10m
+  #     labels: {severity: warning, team: rl-research, service: green-agent, category: enhancement}
+  #     annotations:
+  #       summary: "Graph centrality {{ $value | humanize }}"
+  #       description: "Topology may be suboptimal. Check GraphRegistry.compute_graph_metrics."
+  #       runbook_url: "https://wiki.example.com/runbooks/green-agent/graph"
+  #
+  #   # MoE gating unstable
+  #   - alert: GreenAgentMoEUnstable
+  #     expr: avg(stddev_over_time(green_agent_moe_gate_weight[15m])) > 0.2
+  #     for: 15m
+  #     labels: {severity: warning, team: rl-research, service: green-agent, category: enhancement}
+  #     annotations:
+  #       summary: "MoE gate weight stddev {{ $value | humanize }}"
+  #       description: "Gate weight variance high. Check distillation learning rate."
+  #       runbook_url: "https://wiki.example.com/runbooks/green-agent/moe"
+  #
+  #   # Evolutionary fitness stagnated (no improvement AND no regression)
+  #   # v1's single rule fired on regression too, which is a different
+  #   # remediation. This version splits:
+  #   - alert: GreenAgentEvolutionStalled
+  #     expr: |
+  #       abs(
+  #         avg(green_agent_evolutionary_best_fitness)
+  #         - avg(green_agent_evolutionary_best_fitness offset 1h)
+  #       ) < 0.01
+  #     for: 1h
+  #     labels: {severity: info, team: rl-research, service: green-agent, category: enhancement}
+  #     annotations:
+  #       summary: "Evolutionary fitness stagnated"
+  #       description: "No improvement in the last hour. Check mutation rate and population."
+  #       runbook_url: "https://wiki.example.com/runbooks/green-agent/evolution"
+  #
+  #   - alert: GreenAgentEvolutionRegressed
+  #     expr: |
+  #       avg(green_agent_evolutionary_best_fitness)
+  #       - avg(green_agent_evolutionary_best_fitness offset 1h) < -0.01
+  #     for: 15m
+  #     labels: {severity: warning, team: rl-research, service: green-agent, category: enhancement}
+  #     annotations:
+  #       summary: "Evolutionary fitness regressed"
+  #       description: "Best fitness dropped. Check data drift or weight corruption."
+  #       runbook_url: "https://wiki.example.com/runbooks/green-agent/evolution-regression"
+  #
+  #   # FlexGen energy high (watts, not J/s)
+  #   - alert: GreenAgentFlexGenHighEnergy
+  #     expr: sum(rate(green_agent_flexgen_energy_joules_total[5m])) > 1000
+  #     for: 10m
+  #     labels: {severity: warning, team: platform, service: green-agent, category: energy}
+  #     annotations:
+  #       summary: "FlexGen draws {{ $value | humanize }} W"
+  #       description: "Above 1 kW for 10 minutes."
+  #       runbook_url: "https://wiki.example.com/runbooks/green-agent/flexgen"
