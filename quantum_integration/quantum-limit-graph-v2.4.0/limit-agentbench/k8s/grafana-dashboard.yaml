@@ -1,7 +1,36 @@
 ---
-# Grafana Dashboard ConfigMap (Enhanced)
-# Import this into Grafana for visualization of core and advanced enhancement metrics.
-
+# Grafana dashboard ConfigMap for Green Agent.
+#
+# Requires the kube-prometheus-stack Grafana sidecar:
+#   sidecar:
+#     dashboards:
+#       enabled: true
+#       label: grafana_dashboard
+#
+# BEFORE this dashboard shows any data, these emitters must exist in
+# Prometheus. None of them are implemented in the current codebase (see
+# files 16/17/19 analyses). The dashboard surfaces this in a "Setup
+# Checklist" row at the top — every panel that has no emitter shows
+# "No data" with the emitter requirement in its description.
+#
+#   green_agent_carbon_intensity      (grid API, regional)
+#   green_agent_energy_consumed_kwh_total    (Ray pods, per-workload)
+#   green_agent_carbon_emitted_kg_total      (derived or sidecar)
+#   green_agent_active_workers        (Ray pods)
+#   green_agent_queue_depth           (Ray exporter)
+#   green_agent_accuracy_score        (RLHF / evaluator)
+#   green_agent_tasks_completed_total (Ray pods)
+#   green_agent_modp_score            (NOT IMPLEMENTED — aspirational)
+#   green_agent_rlhf_feedback         (NOT IMPLEMENTED — aspirational)
+#   green_agent_graph_centrality      (NOT IMPLEMENTED — aspirational)
+#   green_agent_graph_connectivity    (NOT IMPLEMENTED — aspirational)
+#   green_agent_distillation_update_count  (NOT IMPLEMENTED — aspirational)
+#   green_agent_moe_gate_weight       (NOT IMPLEMENTED — aspirational)
+#   green_agent_evolutionary_best_fitness  (NOT IMPLEMENTED — aspirational)
+#
+# When emitters land, refresh this dashboard via:
+#   kubectl -n green-agent delete cm green-agent-grafana-dashboard
+#   kubectl apply -f k8s/grafana-dashboard.yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -10,918 +39,394 @@ metadata:
   labels:
     grafana_dashboard: "1"
     app: green-agent
-    enhancements: enabled
-  annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
-    green-agent/flexgen: "true"
 data:
   green-agent-overview.json: |
     {
+      "description": "Green Agent overview. Core metrics require a running Prometheus + exporters. Enhancement metrics (MODP, RLHF, Graph, Distillation, MoE, Evolutionary) are aspirational — no emitter exists yet. See the Setup Checklist row.",
       "annotations": {
-        "list": []
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+            "enable": true,
+            "hide": true,
+            "iconColor": "rgba(0, 211, 255, 1)",
+            "name": "Annotations & Alerts",
+            "type": "dashboard"
+          }
+        ]
       },
-      "editable": true,
-      "fiscalYearStartMonth": 0,
-      "graphTooltip": 0,
+      "editable": false,
+      "graphTooltip": 1,
       "id": null,
       "links": [],
       "liveNow": false,
-      "panels": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "thresholds"
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  },
-                  {
-                    "color": "yellow",
-                    "value": 200
-                  },
-                  {
-                    "color": "red",
-                    "value": 400
-                  }
-                ]
-              },
-              "unit": "none"
-            }
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 6,
-            "x": 0,
-            "y": 0
-          },
-          "id": 1,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": ["lastNotNull"],
-              "fields": "",
-              "values": false
-            },
-            "textMode": "auto"
-          },
-          "pluginVersion": "9.0.0",
-          "targets": [
-            {
-              "expr": "green_agent_carbon_intensity",
-              "legendFormat": "Carbon Intensity",
-              "refId": "A"
-            }
-          ],
-          "title": "Carbon Intensity (gCO2/kWh)",
-          "type": "gauge"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  }
-                ]
-              },
-              "unit": "kwh"
-            }
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 6,
-            "x": 6,
-            "y": 0
-          },
-          "id": 2,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": ["sum"],
-              "fields": "",
-              "values": false
-            }
-          },
-          "pluginVersion": "9.0.0",
-          "targets": [
-            {
-              "expr": "green_agent_energy_consumed_kwh_total",
-              "legendFormat": "Energy Consumed",
-              "refId": "A"
-            }
-          ],
-          "title": "Energy Consumption (kWh)",
-          "type": "stat"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  }
-                ]
-              },
-              "unit": "kg"
-            }
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 6,
-            "x": 12,
-            "y": 0
-          },
-          "id": 3,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": ["sum"],
-              "fields": "",
-              "values": false
-            }
-          },
-          "pluginVersion": "9.0.0",
-          "targets": [
-            {
-              "expr": "green_agent_carbon_emitted_kg_total",
-              "legendFormat": "Carbon Emitted",
-              "refId": "A"
-            }
-          ],
-          "title": "Carbon Footprint (kg CO2)",
-          "type": "stat"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  }
-                ]
-              },
-              "unit": "none"
-            }
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 6,
-            "x": 18,
-            "y": 0
-          },
-          "id": 4,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": ["lastNotNull"],
-              "fields": "",
-              "values": false
-            }
-          },
-          "pluginVersion": "9.0.0",
-          "targets": [
-            {
-              "expr": "green_agent_active_workers",
-              "legendFormat": "Active Workers",
-              "refId": "A"
-            }
-          ],
-          "title": "Active Workers",
-          "type": "stat"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "custom": {
-                "axisCenteredZero": false,
-                "axisLabel": "",
-                "axisPlacement": "auto",
-                "barAlignment": 0,
-                "drawStyle": "line",
-                "fillOpacity": 10,
-                "gradientMode": "none",
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                },
-                "lineInterpolation": "linear",
-                "lineWidth": 1,
-                "pointSize": 5,
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "showPoints": "auto",
-                "spanNulls": false,
-                "stacking": {
-                  "group": "A",
-                  "mode": "none"
-                },
-                "thresholdsStyle": {
-                  "mode": "off"
-                }
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  }
-                ]
-              },
-              "unit": "kwh"
-            }
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 12,
-            "x": 0,
-            "y": 8
-          },
-          "id": 5,
-          "options": {
-            "legend": {
-              "calcs": [],
-              "displayMode": "list",
-              "placement": "bottom",
-              "showLegend": true
-            },
-            "tooltip": {
-              "mode": "single",
-              "sort": "none"
-            }
-          },
-          "targets": [
-            {
-              "expr": "rate(green_agent_energy_consumed_kwh_total[5m])",
-              "legendFormat": "Energy Rate",
-              "refId": "A"
-            }
-          ],
-          "title": "Energy Consumption Rate (kWh/min)",
-          "type": "timeseries"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "custom": {
-                "axisCenteredZero": false,
-                "axisLabel": "",
-                "axisPlacement": "auto",
-                "barAlignment": 0,
-                "drawStyle": "line",
-                "fillOpacity": 10,
-                "gradientMode": "none",
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                },
-                "lineInterpolation": "linear",
-                "lineWidth": 1,
-                "pointSize": 5,
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "showPoints": "auto",
-                "spanNulls": false,
-                "stacking": {
-                  "group": "A",
-                  "mode": "none"
-                },
-                "thresholdsStyle": {
-                  "mode": "off"
-                }
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  }
-                ]
-              },
-              "unit": "none"
-            }
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 12,
-            "x": 12,
-            "y": 8
-          },
-          "id": 6,
-          "options": {
-            "legend": {
-              "calcs": [],
-              "displayMode": "list",
-              "placement": "bottom",
-              "showLegend": true
-            },
-            "tooltip": {
-              "mode": "single",
-              "sort": "none"
-            }
-          },
-          "targets": [
-            {
-              "expr": "green_agent_queue_depth",
-              "legendFormat": "Queue Depth",
-              "refId": "A"
-            }
-          ],
-          "title": "Task Queue Depth",
-          "type": "timeseries"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  },
-                  {
-                    "color": "yellow",
-                    "value": 0.8
-                  },
-                  {
-                    "color": "green",
-                    "value": 0.9
-                  }
-                ]
-              },
-              "unit": "percentunit"
-            }
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 12,
-            "x": 0,
-            "y": 16
-          },
-          "id": 7,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": ["lastNotNull"],
-              "fields": "",
-              "values": false
-            }
-          },
-          "pluginVersion": "9.0.0",
-          "targets": [
-            {
-              "expr": "green_agent_accuracy_score",
-              "legendFormat": "Accuracy",
-              "refId": "A"
-            }
-          ],
-          "title": "Model Accuracy",
-          "type": "stat"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  }
-                ]
-              },
-              "unit": "none"
-            }
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 12,
-            "x": 12,
-            "y": 16
-          },
-          "id": 8,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": ["sum"],
-              "fields": "",
-              "values": false
-            }
-          },
-          "pluginVersion": "9.0.0",
-          "targets": [
-            {
-              "expr": "green_agent_tasks_completed_total",
-              "legendFormat": "{{status}}",
-              "refId": "A"
-            }
-          ],
-          "title": "Tasks Completed",
-          "type": "stat"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  },
-                  {
-                    "color": "yellow",
-                    "value": 0.6
-                  },
-                  {
-                    "color": "red",
-                    "value": 0.4
-                  }
-                ]
-              },
-              "unit": "none"
-            }
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 6,
-            "x": 0,
-            "y": 24
-          },
-          "id": 9,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": ["lastNotNull"],
-              "fields": "",
-              "values": false
-            }
-          },
-          "pluginVersion": "9.0.0",
-          "targets": [
-            {
-              "expr": "green_agent_modp_score",
-              "legendFormat": "MODP Score",
-              "refId": "A"
-            }
-          ],
-          "title": "MODP Composite Score",
-          "type": "gauge"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  }
-                ]
-              },
-              "unit": "none"
-            }
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 6,
-            "x": 6,
-            "y": 24
-          },
-          "id": 10,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": ["lastNotNull"],
-              "fields": "",
-              "values": false
-            }
-          },
-          "pluginVersion": "9.0.0",
-          "targets": [
-            {
-              "expr": "green_agent_rlhf_feedback",
-              "legendFormat": "Human Feedback",
-              "refId": "A"
-            }
-          ],
-          "title": "RLHF Feedback Score",
-          "type": "stat"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "custom": {
-                "axisCenteredZero": false,
-                "axisLabel": "",
-                "axisPlacement": "auto",
-                "barAlignment": 0,
-                "drawStyle": "line",
-                "fillOpacity": 10,
-                "gradientMode": "none",
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                },
-                "lineInterpolation": "linear",
-                "lineWidth": 1,
-                "pointSize": 5,
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "showPoints": "auto",
-                "spanNulls": false,
-                "stacking": {
-                  "group": "A",
-                  "mode": "none"
-                },
-                "thresholdsStyle": {
-                  "mode": "off"
-                }
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  }
-                ]
-              },
-              "unit": "none"
-            }
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 12,
-            "x": 12,
-            "y": 24
-          },
-          "id": 11,
-          "options": {
-            "legend": {
-              "calcs": [],
-              "displayMode": "list",
-              "placement": "bottom",
-              "showLegend": true
-            },
-            "tooltip": {
-              "mode": "single",
-              "sort": "none"
-            }
-          },
-          "targets": [
-            {
-              "expr": "green_agent_graph_centrality",
-              "legendFormat": "Centrality",
-              "refId": "A"
-            },
-            {
-              "expr": "green_agent_graph_connectivity",
-              "legendFormat": "Connectivity",
-              "refId": "B"
-            }
-          ],
-          "title": "LIMIT Graph Metrics",
-          "type": "timeseries"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  }
-                ]
-              },
-              "unit": "none"
-            }
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 6,
-            "x": 0,
-            "y": 32
-          },
-          "id": 12,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": ["lastNotNull"],
-              "fields": "",
-              "values": false
-            }
-          },
-          "pluginVersion": "9.0.0",
-          "targets": [
-            {
-              "expr": "rate(green_agent_distillation_update_count[5m])",
-              "legendFormat": "Update Rate",
-              "refId": "A"
-            }
-          ],
-          "title": "Distillation Update Rate",
-          "type": "stat"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  }
-                ]
-              },
-              "unit": "none"
-            }
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 6,
-            "x": 6,
-            "y": 32
-          },
-          "id": 13,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": {
-              "calcs": ["lastNotNull"],
-              "fields": "",
-              "values": false
-            }
-          },
-          "pluginVersion": "9.0.0",
-          "targets": [
-            {
-              "expr": "stddev_over_time(green_agent_moe_gate_weight[15m])",
-              "legendFormat": "Gate Stddev",
-              "refId": "A"
-            }
-          ],
-          "title": "MoE Gate Stability",
-          "type": "stat"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "custom": {
-                "axisCenteredZero": false,
-                "axisLabel": "",
-                "axisPlacement": "auto",
-                "barAlignment": 0,
-                "drawStyle": "line",
-                "fillOpacity": 10,
-                "gradientMode": "none",
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                },
-                "lineInterpolation": "linear",
-                "lineWidth": 1,
-                "pointSize": 5,
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "showPoints": "auto",
-                "spanNulls": false,
-                "stacking": {
-                  "group": "A",
-                  "mode": "none"
-                },
-                "thresholdsStyle": {
-                  "mode": "off"
-                }
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  }
-                ]
-              },
-              "unit": "none"
-            }
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 12,
-            "x": 12,
-            "y": 32
-          },
-          "id": 14,
-          "options": {
-            "legend": {
-              "calcs": [],
-              "displayMode": "list",
-              "placement": "bottom",
-              "showLegend": true
-            },
-            "tooltip": {
-              "mode": "single",
-              "sort": "none"
-            }
-          },
-          "targets": [
-            {
-              "expr": "green_agent_evolutionary_best_fitness",
-              "legendFormat": "Best Fitness",
-              "refId": "A"
-            }
-          ],
-          "title": "Evolutionary Best Fitness",
-          "type": "timeseries"
-        }
-      ],
-      "refresh": "5s",
-      "schemaVersion": 37,
+      "refresh": "30s",
+      "schemaVersion": 38,
       "style": "dark",
-      "tags": ["green-agent", "sustainability", "ai", "enhanced"],
+      "tags": ["green-agent", "sustainability", "ai"],
       "templating": {
-        "list": []
+        "list": [
+          {
+            "name": "datasource",
+            "label": "Prometheus",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": {},
+            "hide": 0,
+            "refresh": 1,
+            "includeAll": false,
+            "multi": false
+          },
+          {
+            "name": "namespace",
+            "label": "Namespace",
+            "type": "query",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "query": "label_values(up, namespace)",
+            "current": { "text": "green-agent", "value": "green-agent" },
+            "refresh": 2,
+            "includeAll": true,
+            "allValue": ".*",
+            "hide": 0,
+            "multi": false
+          }
+        ]
       },
-      "time": {
-        "from": "now-1h",
-        "to": "now"
+      "time": { "from": "now-1h", "to": "now" },
+      "timepicker": {
+        "refresh_intervals": ["10s", "30s", "1m", "5m", "15m", "30m", "1h"],
+        "time_options": ["5m", "15m", "1h", "6h", "12h", "24h", "2d", "7d", "30d"]
       },
-      "timepicker": {},
-      "timezone": "browser",
-      "title": "Green Agent Overview (Enhanced)",
+      "timezone": "utc",
+      "title": "Green Agent Overview",
       "uid": "green-agent-overview",
-      "version": 1,
-      "weekStart": ""
+      "version": 2,
+      "weekStart": "",
+      "panels": [
+
+        { "type": "row", "title": "🔎 Setup Checklist", "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "id": 100,
+          "panels": [] },
+
+        {
+          "id": 90,
+          "type": "text",
+          "title": "",
+          "gridPos": { "h": 4, "w": 24, "x": 0, "y": 1 },
+          "options": {
+            "mode": "markdown",
+            "content": "**Emitter status** — panels below will show `No data` until an emitter produces each metric.\n\n" +
+              "| Metric | Status | Required emitter |\n" +
+              "|--------|--------|------------------|\n" +
+              "| `green_agent_carbon_intensity` | ❌ | grid API exporter |\n" +
+              "| `green_agent_energy_consumed_kwh_total` | ❌ | Ray pods / sidecar |\n" +
+              "| `green_agent_active_workers` | ❌ | Ray exporter |\n" +
+              "| `green_agent_queue_depth` | ❌ | Ray exporter |\n" +
+              "| `green_agent_accuracy_score` | ❌ | RLHF evaluator |\n" +
+              "| `green_agent_modp_score` … `green_agent_evolutionary_best_fitness` | ❌ | **not implemented** |\n\n" +
+              "See `k8s/prometheus-adapter-values.yaml` for the expected series shape."
+          }
+        },
+
+        { "type": "row", "title": "🌍 Environment & Sustainability", "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }, "id": 101,
+          "panels": [] },
+
+        {
+          "id": 1, "type": "gauge",
+          "title": "Carbon Intensity (gCO₂/kWh)",
+          "description": "Current grid carbon intensity. Requires: green_agent_carbon_intensity with a `region` label.",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 6, "x": 0, "y": 6 },
+          "fieldConfig": { "defaults": {
+            "unit": "none", "min": 0, "max": 600,
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 200 },
+              { "color": "orange", "value": 400 },
+              { "color": "red", "value": 500 }
+            ]}
+          }},
+          "options": {
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true,
+            "reduceOptions": { "calcs": ["lastNotNull"], "values": false }
+          },
+          "targets": [{
+            "refId": "A",
+            "expr": "avg(green_agent_carbon_intensity{namespace=~\"$namespace\"})",
+            "legendFormat": "gCO₂/kWh"
+          }]
+        },
+
+        {
+          "id": 2, "type": "stat",
+          "title": "Energy Consumed (in range, kWh)",
+          "description": "Total energy consumed during the selected dashboard range. Requires: green_agent_energy_consumed_kwh_total (counter).",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 6, "x": 6, "y": 6 },
+          "fieldConfig": { "defaults": { "unit": "kwatth" } },
+          "options": {
+            "colorMode": "value", "graphMode": "area", "textMode": "auto",
+            "reduceOptions": { "calcs": ["sum"], "values": false }
+          },
+          "targets": [{
+            "refId": "A",
+            "expr": "sum(increase(green_agent_energy_consumed_kwh_total{namespace=~\"$namespace\"}[$__range]))",
+            "legendFormat": "kWh"
+          }]
+        },
+
+        {
+          "id": 3, "type": "stat",
+          "title": "Carbon Emitted (in range, kg CO₂)",
+          "description": "Total CO₂ emitted during the selected dashboard range. Requires: green_agent_carbon_emitted_kg_total (counter).",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 6, "x": 12, "y": 6 },
+          "fieldConfig": { "defaults": { "unit": "kg" } },
+          "options": {
+            "colorMode": "value", "graphMode": "area", "textMode": "auto",
+            "reduceOptions": { "calcs": ["sum"], "values": false }
+          },
+          "targets": [{
+            "refId": "A",
+            "expr": "sum(increase(green_agent_carbon_emitted_kg_total{namespace=~\"$namespace\"}[$__range]))",
+            "legendFormat": "kg CO₂"
+          }]
+        },
+
+        {
+          "id": 5, "type": "timeseries",
+          "title": "Power Draw (kW)",
+          "description": "Instantaneous power derived from the kWh counter. Requires: green_agent_energy_consumed_kwh_total.",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 6, "x": 18, "y": 6 },
+          "fieldConfig": { "defaults": { "unit": "kwatt",
+            "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10 }
+          }},
+          "targets": [{
+            "refId": "A",
+            "expr": "sum(rate(green_agent_energy_consumed_kwh_total{namespace=~\"$namespace\"}[$__rate_interval])) * 3600",
+            "legendFormat": "kW"
+          }]
+        },
+
+        { "type": "row", "title": "⚙️ System Health", "collapsed": false,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 }, "id": 102,
+          "panels": [] },
+
+        {
+          "id": 4, "type": "stat",
+          "title": "Active Workers",
+          "description": "Sum of active Ray workers. Requires: green_agent_active_workers (per-pod gauge).",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 6, "x": 0, "y": 15 },
+          "fieldConfig": { "defaults": { "unit": "none" } },
+          "options": {
+            "colorMode": "value", "graphMode": "area", "textMode": "auto",
+            "reduceOptions": { "calcs": ["lastNotNull"], "values": false }
+          },
+          "targets": [{
+            "refId": "A",
+            "expr": "sum(green_agent_active_workers{namespace=~\"$namespace\"})",
+            "legendFormat": "workers"
+          }]
+        },
+
+        {
+          "id": 6, "type": "timeseries",
+          "title": "Task Queue Depth",
+          "description": "Pending tasks in the Ray queue. Requires: green_agent_queue_depth (gauge).",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 6, "y": 15 },
+          "fieldConfig": { "defaults": { "unit": "none",
+            "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10 }
+          }},
+          "targets": [{
+            "refId": "A",
+            "expr": "sum(green_agent_queue_depth{namespace=~\"$namespace\"})",
+            "legendFormat": "queue depth"
+          }]
+        },
+
+        {
+          "id": 7, "type": "stat",
+          "title": "Model Accuracy",
+          "description": "Current model accuracy (0–1). Requires: green_agent_accuracy_score (gauge).",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 6, "x": 18, "y": 15 },
+          "fieldConfig": { "defaults": {
+            "unit": "percentunit", "min": 0, "max": 1,
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "red",    "value": null },
+              { "color": "yellow", "value": 0.70 },
+              { "color": "green",  "value": 0.85 }
+            ]}
+          }},
+          "options": {
+            "colorMode": "value", "graphMode": "area", "textMode": "auto",
+            "reduceOptions": { "calcs": ["lastNotNull"], "values": false }
+          },
+          "targets": [{
+            "refId": "A",
+            "expr": "avg(green_agent_accuracy_score{namespace=~\"$namespace\"})",
+            "legendFormat": "accuracy"
+          }]
+        },
+
+        {
+          "id": 8, "type": "stat",
+          "title": "Tasks Completed (in range)",
+          "description": "Tasks completed during the selected range. Requires: green_agent_tasks_completed_total (counter).",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+          "fieldConfig": { "defaults": { "unit": "none" } },
+          "options": {
+            "colorMode": "value", "graphMode": "area", "textMode": "auto",
+            "reduceOptions": { "calcs": ["sum"], "values": false }
+          },
+          "targets": [{
+            "refId": "A",
+            "expr": "sum(increase(green_agent_tasks_completed_total{namespace=~\"$namespace\"}[$__range]))",
+            "legendFormat": "tasks"
+          }]
+        },
+
+        { "type": "row",
+          "title": "🔬 Enhancement Metrics — requires emitters (currently No data)",
+          "collapsed": true,
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 }, "id": 103,
+          "panels": [
+
+            {
+              "id": 9, "type": "gauge",
+              "title": "MODP Composite Score (aspirational)",
+              "description": "Requires: green_agent_modp_score. NOT CURRENTLY EMITTED — no Python module produces this metric.",
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "gridPos": { "h": 8, "w": 6, "x": 0, "y": 32 },
+              "fieldConfig": { "defaults": {
+                "unit": "percentunit", "min": 0, "max": 1,
+                "thresholds": { "mode": "absolute", "steps": [
+                  { "color": "red",    "value": null },
+                  { "color": "yellow", "value": 0.60 },
+                  { "color": "green",  "value": 0.80 }
+                ]}
+              }},
+              "options": {
+                "showThresholdLabels": false,
+                "showThresholdMarkers": true,
+                "reduceOptions": { "calcs": ["lastNotNull"], "values": false }
+              },
+              "targets": [{
+                "refId": "A",
+                "expr": "avg(green_agent_modp_score{namespace=~\"$namespace\"})"
+              }]
+            },
+
+            {
+              "id": 10, "type": "stat",
+              "title": "RLHF Feedback (aspirational)",
+              "description": "Requires: green_agent_rlhf_feedback. NOT CURRENTLY EMITTED.",
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "gridPos": { "h": 8, "w": 6, "x": 6, "y": 32 },
+              "fieldConfig": { "defaults": {
+                "unit": "percentunit", "min": 0, "max": 1,
+                "thresholds": { "mode": "absolute", "steps": [
+                  { "color": "red",    "value": null },
+                  { "color": "yellow", "value": 0.50 },
+                  { "color": "green",  "value": 0.75 }
+                ]}
+              }},
+              "options": {
+                "colorMode": "value", "graphMode": "area",
+                "reduceOptions": { "calcs": ["lastNotNull"], "values": false }
+              },
+              "targets": [{
+                "refId": "A",
+                "expr": "avg(green_agent_rlhf_feedback{namespace=~\"$namespace\"})"
+              }]
+            },
+
+            {
+              "id": 11, "type": "timeseries",
+              "title": "LIMIT Graph Metrics (aspirational)",
+              "description": "Requires: green_agent_graph_centrality + green_agent_graph_connectivity. NOT CURRENTLY EMITTED.",
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+              "fieldConfig": { "defaults": {
+                "unit": "percentunit", "min": 0, "max": 1,
+                "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10 }
+              }},
+              "targets": [
+                { "refId": "A",
+                  "expr": "avg(green_agent_graph_centrality{namespace=~\"$namespace\"})",
+                  "legendFormat": "centrality" },
+                { "refId": "B",
+                  "expr": "avg(green_agent_graph_connectivity{namespace=~\"$namespace\"})",
+                  "legendFormat": "connectivity" }
+              ]
+            },
+
+            {
+              "id": 12, "type": "stat",
+              "title": "Distillation Update Rate (aspirational)",
+              "description": "Requires: green_agent_distillation_update_count. NOT CURRENTLY EMITTED.",
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "gridPos": { "h": 8, "w": 8, "x": 0, "y": 40 },
+              "fieldConfig": { "defaults": { "unit": "ops" } },
+              "options": {
+                "colorMode": "value", "graphMode": "area",
+                "reduceOptions": { "calcs": ["lastNotNull"], "values": false }
+              },
+              "targets": [{
+                "refId": "A",
+                "expr": "sum(rate(green_agent_distillation_update_count{namespace=~\"$namespace\"}[$__rate_interval]))",
+                "legendFormat": "updates/sec"
+              }]
+            },
+
+            {
+              "id": 13, "type": "stat",
+              "title": "MoE Gate Stddev (aspirational)",
+              "description": "Requires: green_agent_moe_gate_weight. NOT CURRENTLY EMITTED.",
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "gridPos": { "h": 8, "w": 8, "x": 8, "y": 40 },
+              "fieldConfig": { "defaults": {
+                "unit": "none",
+                "thresholds": { "mode": "absolute", "steps": [
+                  { "color": "green",  "value": null },
+                  { "color": "yellow", "value": 0.20 },
+                  { "color": "red",    "value": 0.40 }
+                ]}
+              }},
+              "options": {
+                "colorMode": "value", "graphMode": "area",
+                "reduceOptions": { "calcs": ["lastNotNull"], "values": false }
+              },
+              "targets": [{
+                "refId": "A",
+                "expr": "avg(stddev_over_time(green_agent_moe_gate_weight{namespace=~\"$namespace\"}[15m]))",
+                "legendFormat": "gate stddev"
+              }]
+            },
+
+            {
+              "id": 14, "type": "timeseries",
+              "title": "Evolutionary Best Fitness (aspirational)",
+              "description": "Requires: green_agent_evolutionary_best_fitness. NOT CURRENTLY EMITTED.",
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
+              "fieldConfig": { "defaults": { "unit": "none",
+                "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10 }
+              }},
+              "targets": [{
+                "refId": "A",
+                "expr": "avg(green_agent_evolutionary_best_fitness{namespace=~\"$namespace\"})",
+                "legendFormat": "best fitness"
+              }]
+            }
+          ]
+        }
+      ]
     }
