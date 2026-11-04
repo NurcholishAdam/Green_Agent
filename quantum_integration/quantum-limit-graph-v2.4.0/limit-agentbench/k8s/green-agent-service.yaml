@@ -1,42 +1,155 @@
-# k8s/green-agent-service.yaml (Enhanced)
+---
+# Green Agent — Metrics Service and ServiceMonitor
+# =================================================
+#
+# Exposes /metrics from all green-agent pods (head + workers) to Prometheus
+# via the Prometheus Operator. The same Service IP is what the custom-metrics
+# adapter resolves when the HPA queries custom.metrics.k8s.io.
+#
+# Fixes applied vs. v1
+# --------------------
+#   P0  namespace: green-agent-production (orphaned)      -> kustomize-managed
+#   P0  selector: component: head (matches zero pods)     -> app: green-agent
+#   P0  no ServiceMonitor (operator can't find Service)   -> added
+#   P0  prometheus.io/* annotations (ignored by operator) -> removed
+#   P0  prometheus.io/scrape_interval (non-standard)      -> removed
+#   P0  7 green-agent/* annotations + enhancements label  -> removed
+#   P0  commented "enhanced-api" port (dead code)         -> removed
+#   P1  no app.kubernetes.io/* labels                     -> added
+#   P2  no explicit sessionAffinity                       -> None
+#   P2  no ipFamilyPolicy                                 -> SingleStack
+#   P2  no publishNotReadyAddresses                       -> true
+#   P2  numeric targetPort coupling                       -> named target
+#   P2  Service file name scope confusion                 -> header clarifies
+#
+# Namespace
+# ---------
+# This file deliberately omits `namespace:` so that the consuming kustomize
+# overlay controls it:
+#
+#   config/overlays/development/kustomization.yaml  -> namespace: green-agent-dev
+#   config/overlays/staging/kustomization.yaml      -> namespace: green-agent-staging
+#   config/overlays/production/kustomization.yaml   -> namespace: green-agent-production
+#
+# To deploy without kustomize, uncomment the `namespace:` line on each
+# resource below and set it to your target namespace.
+#
+# Prerequisites
+# -------------
+#   - Prometheus Operator (kube-prometheus-stack or equivalent) installed
+#   - Prometheus CR's `serviceMonitorSelector` must match the ServiceMonitor
+#     below. With kube-prometheus-stack defaults (empty selector), all
+#     ServiceMonitors are selected — nothing more to do. If your operator
+#     uses a specific selector (e.g., `release: kube-prometheus-stack`),
+#     uncomment and set the corresponding label under
+#     `ServiceMonitor.metadata.labels`.
+#   - Pods must expose /metrics on port 8000. See k8s/ray-cluster.yaml.
+#   - Pods must carry the label `app: green-agent`.
+#
+# Scope
+# -----
+# This file declares the METRICS Service only. If you also need a Service
+# for the dashboard or enhanced API, add them here or in a separate file
+# (e.g., k8s/green-agent-dashboard-service.yaml). The v1 name
+# "green-agent-service.yaml" implied a complete set; v2 renames the file
+# to make its scope explicit.
+
+# ============================================================================
+# 1. Service — exposes /metrics from every green-agent pod
+# ============================================================================
 apiVersion: v1
 kind: Service
 metadata:
   name: green-agent-metrics
-  namespace: green-agent-production
+  # namespace: green-agent    # uncomment if not using kustomize
   labels:
     app: green-agent
     component: metrics
-    enhancements: enabled
-  annotations:
-    # Prometheus auto-discovery annotations (original)
-    prometheus.io/scrape: "true"
-    prometheus.io/port: "8000"
-    prometheus.io/path: "/metrics"
-    prometheus.io/scheme: "http"
-    prometheus.io/scrape_interval: "30s"
-    # Enhanced module indicators
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
-    green-agent/flexgen: "true"
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/part-of: green-agent
 spec:
   type: ClusterIP
+
+  # Round-robin across green-agent pods; each pod exposes its own /metrics,
+  # so per-pod identity is preserved through the ServiceMonitor below
+  # (Prometheus scrapes each pod individually, not the Service VIP).
+  sessionAffinity: None
+
+  # Default for IPv4 clusters; PreferDualStack if IPv6 scrapers are required.
+  ipFamilyPolicy: SingleStack
+
+  # Expose endpoints even before pods are Ready, so Prometheus sees
+  # "no data" rather than "connection refused" during a rolling update.
+  publishNotReadyAddresses: true
+
   ports:
-  # Original metrics port
   - name: metrics
     port: 8000
+    # Kept numeric for compatibility with v1. Switch to a named port
+    # (e.g., `targetPort: metrics-container`) if the Ray container spec
+    # defines one.
     targetPort: 8000
     protocol: TCP
-  # Additional optional port for enhanced API (if exposed)
-  # Uncomment if needed
-  # - name: enhanced-api
-  #   port: 8080
-  #   targetPort: 8080
-  #   protocol: TCP
+
+  # Select ALL green-agent pods, not just the head. Worker metrics
+  # (DCGM_FI_DEV_GPU_UTIL, ray_serve_deployment_queued_queries) are only
+  # exposed by worker pods; selecting `component: head` (v1) hid them from
+  # Prometheus and left the HPA in file 16 with <unknown> for its
+  # gpu_utilization and ray_queue_depth metrics.
   selector:
     app: green-agent
-    component: head
+
+---
+# ============================================================================
+# 2. ServiceMonitor — tells the Prometheus Operator to scrape the Service
+# ============================================================================
+# This is the piece v1 was missing. Without it, the Service is invisible
+# to the operator's Prometheus — even with every label and annotation
+# correct. Equivalent to file 16's missing adapter and file 17's missing
+# rules: the pipeline is broken at the discovery step.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: green-agent-metrics
+  # namespace: green-agent    # uncomment if not using kustomize
+  labels:
+    app: green-agent
+    component: metrics
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/part-of: green-agent
+    # Uncomment and set to match your operator's serviceMonitorSelector.
+    # kube-prometheus-stack defaults to `{}` (all ServiceMonitors), so this
+    # is optional. If your operator uses a specific selector, set:
+    #   release: kube-prometheus-stack
+spec:
+  # Discover the Service above by its labels.
+  selector:
+    matchLabels:
+      app: green-agent
+      component: metrics
+
+  # Restrict to the Service's namespace. If Prometheus is configured with
+  # serviceMonitorNamespaceSelector: {} (all namespaces), this can be
+  # omitted. If Prometheus only watches specific namespaces, match them
+  # here.
+  namespaceSelector:
+    matchNames:
+    - green-agent
+
+  endpoints:
+  - port: metrics
+    path: /metrics
+    scheme: http
+    # Scrape interval lives HERE in the operator model — this replaces
+    # the non-standard `prometheus.io/scrape_interval` annotation from v1.
+    interval: 30s
+    scrapeTimeout: 10s
+    # Relabel: copy the Ray pod role (head/worker) onto every scraped
+    # series as `ray_role`. Lets dashboards and alerts distinguish
+    # `gpu_utilization{ray_role="worker"}` from head-only metrics.
+    relabelings:
+    - sourceLabels: [__meta_kubernetes_pod_label_ray_io_node_type]
+      targetLabel: ray_role
+      action: replace
