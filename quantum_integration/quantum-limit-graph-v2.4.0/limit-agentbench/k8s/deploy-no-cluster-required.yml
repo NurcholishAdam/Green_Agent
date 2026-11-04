@@ -1,96 +1,247 @@
-name: Deploy Green Agent
+# -*- coding: utf-8 -*-
+#
+# CI/CD Green Agent (Enhanced, v2)
+# =================================
+#
+# Fixes applied vs. v1
+# --------------------
+#   P0  deploy-to-cluster `if:` used secrets (never ran)  -> event gate
+#   P0  `pytest ... || echo "..."` swallowed failures     -> hard fail
+#   P0  push: true on PRs (fork CI always red)            -> push only on push
+#   P0  validate-manifests needs: build (wrong coupling)  -> needs: test
+#   P0  conditional upload-artifact empty path            -> split artifacts
+#   P0  pytest --cov=src (wrong package)                  -> real packages
+#   P0  "All checks passed" printed unconditionally       -> condition on needs
+#   P1  No permissions: {} (over-privileged)              -> least-privilege
+#   P1  No concurrency (parallel deploys race)            -> grouped + serial
+#   P1  No timeouts (6-hour hangs)                        -> per-job
+#   P1  curl | bash kustomize (supply-chain risk)         -> pinned setup action
+#   P1  kubeconfig in workspace + shell template          -> runner.temp + env
+#   P1  No rollback on failed rollout                     -> rollout undo
+#   P1  No post-deploy smoke test                         -> curl /health
+#   P1  No lint / type-check                              -> ruff + mypy job
+#   P1  No image vuln scan / SBOM / signing               -> trivy + cosign
+#   P2  Emoji output (CI logs are UTF-8; retained)
+#   P2  Summary omitted deploy-to-cluster result          -> full table
+#   P2  No environment protection URL                     -> environment.url
+#   P2  No `set -euo pipefail` on shell steps             -> workflow defaults
+#
+# Action pinning
+# --------------
+# Actions are pinned to major-version tags (@v4, @v5) for readability. For
+# supply-chain hardening, pin to a commit SHA. Enable Dependabot to do this
+# automatically — see .github/dependabot.yml (recommended):
+#
+#   version: 2
+#   updates:
+#     - package-ecosystem: github-actions
+#       directory: "/"
+#       schedule: { interval: weekly }
+#       open-pull-requests-limit: 10
+#
+# Once Dependabot opens PRs, merge them and replace `@vN` with `@<sha> # vN`.
+#
+# Directory layout assumed:
+#   config/base/                        (kustomize base)
+#   config/overlays/development/        (kustomize overlay)
+#   config/overlays/staging/
+#   config/overlays/production/
+#   config/overlays/enhancements/       (optional)
+#   requirements.txt, Dockerfile, tests/
+
+
+name: CI/CD Green Agent
 
 on:
   push:
-    branches:
-      - main
-      - develop
+    branches: [main, develop]
   pull_request:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Environment to deploy to'
+        description: 'Target environment'
         required: true
         default: 'development'
         type: choice
-        options:
-          - development
-          - staging
-          - production
+        options: [development, staging, production]
       enable_enhancements:
-        description: 'Enable advanced enhancements (LIMIT Graph, MODP, RLHF, Distillation, MoE, Bio‑inspired)'
+        description: 'Enable advanced enhancements (LIMIT Graph, MODP, RLHF, Distillation, MoE, Bio-inspired)'
         required: false
         default: false
         type: boolean
 
+
+# Deny all by default; each job grants only what it needs.
+permissions: {}
+
+# Serialize deploys per environment; never cancel a deploy in-flight.
+# CI runs (push/PR) still cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.environment || github.ref }}
+  cancel-in-progress: false
+
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  PYTHON_VERSION: '3.10'
+  KUBECTL_VERSION: 'v1.28.0'
+  KUSTOMIZE_VERSION: 'v5.3.0'
+  # `|| 'false'` handles the empty case on push/PR events (inputs is unset).
   ENHANCEMENTS_ENABLED: ${{ github.event.inputs.enable_enhancements || 'false' }}
 
-jobs:
-  test:
-    name: Run Tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+# Every bash step gets `-e` (errexit), `-u` (nounset), `-o pipefail`.
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+
+jobs:
+
+  # ==========================================================================
+  # lint — fast feedback on style and obvious type errors.
+  # ==========================================================================
+  lint:
+    name: Lint & Type-check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install lint tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'ruff>=0.5,<0.7' 'mypy>=1.10,<1.12'
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          fi
+
+      # Non-blocking initially: the codebase has pre-existing issues.
+      # Remove `continue-on-error` once those are resolved.
+      - name: ruff
+        continue-on-error: true
+        run: |
+          ruff check . \
+            --output-format=github \
+            --select=E9,F63,F7,F82 \
+            --exclude=.git,__pycache__,build,dist,node_modules
+
+      - name: mypy
+        continue-on-error: true
+        run: |
+          packages=()
+          for p in core metrics rlhf constraints reporting analysis visualization; do
+            [[ -d "$p" ]] && packages+=("$p")
+          done
+          if [[ ${#packages[@]} -eq 0 ]]; then
+            echo "::warning::No Python source packages found; skipping mypy"
+            exit 0
+          fi
+          mypy "${packages[@]}" \
+            --ignore-missing-imports \
+            --no-error-summary
+
+
+  # ==========================================================================
+  # test — real tests, real coverage, no swallowing.
+  # ==========================================================================
+  test:
+    name: Tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          if [ -f requirements.txt ]; then
+          python -m pip install --upgrade pip
+          if [[ -f requirements.txt ]]; then
             pip install -r requirements.txt
           fi
-          pip install pytest pytest-cov pytest-asyncio
+          pip install \
+            'pytest>=8.0,<9' \
+            'pytest-cov>=5.0,<6' \
+            'pytest-asyncio>=0.23,<0.25'
 
-      - name: Run tests (if tests exist)
+      - name: Verify tests directory exists
         run: |
-          if [ -d tests ]; then
-            pytest tests/ -v --cov=src --cov-report=term-missing || echo "⚠️  Tests not yet implemented"
-          else
-            echo "⚠️  No tests directory found - skipping tests"
+          if [[ ! -d tests ]]; then
+            echo "::error::No tests directory found — tests are required"
+            exit 1
           fi
 
-      - name: Run enhanced module tests (optional)
+      - name: Run tests (unit + coverage)
+        # NOTE: v1 masked failures with `|| echo "...";` — removed here.
+        # Coverage targets the actual packages; `--cov=src` referenced a
+        # nonexistent directory.
+        run: |
+          pytest tests/ \
+            -v \
+            -ra \
+            --cov=core \
+            --cov=metrics \
+            --cov=rlhf \
+            --cov=constraints \
+            --cov=reporting \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=60
+
+      - name: Run enhanced module tests
         if: ${{ env.ENHANCEMENTS_ENABLED == 'true' }}
+        # Hard fail: if you opt into enhancements, their tests must exist and pass.
         run: |
-          echo "🧪 Running enhanced module unit tests..."
-          # Add test command for enhancements if available
-          if [ -d "quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/tests" ]; then
-            pytest quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/tests/ -v || echo "⚠️  Enhanced tests failed"
-          else
-            echo "ℹ️  No dedicated enhanced tests directory found; skipping."
+          enhanced_dir="quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/tests"
+          if [[ ! -d "$enhanced_dir" ]]; then
+            echo "::error::Enhancements enabled but no tests at $enhanced_dir"
+            exit 1
           fi
+          pytest "$enhanced_dir" -v -ra
 
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.sha }}
+          path: coverage.xml
+          retention-days: 7
+          if-no-files-found: warn
+
+
+  # ==========================================================================
+  # build — build, scan, sign, and push (push only on non-PR events).
+  # ==========================================================================
   build:
-    name: Build Docker Image
-    runs-on: ubuntu-latest
+    name: Build & Scan Image
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
     needs: test
     permissions:
       contents: read
       packages: write
+      id-token: write    # required for cosign keyless signing (OIDC)
+    outputs:
+      image-ref: ${{ steps.meta.outputs.tags }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
 
       - name: Extract metadata
         id: meta
@@ -102,175 +253,372 @@ jobs:
             type=ref,event=pr
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=enhanced,enable=${{ env.ENHANCEMENTS_ENABLED == 'true' }}
+            type=raw,value=enhanced-{{sha}},enable=${{ env.ENHANCEMENTS_ENABLED == 'true' }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Log in to registry
+        # Only on non-PR events: fork PRs have read-only GITHUB_TOKEN.
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
+          file: Dockerfile
+          # PRs build only (proves compile); pushes publish.
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          file: Dockerfile
+          sbom: true
+          provenance: true
 
+      - name: Scan image with Trivy
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Upload Trivy SARIF
+        if: ${{ github.event_name != 'pull_request' && always() }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy'
+
+      - name: Install cosign
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.4'
+
+      - name: Sign image
+        if: ${{ github.event_name != 'pull_request' }}
+        run: |
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
+
+      - name: Upload SBOM
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: |
+            sbom-*.json
+          retention-days: 90
+          if-no-files-found: warn
+
+
+  # ==========================================================================
+  # validate-manifests — build kustomize overlays; independent of build.
+  # ==========================================================================
   validate-manifests:
-    name: Validate Kubernetes Manifests
-    runs-on: ubuntu-latest
-    needs: build
+    name: Validate Manifests (${{ matrix.environment }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    needs: test    # NOT build — manifest validation doesn't need the image.
+    permissions:
+      contents: read
     strategy:
+      fail-fast: false
       matrix:
         environment: [development, staging, production]
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install kustomize
-        run: |
-          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
-          sudo mv kustomize /usr/local/bin/
-          kustomize version
+      - uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: ${{ env.KUSTOMIZE_VERSION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Verify config directory structure
+        # Fail loudly, with the exact missing path — no `|| echo` fallbacks.
         run: |
-          echo "📂 Checking directory structure..."
-          ls -la config/ || echo "❌ config/ directory not found"
-          ls -la config/base/ || echo "❌ config/base/ directory not found"
-          ls -la config/overlays/ || echo "❌ config/overlays/ directory not found"
-          ls -la config/overlays/${{ matrix.environment }}/ || echo "❌ config/overlays/${{ matrix.environment }}/ directory not found"
+          for d in config/base "config/overlays/${{ matrix.environment }}"; do
+            if [[ ! -d "$d" ]]; then
+              echo "::error::Missing directory: $d"
+              exit 1
+            fi
+          done
+          if [[ ! -f "config/overlays/${{ matrix.environment }}/kustomization.yaml" ]]; then
+            echo "::error::Missing config/overlays/${{ matrix.environment }}/kustomization.yaml"
+            exit 1
+          fi
 
-      - name: Build kustomize manifests for ${{ matrix.environment }}
+      - name: Build overlay
         run: |
-          echo "🔨 Building kustomize manifests for ${{ matrix.environment }}..."
-          kustomize build config/overlays/${{ matrix.environment }} > ${{ matrix.environment }}-deployment.yaml
-          echo "✅ Manifests built successfully"
-          echo ""
-          echo "📄 Generated manifest preview (first 50 lines):"
-          head -50 ${{ matrix.environment }}-deployment.yaml
+          kustomize build "config/overlays/${{ matrix.environment }}" \
+            > "${{ matrix.environment }}-deployment.yaml"
+          echo "Built $(wc -l < "${{ matrix.environment }}-deployment.yaml") lines"
 
       - name: Validate YAML syntax
         run: |
-          echo "🔍 Validating YAML syntax..."
-          python -c "import yaml; yaml.safe_load_all(open('${{ matrix.environment }}-deployment.yaml'))"
-          echo "✅ YAML syntax is valid"
+          python - "${{ matrix.environment }}-deployment.yaml" <<'PY'
+          import sys, yaml
+          path = sys.argv[1]
+          with open(path) as f:
+              docs = [d for d in yaml.safe_load_all(f) if d]
+          if not docs:
+              print(f"::error::No YAML documents in {path}")
+              sys.exit(1)
+          print(f"OK — {len(docs)} document(s) parsed")
+          PY
 
-      - name: Check for enhancement configuration
-        if: ${{ env.ENHANCEMENTS_ENABLED == 'true' }}
-        run: |
-          echo "🔧 Checking enhancement overlays..."
-          if [ -d "config/overlays/enhancements" ]; then
-            echo "✅ enhancements overlay found"
-            kustomize build config/overlays/enhancements > enhancements-deployment.yaml
-            echo "Enhanced manifest generated:"
-            head -30 enhancements-deployment.yaml
-            # Validate enhanced manifest
-            python -c "import yaml; yaml.safe_load_all(open('enhancements-deployment.yaml'))"
-          else
-            echo "⚠️  No config/overlays/enhancements found, but enhancement flag set."
-          fi
-
-      - name: Upload deployment manifest
+      - name: Upload manifest
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.environment }}-deployment-manifest
-          path: |
-            ${{ matrix.environment }}-deployment.yaml
-            ${{ env.ENHANCEMENTS_ENABLED == 'true' && 'enhancements-deployment.yaml' || '' }}
+          name: ${{ matrix.environment }}-manifest
+          path: ${{ matrix.environment }}-deployment.yaml
           retention-days: 30
+          if-no-files-found: error
 
-  # This job only runs if you have configured KUBECONFIG secret
-  deploy-to-cluster:
-    name: Deploy to Cluster (Optional)
-    runs-on: ubuntu-latest
-    needs: validate-manifests
-    # IMPORTANT: This only runs if KUBECONFIG secret exists
-    if: ${{ secrets.KUBECONFIG != '' && github.event.inputs.environment != '' }}
-    environment:
-      name: ${{ github.event.inputs.environment }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v3
-        with:
-          version: 'v1.28.0'
-
-      - name: Install kustomize
-        run: |
-          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
-          sudo mv kustomize /usr/local/bin/
-
-      - name: Configure kubectl
-        run: |
-          echo "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig.yaml
-          export KUBECONFIG=kubeconfig.yaml
-          kubectl cluster-info
-
-      - name: Deploy to Kubernetes
-        run: |
-          export KUBECONFIG=kubeconfig.yaml
-          echo "🚀 Deploying Green Agent to ${{ github.event.inputs.environment }}..."
-          kubectl apply -k config/overlays/${{ github.event.inputs.environment }}
-          
-          # Wait for rollout
-          DEPLOYMENT_NAME=$(kubectl get deployments -n green-agent-${{ github.event.inputs.environment }} -o name | head -1)
-          kubectl rollout status $DEPLOYMENT_NAME -n green-agent-${{ github.event.inputs.environment }} --timeout=5m
-          
-          echo "✅ Deployment successful"
-
-      - name: Apply enhancements overlay (optional)
+      - name: Validate enhancements overlay
         if: ${{ env.ENHANCEMENTS_ENABLED == 'true' }}
         run: |
-          export KUBECONFIG=kubeconfig.yaml
-          if [ -d "config/overlays/enhancements" ]; then
-            echo "🔧 Applying enhancements overlay..."
-            kubectl apply -k config/overlays/enhancements
-            echo "✅ Enhancements applied"
-          else
-            echo "⚠️  Enhancements overlay not found; skipping."
+          if [[ ! -d config/overlays/enhancements ]]; then
+            echo "::error::Enhancements enabled but config/overlays/enhancements missing"
+            exit 1
+          fi
+          kustomize build config/overlays/enhancements > enhancements-deployment.yaml
+          python - <<'PY'
+          import yaml
+          with open("enhancements-deployment.yaml") as f:
+              docs = [d for d in yaml.safe_load_all(f) if d]
+          if not docs:
+              raise SystemExit("::error::Empty enhancement manifest")
+          print(f"Enhancement manifest OK — {len(docs)} document(s)")
+          PY
+
+      - name: Upload enhancement manifest
+        if: ${{ env.ENHANCEMENTS_ENABLED == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.environment }}-enhancement-manifest
+          path: enhancements-deployment.yaml
+          retention-days: 30
+          if-no-files-found: error
+
+
+  # ==========================================================================
+  # deploy-to-cluster — runs only on workflow_dispatch (manual trigger).
+  # Secrets cannot gate jobs via `if:`; gate on the event instead.
+  # ==========================================================================
+  deploy-to-cluster:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    needs: [test, build, validate-manifests]
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    environment:
+      name: ${{ inputs.environment }}
+      url: https://console.example.com/green-agent/${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write      # if your cloud uses OIDC (EKS IRSA, GKE Workload Identity)
+    env:
+      KUBECONFIG: ${{ runner.temp }}/kubeconfig
+      NAMESPACE: green-agent-${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: ${{ env.KUSTOMIZE_VERSION }}
+
+      - name: Configure kubectl
+        # Secret goes through env var (not shell template). File lives outside
+        # the workspace (runner.temp) and is chmod 600.
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }}
+        run: |
+          if [[ -z "$KUBECONFIG_DATA" ]]; then
+            echo "::error::KUBECONFIG secret is empty or unset"
+            exit 1
+          fi
+          mkdir -p "$(dirname "$KUBECONFIG")"
+          echo "$KUBECONFIG_DATA" | base64 -d > "$KUBECONFIG"
+          chmod 600 "$KUBECONFIG"
+          echo "Current context: $(kubectl config current-context)"
+          kubectl cluster-info
+
+      - name: Diff against cluster
+        # Non-blocking: shows what will change, even if the manifest is unchanged.
+        continue-on-error: true
+        run: |
+          kubectl diff -k "config/overlays/${{ inputs.environment }}" || true
+
+      - name: Apply manifests
+        id: apply
+        run: |
+          kubectl apply -k "config/overlays/${{ inputs.environment }}"
+
+      - name: Wait for rollouts (rollback on failure)
+        run: |
+          mapfile -t deployments < <(
+            kubectl -n "$NAMESPACE" get deployments \
+              -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true
+          )
+          if [[ ${#deployments[@]} -eq 0 ]]; then
+            echo "::error::No deployments found in namespace $NAMESPACE"
+            exit 1
           fi
 
-  summary:
-    name: Deployment Summary
-    runs-on: ubuntu-latest
-    needs: [test, build, validate-manifests]
-    if: always()
-    steps:
-      - name: Generate summary
+          # Capture pre-apply revisions so we can roll back cleanly.
+          declare -A prev_rev
+          for d in "${deployments[@]}"; do
+            prev_rev["$d"]=$(kubectl -n "$NAMESPACE" get deployment "$d" \
+              -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}' 2>/dev/null || true)
+          done
+
+          failed=0
+          for d in "${deployments[@]}"; do
+            echo "::group::Rollout $d"
+            if ! kubectl -n "$NAMESPACE" rollout status "deployment/$d" --timeout=5m; then
+              echo "::error::Rollout failed for deployment/$d"
+              if [[ -n "${prev_rev[$d]:-}" ]]; then
+                echo "::warning::Rolling back deployment/$d to revision ${prev_rev[$d]}"
+                kubectl -n "$NAMESPACE" rollout undo "deployment/$d" \
+                  --to-revision="${prev_rev[$d]}" || true
+              fi
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $failed
+
+      - name: Smoke test (health endpoint)
         run: |
-          echo "# 🌱 Green Agent Deployment Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Actor:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Enhancements:** ${{ env.ENHANCEMENTS_ENABLED }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          echo "## 📊 Job Status" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Tests | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Validate Manifests | ${{ needs.validate-manifests.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          echo "## 📦 Artifacts" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Deployment manifests have been generated and uploaded as artifacts." >> $GITHUB_STEP_SUMMARY
-          echo "Download them from the 'Artifacts' section above." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [ "${{ secrets.KUBECONFIG }}" == "" ]; then
-            echo "## ℹ️ Cluster Deployment" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "No Kubernetes cluster configured. To deploy to a real cluster:" >> $GITHUB_STEP_SUMMARY
-            echo "1. Add KUBECONFIG secret to repository settings" >> $GITHUB_STEP_SUMMARY
-            echo "2. Trigger workflow with 'workflow_dispatch'" >> $GITHUB_STEP_SUMMARY
-            echo "3. Select environment to deploy" >> $GITHUB_STEP_SUMMARY
+          # Port-forward in background; wait for the service to respond.
+          # Uses a bounded retry loop so a slow start doesn't fail fast.
+          svc="green-agent-dashboard"
+          if ! kubectl -n "$NAMESPACE" get svc "$svc" >/dev/null 2>&1; then
+            echo "::warning::Service $svc not found; skipping smoke test"
+            exit 0
           fi
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "✅ **All validation checks passed!**" >> $GITHUB_STEP_SUMMARY
+
+          kubectl -n "$NAMESPACE" port-forward "svc/$svc" 18000:8000 >/dev/null 2>&1 &
+          pf_pid=$!
+          trap 'kill "$pf_pid" 2>/dev/null || true' EXIT
+
+          for i in $(seq 1 30); do
+            if curl -fsS "http://localhost:18000/health" >/dev/null 2>&1; then
+              echo "::notice::Health check passed after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Health check failed after 30s"
+          exit 1
+
+      - name: Apply enhancements overlay
+        if: ${{ env.ENHANCEMENTS_ENABLED == 'true' }}
+        run: |
+          if [[ ! -d config/overlays/enhancements ]]; then
+            echo "::error::Enhancements enabled but config/overlays/enhancements missing"
+            exit 1
+          fi
+          kubectl apply -k config/overlays/enhancements
+
+      - name: Verify enhancements env
+        if: ${{ env.ENHANCEMENTS_ENABLED == 'true' }}
+        run: |
+          count=$(kubectl -n "$NAMESPACE" get pods -o json 2>/dev/null \
+            | jq '[.items[] | .spec.containers[] | .env[]?
+                   | select(.name == "ENHANCEMENTS_ENABLED" and .value == "true")] | length')
+          if [[ "$count" -eq 0 ]]; then
+            echo "::error::Enhancements enabled but no pods have ENHANCEMENTS_ENABLED=true"
+            exit 1
+          fi
+          echo "::notice::$count container(s) have ENHANCEMENTS_ENABLED=true"
+
+
+  # ==========================================================================
+  # summary — always runs; reflects actual results (no unconditional "passed").
+  # ==========================================================================
+  summary:
+    name: Summary
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    needs: [lint, test, build, validate-manifests, deploy-to-cluster]
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - name: Compose summary
+        env:
+          LINT:      ${{ needs.lint.result }}
+          TEST:      ${{ needs.test.result }}
+          BUILD:     ${{ needs.build.result }}
+          VALIDATE:  ${{ needs.validate-manifests.result }}
+          DEPLOY:    ${{ needs.deploy-to-cluster.result }}
+          SHA:       ${{ github.sha }}
+          ACTOR:     ${{ github.actor }}
+          REF:       ${{ github.ref_name }}
+          EVENT:     ${{ github.event_name }}
+          ENV:       ${{ inputs.environment || 'n/a' }}
+          ENHANCED:  ${{ env.ENHANCEMENTS_ENABLED }}
+        run: |
+          {
+            echo "# 🌱 Green Agent — CI/CD Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Commit | \`${SHA:0:7}\` |"
+            echo "| Branch | \`${REF}\` |"
+            echo "| Actor | ${ACTOR} |"
+            echo "| Event | ${EVENT} |"
+            echo "| Environment | ${ENV} |"
+            echo "| Enhancements | ${ENHANCED} |"
+            echo ""
+            echo "## Job results"
+            echo ""
+            echo "| Job | Result |"
+            echo "|-----|--------|"
+            echo "| lint | ${LINT} |"
+            echo "| test | ${TEST} |"
+            echo "| build | ${BUILD} |"
+            echo "| validate-manifests | ${VALIDATE} |"
+            echo "| deploy-to-cluster | ${DEPLOY} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Verdict is derived, not asserted.
+          if [[ "$TEST" == "success" && "$BUILD" == "success" && "$VALIDATE" == "success" ]]; then
+            case "$DEPLOY" in
+              success)
+                echo "## ✅ CI passed and deployed to \`${ENV}\`" >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              skipped)
+                echo "## ✅ CI passed — deployment skipped (use workflow_dispatch to deploy)" >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              *)
+                echo "## ⚠️ CI passed but deployment result: \`${DEPLOY}\`" >> "$GITHUB_STEP_SUMMARY"
+                ;;
+            esac
+          else
+            echo "## ❌ CI failed — see job results above" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Ensure a non-zero exit propagates if the required jobs failed,
+          # so the summary job itself reflects the overall status in the UI.
+          if [[ "$TEST" != "success" || "$BUILD" != "success" || "$VALIDATE" != "success" ]]; then
+            exit 1
+          fi
