@@ -22,7 +22,7 @@ from typing import Any, Dict, TYPE_CHECKING
 logger = logging.getLogger(__name__)
 
 __version__ = "0.2.0"
-__author__ = "LIMIT-AgentBench contributors"
+__author__ = "AI Research Agent"
 __license__ = "Apache-2.0"
 
 # Single source of truth: name → (submodule, attribute).
