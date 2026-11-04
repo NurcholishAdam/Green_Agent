@@ -1,0 +1,225 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://example.org/green-agent/eval-request-v1.json",
+  "title": "Green Agent evaluation request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "query_id",
+    "provenance",
+    "task",
+    "objectives",
+    "constraints",
+    "execution",
+    "reporting",
+    "framework_config",
+    "modp_weights",
+    "enhancement_config"
+  ],
+  "properties": {
+    "$schema": { "type": "string", "format": "uri" },
+    "schema_version": { "type": "integer", "enum": [1] },
+    "query_id": { "type": "string", "minLength": 1 },
+
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source", "trust_level", "units", "simulated"
+      ],
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": ["measured", "estimated", "simulated", "federated", "external", "unknown"]
+        },
+        "trust_level": {
+          "type": "string",
+          "enum": ["high", "medium", "low"]
+        },
+        "system_version": { "type": ["string", "null"] },
+        "policy_version": { "type": ["string", "null"] },
+        "run_id": { "type": ["string", "null"] },
+        "units": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "baseline": { "type": ["string", "null"] },
+        "simulated": { "type": "boolean" },
+        "notes": { "type": ["string", "null"] }
+      }
+    },
+
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "input"],
+      "properties": {
+        "type": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "dataset": { "type": "string" },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["prompt"],
+          "properties": {
+            "prompt": { "type": "string", "minLength": 1 },
+            "token_count": { "type": "integer", "minimum": 0 },
+            "complexity": { "type": "number", "minimum": 0, "maximum": 1 },
+            "latency_target": { "type": "number", "minimum": 0 },
+            "cost_budget": { "type": "number", "minimum": 0 },
+            "graph_metrics": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "centrality": { "type": "number", "minimum": 0, "maximum": 1 },
+                "connectivity": { "type": "number", "minimum": 0, "maximum": 1 }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "objectives": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "carbon": { "enum": ["minimize"] },
+        "energy": { "enum": ["minimize"] },
+        "latency": { "enum": ["minimize"] },
+        "cost": { "enum": ["minimize"] },
+        "success_gate": { "type": "boolean" }
+      }
+    },
+
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "units": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "max_latency_sec": { "type": "number", "exclusiveMinimum": 0 },
+        "max_energy_wh": { "type": "number", "exclusiveMinimum": 0 },
+        "max_memory_mb": { "type": "number", "exclusiveMinimum": 0 },
+        "enforcement": {
+          "type": "string",
+          "enum": ["hard", "soft", "report-only"]
+        }
+      }
+    },
+
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runs"],
+      "properties": {
+        "runs": { "type": "integer", "minimum": 1 },
+        "deterministic": { "type": "boolean" },
+        "seed": { "type": ["integer", "null"] }
+      }
+    },
+
+    "reporting": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "return_metrics": { "type": "boolean" },
+        "return_raw_outputs": { "type": "boolean" }
+      }
+    },
+
+    "framework_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "autogen": { "$ref": "#/definitions/framework_entry" },
+        "langchain": { "$ref": "#/definitions/framework_entry" },
+        "crewai": { "$ref": "#/definitions/framework_entry" },
+        "limit_graph": { "$ref": "#/definitions/framework_entry" }
+      }
+    },
+
+    "modp_weights": {
+      "type": "array",
+      "items": { "type": "number", "minimum": 0 },
+      "minItems": 4,
+      "maxItems": 4
+    },
+
+    "enhancement_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "limit_graph": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "graph_id": { "type": "string" },
+            "graph_metrics": {
+              "type": "object",
+              "additionalProperties": { "type": "number" }
+            }
+          }
+        },
+        "rlhf": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "human_feedback_score": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        },
+        "distillation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "seed": { "type": ["integer", "null"] },
+            "gate_seed": { "type": ["integer", "null"] },
+            "epsilon": { "type": "number", "minimum": 0, "maximum": 1 },
+            "distillation_lr": { "type": "number", "exclusiveMinimum": 0 },
+            "gating_lr": { "type": "number", "exclusiveMinimum": 0 },
+            "train_every": { "type": "integer", "minimum": 1 },
+            "replay_size": { "type": "integer", "minimum": 1 },
+            "distill_weight": { "type": "number", "minimum": 0 },
+            "rl_weight": { "type": "number", "minimum": 0 },
+            "batch_size": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "flexgen": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allow_flexgen_delegation": { "type": "boolean" },
+            "action_mapping": {
+              "type": "object",
+              "additionalProperties": {
+                "enum": ["flexgen_low_precision", "flexgen_high_precision"]
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "framework_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["use_enhancements"],
+      "properties": {
+        "use_enhancements": { "type": "boolean" },
+        "crewai_strategy_aware": { "type": "boolean" },
+        "langchain_strategy_aware": { "type": "boolean" },
+        "langchain_strategy_executor": { "type": "string" },
+        "limit_graph_strategy_aware": { "type": "boolean" },
+        "limit_graph_strategy_executor": { "type": "string" },
+        "limit_graph_dispatch_order": {
+          "type": "array",
+          "items": { "enum": ["execute", "run", "process"] }
+        }
+      }
+    }
+  }
+}
