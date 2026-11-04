@@ -1,114 +1,165 @@
 ---
-# Network Policy for Green Agent (Enhanced)
-# Provides security isolation and access control,
-# with additional rules for advanced enhancement modules:
-# LIMIT Graph, MODP, RLHF, Multi‑Teacher Distillation, Bio‑inspired, MoE expert gating.
+# Green Agent — NetworkPolicy
+# ============================
+#
+# Provides network isolation for green-agent pods. Applies to all pods
+# carrying `app: green-agent`.
+#
+# Fixes applied vs. v1
+# --------------------
+#   P0  `name:` field on ports (invalid schema)                -> removed
+#   P0  Second `default-deny` policy defeated the first        -> removed
+#   P0  `from: []` opened dashboard + Ray UI publicly          -> restricted
+#   P0  Second 443 egress rule defeated the first's `except`   -> removed
+#   P0  Metadata service (169.254.169.254) reachable           -> excepted
+#   P0  `namespaceSelector: {}` opened port 8000 cluster-wide  -> removed
+#   P0  Monitoring rule used wrong namespace label + OR-logic  -> fixed
+#   P1  Metrics port mismatch with file 21 v2 (8000 vs 9090)   -> 9090
+#   P1  5 dead ports for services that don't exist             -> removed
+#   P1  External Neo4j port (7687) reachable to 0.0.0.0/0     -> removed
+#   P1  14 decorative annotations/labels                       -> removed
+#
+# Interaction with other manifests
+# --------------------------------
+#   - File 21 v2 (Service):  port 8000  ->  MUST be updated to 9090
+#   - File 22 (Service):     port 9090  ->  compatible
+#   - File 18 (deploy.sh):   9090 in port-forward -> compatible
+#
+# CNI Compatibility
+# -----------------
+#   Tested against Calico and Cilium. Some older Calico versions mishandle
+#   `ipBlock.except` on egress — verify with `kubectl exec ... curl` before
+#   relying on the metadata-service protection below.
+#
+# Kubelet Probes
+# --------------
+#   Kubelet originates probe traffic from the node IP, not a pod IP.
+#   NetworkPolicy selectors do not match node IPs. Most CNIs exempt kubelet
+#   traffic from enforcement; verify with your CNI's documentation. If your
+#   CNI enforces on node traffic, add a rule for your node CIDR — but do
+#   NOT use `namespaceSelector: {}`, which matches all pods cluster-wide.
+#
+# Prerequisites
+# -------------
+#   - Pods carry `app: green-agent` (verify: `kubectl -n green-agent get pods -l app=green-agent`)
+#   - Monitoring namespace carries the standard label
+#     `kubernetes.io/metadata.name: monitoring` (auto-applied since K8s 1.21)
+#   - Prometheus pods carry `app.kubernetes.io/name: prometheus`
+#     (adjust if your Prometheus Operator uses a different label)
 
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: green-agent-network-policy
-  namespace: green-agent
+  # namespace: green-agent    # uncomment if not using kustomize
   labels:
     app: green-agent
-    security: enhanced
-    enhancements: enabled
-  annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
-    green-agent/flexgen: "true"
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: network-policy
 spec:
-  # Apply to all Green Agent pods
   podSelector:
     matchLabels:
       app: green-agent
-
-  # Apply to both ingress and egress traffic
   policyTypes:
   - Ingress
   - Egress
 
-  # Ingress rules (incoming traffic)
   ingress:
-  # Allow dashboard access from anywhere (for external users)
-  - from: []
-    ports:
-    - protocol: TCP
-      port: 8000
-      name: dashboard
-    - protocol: TCP
-      port: 8265
-      name: ray-dashboard
-
-  # Allow internal cluster communication between Green Agent pods
+  # ── 1. Intra-namespace traffic between green-agent pods ────────────────
+  # Ray ports (GCS, client, dashboard) and the metrics endpoint.
+  # No 8080/50051/7687/7474 — those services don't exist in this codebase.
   - from:
     - podSelector:
         matchLabels:
           app: green-agent
     ports:
     - protocol: TCP
-      port: 6379
-      name: ray-gcs
+      port: 6379      # Ray GCS
     - protocol: TCP
-      port: 10001
-      name: ray-client
+      port: 10001     # Ray client
     - protocol: TCP
-      port: 8000
-      name: dashboard
+      port: 8000      # dashboard
     - protocol: TCP
-      port: 9090
-      name: metrics
-    # Additional internal ports for enhanced modules
+      port: 8265      # Ray dashboard UI
     - protocol: TCP
-      port: 8080
-      name: enhanced-api          # optional enhanced API endpoint
-    - protocol: TCP
-      port: 50051
-      name: rlhf-feedback         # RLHF feedback service (if gRPC)
-    - protocol: TCP
-      port: 7687
-      name: graph-db-bolt        # LIMIT Graph database (Neo4j bolt)
-    - protocol: TCP
-      port: 7474
-      name: graph-db-http        # LIMIT Graph database HTTP
+      port: 9090      # metrics
 
-  # Allow monitoring from Prometheus namespace
+  # ── 2. Prometheus scrape from the monitoring namespace ─────────────────
+  # Both selectors must be in the SAME `from` entry to AND them.
+  # Uses kubernetes.io/metadata.name, which is auto-applied since K8s 1.21.
   - from:
     - namespaceSelector:
         matchLabels:
-          name: monitoring
-    - podSelector:
+          kubernetes.io/metadata.name: monitoring
+      podSelector:
         matchLabels:
-          app: prometheus
+          app.kubernetes.io/name: prometheus
     ports:
     - protocol: TCP
-      port: 9090
-      name: metrics
+      port: 9090      # metrics
 
-  # Allow health checks from Kubernetes API server
-  - from:
-    - namespaceSelector: {}
-    ports:
-    - protocol: TCP
-      port: 8000
-      name: health
+  # ── 3. Dashboard access — restricted to specific source IPs ────────────
+  # If operator uses `kubectl port-forward` (per deploy.sh), no ingress
+  # rule is needed — port-forward originates from the node and bypasses
+  # NetworkPolicy. If a LoadBalancer is used, replace this with the actual
+  # source range (your VPN, office, or bastion CIDR).
+  #
+  # Commented out by default. Uncomment and set a real CIDR if needed.
+  #
+  # - from:
+  #   - ipBlock:
+  #       cidr: 203.0.113.0/24    # replace with your source range
+  #   ports:
+  #   - protocol: TCP
+  #     port: 8000
 
-  # Egress rules (outgoing traffic)
   egress:
-  # Allow DNS resolution
+  # ── 1. DNS (cluster + external fallback) ───────────────────────────────
+  # Restrict to kube-system to prevent DNS to arbitrary external servers.
   - to:
-    - namespaceSelector: {}
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
     ports:
     - protocol: UDP
       port: 53
     - protocol: TCP
       port: 53
 
-  # Allow HTTPS for external APIs (carbon APIs, etc.)
+  # ── 2. Intra-namespace egress (mirror of ingress rule 1) ───────────────
+  - to:
+    - podSelector:
+        matchLabels:
+          app: green-agent
+    ports:
+    - protocol: TCP
+      port: 6379
+    - protocol: TCP
+      port: 10001
+    - protocol: TCP
+      port: 8000
+    - protocol: TCP
+      port: 8265
+    - protocol: TCP
+      port: 9090
+
+  # ── 3. Kubernetes API server ───────────────────────────────────────────
+  # Replace 10.96.0.0/12 with your cluster's actual Service CIDR
+  # (`kubectl cluster-info dump | grep service-cluster-ip-range`).
+  - to:
+    - ipBlock:
+        cidr: 10.96.0.0/12
+    ports:
+    - protocol: TCP
+      port: 443
+
+  # ── 4. External HTTPS (LLM APIs, carbon APIs, package mirrors) ─────────
+  # Excludes all private, link-local, and CGNAT ranges.
+  #
+  # 169.254.0.0/16 blocks cloud metadata service (IMDS, GCP metadata,
+  # Azure metadata) — the primary SSRF-to-compromise vector.
+  # 100.64.0.0/10 blocks some cloud pod-network ranges.
+  # 10/8, 172.16/12, 192.168/16 block intra-cluster lateral movement.
   - to:
     - ipBlock:
         cidr: 0.0.0.0/0
@@ -116,110 +167,11 @@ spec:
         - 10.0.0.0/8
         - 172.16.0.0/12
         - 192.168.0.0/16
+        - 169.254.0.0/16    # cloud metadata services
+        - 100.64.0.0/10     # carrier-grade NAT (some pod networks)
+        - 127.0.0.0/8       # loopback
     ports:
     - protocol: TCP
       port: 443
-      name: https
-
-  # Allow HTTP for external APIs (if needed)
-  - to:
-    - ipBlock:
-        cidr: 0.0.0.0/0
-    ports:
     - protocol: TCP
       port: 80
-      name: http
-
-  # Allow internal cluster communication
-  - to:
-    - podSelector:
-        matchLabels:
-          app: green-agent
-    ports:
-    - protocol: TCP
-      port: 6379
-    - protocol: TCP
-      port: 10001
-    - protocol: TCP
-      port: 8000
-    - protocol: TCP
-      port: 9090
-    # Additional internal ports for enhanced modules
-    - protocol: TCP
-      port: 8080
-      name: enhanced-api
-    - protocol: TCP
-      port: 50051
-      name: rlhf-feedback
-    - protocol: TCP
-      port: 7687
-      name: graph-db-bolt
-    - protocol: TCP
-      port: 7474
-      name: graph-db-http
-
-  # Allow communication with Kubernetes API server
-  - to:
-    - ipBlock:
-        cidr: 0.0.0.0/0
-    ports:
-    - protocol: TCP
-      port: 443
-      name: kubernetes-api
-
-  # Additional egress for enhanced services:
-  # LIMIT Graph external database (if not internal)
-  - to:
-    - ipBlock:
-        cidr: 0.0.0.0/0
-    ports:
-    - protocol: TCP
-      port: 7687
-      name: external-graph-db-bolt
-  # RLHF feedback / MODP service endpoints (if external)
-  - to:
-    - ipBlock:
-        cidr: 0.0.0.0/0
-    ports:
-    - protocol: TCP
-      port: 9443
-      name: external-enhanced-service
-  # FlexGen model service (if using hosted)
-  - to:
-    - ipBlock:
-        cidr: 0.0.0.0/0
-    ports:
-    - protocol: TCP
-      port: 443
-      name: flexgen-api
-
----
-# Default deny policy for additional security
-# Apply this if you want to deny all traffic by default
-
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: green-agent-default-deny
-  namespace: green-agent
-  labels:
-    app: green-agent
-    security: strict
-    enhancements: enabled
-  annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
-spec:
-  podSelector:
-    matchLabels:
-      app: green-agent
-  policyTypes:
-  - Ingress
-  - Egress
-  # No ingress/egress rules = deny all
-  # Apply this policy only if you want strict security
-  # Then add specific allow policies above
