@@ -1,41 +1,359 @@
-# Update the headGroupSpec with enhanced health probes and advanced enhancement integration
+# -*- coding: utf-8 -*-
+#
+# Green Agent — RayCluster (Enhanced, v2)
+# ========================================
+#
+# The RayCluster CR that runs the green-agent workload. This file is
+# self-contained: it declares every resource the RayCluster depends on
+# (ServiceAccount, ConfigMap, Secret placeholder, PVC) alongside the
+# RayCluster itself, so a fresh `kubectl apply -f k8s/ray-cluster.yaml`
+# in an empty namespace produces a working cluster (assuming GPU nodes
+# and the image pull secret exist — see "Cluster prerequisites" below).
+#
+# Fixes applied vs. v1
+# --------------------
+#   P0  PVC `green-agent-enhancement-pvc` (RWO) mounted on head + 4
+#       workers — cluster hangs in Multi-Attach               -> emptyDir per pod
+#   P0  No `nvidia.com/gpu`; rayStartParams.num-gpus = 0     -> worker GPU=1
+#   P0  `enableInTreeAutoscaling` missing; min/maxReplicas
+#       were dead config                                     -> enabled + documented
+#   P0  `num-cpus: '4'` > `resources.requests.cpu: "2"`      -> num-cpus: '2'
+#   P0  Head memory limit 8 GiB < Ray head's 3.2 GiB idle
+#       + 1 GiB object store                                 -> 16 GiB limit
+#   P0  5 prerequisites assumed but not declared             -> declared here
+#   P0  Worker had no securityContext (ran as root)          -> copied from head
+#   P0  `dashboard-host: '0.0.0.0'` (Ray dashboard RCE)      -> '127.0.0.1'
+#   P0  `image: :latest` (no reproducibility)                -> pinned by digest
+#   P0  `MODP_WEIGHTS: "[0.4,...]"` (unparseable array)      -> MODP_WEIGHTS_JSON
+#   P0  Worker missing FLEXGEN_MODEL_NAME                    -> added
+#   P1  No container hardening                               -> added
+#   P1  serviceAccountName only on head                      -> on both
+#   P1  No /dev/shm (Ray shuffle fails at 64 MiB)            -> 2 GiB memory volume
+#   P1  No ephemeral-storage limits                          -> 10Gi / 50Gi
+#   P1  No runAsGroup                                        -> 1000
+#   P1  Worker had no probes                                 -> Ray-native probes
+#   P1  startupProbe 150s ceiling < LLM load time            -> 600s
+#   P1  startupProbe reused /health (conflated with liveness) -> /ready
+#   P1  No terminationGracePeriodSeconds                     -> 300s + preStop
+#   P1  No priorityClassName                                 -> green-agent-critical
+#   P1  No podAntiAffinity (head+worker could co-locate)     -> preferred anti-affinity
+#   P1  No GPU nodeSelector / tolerations                    -> added
+#   P1  `replicas: 4` > `minReplicas: 2` (scale-down churn)  -> replicas: 2
+#   P1  HPA (file 16) + rayStartParams autoscaling conflict  -> KubeRay-only
+#   P2  No gcsFaultTolerance                                 -> documented stub
+#   P2  `version: "5.0.0"` unmapped to image tag             -> removed
+#   P2  7 decorative `green-agent/*` annotations             -> removed
+#   P2  Metrics port names backwards (`metrics`=8080,
+#       `prometheus`=9090)                                   -> ray-metrics/app-metrics
+#
+# Autoscaling decision
+# --------------------
+# This file enables KubeRay-native autoscaling
+# (`spec.enableInTreeAutoscaling: true`). This is the recommended pattern
+# for Ray workloads because:
+#   - KubeRay's autoscaler reads Ray's own cluster state (queue depth,
+#     pending tasks, per-node resource demand) and scales workers
+#     accordingly.
+#   - The alternative — an external K8s HPA on RayCluster via the /scale
+#     subresource — requires the KubeRay CRD to expose /scale and only
+#     scales the FIRST worker group. It also conflicts with KubeRay's
+#     autoscaler if both are enabled.
+#
+# ⚠️  IMPORTANT: file 16 v2's HPA (k8s/carbon-autoscaler.yaml) targets
+# `kind: RayCluster, name: green-agent-cluster`. If you keep this file's
+# KubeRay autoscaling enabled, you MUST delete or disable the HPA from
+# file 16 — otherwise both controllers write to `replicas`, causing
+# thrashing. Two options:
+#
+#   Option A (recommended): Delete the HPA. KubeRay autoscales based on
+#     Ray's internal queue/CPU/GPU pressure. Carbon-aware scaling is
+#     handled by the KEDA ScaledObject (file 16 §7).
+#
+#   Option B: Set `enableInTreeAutoscaling: false` below and keep the HPA.
+#     Then remove `minReplicas`/`maxReplicas` from this file (they're
+#     ignored when KubeRay autoscaling is off) and let the HPA own the
+#     replica range.
+#
+# Cluster prerequisites (not in this file)
+# ----------------------------------------
+#   - NVIDIA GPU Operator installed (for nvidia.com/gpu resource)
+#   - GPU nodes tainted `nvidia.com/gpu=present:NoSchedule` (default)
+#   - kube-prometheus-stack installed (for ServiceMonitor / PrometheusRule)
+#   - KubeRay operator v1.1+ installed
+#
+# Image pull secret
+# -----------------
+# If `ghcr.io/nurcholishadam/green_agent` is private, uncomment
+# `imagePullSecrets` on both the head and worker pod specs and create the
+# secret out-of-band:
+#
+#   kubectl -n green-agent create secret docker-registry ghcr-pull-secret \
+#     --docker-server=ghcr.io \
+#     --docker-username=<github-user> \
+#     --docker-password=<PAT>
+#
+# Replacing :latest
+# -----------------
+# Replace every occurrence of `<sha256-digest>` below with the digest from
+# your last published image:
+#
+#   docker pull ghcr.io/nurcholishadam/green_agent:latest
+#   docker inspect --format='{{index .RepoDigests 0}}' \
+#     ghcr.io/nurcholishadam/green_agent:latest
+#
+# Or, on the CI side, `docker/build-push-action@v6` outputs
+# `steps.build.outputs.digest` — use that. Never use `:latest` in a
+# production manifest: two pods started five minutes apart can run
+# different code, and rollback is impossible.
 
+# ============================================================================
+# 1. ServiceAccount — must exist before RayCluster applies
+# ============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: green-agent-sa
+  # namespace: green-agent    # uncomment if not using kustomize
+  labels:
+    app: green-agent
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: service-account
+# No RBAC: the workload does not call the K8s API.
+# automountServiceAccountToken: false on the pod spec (below) removes the
+# mounted token even though the SA exists.
+
+# ============================================================================
+# 2. ConfigMap — mounted at /app/config on head + workers
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: green-agent-config
+  # namespace: green-agent
+  labels:
+    app: green-agent
+    app.kubernetes.io/component: config
+data:
+  # The workload reads its runtime configuration from this file. The exact
+  # schema is defined by the Python modules in `core/` (files 1–9); if the
+  # config format changes, update this file and the readers together.
+  green_agent.yaml: |
+    # Reference config consumed by core/orchestrator.py, core/green_metrics.py,
+    # core/dual_graph_evaluator.py, core/meta_cognition.py, core/policy_graph.py.
+    #
+    # NOTE: this is a *starter* config. Populate it from your actual deployment
+    # values (cluster CIDR for carbon-region lookup, model registry paths, etc.)
+    # before relying on it.
+    orchestrator:
+      work_dir: /app/data
+      use_enhancements: true
+    green_metrics:
+      use_enhancements: true
+      energy_scale_kwh: 0.01
+      carbon_scale_kg: 0.001
+    dual_graph:
+      use_enhancements: true
+      graph_metrics:
+        centrality: 0.7
+        connectivity: 0.6
+    meta_cognition:
+      use_enhancements: true
+    policy_graph:
+      use_enhancements: true
+
+# ============================================================================
+# 3. Secret — placeholder for CARBON_API_KEY and any provider API keys
+# ============================================================================
+# The Secret MUST be populated out-of-band (this manifest cannot contain the
+# plaintext value without leaking it into git history). Create it with:
+#
+#   kubectl -n green-agent create secret generic green-agent-secrets \
+#     --from-literal=carbon-api-key=<YOUR_KEY> \
+#     --from-literal=openai-api-key=<YOUR_KEY> \
+#     --from-literal=anthropic-api-key=<YOUR_KEY>
+#
+# Or via `kubectl apply -f secret.yaml` where secret.yaml is stored in a
+# secure location (Vault, SealedSecrets, external-secrets-operator). This
+# manifest declares the Secret with placeholder values so `kubectl apply`
+# doesn't fail with "secret not found"; the placeholder values are NEVER
+# used at runtime (the workload reads them, sees "CHANGEME", and fails
+# fast at startup with a clear error).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: green-agent-secrets
+  # namespace: green-agent
+  labels:
+    app: green-agent
+    app.kubernetes.io/component: secrets
+type: Opaque
+stringData:
+  carbon-api-key: "CHANGEME-replace-with-kubectl-create-secret"
+  openai-api-key: "CHANGEME"
+  anthropic-api-key: "CHANGEME"
+
+# ============================================================================
+# 4. PVC — head-only data volume (RWO is correct: single mount)
+# ============================================================================
+# v1 mounted this on head + workers, but only head needs /app/data per the
+# workload's file layout (files 1–15 write output to work_dir/work_dir).
+# RWO is correct for a head-only mount; workers use emptyDir for scratch.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: green-agent-data-pvc
+  # namespace: green-agent
+  labels:
+    app: green-agent
+    app.kubernetes.io/component: data
+spec:
+  # ReadWriteOnce is correct for a head-only mount. If you later add
+  # workers to this volume, switch to ReadWriteMany and use a storage
+  # class that supports it (NFS, EFS, Filestore, CephFS).
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  # storageClassName: <your-cluster-default>   # defaults to cluster default
+
+# ============================================================================
+# 5. RayCluster — the workload
+# ============================================================================
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
   name: green-agent-cluster
-  namespace: green-agent
+  # namespace: green-agent
   labels:
     app: green-agent
-    version: "5.0.0"
-    enhancements: enabled
-  annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
-    green-agent/flexgen: "true"
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/part-of: green-agent
+    # NOTE: `version: "5.0.0"` from v1 was removed because it didn't match
+    # the image tag (`:latest`). Now that the image is pinned by digest,
+    # track the version via the digest annotation (or via a git tag on
+    # this manifest). Update the `<sha256-digest>` placeholder below and
+    # add:
+    #   app.kubernetes.io/version: "<short-sha>"
+
 spec:
+  # --------------------------------------------------------------------------
+  # Autoscaling: KubeRay-native (see "Autoscaling decision" in header)
+  # --------------------------------------------------------------------------
+  # If you prefer the external HPA from file 16, set this to `false` and
+  # remove `minReplicas`/`maxReplicas` from workerGroupSpecs[0] below.
+  enableInTreeAutoscaling: true
+  autoscalerOptions:
+    # Default mode balances up-scaling across worker groups by resource
+    # demand. Alternative: `Aggressive` (scales up on any pending task).
+    upscalingMode: Default
+    # Wait this long after a worker goes idle before scaling it down.
+    # Shorter values produce churn; 60s matches Ray's default job-grace.
+    idleTimeoutSeconds: 60
+    # The autoscaler runs as a sidecar in the head pod. These resources
+    # are the *autoscaler's own* footprint, not the workload's.
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+  # --------------------------------------------------------------------------
+  # Head group
+  # --------------------------------------------------------------------------
   headGroupSpec:
     rayStartParams:
-      dashboard-host: '0.0.0.0'
+      # Bind the Ray dashboard to loopback only. The dashboard has a history
+      # of RCE CVEs (CVE-2023-48022, CVE-2023-6019, CVE-2023-4990) — do NOT
+      # bind to 0.0.0.0. Use `kubectl port-forward` for operator access:
+      #   kubectl -n green-agent port-forward svc/green-agent-cluster-head-svc 8265:8265
+      dashboard-host: '127.0.0.1'
       dashboard-port: '8265'
+
+      # Ray's metrics export port. Adapter/ServiceMonitor in file 22
+      # selects this via `ray-metrics` port name below.
       metrics-export-port: '8080'
-      num-cpus: '4'
+
+      # num-cpus MUST equal `resources.requests.cpu` to avoid CFS throttling.
+      # If you raise `requests.cpu`, raise this too — but keep them equal,
+      # not `num-cpus` between requests and limits (that's the worst case).
+      num-cpus: '2'
+
+      # Head does not run inference; workers own GPUs.
+      # If your workload needs GPU on the head (e.g., single-node fallback),
+      # set this to '1' AND add `nvidia.com/gpu: "1"` to the head resources.
       num-gpus: '0'
+
+      # Ray object store. 1 GiB is the default; keep it below 30% of the
+      # container memory limit (16 GiB limit → 1 GiB is safe).
       object-store-memory: '1073741824'
+
     template:
       metadata:
         labels:
           app: green-agent
           component: head
+          app.kubernetes.io/name: green-agent
+          app.kubernetes.io/component: head
       spec:
+        serviceAccountName: green-agent-sa
+        # The workload does not call the K8s API. Removing the token mount
+        # eliminates a credential-exposure surface if the pod is compromised.
+        automountServiceAccountToken: false
+
+        # PriorityClass is declared in k8s/priorityclass.yaml (file 18
+        # deploy_core() applies that file before this one).
+        priorityClassName: green-agent-critical
+
+        # Graceful shutdown: give in-flight Ray tasks time to complete.
+        # Default 30s kills long inference requests mid-flight.
+        terminationGracePeriodSeconds: 300
+
+        # Pod-level security context. Applies to all containers in the pod.
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+          fsGroupChangePolicy: OnRootMismatch
+          seccompProfile:
+            type: RuntimeDefault
+
+        # Spread head and workers across nodes so a single node failure
+        # doesn't take out the whole cluster.
+        affinity:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: green-agent
+                topologyKey: kubernetes.io/hostname
+
+        # Image pull secret for private registries. Uncomment if the image
+        # is not public (see "Image pull secret" in header).
+        # imagePullSecrets:
+        # - name: ghcr-pull-secret
+
         containers:
         - name: ray-head
-          image: ghcr.io/nurcholishadam/green_agent:latest
-          imagePullPolicy: Always
+          # REPLACE <sha256-digest> with the actual digest from your last
+          # `docker push` or CI build. Never use `:latest` in production.
+          image: ghcr.io/nurcholishadam/green_agent@sha256:<sha256-digest>
+          imagePullPolicy: IfNotPresent
+
+          # Container-level security hardening. The pod-level context above
+          # covers user/group; these cover the container runtime itself.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            # seccompProfile is inherited from pod-level context above.
+
           ports:
           - containerPort: 6379
             name: gcs
@@ -44,13 +362,24 @@ spec:
           - containerPort: 8000
             name: api
           - containerPort: 8080
-            name: metrics
+            name: ray-metrics    # Ray's metrics-export-port
           - containerPort: 10001
             name: client
           - containerPort: 9090
-            name: prometheus
+            name: app-metrics    # the app's Prometheus /metrics
 
-          # ✅ ENHANCED HEALTH PROBES (original)
+          # -----------------------------------------------------------------
+          # Probes
+          # -----------------------------------------------------------------
+          # Three distinct endpoints:
+          #   /health     → liveness   (process is alive, HTTP server responds)
+          #   /ready      → readiness  (deps ready: Ray connection, DB, model)
+          #   /ready      → startup    (initialization finished — same as ready
+          #                             but with a long failure window)
+          #
+          # The app MUST implement /health and /ready with different semantics.
+          # If it only implements /health, the readiness and startup probes
+          # degrade to "process is up", which is not enough for LLM workloads.
           livenessProbe:
             httpGet:
               path: /health
@@ -74,40 +403,70 @@ spec:
             failureThreshold: 3
 
           startupProbe:
+            # v1 reused /health with a 150s window — too short for LLM
+            # model loading (2–10 min cold cache) and conflated "process
+            # is up" with "initialization finished". Now uses /ready with
+            # a 600s window.
             httpGet:
-              path: /health
+              path: /ready
               port: 8000
               scheme: HTTP
-            initialDelaySeconds: 0
-            periodSeconds: 5
-            timeoutSeconds: 3
-            failureThreshold: 30
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60   # 30 + 60*10 = 630s max
 
-          # Resource limits (original)
+          # -----------------------------------------------------------------
+          # Resources
+          # -----------------------------------------------------------------
           resources:
             requests:
               cpu: "2"
-              memory: "4Gi"
+              memory: "8Gi"                # Ray head idle ≈ 3.2 GiB; request 8
+              ephemeral-storage: "10Gi"
             limits:
               cpu: "4"
-              memory: "8Gi"
+              memory: "16Gi"               # 3.2 idle + 1 object store + app
+              ephemeral-storage: "50Gi"
+              # Head does not use GPUs. To enable:
+              # nvidia.com/gpu: "1"
 
-          # Environment variables – original plus enhanced flags
+          # -----------------------------------------------------------------
+          # Environment
+          # -----------------------------------------------------------------
+          # Secrets from the Secret above are mounted via envFrom below.
+          # Plaintext config lives here. MODP weights use the JSON form
+          # (named keys) rather than an ordered array — the codebase has
+          # six different orderings across files 1, 2, 4, 13, 14, 15, so
+          # ordered arrays are ambiguous.
           env:
           - name: RAY_DISABLE_DOCKER_CPU_WARNING
             value: "1"
+          - name: MODE
+            value: "unified"
+          - name: LOG_LEVEL
+            value: "INFO"
+          # Provider / carbon API keys — from the Secret
           - name: CARBON_API_KEY
             valueFrom:
               secretKeyRef:
                 name: green-agent-secrets
                 key: carbon-api-key
-          - name: QUANTUM_ENABLED
-            value: "false"
-          - name: MODE
-            value: "unified"
-          - name: LOG_LEVEL
-            value: "INFO"
-          # ── Advanced Enhancement Flags ──
+          - name: OPENAI_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: green-agent-secrets
+                key: openai-api-key
+                optional: true
+          - name: ANTHROPIC_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: green-agent-secrets
+                key: anthropic-api-key
+                optional: true
+          # Enhancement flags (see "Cross-file consistency" in file 25's
+          # analysis — no Python module reads these today; they are the
+          # agreed contract for when env-var support is added).
           - name: ENHANCEMENTS_ENABLED
             value: "true"
           - name: LIMIT_GRAPH_ENABLED
@@ -118,8 +477,8 @@ spec:
             value: "0.6"
           - name: MODP_ENABLED
             value: "true"
-          - name: MODP_WEIGHTS
-            value: "[0.4,0.3,0.2,0.1]"
+          - name: MODP_WEIGHTS_JSON
+            value: '{"quality":0.4,"latency":0.3,"energy":0.2,"carbon":0.1}'
           - name: RLHF_ENABLED
             value: "true"
           - name: HUMAN_FEEDBACK_SCORE
@@ -134,25 +493,35 @@ spec:
             value: "20"
           - name: MUTATION_RATE
             value: "0.1"
+          # FlexGen needs GPUs — disable until worker GPUs are wired up.
           - name: FLEXGEN_ENABLED
-            value: "true"
-          - name: FLEXGEN_MODEL_NAME
-            value: "facebook/opt-6.7b"
-          - name: FLEXGEN_DEFAULT_PRECISION
-            value: "fp16"
+            value: "false"
 
-          # Volume mounts (original plus enhanced state volume)
+          # -----------------------------------------------------------------
+          # Volume mounts
+          # -----------------------------------------------------------------
+          # readOnlyRootFilesystem: true below means every writable path
+          # must be an explicit mount. The paths below are the ones Ray,
+          # Python, and the app write to.
           volumeMounts:
           - name: config-volume
             mountPath: /app/config
+            readOnly: true
           - name: data-volume
             mountPath: /app/data
           - name: logs-volume
             mountPath: /app/logs
           - name: enhancement-state
             mountPath: /app/enhancement_state
+          - name: tmp
+            mountPath: /tmp
+          - name: vartmp
+            mountPath: /var/tmp
+          - name: dshm
+            mountPath: /dev/shm
+          - name: ray-tmp
+            mountPath: /tmp/ray
 
-        # Volumes (original plus enhancement state PVC)
         volumes:
         - name: config-volume
           configMap:
@@ -161,37 +530,213 @@ spec:
           persistentVolumeClaim:
             claimName: green-agent-data-pvc
         - name: logs-volume
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 2Gi
+        # v1 used a shared PVC for enhancement state, which fails with
+        # Multi-Attach error when RWO and mounted on head + workers.
+        # Each pod gets its own scratch space; if cross-pod sharing is
+        # needed, replace with a ReadWriteMany PVC (NFS/EFS/CephFS).
         - name: enhancement-state
-          persistentVolumeClaim:
-            claimName: green-agent-enhancement-pvc   # optional; use emptyDir if not needed
+          emptyDir:
+            sizeLimit: 5Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: vartmp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
+        - name: ray-tmp
+          emptyDir:
+            sizeLimit: 10Gi
 
-        serviceAccountName: green-agent-sa
-
-        securityContext:
-          runAsNonRoot: true
-          runAsUser: 1000
-          fsGroup: 1000
-
-  # Worker group specs – added for completeness, with same enhancement flags
+  # --------------------------------------------------------------------------
+  # Worker group
+  # --------------------------------------------------------------------------
   workerGroupSpecs:
-  - replicas: 4
+  - groupName: standard-workers
+    # `replicas` should equal `minReplicas` at creation; otherwise KubeRay
+    # immediately scales from 4 → 2 (churn on first apply).
+    replicas: 2
     minReplicas: 2
     maxReplicas: 20
-    groupName: standard-workers
+
     rayStartParams:
+      # Match `resources.requests.cpu` exactly to avoid CFS throttling.
       num-cpus: '2'
+      # Worker GPUs — must match `resources.limits["nvidia.com/gpu"]`.
+      num-gpus: '1'
+      # 4 GiB is the container memory; Ray uses ~80% for its heap. Adjust
+      # if you raise/lower the container memory.
       memory: '4294967296'
+
     template:
       metadata:
         labels:
           app: green-agent
           component: worker
+          app.kubernetes.io/name: green-agent
+          app.kubernetes.io/component: worker
       spec:
+        # Same ServiceAccount as head so RBAC (if any is added later) is
+        # consistent across the cluster. v1 only set this on head, so
+        # workers fell back to the namespace's default SA.
+        serviceAccountName: green-agent-sa
+        automountServiceAccountToken: false
+
+        priorityClassName: green-agent-critical
+        terminationGracePeriodSeconds: 300
+
+        # Same pod-level hardening as head. v1 omitted this entirely,
+        # leaving workers running as the image's default user (typically
+        # root under Pod Security Standards).
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+          fsGroupChangePolicy: OnRootMismatch
+          seccompProfile:
+            type: RuntimeDefault
+
+        # GPU scheduling. If your cluster has CPU-only nodes as well,
+        # this ensures workers land only on GPU nodes.
+        nodeSelector:
+          nvidia.com/gpu.present: "true"
+        tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+        affinity:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: green-agent
+                topologyKey: kubernetes.io/hostname
+
+        # imagePullSecrets:
+        # - name: ghcr-pull-secret
+
         containers:
         - name: ray-worker
-          image: ghcr.io/nurcholishadam/green_agent:latest
+          # Same digest as the head. Keep them in lockstep.
+          image: ghcr.io/nurcholishadam/green_agent@sha256:<sha256-digest>
+          imagePullPolicy: IfNotPresent
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          ports:
+          - containerPort: 8080
+            name: ray-metrics
+          - containerPort: 9090
+            name: app-metrics
+          - containerPort: 52365
+            name: raylet     # Ray's local rayleth health endpoint
+
+          # -----------------------------------------------------------------
+          # Probes
+          # -----------------------------------------------------------------
+          # Workers had none in v1 — a hung worker stayed "Running" forever.
+          # Ray exposes /api/local_raylet_healthz on 52365; use it for both
+          # liveness and readiness. timeoutSeconds: 10 because Ray's endpoint
+          # can take several seconds under load.
+          livenessProbe:
+            httpGet:
+              path: /api/local_raylet_healthz
+              port: 52365
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 10
+            successThreshold: 1
+            failureThreshold: 6
+
+          readinessProbe:
+            httpGet:
+              path: /api/local_raylet_healthz
+              port: 52365
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /api/local_raylet_healthz
+              port: 52365
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+
+          # -----------------------------------------------------------------
+          # Lifecycle
+          # -----------------------------------------------------------------
+          # On SIGTERM, ask Ray to drain tasks before the process exits.
+          # Without this, long-running inference requests are SIGKILL'd at
+          # the 30s default grace period.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "ray stop --graceful || true"]
+
+          # -----------------------------------------------------------------
+          # Resources
+          # -----------------------------------------------------------------
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "2"                   # equal to request — see num-cpus note
+              memory: "8Gi"
+              ephemeral-storage: "50Gi"
+              nvidia.com/gpu: "1"
+
+          # -----------------------------------------------------------------
+          # Environment
+          # -----------------------------------------------------------------
           env:
+          - name: RAY_DISABLE_DOCKER_CPU_WARNING
+            value: "1"
+          - name: MODE
+            value: "unified"
+          - name: LOG_LEVEL
+            value: "INFO"
+          - name: CARBON_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: green-agent-secrets
+                key: carbon-api-key
+                optional: true
+          - name: OPENAI_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: green-agent-secrets
+                key: openai-api-key
+                optional: true
+          - name: ANTHROPIC_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: green-agent-secrets
+                key: anthropic-api-key
+                optional: true
           - name: ENHANCEMENTS_ENABLED
             value: "true"
           - name: LIMIT_GRAPH_ENABLED
@@ -202,8 +747,8 @@ spec:
             value: "0.6"
           - name: MODP_ENABLED
             value: "true"
-          - name: MODP_WEIGHTS
-            value: "[0.4,0.3,0.2,0.1]"
+          - name: MODP_WEIGHTS_JSON
+            value: '{"quality":0.4,"latency":0.3,"energy":0.2,"carbon":0.1}'
           - name: RLHF_ENABLED
             value: "true"
           - name: HUMAN_FEEDBACK_SCORE
@@ -218,26 +763,124 @@ spec:
             value: "20"
           - name: MUTATION_RATE
             value: "0.1"
+          # FLEXGEN_MODEL_NAME was missing on workers in v1, so distributed
+          # inference failed to load the model.
           - name: FLEXGEN_ENABLED
             value: "true"
+          - name: FLEXGEN_MODEL_NAME
+            value: "facebook/opt-6.7b"
           - name: FLEXGEN_DEFAULT_PRECISION
             value: "fp16"
-          resources:
-            requests:
-              cpu: "2"
-              memory: "4Gi"
-            limits:
-              cpu: "4"
-              memory: "8Gi"
+
+          # -----------------------------------------------------------------
+          # Volume mounts
+          # -----------------------------------------------------------------
           volumeMounts:
           - name: config-volume
             mountPath: /app/config
+            readOnly: true
           - name: enhancement-state
             mountPath: /app/enhancement_state
+          - name: logs-volume
+            mountPath: /app/logs
+          - name: tmp
+            mountPath: /tmp
+          - name: vartmp
+            mountPath: /var/tmp
+          - name: dshm
+            mountPath: /dev/shm
+          - name: ray-tmp
+            mountPath: /tmp/ray
+
         volumes:
         - name: config-volume
           configMap:
             name: green-agent-config
         - name: enhancement-state
-          persistentVolumeClaim:
-            claimName: green-agent-enhancement-pvc
+          emptyDir:
+            sizeLimit: 5Gi
+        - name: logs-volume
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: vartmp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
+        - name: ray-tmp
+          emptyDir:
+            sizeLimit: 20Gi    # workers spill more than the head
+
+# ============================================================================
+# 6. Head Service — exposes the dashboard + GCS for port-forward access
+# ============================================================================
+# KubeRay creates this Service automatically (named
+# `green-agent-cluster-head-svc`) unless `spec.headService` is set. Declaring
+# it here so the port names match what files 16, 22, 23 reference.
+apiVersion: v1
+kind: Service
+metadata:
+  name: green-agent-cluster-head-svc
+  # namespace: green-agent
+  labels:
+    app: green-agent
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: head-svc
+spec:
+  type: ClusterIP
+  selector:
+    app: green-agent
+    component: head
+  ports:
+  - name: dashboard
+    port: 8265
+    targetPort: 8265
+  - name: client
+    port: 10001
+    targetPort: 10001
+  - name: api
+    port: 8000
+    targetPort: 8000
+  - name: ray-metrics
+    port: 8080
+    targetPort: 8080
+  - name: app-metrics
+    port: 9090
+    targetPort: 9090
+
+# ============================================================================
+# Appendix: KubeRay operator version compatibility
+# ============================================================================
+# This manifest assumes KubeRay operator v1.1.0+.
+#
+#   KubeRay 0.6.0 → first version to expose RayCluster /scale subresource
+#                   (required for HPA integration if you choose Option B
+#                   from the header)
+#   KubeRay 1.0.0 → enableInTreeAutoscaling honoured with autoscalerOptions
+#   KubeRay 1.1.0 → headService sub-object supported for custom port names
+#   KubeRay 1.2.0 → gcsFaultTolerance supported (head HA via external Redis)
+#
+# If your cluster runs an older operator, drop to the version's supported
+# fields. The autoscaling sub-object is the most version-sensitive.
+#
+# gcsFaultTolerance (head HA)
+# ---------------------------
+# For production clusters that must survive a head-node failure without
+# losing Ray metadata (job history, actor state), add:
+#
+#   spec:
+#     gcsFaultToleranceOptions:
+#       redisAddress: redis://redis.monitoring.svc:6379
+#       redisPassword:
+#         valueFrom:
+#           secretKeyRef:
+#             name: redis-password
+#             key: password
+#
+# This requires an external Redis and KubeRay v1.2.0+. Without it, a head
+# failure requires a full cluster restart (jobs are lost).
