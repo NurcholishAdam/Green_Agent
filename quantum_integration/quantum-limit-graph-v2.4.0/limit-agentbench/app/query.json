@@ -1,83 +1,124 @@
 {
+  "$schema": "https://example.org/green-agent/eval-request-v1.json",
+  "schema_version": 1,
+
   "query_id": "green_eval_001",
+
+  "provenance": {
+    "source": "measured",
+    "trust_level": "high",
+    "system_version": "green_agent@2.5.0",
+    "policy_version": "policy@2026-11-04",
+    "run_id": "green_eval_001",
+    "units": {
+      "energy": "wh",
+      "carbon": "kg",
+      "latency": "s",
+      "memory": "mb"
+    },
+    "baseline": "agentbench-limit-v1",
+    "simulated": false
+  },
+
   "task": {
     "type": "inference",
     "description": "Evaluate agent on limit-agentbench task",
     "dataset": "agentbench-limit-v2",
     "input": {
-      "prompt": "Classify this input according to task specification"
+      "prompt": "Classify this input according to task specification",
+      "token_count": 1000,
+      "complexity": 0.5,
+      "latency_target": 500.0,
+      "cost_budget": 10.0,
+      "graph_metrics": {
+        "centrality": 0.75,
+        "connectivity": 0.6
+      }
     }
   },
+
   "objectives": {
-    "accuracy": "maximize",
-    "latency": "minimize",
-    "energy": "minimize",
     "carbon": "minimize",
-    "memory": "minimize"
+    "energy": "minimize",
+    "latency": "minimize",
+    "cost": "minimize",
+    "success_gate": true
   },
+
   "constraints": {
+    "units": {
+      "latency": "s",
+      "energy": "wh",
+      "memory": "mb"
+    },
     "max_latency_sec": 2.0,
     "max_energy_wh": 0.05,
-    "max_memory_mb": 4096
+    "max_memory_mb": 4096,
+    "enforcement": "report-only"
   },
+
   "execution": {
     "runs": 5,
-    "deterministic": true
+    "deterministic": true,
+    "seed": 42
   },
+
   "reporting": {
     "return_metrics": true,
     "return_raw_outputs": false
   },
-  "use_enhancements": true,
+
+  "framework_config": {
+    "autogen": {
+      "use_enhancements": true
+    },
+    "langchain": {
+      "use_enhancements": true,
+      "langchain_strategy_aware": true,
+      "langchain_strategy_executor": "green_agent.strategy.langchain_default_executor"
+    },
+    "crewai": {
+      "use_enhancements": false
+    },
+    "limit_graph": {
+      "use_enhancements": true,
+      "limit_graph_strategy_aware": true,
+      "limit_graph_strategy_executor": "green_agent.strategy.limit_graph_executor"
+    }
+  },
+
+  "modp_weights": [0.4, 0.3, 0.2, 0.1],
+
   "enhancement_config": {
     "limit_graph": {
       "graph_id": "graph-agentbench-001",
       "graph_metrics": {
         "centrality": 0.75,
-        "connectivity": 0.6,
-        "density": 0.4
-      },
-      "graph_embedding": [0.1, 0.2, 0.3, 0.4]
-    },
-    "modp": {
-      "objective_weights": {
-        "carbon": 0.4,
-        "energy": 0.3,
-        "latency": 0.2,
-        "cost": 0.1,
-        "quality": 0.0
+        "connectivity": 0.6
       }
     },
     "rlhf": {
-      "human_feedback_score": 0.7,
-      "collect_feedback": true
+      "human_feedback_score": 0.7
     },
     "distillation": {
-      "use_distillation": true,
+      "seed": 42,
+      "gate_seed": 7,
       "epsilon": 0.1,
-      "distillation_learning_rate": 0.01,
+      "distillation_lr": 0.01,
+      "gating_lr": 0.005,
       "train_every": 10,
       "replay_size": 2000,
       "distill_weight": 0.7,
-      "rl_weight": 0.3
-    },
-    "bio_inspired": {
-      "use_evolutionary": true,
-      "population_size": 20,
-      "mutation_rate": 0.1,
-      "crossover_rate": 0.7,
-      "elitism": 2
-    },
-    "moe": {
-      "use_gating": true,
-      "gating_learning_rate": 0.005,
-      "n_experts": 4
+      "rl_weight": 0.3,
+      "batch_size": 8
     },
     "flexgen": {
       "allow_flexgen_delegation": true,
-      "precision_options": ["fp32", "fp16", "int8"],
-      "default_batch_size": 16,
-      "memory_limit_mb": 4096
+      "action_mapping": {
+        "fp32": "flexgen_high_precision",
+        "fp16": "flexgen_low_precision",
+        "int8": "flexgen_low_precision"
+      }
     }
   }
 }
