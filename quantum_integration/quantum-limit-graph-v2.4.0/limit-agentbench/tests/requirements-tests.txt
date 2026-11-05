@@ -1,55 +1,395 @@
-# Test Dependencies for Green Agent v5.0.0 (Enhanced)
+# =============================================================================
+# Green Agent v5.0.0 — Test Dependencies (Enhanced v2)
+# =============================================================================
+# Location: requirements/test.txt
+#
+# ---- Critical fixes vs v1 ---------------------------------------------------
+#   FIX #1   ``-r base.txt`` added. v1 re-declared 12 base dependencies with
+#            weaker bounds (``>=X.0.0``), silently overriding the
+#            ``<next_major`` caps fixed in ``base.txt``. Those duplicates
+#            are removed — ``scikit-learn``, ``joblib``, ``pandas``,
+#            ``pydantic``, ``pydantic-settings``, ``cryptography``,
+#            ``pyjwt[crypto]``, ``prometheus-client``, ``tenacity``,
+#            ``aiofiles``, ``aiohttp``, ``networkx`` now come from
+#            ``base.txt``.
+#   FIX #2   ``pytest-timeout`` added. Every enhanced test uses
+#            ``@pytest.mark.timeout(N)`` — without the plugin those markers
+#            are silent no-ops, so a hung cluster call blocks the CI job's
+#            full ``timeout-minutes`` instead of failing one test in 30s.
+#   FIX #3   ``pytest-xdist`` added. The integration suite has 15+ ``slow``
+#            tests; ``wait_for_pods(timeout=300)`` per test means serial
+#            runs take hours. ``pytest -n auto`` is the difference between
+#            a 5-minute CI and a 4-hour CI.
+#   FIX #4   ``pytest`` pin aligned with ``base.txt`` (``>=8.0,<9``).
+#            v1's ``>=7.4.0`` silently downgraded base's floor.
+#   FIX #5   ``pyjwt[crypto]`` inherited from ``base.txt``. The bare
+#            ``pyjwt>=2.8.0`` in v1 only supports HMAC; RS256/ES256/EdDSA
+#            zero-trust tests fail with ``Algorithm not supported``.
+#   FIX #6   ``respx``, ``responses``, ``freezegun`` added — the v2 test
+#            files use them directly. Omitted from v1, so those tests skip
+#            or error depending on their internal guards.
+#   FIX #7   ``torch`` added. ``test_distillation_orchestrator.py`` uses
+#            ``pytest.importorskip("torch")`` — without it, the entire
+#            distillation test module skips and the multi-teacher + MoE
+#            gating never actually runs.
+#   FIX #8   ``pytest-rerunfailures`` added. Kubernetes test fixtures flake
+#            (kubelet scheduling, image pull). Retries only help when
+#            scoped via ``--only-rerun`` — see the CI snippet at the bottom.
+#   FIX #9   ``hypothesis`` added. The dominance invariants (irreflexive /
+#            transitive / asymmetric) are property-based-testing targets —
+#            hand-rolled examples miss NaN / infinity / denormal edges.
+#   FIX #10  ``pytest-dash``, ``playwright``, ``pytest-playwright`` added —
+#            the E2E dashboard and unified-system tests use them.
+#   FIX #11  ``pytest-benchmark``, ``locust`` added — micro-benchmarks and
+#            load testing.
+#   FIX #12  Upper bounds on every remaining pin (v1 had only ``>=``).
+#   FIX #13  ``kubernetes`` pinned ``>=28,<33``. v1's bare ``>=28`` allowed
+#            client 32.x on a 1.28 cluster — the client is only guaranteed
+#            to talk to the cluster within ±1 minor of its own version.
+#   FIX #14  ``coverage[toml]``, ``pytest-html``, ``pytest-json-report``,
+#            ``pytest-github-actions-annotate-failures`` added so CI has
+#            machine-readable output + inline PR annotations.
+#   FIX #15  Type stubs added (``types-PyYAML``, ``types-requests``,
+#            ``pandas-stubs``) so mypy can type-check both the test suite
+#            and the production modules the tests import.
+#
+# ---- Design notes -----------------------------------------------------------
+#   * Everything here installs in under ~5 minutes on a warm pip cache.
+#     On a cold cache the heavy deps (``torch`` ~800 MB on Linux,
+#     ``playwright`` browser binaries ~150 MB per browser) dominate the
+#     install time. If your CI runs multiple stages (unit / integration /
+#     e2e), consider splitting the heavy sections into a separate
+#     ``requirements/test-extras.txt`` and installing it only in the
+#     stages that need it — a sample split is documented at the bottom.
+#   * Every pytest plugin that changes collection or execution is
+#     explicitly pinned — ``timeout``, ``xdist``, ``rerunfailures``,
+#     ``asyncio``, ``cov``. Silent behaviour changes from these plugins
+#     produce the classic "flaky-then-green-because-everything-skipped"
+#     pattern.
+#   * ``pytest-asyncio >= 0.23`` changed fixture loop-scope defaults.
+#     ``asyncio_mode = "auto"`` in ``pyproject.toml`` (documented below)
+#     is required for the v2 async fixtures to run correctly.
+#   * ``kubernetes`` follows the cluster minor ±1. Pin to the range your
+#     deployment supports; if you support 1.28–1.32, keep ``<33``.
+# =============================================================================
 
-# Core testing
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
-pytest-cov>=4.1.0
+-r base.txt
 
-# Kubernetes testing
-kubernetes>=28.0.0
 
-# HTTP testing
-requests>=2.31.0
+# =============================================================================
+# SECTION 1 — PYTEST CORE + PLUGINS
+# =============================================================================
+# Every plugin that changes collection or execution is explicitly pinned.
+# ``pytest`` is aligned with base.txt (>=8.0,<9); do not downgrade here.
 
-# Mocking
-pytest-mock>=3.11.0
+pytest>=8.0,<9                               # aligned with base.txt
+pytest-asyncio>=0.23,<1                      # 0.23 changed fixture loop-scope
+pytest-cov>=5.0,<7                           # 5.x is current
+pytest-xdist>=3.5,<4                         # FIX #3 — parallel execution
+pytest-timeout>=2.3,<3                       # FIX #2 — @pytest.mark.timeout
+pytest-rerunfailures>=14,<16                 # FIX #8 — flaky cluster retries
+pytest-mock>=3.12,<4
+pytest-html>=4.1,<5                          # FIX #14 — HTML reports
+pytest-json-report>=1.5,<2                   # FIX #14 — CI dashboards
+pytest-github-actions-annotate-failures>=0.2,<1  # FIX #14 — inline PR notes
 
-# Utilities
-pyyaml>=6.0.0
-python-dotenv>=1.0.0
 
-# ---------------------------------------------------------------------------
-# Additional dependencies for testing advanced enhancements:
-# LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation,
-# Bio‑inspired Optimisation, MoE expert gating, and FlexGen integration.
-# ---------------------------------------------------------------------------
+# =============================================================================
+# SECTION 2 — COVERAGE + QUALITY
+# =============================================================================
 
-# Historical ML teachers and model serialization (RandomForest, etc.)
-scikit-learn>=1.3.0
-joblib>=1.3.0
+coverage[toml]>=7.4,<8                       # FIX #14 — toml config, not CLI.
+                                             # pytest-cov pulls coverage in,
+                                             # but [toml] enables config-file
+                                             # parsing for branch coverage.
 
-# Data handling for interaction logs and state vectors (CSV/JSON)
-pandas>=2.0.0
 
-# Pydantic schemas and settings management (feedback events, descriptors, configs)
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
+# =============================================================================
+# SECTION 3 — CLUSTER / KUBERNETES
+# =============================================================================
+# The Kubernetes Python client is only guaranteed to talk to a cluster
+# within ±1 minor of its own version. Pin the range to what the deployment
+# supports; v1's bare ``>=28`` allowed client 32.x.
 
-# Zero Trust security: cryptography, JWT
-cryptography>=41.0.0
-pyjwt>=2.8.0
+kubernetes>=28,<33                           # FIX #13
 
-# Prometheus client for metrics testing
-prometheus-client>=0.17.0
+# --- Optional cluster tooling (uncomment as needed) ---
+# testcontainers[kubernetes]>=4.4,<5         # ephemeral dependencies per test
+# kubernetes-asyncio>=29,<31                 # async client for async fixtures
+# pytest-docker>=3.1,<4                      # container fixtures (alternative)
 
-# Retry logic with exponential backoff (circuit breakers)
-tenacity>=8.2.0
 
-# Asynchronous file I/O (persistence tests)
-aiofiles>=23.0.0
+# =============================================================================
+# SECTION 4 — HTTP MOCKING + DETERMINISTIC TIME
+# =============================================================================
+# The v2 test files import these directly. Omitted from v1 → those tests
+# skip or error depending on their internal guards.
 
-# Async HTTP client (for carbon API and external services tests)
-aiohttp>=3.8.0
+respx>=0.21,<1                               # FIX #6 — httpx mocking
+responses>=0.25,<1                           # FIX #6 — requests / aiohttp mocking
+freezegun>=1.4,<2                            # FIX #6 — deterministic time
+# time-machine>=2.13,<3                      # alternative: faster, stricter
 
-# Network analysis for LIMIT Graph testing
-networkx>=3.1
+
+# =============================================================================
+# SECTION 5 — PROPERTY-BASED TESTING + FIXTURES
+# =============================================================================
+
+hypothesis>=6.98,<7                          # FIX #9 — dominance invariants
+faker>=24,<27                                # FIX #14 — realistic fixtures
+factory-boy>=3.3,<4                          # FIX #14 — factory fixtures
+
+
+# =============================================================================
+# SECTION 6 — ML / MODEL TESTING
+# =============================================================================
+# torch is required by test_distillation_orchestrator.py. Without it the
+# module skips via pytest.importorskip and the multi-teacher + MoE gating
+# never runs.
+#
+# NOTE: torch is 700 MB+ on Linux and 1.5 GB+ with CUDA. If your CI stages
+# run only unit tests, install this only in the stage that runs the
+# distillation tests (see the split suggestion at the bottom).
+
+torch>=2.0,<3                                # FIX #7 — distillation tests
+
+# --- Optional model dependencies (uncomment if teachers are HF models) ---
+# transformers>=4.40,<5
+# sentencepiece>=0.2,<1
+# accelerate>=0.28,<1
+
+
+# =============================================================================
+# SECTION 7 — DASHBOARD / E2E
+# =============================================================================
+# Used by the dashboard and unified-system tests. ``playwright`` pulls in
+# browser binaries (~150 MB per browser) on first use — install the
+# browser in a dedicated CI step:
+#
+#     python -m playwright install --with-deps chromium
+#
+# or let ``pytest-playwright`` trigger the download lazily on first run.
+
+pytest-dash>=2.1,<3                          # FIX #10 — Dash callback tests
+playwright>=1.44,<2                          # FIX #10 — headless browser
+pytest-playwright>=0.5,<1                    # FIX #10 — pytest integration
+
+# --- Optional (uncomment if using Dash's own testing helpers) ---
+# dash[testing]>=2.14,<3
+
+
+# =============================================================================
+# SECTION 8 — PERFORMANCE / LOAD
+# =============================================================================
+
+pytest-benchmark>=4.0,<5                     # FIX #11 — micro-benchmarks
+locust>=2.29,<3                              # FIX #11 — load testing
+
+
+# =============================================================================
+# SECTION 9 — TYPE STUBS
+# =============================================================================
+# Needed for mypy to check both the test suite and the production modules
+# the tests import. Without these, mypy treats those modules as ``Any``.
+
+types-PyYAML>=6.0,<7                         # FIX #15
+types-requests>=2.31,<3                      # FIX #15
+pandas-stubs>=2.0,<3                         # FIX #15
+# types-aiofiles>=23.0,<25                   # uncomment if aiofiles is used
+
+
+# =============================================================================
+# SECTION 10 — INHERITED FROM base.txt (DO NOT RE-DECLARE)
+# =============================================================================
+# The following are provided by ``-r base.txt`` and MUST NOT be re-declared
+# here without matching upper bounds. v1 re-declared all of these with
+# weaker ``>=X.0.0`` bounds, silently removing base.txt's ``<next_major``
+# caps:
+#
+#     numpy, pandas, scipy, scikit-learn, joblib, pydantic,
+#     pydantic-settings, cryptography, pyjwt[crypto], prometheus-client,
+#     tenacity, aiofiles, aiohttp, networkx, pyyaml, python-dotenv,
+#     click, tqdm, structlog, rich, opentelemetry-*
+#
+# If a test needs a *different* version of one of these (e.g. pandas 2.2.x
+# specifically for a bug-compatibility test), override here with matching
+# upper bounds:
+#
+#     pandas>=2.2,<2.3                      # only if a specific 2.2.x bug
+#
+# Otherwise rely on base.txt and keep the pin single-sourced.
+
+
+# =============================================================================
+# COMPANION pyproject.toml SNIPPET (recommended)
+# =============================================================================
+# Moving the dependency groups into ``pyproject.toml`` is the modern
+# equivalent of splitting the requirements files. With this in place, each
+# CI stage can install only what it needs.
+#
+#     [project.optional-dependencies]
+#     test = [
+#         "pytest>=8.0,<9",
+#         "pytest-asyncio>=0.23,<1",
+#         "pytest-cov>=5.0,<7",
+#         "pytest-xdist>=3.5,<4",
+#         "pytest-timeout>=2.3,<3",
+#         "pytest-rerunfailures>=14,<16",
+#         "pytest-mock>=3.12,<4",
+#         "pytest-html>=4.1,<5",
+#         "pytest-json-report>=1.5,<2",
+#         "pytest-github-actions-annotate-failures>=0.2,<1",
+#         "coverage[toml]>=7.4,<8",
+#         "kubernetes>=28,<33",
+#         "respx>=0.21,<1",
+#         "responses>=0.25,<1",
+#         "freezegun>=1.4,<2",
+#         "hypothesis>=6.98,<7",
+#         "faker>=24,<27",
+#         "factory-boy>=3.3,<4",
+#         "types-PyYAML>=6.0,<7",
+#         "types-requests>=2.31,<3",
+#         "pandas-stubs>=2.0,<3",
+#     ]
+#     test-ml = [
+#         "green-agent[test]",
+#         "torch>=2.0,<3",
+#     ]
+#     test-e2e = [
+#         "green-agent[test]",
+#         "pytest-dash>=2.1,<3",
+#         "playwright>=1.44,<2",
+#         "pytest-playwright>=0.5,<1",
+#     ]
+#     test-perf = [
+#         "green-agent[test]",
+#         "pytest-benchmark>=4.0,<5",
+#         "locust>=2.29,<3",
+#     ]
+#
+#     [tool.pytest.ini_options]
+#     asyncio_mode = "auto"
+#     timeout = 60
+#     timeout_method = "thread"
+#     pythonpath = ["src"]
+#     testpaths = ["tests"]
+#     addopts = "-ra -q --strict-markers"
+#     markers = [
+#         "e2e: requires a live deployment",
+#         "slow: long-running test",
+#         "integration: multi-component integration",
+#         "quantum: quantum simulation",
+#         "dashboard: requires the dashboard service",
+#         "requires_cluster: requires a live Kubernetes cluster",
+#         "enhancements: advanced enhancements (LIMIT/MODP/RLHF/MoE)",
+#         "networkpolicy: NetworkPolicy tests",
+#         "scaling: carbon-aware scaling tests",
+#         "monitoring: ServiceMonitor / PrometheusRule / Grafana",
+#         "health: health / readiness / liveness endpoints",
+#         "hpa: legacy Horizontal Pod Autoscaler tests",
+#         "k8s: Kubernetes API interaction",
+#     ]
+#
+#     [tool.coverage.run]
+#     branch = true
+#     source = ["src"]
+#
+#     [tool.coverage.report]
+#     show_missing = true
+#     skip_covered = true
+
+
+# =============================================================================
+# OPTIONAL SPLIT INTO requirements/test-extras.txt
+# =============================================================================
+# If your CI runs multiple stages (unit / integration / e2e), the split
+# below lets each stage install only what it needs. In that layout:
+#
+#   requirements/test.txt        = Sections 1-5, 9, 10 (pytest core,
+#                                  coverage, cluster, mocks, property,
+#                                  types) ~50 MB install
+#   requirements/test-extras.txt = -r test.txt + Section 6 (torch),
+#                                  Section 7 (dash/playwright),
+#                                  Section 8 (benchmark/locust) ~1 GB install
+#
+# Stage installer examples:
+#
+#   # Unit tests — no cluster, no torch, no browser
+#   pip install -r requirements/test.txt
+#   pytest -m "not e2e and not slow and not requires_cluster" -n auto
+#
+#   # Integration — cluster + distillation
+#   pip install -r requirements/test-extras.txt
+#   pytest -m "integration and not e2e" -n 4 --timeout=120 \
+#          --reruns 2 --only-rerun "(ApiException|ConnectionError|Timeout)"
+#
+#   # E2E — full stack
+#   pip install -r requirements/test-extras.txt
+#   python -m playwright install --with-deps chromium
+#   pytest -m e2e --timeout=300
+#
+# To adopt the split, copy Sections 6-8 of this file into a new
+# ``requirements/test-extras.txt`` prefixed with ``-r test.txt`` and
+# delete those sections here.
+
+
+# =============================================================================
+# COMPANION CI SNIPPET (.github/workflows/test.yml)
+# =============================================================================
+# The pins above only matter if CI uses them. A staged workflow that
+# installs only what each stage needs:
+#
+#     jobs:
+#       unit:
+#         runs-on: ubuntu-latest
+#         steps:
+#           - uses: actions/checkout@v4
+#           - uses: actions/setup-python@v5
+#             with:
+#               python-version: "3.11"
+#               cache: pip
+#           - run: pip install -r requirements/test.txt
+#           - run: pytest -m "not e2e and not slow and not requires_cluster" \
+#                    -n auto --timeout=60 \
+#                    --cov=src --cov-report=xml \
+#                    --json-report --json-report-file=report.json
+#           - uses: actions/upload-artifact@v4
+#             if: always()
+#             with:
+#               name: unit-report
+#               path: |
+#                 report.json
+#                 coverage.xml
+#
+#       integration:
+#         runs-on: ubuntu-latest
+#         needs: unit
+#         steps:
+#           - uses: actions/checkout@v4
+#           - uses: actions/setup-python@v5
+#             with:
+#               python-version: "3.11"
+#               cache: pip
+#           - run: pip install -r requirements/test-extras.txt
+#           - run: pytest -m "integration and not e2e" \
+#                    -n 4 --timeout=120 \
+#                    --reruns 2 --only-rerun "(ApiException|ConnectionError|Timeout)"
+#
+#       e2e:
+#         if: github.event_name == 'workflow_dispatch'
+#         runs-on: ubuntu-latest
+#         needs: integration
+#         environment: staging
+#         steps:
+#           - uses: actions/checkout@v4
+#           - uses: actions/setup-python@v5
+#             with:
+#               python-version: "3.11"
+#               cache: pip
+#           - run: pip install -r requirements/test-extras.txt
+#           - run: python -m playwright install --with-deps chromium
+#           - run: pytest -m "e2e" --timeout=300
+#             env:
+#               GREEN_AGENT_URL: ${{ secrets.STAGING_URL }}
+#               KUBECONFIG_DATA: ${{ secrets.STAGING_KUBECONFIG }}
+# =============================================================================
