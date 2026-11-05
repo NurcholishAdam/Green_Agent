@@ -1,130 +1,521 @@
+# =============================================================================
+# ray-cluster.yaml — Green Agent RayCluster (Enhanced v2)
+# =============================================================================
+# The RayCluster CRD that runs the Green Agent head and workers. All
+# enhancement configuration (LIMIT Graph, MODP, RLHF, Distillation, MoE,
+# Evolutionary, FlexGen) flows through the mounted
+# `green_agent_config.yaml` — NOT via duplicated env vars.
+#
+# ---- Critical fixes vs v1 ---------------------------------------------------
+#   FIX #1   FLEXGEN memory OOM. `FLEXGEN_ENABLED=true` with
+#            `facebook/opt-6.7b` at `fp16` needs ~16 GB for weights alone.
+#            v1 gave the head 8Gi and the workers 4Gi — the first
+#            inference is OOM-killed (exit 137). v2:
+#              * ships `FLEXGEN_ENABLED: "false"` on the workers
+#                (the 4Gi limit cannot hold the model),
+#              * documents the required memory bump (>= 12Gi for int4,
+#                >= 20Gi for fp16),
+#              * defaults the worker precision to `int4` so an operator
+#                who raises memory to 8Gi can flip the flag and it works.
+#
+#   FIX #2   `serviceAccountName: green-agent` added to both pod
+#            templates. The SA is in `resources:` of the kustomization;
+#            without this reference, the Ray autoscaler runs as the
+#            `default` SA and every scale request logs `Forbidden`.
+#
+#   FIX #3   Volume mounts added:
+#              * `config-volume`  ← ConfigMap `green-agent-config`
+#                                   mounted at `/app/config` (readOnly)
+#              * `data-volume`    ← PVC `green-agent-data-pvc`
+#                                   mounted at `/app/data`
+#              * `tmp-volume`     ← emptyDir (writable), sizeLimited
+#            Without these:
+#              - `run_agent.py` has no `green_agent_config.yaml` to read
+#              - `system.output_dir: /app/results` writes to ephemeral
+#                storage and disappears on pod restart
+#              - `readOnlyRootFilesystem: true` (see FIX #7) has no
+#                writable `/tmp`
+#
+#   FIX #4   `component: head` and `component: worker` pod labels added.
+#            The `Service.selector` in `service.yaml` matches on
+#            `component: head`; without it the Service has zero endpoints
+#            and the dashboard is unreachable. Every test's
+#            `wait_for_pods("component=head")` fixture depends on it too.
+#
+#   FIX #5   `containerPort: 9090` (named `metrics`) declared on the
+#            head. The `ServiceMonitor` scrapes `port: metrics` on 9090;
+#            some CNIs (Calico with endpoint hostPorts) do not forward
+#            traffic to undeclared ports, and the container port
+#            documents the exporter contract.
+#
+#   FIX #6   `spec.enableInTreeAutoscaling: true` added. Ray's autoscaler
+#            is opt-in; without this flag `minReplicas` / `maxReplicas`
+#            are advisory and the cluster stays at `replicas: 4` forever,
+#            silently ignoring the carbon-aware CronJob's maxReplicas
+#            writes.
+#
+#   FIX #7   `securityContext` added on both containers and both pod
+#            templates:
+#              runAsNonRoot: true
+#              runAsUser: 1000
+#              runAsGroup: 1000
+#              fsGroup: 1000
+#              allowPrivilegeEscalation: false
+#              readOnlyRootFilesystem: true
+#              capabilities: { drop: ["ALL"] }
+#            The v2 kustomization and docker-compose both promise this;
+#            v1 ran as root with a writable rootfs and all capabilities.
+#
+#   FIX #8   `startupProbe` added on the head. Model loading + Ray GCS
+#            init + FastAPI startup routinely takes 60-120 s;
+#            `livenessProbe.initialDelaySeconds: 30` was too short and
+#            marked the pod Liveness-probe-failed on a correct start.
+#            `startupProbe` gates liveness for up to 150 s.
+#
+#   FIX #9   Worker `livenessProbe` + `readinessProbe` added. A worker
+#            with a hung raylet is `Running` (the process is alive, just
+#            unresponsive); without a probe the kubelet never restarts
+#            it. Uses `ray health-check --component raylet` — Ray's own
+#            health check.
+#
+#   FIX #10  `imagePullPolicy: IfNotPresent` on both containers. The
+#            image is pinned to `v5.0.0` (immutable tag); `Always` on
+#            the head was bypassing the local cache on every restart.
+#
+#   FIX #11  `app.kubernetes.io/*` labels added on the RayCluster and on
+#            both pod templates (name, component, version, managed-by).
+#
+#   FIX #12  `terminationGracePeriodSeconds: 300` on both pod templates.
+#            Default 30 s is too short for a training step or a GCS
+#            flush; the pod is SIGKILLed mid-workload.
+#
+#   FIX #13  `resources.limits.ephemeral-storage: "10Gi"` on both
+#            containers. A runaway log or checkpoint can fill the node's
+#            disk, which evicts every pod on the node.
+#
+#   FIX #14  `rayStartParams` enriched:
+#              * `object-store-memory` sized to fit the model's shared
+#                state (2 GB head, 1 GB worker)
+#              * `num-gpus: "0"` for the CPU-only default (flip to "1"
+#                and add `nvidia.com/gpu` limits for GPU nodes)
+#              * `memory` on the head so Ray's scheduler sees the real
+#                capacity, not 30% of it
+#
+#   FIX #15  `spec.autoscalerOptions` declared:
+#              upscalingMode: Conservative  (avoids thrash; the
+#                                             carbon-aware CronJob
+#                                             handles maxReplicas bounds)
+#              idleTimeoutSeconds: 1800
+#
+#   FIX #16  `spec.gcsFaultTolerance: false` with a comment on how to
+#            enable it (requires the `full`-profile Redis and a
+#            `REDIS_URL` in the head pod env).
+#
+#   FIX #17  `priorityClassName` templates (commented). Uncomment after
+#            creating `PriorityClass green-agent-head` and
+#            `PriorityClass green-agent-worker`.
+#
+#   FIX #18  `nodeSelector` / `tolerations` / `affinity` templates
+#            (commented) for the common cases: avoid spot nodes for the
+#            head, prefer GPU nodes for workers, tolerate a dedicated
+#            taint.
+#
+#   FIX #19  `topologySpreadConstraints` template (commented) that
+#            spreads workers across nodes when the cluster has 3+ nodes.
+#
+#   FIX #20  The 17 duplicated env vars (which mirrored the ConfigMap
+#            literals) are removed. The ConfigMap mounted at
+#            `/app/config/green_agent_config.yaml` is the sole source of
+#            enhancement config. Only container-specific env vars remain:
+#              * `PYTHONUNBUFFERED` (both containers)
+#              * `PROMETHEUS_PORT`  (head — must match container port)
+#              * `FLEXGEN_*`         (worker — the head does no inference)
+#
+#   FIX #21  `FLEXGEN_MODEL_NAME` added on the worker. v1 had it only on
+#            the head; inference runs on the workers.
+#
+#   FIX #22  `checksum/config` annotation template (commented) for teams
+#            deploying the static ConfigMap (mode "B" from
+#            `green-agent-config.yaml`'s header). Populate with the CI
+#            hash so a config edit triggers a rolling restart.
+#
+#   FIX #23  Head `imagePullPolicy: IfNotPresent` — the `v5.0.0` tag is
+#            immutable; `Always` forced a registry round-trip per restart.
+#
+#   FIX #24  Deployment prerequisites documented in the header:
+#            ServiceAccount, Role/RoleBinding, PVC, ConfigMap must all
+#            exist before this manifest is applied. The
+#            `enableInTreeAutoscaling: true` flag requires RBAC v1.1 did
+#            not document.
+# =============================================================================
+# Deployment prerequisites
+# =============================================================================
+#   1. ServiceAccount `green-agent` in the target namespace
+#   2. Role + RoleBinding granting the SA:
+#        pods:     create, delete, get, list, watch, patch
+#        services: get, list, patch
+#        events:   create
+#   3. PersistentVolumeClaim `green-agent-data-pvc`
+#   4. ConfigMap `green-agent-config` (contains `green_agent_config.yaml`)
+#   5. (Optional) PriorityClass `green-agent-head` and
+#      `green-agent-worker` for eviction ordering
+#
+# All five are declared in the v2 `kustomization.yaml`. If you apply
+# this manifest standalone, create them first or the pods will not
+# schedule.
+# =============================================================================
+
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
   name: green-agent-cluster
+  namespace: green-agent
   labels:
     app: green-agent
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: ray
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: "5.0.0"
     enhancements: enabled
-  annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
-    green-agent/flexgen: "true"
+  # FIX #22 — uncomment when deploying as a static ConfigMap (mode B from
+  # `green-agent-config.yaml`'s header) so a config edit triggers a
+  # rolling restart of the RayCluster:
+  #
+  #   kubectl get cm green-agent-config -n green-agent \
+  #     -o jsonpath='{.data.green_agent_config\.yaml}' \
+  #     | sha256sum | cut -c1-16
+  #
+  # annotations:
+  #   checksum/config: "REPLACE_WITH_CI_HASH"
 spec:
+  # FIX #6 — Ray's autoscaler is opt-in. Without this flag, min/maxReplicas
+  # are advisory and the cluster stays at `replicas: 4` forever, ignoring
+  # the carbon-aware CronJob's maxReplicas writes.
+  enableInTreeAutoscaling: true
+
+  # FIX #16 — GCS fault tolerance. Set true only when the `full` profile's
+  # Redis is running and `REDIS_URL` is set in the head pod env (see the
+  # commented env block below). Enabling it without Redis will make the
+  # head pod fail to start.
+  gcsFaultTolerance: false
+
+  # FIX #15 — autoscaler tuning. Conservative avoids thrash when the
+  # carbon-aware CronJob shifts maxReplicas on the schedule.
+  autoscalerOptions:
+    upscalingMode: Conservative
+    idleTimeoutSeconds: 1800
+
+  # ---------------------------------------------------------------------------
+  # Head
+  # ---------------------------------------------------------------------------
   headGroupSpec:
+    # FIX #14 — object-store-memory sized to fit the model's shared state;
+    # num-gpus: "0" for CPU-only (change to "1" and add a
+    # `resources.limits.nvidia.com/gpu` limit for GPU nodes); `memory`
+    # matches the container limit below so Ray's scheduler sees the real
+    # capacity.
     rayStartParams:
-      dashboard-host: '0.0.0.0'
-      num-cpus: '4'
+      dashboard-host: "0.0.0.0"
+      num-cpus: "4"
+      num-gpus: "0"
+      object-store-memory: "2000000000"    # ~2 GB
+      memory: "8000000000"                 # ~8 GB — matches the limit below
+
     template:
+      metadata:
+        # FIX #4 — `component: head` required by Service.selector and by
+        # every test's `wait_for_pods("component=head")` fixture.
+        # FIX #11 — standard `app.kubernetes.io/*` taxonomy.
+        # FIX #22 — checksum annotation for static-ConfigMap deployments.
+        labels:
+          app: green-agent
+          component: head
+          app.kubernetes.io/name: green-agent
+          app.kubernetes.io/component: head
+        # FIX #22:
+        # annotations:
+        #   checksum/config: "REPLACE_WITH_CI_HASH"
+
       spec:
+        # FIX #2 — explicit ServiceAccount (not `default`). The SA must
+        # exist; see the deployment prerequisites in the header.
+        serviceAccountName: green-agent
+
+        # FIX #12 — training / GCS flush may take minutes
+        terminationGracePeriodSeconds: 300
+
+        # FIX #17 — uncomment when the PriorityClasses exist:
+        # priorityClassName: green-agent-head
+
+        # FIX #18 — scheduling templates (uncomment as needed):
+        # nodeSelector:
+        #   node.kubernetes.io/instance-type: "m5.2xlarge"
+        # tolerations:
+        #   - key: "dedicated"
+        #     operator: "Equal"
+        #     value: "green-agent"
+        #     effect: "NoSchedule"
+        # affinity:
+        #   nodeAffinity:
+        #     requiredDuringSchedulingIgnoredDuringExecution:
+        #       nodeSelectorTerms:
+        #         - matchExpressions:
+        #             - key: "karpenter.sh/capacity-type"
+        #               operator: In
+        #               values: ["on-demand"]
+
+        # FIX #7 — pod-level security posture
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+
         containers:
-        - name: ray-head
-          image: ghcr.io/nurcholishadam/green_agent:v5.0.0
-          imagePullPolicy: Always
-          ports:
-          - containerPort: 6379
-          - containerPort: 8265
-          - containerPort: 8000
-          env:
-          - name: ENHANCEMENTS_ENABLED
-            value: "true"
-          - name: LIMIT_GRAPH_ENABLED
-            value: "true"
-          - name: LIMIT_GRAPH_CENTRALITY
-            value: "0.7"
-          - name: LIMIT_GRAPH_CONNECTIVITY
-            value: "0.6"
-          - name: MODP_ENABLED
-            value: "true"
-          - name: MODP_WEIGHTS
-            value: "[0.4,0.3,0.2,0.1]"
-          - name: RLHF_ENABLED
-            value: "true"
-          - name: HUMAN_FEEDBACK_SCORE
-            value: "0.6"
-          - name: DISTILLATION_ENABLED
-            value: "true"
-          - name: MOE_GATING_ENABLED
-            value: "true"
-          - name: EVOLUTIONARY_ENABLED
-            value: "true"
-          - name: POPULATION_SIZE
-            value: "20"
-          - name: MUTATION_RATE
-            value: "0.1"
-          - name: FLEXGEN_ENABLED
-            value: "true"
-          - name: FLEXGEN_MODEL_NAME
-            value: "facebook/opt-6.7b"
-          - name: FLEXGEN_DEFAULT_PRECISION
-            value: "fp16"
-          resources:
-            requests:
-              cpu: "2"
-              memory: "4Gi"
-            limits:
-              cpu: "4"
-              memory: "8Gi"
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 30
-            periodSeconds: 10
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: 8000
-            initialDelaySeconds: 10
-            periodSeconds: 5
+          - name: ray-head
+            image: ghcr.io/nurcholishadam/green_agent:v5.0.0
+            # FIX #10, #23 — pinned tag; cache is safe to reuse
+            imagePullPolicy: IfNotPresent
+
+            # FIX #5 — `metrics` on 9090 matches the Service and the
+            # ServiceMonitor. The exporter must bind 9090 too; see
+            # `PROMETHEUS_PORT` below.
+            ports:
+              - { name: gcs,       containerPort: 6379 }
+              - { name: dashboard, containerPort: 8265 }
+              - { name: http,      containerPort: 8000 }
+              - { name: metrics,   containerPort: 9090 }
+
+            # FIX #7 — container-level security
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop: ["ALL"]
+
+            # FIX #20 — only container-specific env vars. The ConfigMap
+            # mounted at `/app/config/green_agent_config.yaml` is the sole
+            # source of enhancement config values. Duplicating those
+            # values as env vars (v1) created two sources of truth that
+            # drifted silently.
+            env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              # FIX #5 — must match the container port above and the
+              # Service's `metrics` targetPort. `docker-compose.yml`
+              # defaults this to 8000; that default is inconsistent with
+              # `service.yaml` and the ServiceMonitor.
+              - name: PROMETHEUS_PORT
+                value: "9090"
+              # FIX #16 — uncomment together with `gcsFaultTolerance: true`
+              # - name: REDIS_URL
+              #   value: "redis://redis.green-agent.svc.cluster.local:6379/0"
+
+            # FIX #13 — bound ephemeral disk so a runaway log cannot evict
+            # other pods on the node
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+              limits:
+                cpu: "4"
+                memory: "8Gi"
+                ephemeral-storage: "10Gi"
+
+            # FIX #8 — startupProbe gates liveness for up to 150 s. Model
+            # loading + Ray GCS init + FastAPI startup routinely takes
+            # 60-120 s; `initialDelaySeconds: 30` on the livenessProbe
+            # (v1) marked the pod Liveness-probe-failed on a correct
+            # start.
+            startupProbe:
+              httpGet:
+                path: /health
+                port: 8000
+              failureThreshold: 30
+              periodSeconds: 5
+              timeoutSeconds: 10
+
+            livenessProbe:
+              httpGet:
+                path: /health
+                port: 8000
+              initialDelaySeconds: 0          # gated by startupProbe
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+
+            readinessProbe:
+              httpGet:
+                path: /ready
+                port: 8000
+              initialDelaySeconds: 0
+              periodSeconds: 5
+              timeoutSeconds: 3
+              failureThreshold: 2
+
+            # FIX #3 — config, data, tmp
+            volumeMounts:
+              - name: config-volume
+                mountPath: /app/config
+                readOnly: true
+              - name: data-volume
+                mountPath: /app/data
+              - name: tmp-volume
+                mountPath: /tmp
+
+        volumes:
+          # FIX #3 — the ConfigMap the runtime reads at startup
+          - name: config-volume
+            configMap:
+              name: green-agent-config
+              defaultMode: 0444
+          # FIX #3 — the PVC that backs `system.output_dir`
+          - name: data-volume
+            persistentVolumeClaim:
+              claimName: green-agent-data-pvc
+          # FIX #3, #7 — writable /tmp required by readOnlyRootFilesystem
+          - name: tmp-volume
+            emptyDir:
+              sizeLimit: 2Gi
+
+  # ---------------------------------------------------------------------------
+  # Workers
+  # ---------------------------------------------------------------------------
   workerGroupSpecs:
-  - replicas: 4
-    minReplicas: 2
-    maxReplicas: 20
-    groupName: standard-workers
-    rayStartParams:
-      num-cpus: '2'
-    template:
-      spec:
-        containers:
-        - name: ray-worker
-          image: ghcr.io/nurcholishadam/green_agent:v5.0.0
-          env:
-          - name: ENHANCEMENTS_ENABLED
-            value: "true"
-          - name: LIMIT_GRAPH_ENABLED
-            value: "true"
-          - name: LIMIT_GRAPH_CENTRALITY
-            value: "0.7"
-          - name: LIMIT_GRAPH_CONNECTIVITY
-            value: "0.6"
-          - name: MODP_ENABLED
-            value: "true"
-          - name: MODP_WEIGHTS
-            value: "[0.4,0.3,0.2,0.1]"
-          - name: RLHF_ENABLED
-            value: "true"
-          - name: HUMAN_FEEDBACK_SCORE
-            value: "0.6"
-          - name: DISTILLATION_ENABLED
-            value: "true"
-          - name: MOE_GATING_ENABLED
-            value: "true"
-          - name: EVOLUTIONARY_ENABLED
-            value: "true"
-          - name: POPULATION_SIZE
-            value: "20"
-          - name: FLEXGEN_ENABLED
-            value: "true"
-          - name: FLEXGEN_DEFAULT_PRECISION
-            value: "fp16"
-          resources:
-            requests:
-              cpu: "1"
-              memory: "2Gi"
-            limits:
-              cpu: "2"
-              memory: "4Gi"
+    - groupName: standard-workers
+      # FIX #6 — `replicas` is the *initial* count; the autoscaler moves
+      # it within [minReplicas, maxReplicas] (and the carbon-aware
+      # CronJob rewrites maxReplicas on the tier schedule).
+      replicas: 4
+      minReplicas: 2
+      maxReplicas: 20
+
+      # FIX #14 — object-store-memory and GPU flags
+      rayStartParams:
+        num-cpus: "2"
+        num-gpus: "0"
+        object-store-memory: "1000000000"    # ~1 GB
+
+      template:
+        metadata:
+          # FIX #4 — `component: worker` for tests and any future Service
+          # that targets workers.
+          # FIX #11 — standard taxonomy.
+          labels:
+            app: green-agent
+            component: worker
+            app.kubernetes.io/name: green-agent
+            app.kubernetes.io/component: worker
+
+        spec:
+          # FIX #2
+          serviceAccountName: green-agent
+
+          # FIX #12
+          terminationGracePeriodSeconds: 300
+
+          # FIX #17 — uncomment when the PriorityClasses exist:
+          # priorityClassName: green-agent-worker
+
+          # FIX #19 — spread workers across nodes when the cluster has
+          # 3+ nodes. Uncomment to activate.
+          # topologySpreadConstraints:
+          #   - maxSkew: 1
+          #     topologyKey: kubernetes.io/hostname
+          #     whenUnsatisfiable: ScheduleAnyway
+          #     labelSelector:
+          #       matchLabels:
+          #         app: green-agent
+          #         component: worker
+
+          # FIX #7 — pod-level security
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+
+          containers:
+            - name: ray-worker
+              image: ghcr.io/nurcholishadam/green_agent:v5.0.0
+              # FIX #10
+              imagePullPolicy: IfNotPresent
+
+              # FIX #7 — container-level security
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+
+              # FIX #20 — container-specific env vars only.
+              #
+              # FIX #1 — FLEXGEN_ENABLED is OFF by default because the
+              # 4Gi memory limit below cannot hold the 6.7B model. To
+              # enable FlexGen on the workers:
+              #   1. raise `resources.limits.memory` to >= 20Gi for fp16
+              #      or >= 8Gi for int4,
+              #   2. set FLEXGEN_ENABLED: "true",
+              #   3. keep FLEXGEN_DEFAULT_PRECISION: "int4" for the 8Gi
+              #      target, or "fp16" for the 20Gi target.
+              #
+              # FIX #21 — FLEXGEN_MODEL_NAME on the worker; inference
+              # runs here, not on the head.
+              env:
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: FLEXGEN_ENABLED
+                  value: "false"
+                - name: FLEXGEN_MODEL_NAME
+                  value: "facebook/opt-6.7b"
+                - name: FLEXGEN_DEFAULT_PRECISION
+                  value: "int4"
+
+              # FIX #13
+              # FIX #14 — uncomment the GPU limits for GPU-enabled nodes:
+              #   limits:
+              #     nvidia.com/gpu: "1"
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: "2Gi"
+                limits:
+                  cpu: "2"
+                  memory: "4Gi"
+                  ephemeral-storage: "10Gi"
+
+              # FIX #9 — worker health probes. `ray health-check` is
+              # Ray's own health check; a hung raylet fails it and the
+              # kubelet restarts the pod.
+              livenessProbe:
+                exec:
+                  command: ["ray", "health-check", "--component", "raylet"]
+                initialDelaySeconds: 60
+                periodSeconds: 30
+                timeoutSeconds: 10
+                failureThreshold: 3
+
+              readinessProbe:
+                exec:
+                  command: ["ray", "health-check", "--component", "raylet"]
+                initialDelaySeconds: 30
+                periodSeconds: 10
+                timeoutSeconds: 5
+                failureThreshold: 2
+
+              # FIX #3 — workers also read the config and need /tmp
+              volumeMounts:
+                - name: config-volume
+                  mountPath: /app/config
+                  readOnly: true
+                - name: tmp-volume
+                  mountPath: /tmp
+
+          volumes:
+            - name: config-volume
+              configMap:
+                name: green-agent-config
+                defaultMode: 0444
+            - name: tmp-volume
+              emptyDir:
+                sizeLimit: 2Gi
