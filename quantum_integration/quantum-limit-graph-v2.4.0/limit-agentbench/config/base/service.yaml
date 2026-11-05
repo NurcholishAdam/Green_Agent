@@ -1,34 +1,255 @@
+# =============================================================================
+# service.yaml — Green Agent Services (Enhanced v2)
+# =============================================================================
+# Two Services, one per concern:
+#
+#   green-agent-api   — dashboard / A2A / metrics on the head pod (HTTP)
+#   green-agent-ray   — Ray dashboard UI on the head pod (internal-only)
+#
+# Splitting them lets each Service carry its own traffic policy, session
+# affinity, and access controls — without leaking the unauthenticated Ray
+# dashboard UI onto the Service the ingress controller fronts.
+#
+# ---- Critical fixes vs v1 ---------------------------------------------------
+#   FIX #1   Selector dependency documented. v1's selector required
+#            `component: head`, but the v1 `ray-cluster.yaml` head pod
+#            template had no pod labels — the Service matched zero pods
+#            and had zero endpoints. The v2 `ray-cluster.yaml` adds the
+#            label; this file's header names the dependency so a future
+#            change to `ray-cluster.yaml` cannot silently break the
+#            Service again.
+#   FIX #2   `sessionAffinity: ClientIP` added. The runtime has WebSocket
+#            endpoints (`/ws/metrics`, `/ws`); a Service load-balances
+#            per TCP connection, so a WebSocket reconnection can land on
+#            a different pod and the client sees an instant disconnect.
+#            ClientIP affinity keeps a given client on the same pod for
+#            the duration of the affinity window.
+#   FIX #3   Metrics port reconciliation documented. The `metrics` port
+#            targets 9090; the exporter inside the pod must bind 9090
+#            too. `docker-compose.yml` defaults `PROMETHEUS_PORT` to
+#            8000; that default is inconsistent with this Service and
+#            with `monitoring.yaml`'s ServiceMonitor. Fix by setting
+#            `PROMETHEUS_PORT=9090` in the pod env (already done in the
+#            v2 `ray-cluster.yaml`).
+#   FIX #4   `ray-dashboard` (8265) split into a dedicated
+#            `green-agent-ray` Service. Ray's dashboard has no
+#            authentication — it exposes `/api/jobs` (submit jobs),
+#            `/api/nodes`, `/api/logs`, `/api/actors`. Putting it on the
+#            same Service as the A2A gateway means any ingress controller
+#            that fronts the dashboard Service can reach Ray's admin
+#            API. The split makes the exposure explicit and scopeable.
+#   FIX #5   `appProtocol: http` on every HTTP port. Lets Gateways
+#            (Istio, Gateway API, Envoy) route L7 — path-based rules,
+#            HTTP retries, gzip — instead of falling back to raw TCP.
+#   FIX #6   `targetPort` uses the container port **name** (`http`,
+#            `metrics`, `gcs`, `dashboard`) instead of an integer. If
+#            the container port changes, the Service still resolves.
+#   FIX #7   The 7 decorative `green-agent/*` annotations removed. No
+#            consumer reads them; Prometheus reads `labels`; the ingress
+#            controller reads only its own specific annotations. Kept two
+#            `green-agent.example/*` documentation annotations on the
+#            Ray Service only, where the intent ("internal, no auth") is
+#            operationally relevant.
+#   FIX #8   `app.kubernetes.io/*` labels added on both Services.
+#   FIX #9   `internalTrafficPolicy: Local` on the API Service — keeps
+#            intra-cluster traffic on the same node (fewer hops, lower
+#            latency for the WebSocket and Prometheus scrape paths).
+#   FIX #10  `topologyAwareHints: Auto` on both Services — kube-proxy
+#            prefers same-zone endpoints on multi-zone clusters
+#            (Kubernetes 1.27+).
+#   FIX #11  Header documents the Ingress / Gateway pairing. A
+#            ClusterIP Service is unreachable from outside the cluster;
+#            production needs one of the two.
+#   FIX #12  `publishNotReadyAddresses` deliberately left at the default
+#            (`false`). A not-ready pod should not receive traffic. If a
+#            headless Service is added later for Ray's own `ray start`
+#            discovery, set `true` there.
+#   FIX #13  The speculative `enhanced-api` (8080) port stays commented.
+#            No service in this repo exposes 8080; a speculative port is
+#            how NetworkPolicies end up allowing traffic to nothing.
+#   FIX #14  `externalTrafficPolicy` and `loadBalancerSourceRanges` are
+#            no-ops on ClusterIP; documented as `LoadBalancer`-only.
+#
+# ---- Prerequisites ----------------------------------------------------------
+#   1. The head pod template in `ray-cluster.yaml` MUST carry:
+#          metadata.labels.app: green-agent
+#          metadata.labels.component: head
+#      Without these, both Services have zero endpoints.
+#   2. The pod env MUST set `PROMETHEUS_PORT=9090` so the metrics
+#      targetPort (9090) is actually listening. The v2 `ray-cluster.yaml`
+#      already sets this.
+#   3. For external access, pair `green-agent-api` with either:
+#          * an `Ingress` (nginx / traefik / alb), or
+#          * a `Gateway` + `HTTPRoute` (Gateway API)
+#      `green-agent-ray` must NOT be exposed externally — Ray's dashboard
+#      has no authentication.
+#   4. The companion `network-policy.yaml` should limit 8265 ingress to
+#      the operator's UI namespace (kubernetes-dashboard / a dedicated
+#      observability namespace). Without it, every pod in the namespace
+#      can reach the unauthenticated Ray dashboard.
+# =============================================================================
+
+---
+# =============================================================================
+# Service 1 — Green Agent API / dashboard / metrics (HTTP)
+# =============================================================================
 apiVersion: v1
 kind: Service
 metadata:
-  name: green-agent-dashboard
+  name: green-agent-api
+  namespace: green-agent
   labels:
     app: green-agent
-    enhancements: enabled
-  annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
-    green-agent/flexgen: "true"
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: api
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: "5.0.0"
 spec:
   type: ClusterIP
+
+  # FIX #9 — keep intra-cluster traffic on the same node
+  internalTrafficPolicy: Local
+
+  # FIX #10 — kube-proxy prefers same-zone endpoints on multi-zone
+  # clusters (Kubernetes 1.27+)
+  topologyAwareHints: Auto
+
+  # FIX #2 — WebSocket reconnection stickiness. `ClientIP` groups a
+  # client (by source IP) to the same pod for the duration of the
+  # affinity window. 3 hours is one full session — a browser reconnect
+  # returns to the same pod and the session state survives.
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800    # 3 hours
+
+  # FIX #6 — targetPort by container port *name*. The v2 ray-cluster.yaml
+  # container declares `name: http`, `name: metrics`, `name: gcs`,
+  # `name: dashboard`.
   ports:
-  - name: dashboard
-    port: 8000
-    targetPort: 8000
-  - name: ray-dashboard
-    port: 8265
-    targetPort: 8265
-  - name: metrics
-    port: 9090
-    targetPort: 9090
-  # Optional: additional port for enhanced API if exposed
-  # - name: enhanced-api
-  #   port: 8080
-  #   targetPort: 8080
+    - name: http
+      port: 8000
+      targetPort: http         # containerPort name — not the integer
+      protocol: TCP
+      # FIX #5 — appProtocol lets Gateways route L7 (path rules,
+      # retries, gzip) instead of falling back to raw TCP.
+      appProtocol: http
+
+    # FIX #3 — the exporter must bind 9090. Set `PROMETHEUS_PORT=9090`
+      # in the pod env (v2 ray-cluster.yaml already does). If the pod
+      # binds 8000 (compose default), this port forwards to a closed
+      # socket and the ServiceMonitor scrapes nothing.
+    - name: metrics
+      port: 9090
+      targetPort: metrics      # containerPort name
+      protocol: TCP
+      appProtocol: http
+
+    # Ray GCS. Workers reach the head via the Service DNS the Ray
+    # operator creates — this port is included for parity with the v1
+    # manifest and for any same-namespace client that needs it
+    # directly. Optional; remove if no direct consumer exists.
+    - name: gcs
+      port: 6379
+      targetPort: gcs          # containerPort name
+      protocol: TCP
+      # Not HTTP — no appProtocol.
+
+    # FIX #13 — speculative `enhanced-api` port stays commented. No
+    # service in this repo exposes 8080; uncomment only when a real
+    # consumer exists AND the container port is declared in
+    # ray-cluster.yaml AND the NetworkPolicy allows it.
+    # - name: enhanced-api
+    #   port: 8080
+    #   targetPort: enhanced-api
+    #   protocol: TCP
+    #   appProtocol: http
+
+  # FIX #1 — the head pod template in ray-cluster.yaml MUST carry both
+  # `app: green-agent` and `component: head`. Both are declared in the
+  # v2 ray-cluster.yaml. Do NOT widen this selector to `app:
+  # green-agent` — the workers don't serve port 8000, and
+  # load-balancing the dashboard across them produces intermittent
+  # 502s.
   selector:
     app: green-agent
     component: head
+
+---
+# =============================================================================
+# Service 2 — Ray dashboard UI (internal only, unauthenticated)
+# =============================================================================
+# FIX #4 — split out from the dashboard Service. Ray's dashboard has no
+# authentication and exposes:
+#     /api/jobs     submit arbitrary jobs to the cluster
+#     /api/nodes    node IPs, resource counts, capacity
+#     /api/logs     worker logs
+#     /api/actors   actor state and hierarchy
+# Putting it on the same Service as the A2A gateway meant any ingress
+# controller that fronted the dashboard could reach Ray's admin API.
+# This Service is intentionally internal-only — never front it with an
+# Ingress, and pair it with a NetworkPolicy that allows 8265 only from
+# the operator's UI namespace.
+apiVersion: v1
+kind: Service
+metadata:
+  name: green-agent-ray
+  namespace: green-agent
+  labels:
+    app: green-agent
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: ray-dashboard
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: "5.0.0"
+  annotations:
+    # FIX #7 — documentation-only. The NetworkPolicy in
+    # network-policy.yaml is what actually restricts this Service.
+    green-agent.example/internal-only: "true"
+    green-agent.example/no-auth: "true"
+spec:
+  type: ClusterIP
+
+  # Ray dashboard traffic is short-lived polling; no session affinity
+  # needed. Local policy still reduces hops within a node.
+  internalTrafficPolicy: Local
+  topologyAwareHints: Auto
+
+  ports:
+    - name: ray-dashboard
+      port: 8265
+      targetPort: dashboard    # containerPort name
+      protocol: TCP
+      appProtocol: http
+
+  selector:
+    app: green-agent
+    component: head
+
+# =============================================================================
+# Companion network-policy.yaml additions (recommended, not included here)
+# =============================================================================
+# To actually restrict the Ray dashboard, add to `network-policy.yaml`'s
+# `green-agent-allow-internal` ingress rules:
+#
+#     - from:
+#         - namespaceSelector:
+#             matchLabels:
+#               kubernetes.io/metadata.name: kubernetes-dashboard
+#       ports:
+#         - protocol: TCP
+#           port: 8265
+#
+# And in the *egress* rules of any namespace that should NOT reach it,
+# ensure 8265 is not on the allow-list. The default-deny policy in
+# network-policy.yaml already handles pods outside the namespace.
+#
+# ---- Why no Ingress for green-agent-ray -------------------------------------
+# Ray's dashboard has no authentication. An Ingress (nginx / traefik /
+# alb) fronting it would make the Ray admin API reachable from the
+# internet. If operators need browser access, use `kubectl port-forward`:
+#
+#     kubectl port-forward -n green-agent svc/green-agent-ray 8265:8265
+#
+# This keeps the exposure per-operator and audited by the API server,
+# not wide open to anything with the URL.
+# =============================================================================
