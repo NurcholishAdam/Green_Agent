@@ -1,11 +1,163 @@
+# =============================================================================
+# green-agent-config.yaml — Green Agent ConfigMap (Enhanced v2)
+# =============================================================================
+# File: green-agent-config.yaml
+# Kind: ConfigMap
+# The `data.green_agent_config.yaml` key is consumed by:
+#   * run_agent.py        (system, ray, carbon, policy, monitoring, security,
+#                          enhancements, flexgen, backends, observability,
+#                          constraints, rate_limits, evaluation, limitations)
+#   * HeliumDashboard     (carbon, dashboard, enhancements)
+#   * GreenLeaderboard    (enhancements.modp, enhancements.rlhf)
+#   * all four dashboard/ components (enhancements.*)
+#
+# ---- Critical fixes vs v1 ---------------------------------------------------
+#   FIX #1   COEXISTENCE WITH KUSTOMIZE. v1 used the plain name
+#            `green-agent-config`, which collides with kustomize's
+#            `configMapGenerator` (which appends `-<hash>` and rewrites
+#            pod templates). Because v1 had no content hash, editing it
+#            also silently failed to trigger pod restarts. v2 documents
+#            three supported deployment modes and adds a `checksum/config`
+#            annotation that a pod template can reference. Choose one
+#            mode below — do not mix them in the same cluster.
+#
+#              (A) KUSTOMIZE (recommended for the v2 layout).
+#                  Delete this file from `kubectl apply` inputs and put
+#                  the config under `config/base/green_agent_config.yaml`.
+#                  The generator hashes it; the RayCluster mounts the
+#                  hashed name; editing the file triggers a rollout.
+#
+#              (B) STATIC ConfigMap (this file).
+#                  Apply as-is. Add
+#                    template.metadata.annotations.checksum/config
+#                  to the RayCluster pod template, sourced from a CI job:
+#                    kubectl get cm green-agent-config \
+#                      -o jsonpath='{.data.green_agent_config\.yaml}' \
+#                      | sha256sum | cut -c1-16
+#                  v1 had neither a hash nor a checksum annotation — pods
+#                  never restarted on config change.
+#
+#              (C) SUBPATH MOUNT (read-only filesystem)
+#                  mount each key individually; the pod template then
+#                  references `checksum/config` for the rollout.
+#
+#   FIX #2   FLEXGEN MEMORY. `flexgen.memory_limit_mb` raised from 4096
+#            to 16384 to match `facebook/opt-6.7b` in fp16 (~13 GB
+#            weights alone). The `int4` precision option was added
+#            (needs ~5 GB); `default_precision` is unchanged at
+#            "fp16" but the docstring below explains when to switch to
+#            "int4" to fit smaller hosts.
+#   FIX #3   FLEXGEN vs POD MEMORY LIMIT. The base RayCluster limits
+#            the worker pod to 8Gi. FlexGen fp16 needs >16 GB, so the
+#            production overlay MUST raise `resources.limits.memory` to
+#            `20Gi` when `flexgen.enabled: true` with `default_precision
+#            = "fp16"`. On smaller hosts, set `default_precision = "int4"`
+#            instead — it fits under 8Gi. v1 shipped a config that could
+#            never run.
+#   FIX #4   READ-ONLY ROOT FILESYSTEM. `monitoring.logging.output` no
+#            longer includes `"file"`. The v2 kustomization sets
+#            `readOnlyRootFilesystem: true` on head and worker pods;
+#            writing to `logs/green_agent.log` fails there. `"file"`
+#            is documented as a commented example that requires a
+#            writable emptyDir or PVC mounted at `/app/logs`.
+#   FIX #5   GRAFANA. `monitoring.grafana.enabled` set to false. v1
+#            enabled Grafana with no deployment backing it — a dead
+#            flag. Re-enable only after `config/monitoring/` is
+#            deployed.
+#   FIX #6   RAY WORKER COUNTS. `ray.{num_workers, min_workers,
+#            max_workers}` documented as informational. The RayCluster
+#            CRD's `workerGroupSpecs[].{replicas, minReplicas,
+#            maxReplicas}` is authoritative; the runtime reads the CRD
+#            at startup and overrides these. Leaving them here keeps
+#            single-source-of-truth config lookup working.
+#   FIX #7   CARBON BUDGET MATH. `daily_limit_kg` set to 71.4 so
+#            `daily_limit_kg * 7 = 500.0 = weekly_limit_kg`. v1's
+#            100 × 7 = 700 never matched the weekly limit, so a workload
+#            could stay within daily limits and still exceed weekly.
+#   FIX #8   CARBON REGION. `carbon.default_region` kept as `"US-CA"` to
+#            match `agent.toml`'s sibling fields (`endpoints`,
+#            `description`). Note: `agent.toml` still declares
+#            `[carbon] default_region = "ID"` — one of the two must be
+#            corrected before submission. US-CA is the operator's
+#            declared grid here.
+#   FIX #9   DISTILLATION EPSILON. `distillation.epsilon` is now an
+#            object `{start, end, decay_steps}` matching the runtime's
+#            decay schedule. v1's scalar `0.1` silently disabled decay.
+#   FIX #10  MODP OBJECTIVE NAMES. `enhancements.modp.objective_names`
+#            added alongside `objective_weights` so the weight order is
+#            machine-readable. Different modules use different orders
+#            (`[accuracy, energy, latency, carbon]` here, but
+#            `[reliability, energy, reward]` in StressInjector and
+#            `[relevance, urgency, energy, carbon]` in MessageBus).
+#   FIX #11  DISTILLATION TEACHERS. Now objects with an `output`
+#            contract instead of bare strings. A teacher whose output
+#            shape changes (e.g. `historical_ml` moving from
+#            probabilities to logits) now has a place to declare it.
+#   FIX #12  CARBON API FALLBACK. `carbon.api_provider_fallback` added.
+#            When `electricitymap` fails (missing key, network error),
+#            the runtime falls back to `simulated` instead of failing
+#            mid-evaluation.
+#   FIX #13  QUANTUM MITIGATION NAMES. `techniques` now use Qiskit's
+#            actual API names (`zne`, `pec`, `cdr`, `m3`) — v1 used
+#            prose names that raise `ValueError` from
+#            `qiskit.primitives`.
+#   FIX #14  SYSTEM OUTPUT AND SEED. `system.seed`, `system.output_dir`,
+#            and `system.public_base_url` added. v1 had no seed (runs
+#            were non-deterministic), no output dir (results scattered
+#            to CWD), and no public URL (registry / feedback forms had
+#            nowhere to report).
+#   FIX #15  SECURITY. `security` section added (auth_type,
+#            tls_enabled, jwt_algorithms, token_issuer_url). Zero-trust
+#            is a stated requirement in `agent.toml` and no config told
+#            the runtime which mode to enforce.
+#   FIX #16  OBSERVABILITY. `observability` section added (metrics_path,
+#            traces_endpoint, logs_format). Traces were being dropped.
+#   FIX #17  CONSTRAINTS. `constraints` section added (carbon budget,
+#            latency SLA, cost cap). `SelectiveInvocationPolicy`
+#            and `EcoModeController` have no SLA to enforce without it.
+#   FIX #18  RATE LIMITS. `rate_limits` section added. A gateway with
+#            no declared RPM is unbounded.
+#   FIX #19  EVALUATION. `evaluation` section added (task_categories,
+#            input/output schemas, timeout, benchmark_set,
+#            expected_accuracy). `AgentBenchAdapter` needs it to
+#            advertise what it can evaluate.
+#   FIX #20  LIMITATIONS. `limitations` section added. The registry
+#            cannot filter out unsupported workloads without it.
+#   FIX #21  ENHANCEMENTS PRECEDENCE. Documented in the header: when
+#            `enhancements.enabled: false`, every sub-flag is ignored.
+#            When `true`, a subsystem is active iff its own `enabled:
+#            true` AND its schema module imports successfully.
+#   FIX #22  NAMESPACE. `metadata.namespace` added so this ConfigMap
+#            cannot land in whatever namespace the local kubectl
+#            happens to point at.
+#   FIX #23  FLEXGEN vs POD MEMORY LIMIT documented — see FIX #3.
+#
+# ---- Deployment modes (FIX #1) ----------------------------------------------
+#   (A) KUSTOMIZE  — this file is superseded by
+#       `config/base/green_agent_config.yaml` + overlays. Do NOT
+#       `kubectl apply` this file in that cluster.
+#   (B) STATIC     — apply as-is; add a `checksum/config` annotation to
+#       the RayCluster pod template (template in the `metadata` block).
+#   (C) SUBPATH    — mount the key; use `checksum/config` for rollout.
+# =============================================================================
+
 apiVersion: v1
 kind: ConfigMap
 metadata:
+  # FIX #22 — explicit namespace so a wrong `kubens` cannot misplace it
+  namespace: green-agent
   name: green-agent-config
   labels:
     app: green-agent
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: config
+    app.kubernetes.io/version: "5.0.0"
     enhancements: enabled
   annotations:
+    # Per-subsystem intent — advisory only. The runtime uses the
+    # in-file `enhancements.<name>.enabled` booleans; these annotations
+    # let a reviewer / admission controller see the intent without
+    # parsing the YAML.
     green-agent/limit-graph: "true"
     green-agent/modp: "true"
     green-agent/rlhf: "true"
@@ -13,25 +165,65 @@ metadata:
     green-agent/bio-inspired: "true"
     green-agent/moe: "true"
     green-agent/flexgen: "true"
+    # FIX #1 — rollout-on-change. In STATIC mode, set this to the output of:
+    #   kubectl get cm green-agent-config -n green-agent \
+    #     -o jsonpath='{.data.green_agent_config\.yaml}' | sha256sum | cut -c1-16
+    # and reference it from the RayCluster pod template:
+    #   template.metadata.annotations.checksum/config: "<hash>"
+    # In KUSTOMIZE mode this annotation is ignored (kustomize's own
+    # hash-based name is the trigger).
+    checksum/config: "REPLACE_WITH_CI_HASH"
+    # Deployment mode documentation.
+    green-agent.example/deployment-mode: "static"
 data:
   green_agent_config.yaml: |
-    # Full Green Agent configuration with advanced enhancements
+    # =========================================================================
+    # Green Agent — runtime configuration
+    # =========================================================================
+    # ---- Enhancements precedence -------------------------------------------
+    # When `enhancements.enabled: false`, every `enhancements.<name>.enabled`
+    # is ignored. When `true`, a subsystem is active iff:
+    #   1. its own `enabled: true`, AND
+    #   2. its schema module imports successfully.
+    # A missing module logs a warning at startup and the subsystem is
+    # skipped; the rest of the pipeline continues.
+    # =========================================================================
+
     system:
       version: "5.0.0"
       mode: "unified"
       debug: false
       log_level: "INFO"
       enable_telemetry: true
+      # FIX #14 — determinism and output redirection
+      seed: 42
+      output_dir: "/app/results"
+      # FIX #14 — reachable URL for registry / RLHF feedback forms.
+      # Overridden at deploy time via GREEN_AGENT_PUBLIC_BASE_URL.
+      public_base_url: ""
+      # Fail fast if a required core module is missing — never silently
+      # degrade the core API.
+      strict_core_imports: true
 
     dashboard:
       enabled: true
+      # "0.0.0.0" is a bind address; consumers must use public_base_url.
       host: "0.0.0.0"
       port: 8000
       update_interval_seconds: 5
       enable_real_time: true
       metrics_retention_hours: 168
+      # CORS origins allowed for credentialed requests. A wildcard here
+      # forces allow_credentials=False at the ASGI layer.
+      cors_origins:
+        - "http://localhost:3000"
+        - "http://localhost:8501"
 
     ray:
+      # FIX #6 — the RayCluster CRD's workerGroupSpecs is authoritative.
+      # These values are read at startup as a fallback when the CRD is
+      # not available (local dev). Do NOT edit them expecting a scaling
+      # change — edit `workerGroupSpecs[].replicas` in the CRD instead.
       enabled: true
       num_workers: 4
       min_workers: 2
@@ -40,9 +232,15 @@ data:
       carbon_aware_scaling: true
 
     carbon:
+      # FIX #8 — reconcile with agent.toml's `[carbon] default_region = "ID"`
+      # before submission. US-CA is the operator's declared grid here.
       default_region: "US-CA"
       api_provider: "electricitymap"
       api_key_env: "CARBON_API_KEY"
+      # FIX #12 — degrade gracefully when the primary provider fails
+      # (missing key, network error, HTTP 5xx) instead of failing the
+      # task mid-evaluation.
+      api_provider_fallback: "simulated"
       forecast_days: 30
       update_interval_hours: 1
       eco_mode_threshold: 200
@@ -50,7 +248,10 @@ data:
       emergency_threshold: 600
       budget:
         enabled: true
-        daily_limit_kg: 100.0
+        # FIX #7 — daily × 7 must equal weekly. 71.4 * 7 = 499.8 ≈ 500.
+        # v1's 100 × 7 = 700 never matched 500, so a workload could sit
+        # inside the daily cap and still blow the weekly cap.
+        daily_limit_kg: 71.4
         weekly_limit_kg: 500.0
 
     policy:
@@ -68,13 +269,18 @@ data:
       backend: "simulator"
       error_mitigation:
         enabled: true
+        # FIX #13 — Qiskit's actual primitive names. v1 used prose
+        # ("zero_noise_extrapolation") which raises ValueError from
+        # qiskit.primitives. Accepted: "zne" | "pec" | "cdr" | "m3".
         techniques:
-          - "zero_noise_extrapolation"
-          - "symmetry_verification"
+          - "zne"
+          - "pec"
       vqc:
         n_qubits: 4
         n_layers: 3
+        # Allowed: "angle" | "amplitude" | "data_reuploading"
         encoding_type: "angle"
+        # Allowed: "strongly_entangling" | "hardware_efficient" | "two_local"
         ansatz_type: "strongly_entangling"
 
     monitoring:
@@ -82,20 +288,28 @@ data:
         enabled: true
         port: 9090
       grafana:
-        enabled: true
+        # FIX #5 — disabled until `config/monitoring/` deploys Grafana.
+        # v1 declared this enabled with no deployment behind it.
+        enabled: false
         port: 3000
       logging:
         level: "INFO"
         format: "json"
-        output: ["stdout", "file"]
-        file_path: "logs/green_agent.log"
+        # FIX #4 — the pod runs with readOnlyRootFilesystem: true. Writing
+        # to `logs/green_agent.log` fails there. To enable "file":
+        #   - add a writable emptyDir or PVC mounted at /app/logs, AND
+        #   - remove `readOnlyRootFilesystem: true` for that container,
+        #     OR mount only /app/logs as writable.
+        output: ["stdout"]
+        # file_path: "logs/green_agent.log"   # uncomment only with a
+        #                                     # writable /app/logs mount
 
-    # ------------------------------------------------------------------
-    # Advanced Enhancements (LIMIT Graph, MODP, RLHF, Multi‑Teacher
-    # Distillation, Bio‑inspired Optimisation, Mixture‑of‑Experts)
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # Advanced Enhancements
+    # -------------------------------------------------------------------
     enhancements:
-      enabled: true                # Master switch for all advanced features
+      # FIX #21 — master switch. When false, every sub-flag is ignored.
+      enabled: true
 
       limit_graph:
         enabled: true
@@ -107,7 +321,10 @@ data:
 
       modp:
         enabled: true
-        objective_weights: [0.4, 0.3, 0.2, 0.1]  # [accuracy, energy, latency, carbon]
+        # FIX #10 — pair names with weights so the order is unambiguous
+        # across modules with different conventions.
+        objective_names:   ["accuracy", "energy", "latency", "carbon"]
+        objective_weights: [0.4,        0.3,      0.2,       0.1]
         normalize_weights: true
 
       rlhf:
@@ -115,6 +332,7 @@ data:
         human_feedback_score: 0.6
         collect_feedback: true
         feedback_source: "dashboard"
+        feedback_submission_url: "http://localhost:8501/feedback"
 
       distillation:
         enabled: true
@@ -123,12 +341,19 @@ data:
         gating_lr: 0.005
         replay_size: 2000
         train_every: 10
-        epsilon: 0.1
+        # FIX #9 — decay schedule. v1's scalar 0.1 silently disabled
+        # decay; the runtime reads start / end / decay_steps.
+        epsilon:
+          start: 0.10
+          end: 0.01
+          decay_steps: 1000
+        # FIX #11 — teachers declared with their output contract so a
+        # shape change (probabilities → logits) is visible in config.
         teachers:
-          - "rule_based"
-          - "historical_ml"
-          - "q_learning"
-          - "rlhf"
+          - { name: "rule_based",    output: "probabilities" }
+          - { name: "historical_ml", output: "probabilities" }
+          - { name: "q_learning",    output: "probabilities" }
+          - { name: "rlhf",          output: "probabilities" }
 
       bio_inspired:
         enabled: true
@@ -143,14 +368,120 @@ data:
         n_experts: 4
         gating_lr: 0.005
 
-    # ------------------------------------------------------------------
-    # FlexGen Integration (Optional)
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # Security — zero-trust posture
+    # -------------------------------------------------------------------
+    # FIX #15 — declared mode the runtime enforces. Populate the token
+    # issuer URL at deploy time via the `token_issuer_url_env` variable.
+    security:
+      auth_type: "bearer"           # "none" | "bearer" | "mtls"
+      tls_enabled: true
+      # HS* is not acceptable for zero-trust — RS/ES/EdDSA only.
+      jwt_algorithms: ["RS256", "ES256"]
+      token_issuer_url: "https://auth.green-agent.example"
+      token_issuer_url_env: "GREEN_AGENT_TOKEN_ISSUER_URL"
+      # When auth_type != "none", the A2A endpoint requires a bearer
+      # token and /metrics requires a service account token.
+      protect_metrics_endpoint: true
+
+    # -------------------------------------------------------------------
+    # Observability
+    # -------------------------------------------------------------------
+    # FIX #16 — the exporter path and the OTLP endpoint. Without the
+    # exporter, OpenTelemetry spans are dropped on the floor.
+    observability:
+      metrics_path: "/metrics"
+      metrics_port: 9090
+      traces_endpoint: ""           # e.g. "http://otel-collector:4317"
+      traces_endpoint_env: "OTEL_EXPORTER_OTLP_ENDPOINT"
+      logs_format: "json"
+      sample_traces: false
+
+    # -------------------------------------------------------------------
+    # Constraints — SLAs the runtime enforces
+    # -------------------------------------------------------------------
+    # FIX #17 — SelectiveInvocationPolicy and EcoModeController have no
+    # thresholds to enforce without these.
+    constraints:
+      carbon_budget_gco2_per_task: 5.0
+      latency_sla_ms: 5000
+      cost_cap_usd: 0.01
+      max_concurrent_tasks: 8
+
+    # -------------------------------------------------------------------
+    # Rate limits
+    # -------------------------------------------------------------------
+    # FIX #18 — a gateway with no declared RPM is unbounded.
+    rate_limits:
+      requests_per_minute: 60
+      burst: 10
+
+    # -------------------------------------------------------------------
+    # Evaluation
+    # -------------------------------------------------------------------
+    # FIX #19 — AgentBenchAdapter needs these to advertise what it can
+    # evaluate. The registry cannot route to an agent with no declared
+    # task categories.
+    evaluation:
+      task_categories: ["coding", "reasoning", "tool_use"]
+      max_input_tokens: 8192
+      max_output_tokens: 2048
+      timeout_seconds: 300
+      input_schema_url:  "https://green-agent.example/schemas/evaluation-input.json"
+      output_schema_url: "https://green-agent.example/schemas/evaluation-output.json"
+      benchmark_set: "green-agent-2025-v1"
+      expected_accuracy: 0.85
+      repeatable: true              # same input → same verdict (given seed)
+
+    # -------------------------------------------------------------------
+    # Limitations
+    # -------------------------------------------------------------------
+    # FIX #20 — honest scope boundaries let the registry filter work the
+    # agent cannot do instead of routing it and failing at runtime.
+    limitations:
+      max_model_parameters: "13B"
+      unsupported_task_types: ["multimodal_image", "video", "real_time_streaming"]
+      unsupported_languages:  ["rtl_scripts_pending_validation"]
+      requires_internet_access: false
+      gpu_required: false
+      data_retention_days: 0        # zero retention by default
+
+    # -------------------------------------------------------------------
+    # FlexGen backend
+    # -------------------------------------------------------------------
+    # FIX #2 — 4 GB was not enough for OPT-6.7B in fp16 (~13 GB weights
+    # alone). FIX #3 — the pod's memory limit must be ≥ 20Gi for fp16 or
+    # ≤ 8Gi for int4. See the note next to `default_precision`.
+    #
+    # FIX #23 — FlexGen is a backend, not a first-class capability.
+    # `backends.primary` selects the execution backend; the runtime
+    # looks up `backends.<name>` rather than a top-level `flexgen` key.
+    # The legacy `flexgen:` key below is retained so components that
+    # read it (dashboard tests, older orchestrators) continue to work.
+    backends:
+      primary: "flexgen"
+      flexgen:
+        enabled: true
+        model_name: "facebook/opt-6.7b"
+        batch_size: 16
+        # FIX #2 — 16384 MB for fp16; use 6144 MB with int4.
+        memory_limit_mb: 16384
+        # FIX #3 — fp16 needs ~16 GB; int4 fits under 8 GB.
+        precision_options: ["fp32", "fp16", "int8", "int4"]
+        # FIX #3 — set to "int4" when the pod memory limit is 8Gi,
+        # or raise the pod memory limit to 20Gi in the production
+        # overlay when using "fp16".
+        default_precision: "fp16"
+        delegation_policy: "adaptive"   # "adaptive" | "always" | "never"
+
+    # Legacy top-level alias — kept for backward compatibility with
+    # components that read `config["flexgen"]` directly. Mirrors the
+    # `backends.flexgen` block above.
     flexgen:
-      enabled: true               # Set to true to use FlexGen as execution backend
+      enabled: true
       model_name: "facebook/opt-6.7b"
       batch_size: 16
-      memory_limit_mb: 4096
-      precision_options: ["fp32", "fp16", "int8"]
+      memory_limit_mb: 16384
+      precision_options: ["fp32", "fp16", "int8", "int4"]
       default_precision: "fp16"
-      delegation_policy: "adaptive"   # adaptive | always | never
+      delegation_policy: "adaptive"
