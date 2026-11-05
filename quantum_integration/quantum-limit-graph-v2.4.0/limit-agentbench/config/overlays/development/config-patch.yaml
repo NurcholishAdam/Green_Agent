@@ -1,58 +1,153 @@
+# =============================================================================
+# green-agent-config-dev.yaml — Development ConfigMap (Enhanced v2)
+# =============================================================================
+# The development-environment ConfigMap consumed by the Green Agent
+# runtime. Every section present in `config/base/green_agent_config.yaml`
+# is also present here, with dev-appropriate values. Missing sections
+# would fall back to runtime hardcoded defaults that silently diverge
+# from the base.
+#
+# =============================================================================
+# !! DO NOT DEPLOY THIS FILE TO STAGING OR PRODUCTION !!
+# =============================================================================
+# The security block intentionally disables auth and TLS, and enables
+# debug endpoints:
+#
+#     security.auth_type: "none"
+#     security.tls_enabled: false
+#     development.enable_debug_endpoints: true
+#
+# Copying this file as a starting point for staging/production produces
+# an unauthenticated, unencrypted service with debug endpoints visible.
+# Change those three values FIRST.
+# =============================================================================
+#
+# Deployment:
+#   kubectl apply -f green-agent-config-dev.yaml
+#   OR, via kustomize overlay:
+#   kubectl apply -k config/overlays/development
+#
+# Verification:
+#   kubectl get cm green-agent-config -n green-agent-dev -o yaml
+#   kubectl exec -it deploy/green-agent-dashboard -n green-agent-dev -- \
+#     python -c "import yaml; print(yaml.safe_load(open('/app/config/green_agent_config.yaml'))['security'])"
+# =============================================================================
+
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: green-agent-config
+  namespace: green-agent-dev
+  labels:
+    app: green-agent
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: config
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: "5.0.0"
+    app.kubernetes.io/environment: development
+  annotations:
+    green-agent.example/environment: "development"
+    green-agent.example/do-not-deploy: "true"
 data:
   green_agent_config.yaml: |
+    # =========================================================================
+    # Development environment configuration
+    # =========================================================================
+    # Complete — every section from `config/base/green_agent_config.yaml`
+    # is present. Missing sections fall back to runtime hardcoded defaults
+    # that silently diverge from the base.
+    # =========================================================================
+
     system:
-      version: "5.0.0-dev"
+      version: "5.0.0"
+      channel: "dev"                # distinguishes dev from release
       mode: "unified"
       debug: true
       log_level: "DEBUG"
+      enable_telemetry: true
+      seed: 42                       # reproducible dev runs
+      output_dir: "/app/data/results"
+      public_base_url: "http://localhost:8000"
+      strict_core_imports: true
 
     dashboard:
       enabled: true
       host: "0.0.0.0"
       port: 8000
+      update_interval_seconds: 5
+      enable_real_time: true
+      metrics_retention_hours: 24    # shorter retention for dev
+      cors_origins:
+        - "http://localhost:3000"
+        - "http://localhost:8501"
 
     ray:
-      enabled: false
-      num_workers: 2
+      enabled: false                 # dev runs single-process
+      # num_workers: 2               # only meaningful when enabled: true
+      min_workers: 1
+      max_workers: 4
+      dashboard_port: 8265
+      carbon_aware_scaling: false
 
     carbon:
       default_region: "US-CA"
       api_provider: "simulation"
+      api_provider_fallback: "simulation"
+      # api_key_env: "CARBON_API_KEY"   # simulation doesn't need a key
+      forecast_days: 7
+      update_interval_hours: 1
       eco_mode_threshold: 200
+      defer_threshold: 400
+      emergency_threshold: 600
+      budget:
+        enabled: false               # dev doesn't enforce budget
+        daily_limit_kg: 71.4
+        weekly_limit_kg: 500.0
+
+    policy:
+      mode: "moderate"
+      enforce_lora_above_1b_params: false
+      block_if_budget_exceeded: false
+      weights:
+        carbon_importance: 0.4
+        performance_importance: 0.3
+        cost_importance: 0.2
+        deadline_importance: 0.1
 
     quantum:
       enabled: false
       backend: "simulator"
+      error_mitigation:
+        enabled: false               # dev doesn't run on real hardware
+        techniques: ["zne"]
+      vqc:
+        n_qubits: 4
+        n_layers: 3
+        encoding_type: "angle"
+        ansatz_type: "strongly_entangling"
 
     monitoring:
       prometheus:
         enabled: true
+        port: 8000                   # dev convention — matches dashboard
+      grafana:
+        enabled: false               # no Grafana deployment in this repo
+        port: 3000
       logging:
         level: "DEBUG"
+        format: "text"               # dev-readable
+        output: ["stdout"]
 
     development:
       enable_profiling: true
       enable_debug_endpoints: true
-      mock_carbon_api: true
-      simulate_quantum: true
+      mock_carbon_api: true          # redundant with api_provider:
+                                     # simulation, but read by different
+                                     # code paths; both must be set
 
-    security:
-      enable_auth: false
-      tls:
-        enabled: false
-
-    # ------------------------------------------------------------------
-    # Advanced Enhancements (LIMIT Graph, MODP, RLHF, Multi‑Teacher
-    # Distillation, Bio‑inspired Optimisation, Mixture‑of‑Experts)
-    # ------------------------------------------------------------------
     enhancements:
-      enabled: true                # Master switch for advanced features
+      enabled: true
 
-      # LIMIT Graph integration
       limit_graph:
         enabled: true
         graph_metrics:
@@ -61,20 +156,19 @@ data:
           density: 0.4
         update_interval_seconds: 60
 
-      # Multi‑Objective Decision Process (MODP)
       modp:
         enabled: true
-        objective_weights: [0.4, 0.3, 0.2, 0.1]  # [accuracy, energy, latency, carbon]
+        objective_names:   ["accuracy", "energy", "latency", "carbon"]
+        objective_weights: [0.4,        0.3,      0.2,       0.1]
         normalize_weights: true
 
-      # Reinforcement Learning from Human Feedback (RLHF)
       rlhf:
         enabled: true
         human_feedback_score: 0.5
         collect_feedback: true
         feedback_source: "dashboard"
+        feedback_submission_url: "http://localhost:8501/feedback"
 
-      # Multi‑Teacher On‑Policy Distillation with MoE
       distillation:
         enabled: true
         use_moe_gating: true
@@ -82,36 +176,90 @@ data:
         gating_lr: 0.005
         replay_size: 2000
         train_every: 10
-        epsilon: 0.1
+        epsilon:
+          start: 0.10
+          end: 0.01
+          decay_steps: 1000
         teachers:
-          - "rule_based"
-          - "historical_ml"
-          - "q_learning"
-          - "rlhf"
+          - { name: "rule_based",    output: "probabilities" }
+          - { name: "historical_ml", output: "probabilities" }
+          - { name: "q_learning",    output: "probabilities" }
+          - { name: "rlhf",          output: "probabilities" }
 
-      # Bio‑inspired Optimisation (Evolutionary)
       bio_inspired:
         enabled: true
         use_evolutionary: true
-        population_size: 10
+        population_size: 10          # smaller than prod for faster dev
         mutation_rate: 0.1
         crossover_rate: 0.7
         elitism: 2
 
-      # Mixture‑of‑Experts expert gating
       moe_expert:
         enabled: true
         n_experts: 4
         gating_lr: 0.005
 
-    # ------------------------------------------------------------------
-    # FlexGen Integration (Optional)
-    # ------------------------------------------------------------------
+    security:
+      auth_type: "none"              # !! DO NOT DEPLOY !!
+      tls_enabled: false
+      jwt_algorithms: []
+      token_issuer_url: ""
+      protect_metrics_endpoint: false
+
+    observability:
+      metrics_path: "/metrics"
+      metrics_port: 8000
+      traces_endpoint: ""            # empty = traces discarded
+      traces_endpoint_env: "OTEL_EXPORTER_OTLP_ENDPOINT"
+      logs_format: "text"
+      sample_traces: false
+
+    constraints:
+      carbon_budget_gco2_per_task: 10.0    # looser for dev
+      latency_sla_ms: 10000
+      cost_cap_usd: 0.05
+      max_concurrent_tasks: 4
+
+    rate_limits:
+      requests_per_minute: 600
+      burst: 50
+
+    evaluation:
+      task_categories: ["coding", "reasoning", "tool_use"]
+      max_input_tokens: 8192
+      max_output_tokens: 2048
+      timeout_seconds: 300
+      input_schema_url:  ""
+      output_schema_url: ""
+      benchmark_set: "green-agent-dev"
+      expected_accuracy: 0.85
+      repeatable: true
+
+    limitations:
+      max_model_parameters: "13B"
+      unsupported_task_types: ["multimodal_image", "video", "real_time_streaming"]
+      unsupported_languages:  ["rtl_scripts_pending_validation"]
+      requires_internet_access: false
+      gpu_required: false
+      data_retention_days: 7
+
+    backends:
+      primary: "none"                # dev doesn't run a backend by default
+      flexgen:
+        enabled: false
+        model_name: "facebook/opt-6.7b"
+        batch_size: 16
+        memory_limit_mb: 6144        # fits int4 on a typical dev laptop
+        precision_options: ["fp32", "fp16", "int8", "int4"]
+        default_precision: "int4"
+        delegation_policy: "adaptive"
+
+    # Legacy alias — mirrors `backends.flexgen` for older readers
     flexgen:
-      enabled: false               # Set to true to use FlexGen as execution backend
+      enabled: false
       model_name: "facebook/opt-6.7b"
       batch_size: 16
-      memory_limit_mb: 4096
-      precision_options: ["fp32", "fp16", "int8"]
-      default_precision: "fp16"
-      delegation_policy: "adaptive"   # adaptive | always | never
+      memory_limit_mb: 6144
+      precision_options: ["fp32", "fp16", "int8", "int4"]
+      default_precision: "int4"
+      delegation_policy: "adaptive"
