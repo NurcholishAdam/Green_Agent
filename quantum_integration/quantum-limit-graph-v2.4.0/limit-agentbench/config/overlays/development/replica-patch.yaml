@@ -1,100 +1,276 @@
+# =============================================================================
+# ray-cluster-dev.yaml — Standalone Development RayCluster (Enhanced v2)
+# =============================================================================
+# A complete, self-contained dev RayCluster that can be applied directly:
+#
+#     kubectl apply -f ray-cluster-dev.yaml
+#
+# This file is an ALTERNATIVE to the kustomize overlay
+# (`kubectl apply -k config/overlays/development`). Use one or the other,
+# not both — they both target the same object name and would conflict.
+#
+# Prefer the overlay when you already use kustomize. Prefer this file
+# when you want a single `kubectl apply -f` that ships the entire dev
+# cluster without any kustomize dependency.
+#
+# =============================================================================
+# !! DO NOT DEPLOY TO STAGING OR PRODUCTION !!
+# =============================================================================
+# The companion dev ConfigMap (`green-agent-config` in namespace
+# `green-agent-dev`) disables auth and TLS, and enables debug endpoints.
+# This RayCluster mounts that ConfigMap. Copying both to a non-dev
+# environment produces an unauthenticated, unencrypted service.
+# =============================================================================
+#
+# ---- Prerequisites (must exist before apply) ------------------------------
+#   1. Namespace `green-agent-dev`
+#   2. ServiceAccount `green-agent` in that namespace
+#      (with RBAC granting create/delete/get/list/watch/patch on pods)
+#   3. PersistentVolumeClaim `green-agent-data-pvc` in that namespace
+#   4. ConfigMap `green-agent-config` in that namespace, containing a
+#      `green_agent_config.yaml` key (the dev config)
+#   5. (Optional) PriorityClasses `green-agent-head`, `green-agent-worker`
+#
+# All five are provided by `config/overlays/development/` if you use the
+# overlay. If you're using this standalone file, create them first.
+#
+# ---- What this file fixes vs the original dev file ------------------------
+#   * Removes the 13 per-container env vars. The dev ConfigMap is the
+#     sole source of truth (matches the v2 base).
+#   * Adds image, serviceAccountName, component labels, containerPorts,
+#     volumeMounts + volumes, securityContext, startupProbe, liveness
+#     and readiness probes (head + worker), enableInTreeAutoscaling,
+#     terminationGracePeriodSeconds, ephemeral-storage limits, and the
+#     standard app.kubernetes.io/* labels — all of which were missing.
+#   * Dev-appropriate sizing: head 1/2 CPU / 2Gi/4Gi (from base 2/4 and
+#     4Gi/8Gi); worker 500m/1 CPU / 1Gi/2Gi (from base 1/2 and 2Gi/4Gi).
+#   * Worker replicas 2 with max 4 (from base 4 with max 20), matching
+#     the dev overlay's intent.
+#   * rayStartParams completed: dashboard-host, num-cpus, memory, and
+#     object-store-memory on head; object-store-memory on worker.
+#   * Removes 7 decorative green-agent/* annotations and the
+#     `enhancements: enabled` label.
+#   * `readOnlyRootFilesystem: true` on both containers, with the
+#     writable `/tmp` mount that setting requires.
+# =============================================================================
+
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
   name: green-agent-cluster
+  namespace: green-agent-dev
   labels:
     app: green-agent
-    enhancements: enabled
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: ray
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: "5.0.0"
+    app.kubernetes.io/environment: development
   annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
+    green-agent.example/environment: "development"
+    green-agent.example/do-not-deploy: "true"
 spec:
+  # Ray's autoscaler is opt-in. Without this, min/maxReplicas are
+  # advisory and the cluster stays at `replicas: 2` forever.
+  enableInTreeAutoscaling: true
+
+  # GCS fault tolerance requires the `full`-profile Redis; leave false
+  # for dev unless Redis is running.
+  gcsFaultTolerance: false
+
+  autoscalerOptions:
+    upscalingMode: Conservative
+    idleTimeoutSeconds: 1800
+
   headGroupSpec:
-    template:
-      spec:
-        containers:
-        - name: ray-head
-          env:
-          - name: ENHANCEMENTS_ENABLED
-            value: "true"
-          - name: LIMIT_GRAPH_ENABLED
-            value: "true"
-          - name: LIMIT_GRAPH_CENTRALITY
-            value: "0.5"
-          - name: LIMIT_GRAPH_CONNECTIVITY
-            value: "0.5"
-          - name: MODP_ENABLED
-            value: "true"
-          - name: MODP_WEIGHTS
-            value: "[0.4,0.3,0.2,0.1]"
-          - name: RLHF_ENABLED
-            value: "true"
-          - name: HUMAN_FEEDBACK_SCORE
-            value: "0.5"
-          - name: DISTILLATION_ENABLED
-            value: "true"
-          - name: MOE_GATING_ENABLED
-            value: "true"
-          - name: EVOLUTIONARY_ENABLED
-            value: "true"
-          - name: POPULATION_SIZE
-            value: "10"
-          - name: MUTATION_RATE
-            value: "0.1"
-          resources:
-            requests:
-              cpu: "1"
-              memory: "2Gi"
-            limits:
-              cpu: "2"
-              memory: "4Gi"
-  workerGroupSpecs:
-  - replicas: 2
-    minReplicas: 1
-    maxReplicas: 4
-    groupName: standard-workers
     rayStartParams:
-      num-cpus: '2'
-      memory: '4294967296'
+      dashboard-host: "0.0.0.0"
+      num-cpus: "2"
+      num-gpus: "0"
+      object-store-memory: "1000000000"   # ~1 GB — smaller than base
+      memory: "4000000000"                # ~4 GB — matches the limit below
+
     template:
+      metadata:
+        labels:
+          app: green-agent
+          component: head
+          app.kubernetes.io/name: green-agent
+          app.kubernetes.io/component: head
+
       spec:
+        serviceAccountName: green-agent
+        terminationGracePeriodSeconds: 300
+
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+
         containers:
-        - name: ray-worker
-          env:
-          - name: ENHANCEMENTS_ENABLED
-            value: "true"
-          - name: LIMIT_GRAPH_ENABLED
-            value: "true"
-          - name: LIMIT_GRAPH_CENTRALITY
-            value: "0.5"
-          - name: LIMIT_GRAPH_CONNECTIVITY
-            value: "0.5"
-          - name: MODP_ENABLED
-            value: "true"
-          - name: MODP_WEIGHTS
-            value: "[0.4,0.3,0.2,0.1]"
-          - name: RLHF_ENABLED
-            value: "true"
-          - name: HUMAN_FEEDBACK_SCORE
-            value: "0.5"
-          - name: DISTILLATION_ENABLED
-            value: "true"
-          - name: MOE_GATING_ENABLED
-            value: "true"
-          - name: EVOLUTIONARY_ENABLED
-            value: "true"
-          - name: POPULATION_SIZE
-            value: "10"
-          - name: MUTATION_RATE
-            value: "0.1"
-          resources:
-            requests:
-              cpu: "1"
-              memory: "2Gi"
-            limits:
-              cpu: "2"
-              memory: "4Gi"
+          - name: ray-head
+            image: ghcr.io/nurcholishadam/green_agent:v5.0.0-dev
+            imagePullPolicy: IfNotPresent
+
+            ports:
+              - { name: gcs,       containerPort: 6379 }
+              - { name: dashboard, containerPort: 8265 }
+              - { name: http,      containerPort: 8000 }
+              - { name: metrics,   containerPort: 9090 }
+
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop: ["ALL"]
+
+            # Only container-specific env vars. All enhancement and
+            # security config comes from the mounted ConfigMap.
+            env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: PROMETHEUS_PORT
+                value: "9090"
+
+            resources:
+              requests:
+                cpu: "1"
+                memory: "2Gi"
+              limits:
+                cpu: "2"
+                memory: "4Gi"
+                ephemeral-storage: "5Gi"
+
+            startupProbe:
+              httpGet:
+                path: /health
+                port: 8000
+              failureThreshold: 30
+              periodSeconds: 5
+              timeoutSeconds: 10
+
+            livenessProbe:
+              httpGet:
+                path: /health
+                port: 8000
+              initialDelaySeconds: 0
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+
+            readinessProbe:
+              httpGet:
+                path: /ready
+                port: 8000
+              initialDelaySeconds: 0
+              periodSeconds: 5
+              timeoutSeconds: 3
+              failureThreshold: 2
+
+            volumeMounts:
+              - name: config-volume
+                mountPath: /app/config
+                readOnly: true
+              - name: data-volume
+                mountPath: /app/data
+              - name: tmp-volume
+                mountPath: /tmp
+
+        volumes:
+          - name: config-volume
+            configMap:
+              name: green-agent-config
+              defaultMode: 0444
+          - name: data-volume
+            persistentVolumeClaim:
+              claimName: green-agent-data-pvc
+          - name: tmp-volume
+            emptyDir:
+              sizeLimit: 2Gi
+
+  workerGroupSpecs:
+    - groupName: standard-workers
+      replicas: 2
+      minReplicas: 1
+      maxReplicas: 4
+      rayStartParams:
+        num-cpus: "2"
+        num-gpus: "0"
+        object-store-memory: "500000000"   # ~500 MB
+
+      template:
+        metadata:
+          labels:
+            app: green-agent
+            component: worker
+            app.kubernetes.io/name: green-agent
+            app.kubernetes.io/component: worker
+
+        spec:
+          serviceAccountName: green-agent
+          terminationGracePeriodSeconds: 300
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+
+          containers:
+            - name: ray-worker
+              image: ghcr.io/nurcholishadam/green_agent:v5.0.0-dev
+              imagePullPolicy: IfNotPresent
+
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+
+              # Only container-specific env vars. The dev ConfigMap
+              # (mounted at /app/config) carries everything else.
+              env:
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+
+              resources:
+                requests:
+                  cpu: "500m"
+                  memory: "1Gi"
+                limits:
+                  cpu: "1"
+                  memory: "2Gi"
+                  ephemeral-storage: "5Gi"
+
+              livenessProbe:
+                exec:
+                  command: ["ray", "health-check", "--component", "raylet"]
+                initialDelaySeconds: 60
+                periodSeconds: 30
+                timeoutSeconds: 10
+                failureThreshold: 3
+
+              readinessProbe:
+                exec:
+                  command: ["ray", "health-check", "--component", "raylet"]
+                initialDelaySeconds: 30
+                periodSeconds: 10
+                timeoutSeconds: 5
+                failureThreshold: 2
+
+              volumeMounts:
+                - name: config-volume
+                  mountPath: /app/config
+                  readOnly: true
+                - name: tmp-volume
+                  mountPath: /tmp
+
+          volumes:
+            - name: config-volume
+              configMap:
+                name: green-agent-config
+                defaultMode: 0444
+            - name: tmp-volume
+              emptyDir:
+                sizeLimit: 2Gi
