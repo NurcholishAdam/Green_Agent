@@ -1,45 +1,118 @@
-# Green Agent - Distributed Runtime Requirements (Enhanced)
+# =============================================================================
+# Green Agent — Distributed Runtime Requirements (Enhanced v2)
+# =============================================================================
 # Location: requirements/distributed.txt
+#
+# ---- Critical fixes vs. v1 --------------------------------------------------
+# * ray[default]>=2.9.0 REMOVED. Ray < 2.52.0 carries CVE-2025-62593
+#   (unauthenticated dashboard RCE, CVSS 9.4, CISA KEV, actively exploited).
+#   Replaced with ray[serve,train,tune]>=2.52,<3.
+#   Ray 2.9.x also does NOT support Python 3.12+.
+# * gputil>=1.4.0 REPLACED with nvidia-ml-py>=13,<14. GPUtil's last release
+#   was 2018-12-18; it is unmaintained and unverified on modern CUDA/drivers.
+# * 11 duplicates of base.txt removed — re-declaring them as >=X.0.0 silently
+#   removed the <next_major caps fixed in base.txt.
+# * psutil capped <8 (latest is 7.2.2, a breaking major).
+#
+# ---- Inherits from base.txt -------------------------------------------------
+# numpy, pandas, scipy, pydantic, pydantic-settings, cryptography,
+# pyjwt[crypto], prometheus-client, tenacity, aiofiles, aiohttp, pyRAPL —
+# do NOT re-declare them here with weaker bounds.
+# =============================================================================
 
 -r base.txt
 
-# Ray for distributed execution
-ray[default]>=2.9.0
-ray[serve]>=2.9.0
 
-# Resource management
-psutil>=5.9.0
-gputil>=1.4.0
-py-cpuinfo>=9.0.0
+# =============================================================================
+# SECTION 1 — RAY DISTRIBUTED RUNTIME
+# =============================================================================
+# Ray 2.52.0 is the minimum safe floor (CVE-2025-62593). Ray 2.56+ supports
+# Python 3.10–3.14 and NumPy 2.x; base.txt already pins numpy<3.
+#
+# ray[serve]      = Core, Dashboard, Cluster Launcher, Serve
+# ray[serve] does NOT include Data/Train/Tune — declare them explicitly
+# because multi-teacher distillation needs distributed training + HPO.
 
-# ---------------------------------------------------------------------------
-# Advanced Enhancements (LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy
-# Distillation, Bio‑inspired Optimisation, Mixture‑of‑Experts expert gating)
-# ---------------------------------------------------------------------------
+ray[serve,train,tune]>=2.52,<3
+# ray[serve-grpc]>=2.52,<3        # uncomment if Serve uses gRPC ingress
+# ray[client]>=2.52,<3            # uncomment if connecting to a remote cluster
+# ray[data]>=2.52,<3              # uncomment if using Ray Data for logs
 
-# Historical ML teachers and model serialization for distillation
-scikit-learn>=1.3.0
-joblib>=1.3.0
 
-# Data handling for interaction logs and state vectors (CSV/JSON)
-pandas>=2.0.0
+# =============================================================================
+# SECTION 2 — RESOURCE MANAGEMENT / GPU TELEMETRY
+# =============================================================================
 
-# Pydantic schemas and settings management (for feedback events, descriptors, configs)
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
+psutil>=5.9,<8                    # 7.x is a breaking major; latest 7.2.2
+py-cpuinfo>=9.0,<10
 
-# Zero Trust security: cryptography, tokens
-cryptography>=41.0.0
-pyjwt>=2.8.0
+# GPUtil is abandoned (last release 2018-12-18, inactive on Snyk, sdist-only,
+# no official 3.12 support). Use NVIDIA's official NVML binding instead.
+nvidia-ml-py>=13,<14
 
-# Telemetry / monitoring (Prometheus client for MODP/RLHF metrics export)
-prometheus-client>=0.17.0
+# If existing code hard-imports ``GPUtil``, use the maintained fork instead:
+# GPUtil-fix>=1.4.0.post1,<2
+#
+# If you absolutely must keep the original (frozen at 1.4.0):
+# gputil==1.4.0; platform_system != "Darwin"
 
-# Retry logic with exponential backoff (circuit breakers, resilience)
-tenacity>=8.2.0
 
-# Asynchronous file I/O (persistence of routing logs, Q‑weights, etc.)
-aiofiles>=23.0.0
+# =============================================================================
+# SECTION 3 — GREEN AGENT TELEMETRY (carbon / energy across workers)
+# =============================================================================
 
-# Optional: async HTTP client for external APIs (carbon intensity, etc.)
-aiohttp>=3.8.0
+codecarbon>=2.3,<3                # per-node carbon accounting
+# nvidia-ml-py (above) provides per-GPU power draw for attribution
+# pyRAPL is inherited from base.txt for Intel RAPL CPU counters
+
+
+# =============================================================================
+# SECTION 4 — DISTRIBUTED OBSERVABILITY
+# =============================================================================
+
+opentelemetry-sdk>=1.24,<2
+opentelemetry-exporter-otlp>=1.24,<2
+
+memray>=1.13,<2                   # memory profiling across Ray workers
+py-spy>=0.3,<1                    # attach to workers without restart
+
+
+# =============================================================================
+# SECTION 5 — SERIALIZATION / I/O PERFORMANCE
+# =============================================================================
+
+orjson>=3.10,<4                   # fast JSON for logs / dashboard traffic
+msgspec>=0.18,<1                  # fast cross-process record serialization
+filelock>=3.13,<4                 # safe shared-filesystem checkpoint writes
+fsspec>=2024.2,<2026              # cloud filesystem abstraction
+
+# Pick the cloud backend(s) you actually deploy to:
+# s3fs>=2024.2,<2026
+# gcsfs>=2024.2,<2026
+# adlfs>=2024.2,<2026
+
+
+# =============================================================================
+# SECTION 6 — RELIABILITY
+# =============================================================================
+
+pybreaker>=1.0,<2                 # sync circuit breakers
+aiobreaker>=1.2,<2                # async circuit breakers (Serve replicas)
+# tenacity is inherited from base.txt for retry / backoff
+
+# Optional: external GCS / cross-cluster state
+# redis>=5.0,<6
+
+# Optional: faster event loop for Serve replicas (Linux/macOS only)
+uvloop>=0.19,<1; sys_platform != "win32"
+
+
+# =============================================================================
+# SECTION 7 — TESTING DISTRIBUTED CODE
+# =============================================================================
+
+pytest>=8.0,<9
+pytest-asyncio>=0.23,<1
+hypothesis>=6.98,<7               # property-based tests for reward/state invariants
+locust>=2.29,<3                   # load-test Serve deployments
+# pytest-ray>=0.2,<1              # local Ray cluster fixture (if available for your Ray version)
