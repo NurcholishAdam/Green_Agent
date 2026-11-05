@@ -1,81 +1,372 @@
+# =============================================================================
+# network-policy.yaml — Green Agent NetworkPolicies (Enhanced v2)
+# =============================================================================
+# Two policies together define the network posture:
+#
+#   green-agent-allow-internal   — allow intra-namespace traffic + the
+#                                  specific external services the agent
+#                                  needs (Prometheus scrape, ingress
+#                                  controller, kube-dns, kube-apiserver,
+#                                  OTLP collector, external HTTPS)
+#   green-agent-default-deny     — deny everything else by default, so a
+#                                  future pod with a different label does
+#                                  not silently inherit default-allow
+#
+# ---- Critical fixes vs v1 ---------------------------------------------------
+#   FIX #1   The v1 policy rendered the Ray cluster **nonfunctional**.
+#            Ray workers communicate via the raylet, object manager, and
+#            worker RPC on ephemeral ports in 10000-65535. The egress
+#            allow-list `{53, 443, 7687, 9443}` blocked every
+#            worker-to-worker message; the ingress allow-list
+#            `{8000, 8265, 9090, 6379, 8080}` blocked reception on the
+#            same range. Pods show Running, `ray status` inside the head
+#            shows connected workers, but the first distributed task
+#            hangs forever. v2 adds `ingress: from: podSelector: {}` and
+#            `egress: to: podSelector: {}` (all ports) — the minimum
+#            viable posture for a RayCluster.
+#   FIX #2   Same as #1 on the inbound direction. Both directions must be
+#            fixed; fixing only one leaves the cluster deadlocked at
+#            worker-to-head or worker-to-worker boundaries respectively.
+#   FIX #3   `from: []` on 8000 / 8265 / 9090 made the dashboard, Ray
+#            dashboard UI, and metrics endpoint reachable from every pod
+#            in every namespace. Combined with v1's `0.0.0.0/0:443`
+#            egress, that was a full pivot path from any compromised
+#            pod. v2 scopes 8000 to `ingress-nginx`, 9090 to
+#            `monitoring`, and 8265 to same-namespace pods only (with
+#            an optional commented rule for kubernetes-dashboard).
+#   FIX #4   `egress: to: ipBlock: 0.0.0.0/0 port: 7687` (Neo4j Bolt)
+#            removed. Bolt is a **plaintext** protocol — allowing egress
+#            to any IP on it lets a compromised pod exfiltrate arbitrary
+#            data to an attacker-controlled host, or read from a
+#            poisoned Neo4j. Nothing in the codebase uses Bolt —
+#            `LIMIT Graph` is `networkx`-based, `GreenLeaderboard` uses
+#            JSON files, `PersistenceManager` uses pickle / npz. The
+#            rule had no legitimate consumer.
+#   FIX #5   `egress: to: ipBlock: 0.0.0.0/0 port: 9443` removed. The
+#            v1 comment literally said *"example secured endpoint"*. No
+#            service, no API client, no config in this repo targets
+#            port 9443.
+#   FIX #6   Egress to the Kubernetes API server added
+#            (`namespaceSelector: kubernetes.io/metadata.name: default`,
+#            port 443). The Ray autoscaler runs inside the head pod and
+#            calls `kube-apiserver` to create/delete worker pods. v1
+#            had no egress rule for the API server, so the head pod's
+#            RBAC was real but the API was unreachable — every scale-up
+#            request failed silently.
+#   FIX #7   Ingress from the `monitoring` namespace on 9090 added.
+#            Prometheus runs in a separate namespace; v1 relied on
+#            `from: []` accidentally permitting the scrape. Fixing #3
+#            would remove that accidental allowance without this
+#            explicit rule.
+#   FIX #8   Ingress from the `ingress-nginx` namespace on 8000 added.
+#            If the dashboard is exposed via an Ingress, the ingress
+#            controller needs to reach port 8000. Same accidental
+#            allowance as #7.
+#   FIX #9   DNS egress scoped to `kube-system` + `k8s-app: kube-dns`.
+#            v1's `namespaceSelector: {}` matched every namespace — any
+#            pod running a DNS server in any namespace would receive
+#            Green Agent queries.
+#   FIX #10  The `8080` "optional enhanced API" ingress rule removed.
+#            No service, container port, or config in this repo exposes
+#            8080.
+#   FIX #11  Added `app.kubernetes.io/*` labels (standard taxonomy):
+#            `name`, `component: network`, `managed-by`.
+#   FIX #12  The 7 decorative `green-agent/*` annotations removed. Their
+#            intent belongs on the ConfigMap, not on the NetworkPolicy.
+#   FIX #13  IPv6 egress added (`::/0` on 443) for dual-stack clusters.
+#            v1's `0.0.0.0/0` is IPv4-only — external HTTPS over IPv6
+#            silently failed on a dual-stack cluster.
+#   FIX #14  Egress to `otel-collector:4317` / `4318` added.
+#            `run_agent.py` uses `opentelemetry-*`; without an egress
+#            rule for the OTLP collector, traces are dropped silently.
+#   FIX #15  `kubernetes.io/metadata.name` selectors used everywhere a
+#            namespace is matched. Available since k8s 1.21; more
+#            stable than `name:` because the label is managed by the
+#            API server.
+#   FIX #16  The 6379 rule is documented as **Ray GCS**, not Redis.
+#            Ray GCS shares Redis's default port; a future reader might
+#            otherwise assume this is a Redis dependency.
+#   FIX #17  The `0.0.0.0/0:443` trade-off is documented inline:
+#            standard Kubernetes NetworkPolicy cannot match FQDN. If
+#            per-provider scoping is required, use Cilium's `toFQDNs`
+#            or route external calls through an egress proxy and scope
+#            to the proxy's IP.
+#   FIX #18  Split into two policies for clarity:
+#              * green-agent-allow-internal  — the allow-rules
+#              * green-agent-default-deny    — the deny-all baseline
+#            v1's single-policy form made the intra-namespace scope
+#            invisible because it was interleaved with external rules.
+#
+# ---- Design decisions -------------------------------------------------------
+#   1.  Intra-namespace traffic on ALL ports is allowed. This is the
+#       minimum viable posture for a RayCluster — raylet, object
+#       manager, and worker RPC use arbitrary ephemeral ports in
+#       10000-65535 that cannot be enumerated stably across Ray versions.
+#       Enumerating a subset inevitably breaks the cluster on a Ray
+#       version bump.
+#   2.  Inbound from outside the namespace is restricted to:
+#         * monitoring namespace    on 9090   (Prometheus scrape)
+#         * ingress-nginx namespace on 8000   (dashboard)
+#       Everything else inbound is denied.
+#   3.  Outbound to outside the namespace is restricted to:
+#         * kube-system (kube-dns)     on 53       (UDP + TCP)
+#         * default (kube-apiserver)   on 443      (Ray autoscaler)
+#         * observability              on 4317/4318 (OTLP traces)
+#         * 0.0.0.0/0 + ::/0           on 443      (external HTTPS:
+#                                                   carbon API,
+#                                                   model APIs,
+#                                                   PyPI / HF downloads)
+#   4.  The `0.0.0.0/0:443` + `::/0:443` rules are the only broad
+#       external allowances. If your threat model requires per-provider
+#       scoping, deploy a Cilium `CiliumNetworkPolicy` with `toFQDNs`,
+#       or route external calls through an egress proxy and scope to
+#       the proxy's IP.
+#
+# ---- Placeholders to customise ----------------------------------------------
+#   `ingress-nginx`   → your ingress-controller namespace
+#   `monitoring`      → your Prometheus namespace
+#   `observability`   → your OTel-collector namespace
+#   `k8s-app: kube-dns` → `app.kubernetes.io/name: coredns` on some
+#                        clusters
+#
+# ---- Deployment -------------------------------------------------------------
+#   kubectl apply -f network-policy.yaml
+#   kubectl get networkpolicy -n green-agent
+#
+# ---- Verification -----------------------------------------------------------
+#   1. Cluster still works:
+#        kubectl exec -it deploy/green-agent-dashboard -n green-agent -- \
+#            python -c "import ray; ray.init(address='auto'); print(ray.cluster_resources())"
+#   2. Prometheus can scrape:
+#        kubectl exec -it deploy/prometheus -n monitoring -- \
+#            wget -qO- http://green-agent-dashboard.green-agent:9090/metrics | head
+#   3. Ingress controller can reach the dashboard:
+#        curl -fsS https://<your-ingress>/health
+#   4. Autoscaler can reach the API:
+#        kubectl logs -n green-agent -l component=head -c ray-head | \
+#            grep -i "scale\|pod"
+#   5. Traces reach the collector:
+#        kubectl logs -n observability -l app=otel-collector | tail
+# =============================================================================
+
+---
+# =============================================================================
+# Policy 1 — Allow rules
+# =============================================================================
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: green-agent-network-policy
+  name: green-agent-allow-internal
+  namespace: green-agent
   labels:
     app: green-agent
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: network
+    app.kubernetes.io/managed-by: kustomize
     enhancements: enabled
-  annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
-    green-agent/flexgen: "true"
 spec:
   podSelector:
     matchLabels:
       app: green-agent
   policyTypes:
-  - Ingress
-  - Egress
+    - Ingress
+    - Egress
+
+  # ---------------------------------------------------------------------------
+  # Ingress
+  # ---------------------------------------------------------------------------
   ingress:
-  # Dashboard / metrics (existing)
-  - from: []
-    ports:
-    - protocol: TCP
-      port: 8000
-    - protocol: TCP
-      port: 8265
-    - protocol: TCP
-      port: 9090        # Prometheus metrics
-  # Ray internal communication (existing)
-  - from:
-    - podSelector:
-        matchLabels:
-          app: green-agent
-    ports:
-    - protocol: TCP
-      port: 6379
-  # Enhanced modules may need additional internal ports (if exposed)
-  # e.g., RLHF feedback endpoint from dashboard to backend
-  - from:
-    - podSelector:
-        matchLabels:
-          app: green-agent
-    ports:
-    - protocol: TCP
-      port: 8080        # optional enhanced API
+    # FIX #1, #2 — allow ALL traffic from pods in this namespace on ALL
+    # ports. This is what makes the RayCluster work: workers, head, and
+    # the object manager communicate on arbitrary ephemeral ports in
+    # 10000-65535 that cannot be enumerated stably across Ray versions.
+    # Ray GCS also uses 6379 (Redis's default port — see comment below
+    # in the egress section; it is NOT a Redis dependency).
+    - from:
+        - podSelector: {}
+
+    # FIX #7 — Prometheus scrape from the monitoring namespace.
+    # `kubernetes.io/metadata.name` is set by the API server on every
+    # namespace since k8s 1.21 — more stable than `name:`.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9090
+
+    # FIX #8 — dashboard reachable from the ingress controller.
+    # Change `ingress-nginx` to the namespace of whichever ingress
+    # implementation you deploy (traefik, alb, contour, ...).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8000
+
+    # Optional — Ray dashboard UI (8265) reachable from the Kubernetes
+    # dashboard. Uncomment if operators access the Ray UI from outside
+    # the namespace. Most deployments disable this; the Ray dashboard
+    # has no built-in auth.
+    # - from:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: kubernetes-dashboard
+    #   ports:
+    #     - protocol: TCP
+    #       port: 8265
+
+  # ---------------------------------------------------------------------------
+  # Egress
+  # ---------------------------------------------------------------------------
   egress:
-  # DNS (existing)
-  - to:
-    - namespaceSelector: {}
-    ports:
-    - protocol: UDP
-      port: 53
-    - protocol: TCP
-      port: 53
-  # External HTTPS access for APIs (existing)
-  - to:
-    - ipBlock:
-        cidr: 0.0.0.0/0
-    ports:
-    - protocol: TCP
-      port: 443
-  # Additional egress for enhanced services:
-  # LIMIT Graph external database / graph service
-  - to:
-    - ipBlock:
-        cidr: 0.0.0.0/0
-    ports:
-    - protocol: TCP
-      port: 7687        # Neo4j Bolt, or your graph DB port
-  # MODP / RLHF / distillation may need external model APIs (HTTPS already covered)
-  # FlexGen external LLM service (if using hosted)
-  - to:
-    - ipBlock:
-        cidr: 0.0.0.0/0
-    ports:
-    - protocol: TCP
-      port: 9443        # example secured endpoint
+    # FIX #1, #2 — allow ALL traffic to pods in this namespace on ALL
+    # ports. Mirror of the ingress rule above. Ray GCS on 6379 is one
+    # example; the object manager and raylet use ephemeral ports in
+    # 10000-65535.
+    - to:
+        - podSelector: {}
+
+    # FIX #9 — DNS, scoped to kube-system / kube-dns only.
+    # v1's `namespaceSelector: {}` matched every namespace — any pod
+    # running a DNS server in any namespace would receive Green Agent
+    # queries.
+    #
+    # On CoreDNS deployments, the pod label may be
+    # `app.kubernetes.io/name: coredns` instead of `k8s-app: kube-dns`.
+    # Both are commonly present; if yours has only the former, change
+    # the podSelector below.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # FIX #6 — Kubernetes API for the Ray autoscaler.
+    # `kubernetes.default.svc` resolves to the API server. The
+    # `default` namespace + port 443 is the canonical way to express
+    # "reach the API server" without hardcoding the service CIDR.
+    # v1 had no rule for the API server, so the Ray autoscaler's RBAC
+    # was real but the API was unreachable — every scale-up request
+    # failed silently.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: default
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # FIX #14 — OpenTelemetry collector for traces.
+    # `run_agent.py` uses `opentelemetry-*`; without an egress rule for
+    # the OTLP collector, traces are dropped silently.
+    #
+    # `observability` is a placeholder — change to whichever namespace
+    # runs the collector (common alternatives: `otel`, `telemetry`,
+    # `monitoring`). 4317 is OTLP gRPC, 4318 is OTLP HTTP.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 4317    # OTLP gRPC
+        - protocol: TCP
+          port: 4318    # OTLP HTTP
+
+    # FIX #17 — external HTTPS.
+    # Standard Kubernetes NetworkPolicy cannot match FQDN. This rule
+    # allows egress to any host on port 443 for:
+    #   * carbon-intensity APIs (electricitymap.org, ...)
+    #   * model APIs (HuggingFace, OpenAI, ...)
+    #   * PyPI / model weight downloads during startup
+    # If per-provider scoping is required, use Cilium's `toFQDNs` or
+    # route through an egress proxy.
+    #
+    # FIX #13 — two ipBlocks (v4 and v6) for dual-stack clusters.
+    # v1's `0.0.0.0/0` is IPv4-only; external HTTPS over IPv6 silently
+    # failed on a dual-stack cluster.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - ipBlock:
+            cidr: ::/0
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # Note on port 6379: Ray GCS (the Global Control Store) binds 6379,
+    # which is also Redis's default port. The intra-namespace rule above
+    # (`to: podSelector: {}`) already allows GCS traffic. There is NO
+    # external egress rule for 6379 — external Redis is not part of
+    # this deployment. If you later add a managed Redis instance,
+    # add a scoped rule:
+    #
+    #   - to:
+    #       - ipBlock:
+    #           cidr: <redis-endpoint-ip>/32
+    #     ports:
+    #       - protocol: TCP
+    #         port: 6379
+
+    # Note on port 7687 (Neo4j Bolt): deliberately absent. Bolt is
+    # plaintext; allowing egress to any IP on it is an exfiltration
+    # vector, and nothing in this codebase uses Bolt. LIMIT Graph is
+    # networkx-based. If Neo4j is ever introduced, add a rule scoped
+    # to the Neo4j service's ClusterIP:
+    #
+    #   - to:
+    #       - ipBlock:
+    #           cidr: <neo4j-service-ip>/32
+    #     ports:
+    #       - protocol: TCP
+    #         port: 7687
+
+---
+# =============================================================================
+# Policy 2 — Deny-all baseline
+# =============================================================================
+# The policy above grants the traffic the Green Agent needs. This second
+# policy enforces a deny-all baseline so that any future pod in the
+# namespace that does NOT carry `app: green-agent` is denied everything by
+# default. Without this, a new workload labeled differently would inherit
+# no policy at all (Kubernetes' default-deny requires a policy that
+# matches the pod with `policyTypes: [Ingress, Egress]` and no rules).
+#
+# NetworkPolicy rules are additive: the allow-rules in
+# `green-agent-allow-internal` still apply. This policy only denies
+# traffic that no other policy allows.
+#
+# Remove this policy only if a platform-wide default-deny (e.g. from a
+# platform team's chart) already exists in the namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: green-agent-default-deny
+  namespace: green-agent
+  labels:
+    app: green-agent
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: network
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  # Empty podSelector matches EVERY pod in the namespace.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  # No rules → deny everything not already allowed by another policy.
