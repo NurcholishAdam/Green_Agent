@@ -1,56 +1,140 @@
-# Prometheus Configuration for Green Agent v5.0.0 (Enhanced)
-# ========================================================
-# Deploy alongside Green Agent to scrape metrics and evaluate alerting rules.
-# Adds support for advanced enhancement metrics:
-#   - LIMIT Graph (centrality, connectivity)
-#   - MODP (multi‑objective composite score)
-#   - RLHF (human feedback)
-#   - Multi‑Teacher Distillation (update rate)
-#   - MoE Gating (gate stability)
-#   - Bio‑inspired Optimisation (evolutionary fitness)
-#   - FlexGen (energy consumption)
+# ============================================================================
+# Green Agent v5.0.0 — Complete Prometheus Bundle (Single File)
+# ============================================================================
+# This is ONE file containing:
+#   1. The main Prometheus configuration (prometheus.yml)
+#   2. The enhanced-module absent/liveness rules
+#   3. The Prometheus self-monitoring rules
+#
+# Prometheus technically requires rule_files to live in separate files at
+# runtime. Each YAML document below (separated by `---`) is annotated with
+# a `# === SAVE AS: <path> ===` header telling you exactly where to split
+# it if you deploy. Reading/editing, it is a single file.
+# ============================================================================
 
+
+# ============================================================================
+# === SAVE AS: prometheus.yml ===
+# ============================================================================
 global:
   scrape_interval: 30s
   evaluation_interval: 30s
+  scrape_timeout: 10s
   external_labels:
+    # `environment` is derived per-target from the K8s namespace, so
+    # staging/dev metrics are never mislabeled as production.
     cluster: 'green-agent-prod'
-    environment: 'production'
     region: 'us-east-1'
+    prometheus_replica: '$(POD_NAME)'   # injected via Downward API / envsubst
 
-# Rule files for alerting and recording
+# ----------------------------------------------------------------------------
+# Rule files — after splitting this bundle, these must exist on disk.
+# ----------------------------------------------------------------------------
 rule_files:
   - "rules/green_agent_alerts.yml"
   - "rules/helium_alerts.yml"
   - "rules/green_agent_recording.yml"
-  # --- Enhanced rule files for advanced modules ---
-  - "rules/enhanced_alerts.yml"           # Alerts for MODP, RLHF, graph, distillation, MoE, evolutionary, FlexGen
-  - "rules/enhanced_recording.yml"        # Recording rules for enhanced metrics (optional)
+  - "rules/enhanced_alerts.yml"
+  - "rules/enhanced_recording.yml"
+  - "rules/enhanced_absent_alerts.yml"     # below in this bundle
+  - "rules/prometheus_self_alerts.yml"     # below in this bundle
 
-# Alertmanager configuration
+# ----------------------------------------------------------------------------
+# Alertmanager configuration (HA-ready, mTLS)
+# ----------------------------------------------------------------------------
 alerting:
   alertmanagers:
     - static_configs:
-        - targets: ['alertmanager:9093']
-      scheme: http
+        - targets:
+            - 'alertmanager-0.alertmanager-headless:9093'
+            - 'alertmanager-1.alertmanager-headless:9093'
+            - 'alertmanager-2.alertmanager-headless:9093'
+      scheme: https
       timeout: 10s
+      api_version: v2
+      tls_config:
+        ca_file: /etc/prometheus/certs/ca.crt
+        cert_file: /etc/prometheus/certs/client.crt
+        key_file: /etc/prometheus/certs/client.key
+        insecure_skip_verify: false
+      # authorization:
+      #   type: Bearer
+      #   credentials_file: /etc/prometheus/secrets/alertmanager-token
 
+# ----------------------------------------------------------------------------
 # Scrape configurations
+# ----------------------------------------------------------------------------
 scrape_configs:
+
+  # ==========================================================================
   # Prometheus self-monitoring
+  # ==========================================================================
   - job_name: 'prometheus'
+    scrape_interval: 15s
     static_configs:
       - targets: ['localhost:9090']
+    relabel_configs:
+      - target_label: environment
+        replacement: production
+      - target_label: component
+        replacement: prometheus
 
-  # Green Agent metrics (includes helium and enhanced metrics automatically)
+  # ==========================================================================
+  # Alertmanager self-monitoring
+  # ==========================================================================
+  - job_name: 'alertmanager'
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - 'alertmanager-0.alertmanager-headless:9093'
+          - 'alertmanager-1.alertmanager-headless:9093'
+          - 'alertmanager-2.alertmanager-headless:9093'
+    scheme: https
+    tls_config:
+      ca_file: /etc/prometheus/certs/ca.crt
+      cert_file: /etc/prometheus/certs/client.crt
+      key_file: /etc/prometheus/certs/client.key
+    relabel_configs:
+      - target_label: environment
+        replacement: production
+      - target_label: component
+        replacement: alertmanager
+
+  # ==========================================================================
+  # kube-state-metrics — cluster state
+  # ==========================================================================
+  - job_name: 'kube-state-metrics'
+    scrape_interval: 30s
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names: [kube-system]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        regex: kube-state-metrics
+        action: keep
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: kubernetes_namespace
+      - target_label: component
+        replacement: kube-state-metrics
+
+  # ==========================================================================
+  # Green Agent — primary metrics (helium + enhanced modules)
+  # ==========================================================================
   - job_name: 'green-agent'
-    honor_labels: true
+    honor_labels: false
     scrape_interval: 30s
     scrape_timeout: 10s
     metrics_path: /metrics
     scheme: http
 
-    # Kubernetes service discovery
+    # --- Scrape safety limits (cardinality protection) ----------------------
+    sample_limit: 50000
+    label_limit: 30
+    label_name_length_limit: 200
+    label_value_length_limit: 500
+    body_size_limit: 10MB
+
     kubernetes_sd_configs:
       - role: endpoints
         namespaces:
@@ -59,61 +143,404 @@ scrape_configs:
             - green-agent-staging
             - green-agent-dev
 
-    # Relabeling for auto-discovery
+    # --- Relabeling ---------------------------------------------------------
     relabel_configs:
+      # 1. Only services that explicitly opt in
       - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
         action: keep
-        regex: true
+        regex: "true"
 
+      # 2. Require a numeric port annotation
       - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_port]
-        action: replace
-        target_label: __metrics_port__
-        regex: (\d+)
+        action: keep
+        regex: \d+
 
-      - source_labels: [__address__, __metrics_port__]
+      # 3. Only ready endpoints
+      - source_labels: [__meta_kubernetes_endpoint_ready]
+        action: keep
+        regex: "true"
+
+      # 4. Rewrite __address__ to use the annotated port
+      - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
         action: replace
         regex: ([^:]+)(?::\d+)?;(\d+)
         replacement: $1:$2
         target_label: __address__
 
+      # 5. Respect prometheus.io/scheme
+      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]
+        action: replace
+        target_label: __scheme__
+        regex: (https?)
+
+      # 6. Respect prometheus.io/path
+      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+
+      # 7. Propagate target labels
       - source_labels: [__meta_kubernetes_namespace]
         action: replace
         target_label: kubernetes_namespace
-
       - source_labels: [__meta_kubernetes_pod_name]
         action: replace
         target_label: pod
-
       - source_labels: [__meta_kubernetes_pod_label_app]
         action: replace
         target_label: app
-
       - source_labels: [__meta_kubernetes_pod_label_component]
         action: replace
         target_label: component
-
-      # Additional relabeling for enhanced modules (optional, to identify enhancement pods)
       - source_labels: [__meta_kubernetes_pod_label_enhancements]
         action: replace
         target_label: enhancements
-        regex: '(.+)'
+        regex: "(.+)"
 
-  # Optional: Node exporter for infrastructure metrics
+      # 8. Derive `environment` from namespace
+      - source_labels: [__meta_kubernetes_namespace]
+        regex: 'green-agent-production'
+        target_label: environment
+        replacement: production
+      - source_labels: [__meta_kubernetes_namespace]
+        regex: 'green-agent-staging'
+        target_label: environment
+        replacement: staging
+      - source_labels: [__meta_kubernetes_namespace]
+        regex: 'green-agent-dev'
+        target_label: environment
+        replacement: dev
+
+      # 9. Derive `enhancement_module` from pod label (first matching wins)
+      - source_labels: [__meta_kubernetes_pod_label_enhancements]
+        regex: '.*modp.*'
+        target_label: enhancement_module
+        replacement: modp
+      - source_labels: [__meta_kubernetes_pod_label_enhancements]
+        regex: '.*rlhf.*'
+        target_label: enhancement_module
+        replacement: rlhf
+      - source_labels: [__meta_kubernetes_pod_label_enhancements]
+        regex: '.*moe.*'
+        target_label: enhancement_module
+        replacement: moe
+      - source_labels: [__meta_kubernetes_pod_label_enhancements]
+        regex: '.*flexgen.*'
+        target_label: enhancement_module
+        replacement: flexgen
+
+    # --- Metric-level relabeling (cardinality control) ----------------------
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'green_agent_debug_.*'
+        action: drop
+      - source_labels: [__name__]
+        regex: 'green_agent_http_request_duration_seconds_bucket'
+        action: drop
+      - source_labels: [__name__]
+        regex: 'go_(memstats|gc)_.*'
+        action: drop
+      # Bound RLHF user cardinality: hash user_id, drop raw
+      - source_labels: [__name__, user_id]
+        regex: 'green_agent_rlhf_feedback_total;(.+)'
+        target_label: user_id_hash
+        replacement: '${1}'
+        action: replace
+      - regex: 'user_id'
+        action: labeldrop
+
+    # --- Optional scrape auth (enable if agent supports it) -----------------
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/secrets/green-agent-token
+    # tls_config:
+    #   ca_file: /etc/prometheus/certs/ca.crt
+    #   cert_file: /etc/prometheus/certs/client.crt
+    #   key_file: /etc/prometheus/certs/client.key
+    #   insecure_skip_verify: false
+
+  # ==========================================================================
+  # Node exporter
+  # ==========================================================================
   - job_name: 'node-exporter'
+    scrape_interval: 15s
     static_configs:
       - targets: ['node-exporter:9100']
-    scrape_interval: 15s
+    relabel_configs:
+      - target_label: environment
+        replacement: production
+      - target_label: component
+        replacement: node-exporter
 
-# Remote write configuration (Optional: for Thanos/Cortex/Mimir)
-# remote_write:
-#   - url: 'https://thanos-receive.example.com/api/v1/receive'
-#     remote_timeout: 30s
-#     queue_config:
-#       max_samples_per_send: 1000
-#       capacity: 10000
-#       max_shards: 50
-#     tls_config:
-#       ca_file: /etc/prometheus/certs/ca.crt
-#     basic_auth:
-#       username: 'prometheus'
-#       password_file: /etc/prometheus/secrets/remote-write-password
+# ----------------------------------------------------------------------------
+# Remote write — Thanos / Mimir / Cortex
+# ----------------------------------------------------------------------------
+remote_write:
+  - url: 'https://thanos-receive.example.com/api/v1/receive'
+    remote_timeout: 30s
+    name: thanos-primary
+
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'green_agent_debug_.*'
+        action: drop
+      - source_labels: [__name__]
+        regex: 'go_.*'
+        action: drop
+      - source_labels: [__name__]
+        regex: 'promhttp_.*'
+        action: drop
+      - source_labels: [__name__]
+        regex: 'green_agent_http_request_duration_seconds_bucket'
+        action: drop
+
+    queue_config:
+      max_samples_per_send: 2000
+      capacity: 20000
+      max_shards: 50
+      min_shards: 2
+      max_retries: 10
+      min_backoff: 30ms
+      max_backoff: 5s
+      batch_send_deadline: 5s
+
+    metadata_config:
+      send: true
+      send_interval: 1m
+
+    send_exemplars: false
+
+    tls_config:
+      ca_file: /etc/prometheus/certs/ca.crt
+      cert_file: /etc/prometheus/certs/client.crt
+      key_file: /etc/prometheus/certs/client.key
+      insecure_skip_verify: false
+
+    basic_auth:
+      username: 'prometheus'
+      password_file: /etc/prometheus/secrets/remote-write-password
+
+
+# ============================================================================
+# === SAVE AS: rules/enhanced_absent_alerts.yml ===
+# ============================================================================
+# Liveness / absent-metric guards for MODP, RLHF, LIMIT graph, distillation,
+# MoE gating, evolutionary fitness, and FlexGen. Threshold rules live in
+# enhanced_alerts.yml; this file catches *silence* (missing metrics).
+# ============================================================================
+---
+groups:
+  - name: enhanced_absent_alerts
+    interval: 30s
+    rules:
+
+      # ---- MODP -----------------------------------------------------------
+      - alert: GreenAgentMODPMetricMissing
+        expr: absent(green_agent_modp_composite_score{job="green-agent"})
+        for: 10m
+        labels:
+          severity: warning
+          module: modp
+        annotations:
+          summary: "MODP composite score metric missing"
+          description: "No green_agent_modp_composite_score samples in the last 10m."
+          runbook_url: "https://runbooks.example.com/green-agent/modp-missing"
+
+      - alert: GreenAgentMODPScoreDegraded
+        expr: green_agent_modp_composite_score{job="green-agent"} < 0.5
+        for: 15m
+        labels:
+          severity: warning
+          module: modp
+        annotations:
+          summary: "MODP composite score below 0.5"
+          description: "MODP score is {{ $value }} in {{ $labels.environment }}."
+
+      # ---- RLHF -----------------------------------------------------------
+      - alert: GreenAgentRLHFMetricMissing
+        expr: absent(green_agent_rlhf_feedback_total{job="green-agent"})
+        for: 15m
+        labels:
+          severity: warning
+          module: rlhf
+        annotations:
+          summary: "RLHF feedback counter missing"
+          description: "No RLHF feedback samples in {{ $labels.environment }}."
+
+      - alert: GreenAgentRLHFNegativeRateHigh
+        expr: |
+          sum(rate(green_agent_rlhf_feedback_total{job="green-agent",rating="negative"}[15m]))
+            /
+          sum(rate(green_agent_rlhf_feedback_total{job="green-agent"}[15m]))
+            > 0.30
+        for: 20m
+        labels:
+          severity: warning
+          module: rlhf
+        annotations:
+          summary: "RLHF negative feedback rate above 30%"
+          description: "Negative RLHF rate is {{ $value | humanizePercentage }} in {{ $labels.environment }}."
+
+      # ---- LIMIT Graph ----------------------------------------------------
+      - alert: GreenAgentGraphMetricMissing
+        expr: absent(green_agent_limit_graph_centrality_score{job="green-agent"})
+        for: 10m
+        labels:
+          severity: warning
+          module: limit_graph
+        annotations:
+          summary: "LIMIT graph centrality metric missing"
+          description: "Graph centrality metric absent in {{ $labels.environment }}."
+
+      - alert: GreenAgentGraphConnectivityLow
+        expr: green_agent_limit_graph_connectivity_ratio{job="green-agent"} < 0.6
+        for: 15m
+        labels:
+          severity: warning
+          module: limit_graph
+        annotations:
+          summary: "Graph connectivity below 0.6"
+          description: "Connectivity is {{ $value }} in {{ $labels.environment }}."
+
+      # ---- Multi-Teacher Distillation -------------------------------------
+      - alert: GreenAgentDistillationUpdateRateLow
+        expr: rate(green_agent_distillation_updates_total{job="green-agent"}[15m]) < 0.01
+        for: 20m
+        labels:
+          severity: warning
+          module: distillation
+        annotations:
+          summary: "Distillation update rate near zero"
+          description: "Distillation not updating in {{ $labels.environment }} (rate={{ $value }}/s)."
+
+      # ---- MoE Gating -----------------------------------------------------
+      - alert: GreenAgentMoEGateUnstable
+        expr: stddev_over_time(green_agent_moe_gate_weight{job="green-agent"}[10m]) > 0.25
+        for: 15m
+        labels:
+          severity: warning
+          module: moe
+        annotations:
+          summary: "MoE gate weight instability detected"
+          description: "Gate weight stddev over 10m is {{ $value }} in {{ $labels.environment }}."
+
+      # ---- Bio-inspired / Evolutionary ------------------------------------
+      - alert: GreenAgentEvolutionaryFitnessRegression
+        expr: |
+          green_agent_evolutionary_fitness{job="green-agent"}
+            <
+          green_agent_evolutionary_fitness{job="green-agent"} offset 1h
+        for: 30m
+        labels:
+          severity: warning
+          module: evolutionary
+        annotations:
+          summary: "Evolutionary fitness regressed vs 1h ago"
+          description: "Fitness dropped to {{ $value }} in {{ $labels.environment }}."
+
+      # ---- FlexGen Energy -------------------------------------------------
+      - alert: GreenAgentFlexGenMetricMissing
+        expr: absent(green_agent_flexgen_energy_consumed_joules_total{job="green-agent"})
+        for: 15m
+        labels:
+          severity: warning
+          module: flexgen
+        annotations:
+          summary: "FlexGen energy metric missing"
+          description: "Energy counter absent in {{ $labels.environment }}."
+
+      - alert: GreenAgentFlexGenEnergySpike
+        expr: |
+          rate(green_agent_flexgen_energy_consumed_joules_total{job="green-agent"}[5m])
+            >
+          2 * avg_over_time(rate(green_agent_flexgen_energy_consumed_joules_total{job="green-agent"}[1h] offset 5m))
+        for: 10m
+        labels:
+          severity: warning
+          module: flexgen
+        annotations:
+          summary: "FlexGen energy consumption spike (>2x hourly avg)"
+          description: "Energy rate is {{ $value }} J/s in {{ $labels.environment }}."
+
+      # ---- Global liveness ------------------------------------------------
+      - alert: GreenAgentTargetDown
+        expr: up{job="green-agent"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Green Agent scrape target is down"
+          description: "Target {{ $labels.instance }} in {{ $labels.environment }} has been down for 5m."
+
+      - alert: GreenAgentNoTargets
+        expr: absent(up{job="green-agent"} == 1)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No healthy Green Agent targets discovered"
+          description: "Prometheus is not scraping any healthy Green Agent instance."
+
+
+# ============================================================================
+# === SAVE AS: rules/prometheus_self_alerts.yml ===
+# ============================================================================
+---
+groups:
+  - name: prometheus_self_alerts
+    interval: 30s
+    rules:
+
+      - alert: PrometheusRuleEvaluationFailures
+        expr: rate(prometheus_rule_evaluation_failures_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus rule evaluation failures"
+          description: "Rule group {{ $labels.rule_group }} is failing to evaluate."
+
+      - alert: PrometheusTargetScrapeFailing
+        expr: rate(prometheus_target_scrapes_exceeded_sample_limit_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scrape sample limit exceeded"
+          description: "Job {{ $labels.job }} exceeded sample_limit — check cardinality."
+
+      - alert: PrometheusConfigReloadFailed
+        expr: prometheus_config_last_reload_successful == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus config reload failed"
+          description: "Last config reload was unsuccessful; fix and reload."
+
+      - alert: PrometheusTSDBCompactionFailed
+        expr: rate(prometheus_tsdb_compactions_failed_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TSDB compaction failures"
+          description: "Prometheus is failing TSDB compactions."
+
+      - alert: PrometheusRemoteWriteFailing
+        expr: rate(prometheus_remote_storage_failed_samples_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Remote write is failing"
+          description: "Remote write endpoint {{ $labels.url }} is dropping samples."
+
+      - alert: AlertmanagerDown
+        expr: up{job="alertmanager"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Alertmanager target down"
+          description: "Alertmanager instance {{ $labels.instance }} is down."
