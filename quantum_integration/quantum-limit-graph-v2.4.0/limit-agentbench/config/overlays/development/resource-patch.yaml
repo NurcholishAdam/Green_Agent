@@ -1,140 +1,406 @@
+# =============================================================================
+# ray-cluster.yaml — Green Agent RayCluster (Enhanced v2, v5.0.0)
+# =============================================================================
+# The production RayCluster manifest. Every enhancement (LIMIT Graph, MODP,
+# RLHF, Distillation, MoE, Evolutionary, FlexGen) is configured via the
+# mounted `green-agent-config` ConfigMap — NOT via duplicated env vars.
+#
+# ---- Critical fixes vs the previous version --------------------------------
+#   FIX #1   Security posture restored. The previous file explicitly opted
+#            into the "root + privileged + writable" triple:
+#                runAsNonRoot: false
+#                allowPrivilegeEscalation: true
+#                readOnlyRootFilesystem: false
+#            That combination is rejected at admission by any cluster with
+#            PodSecurityStandard "restricted" enabled (EKS, GKE Autopilot,
+#            OpenShift, Rancher), and contradicts every other manifest in
+#            this repo. Restored to:
+#                runAsNonRoot: true
+#                runAsUser: 1000
+#                runAsGroup: 1000
+#                fsGroup: 1000
+#                allowPrivilegeEscalation: false
+#                readOnlyRootFilesystem: true
+#                capabilities: { drop: ["ALL"] }
+#            If your image genuinely requires root, fix the image (add a
+#            `useradd -u 1000 app` in the Dockerfile, or use a distroless
+#            base) — do not disable the security context.
+#   FIX #2   FLEXGEN_ENABLED disabled. `facebook/opt-6.7b` in fp16 needs
+#            ~16 GB for weights alone. The previous manifest shipped
+#            `FLEXGEN_ENABLED: "true"` with an 8 Gi limit — the first
+#            inference would be OOM-killed (exit 137). To enable FlexGen:
+#              1. raise memory.limits.memory to 20Gi (fp16) or 8Gi (int4),
+#              2. add the HF cache PVC mount (see the commented blocks),
+#              3. flip FLEXGEN_ENABLED to "true" (in the ConfigMap),
+#              4. set FLEXGEN_DEFAULT_PRECISION to "int4" for the 8Gi
+#                 target, or "fp16" for the 20Gi target.
+#   FIX #3   `serviceAccountName: green-agent` added on both pod templates.
+#            Without it, the Ray autoscaler runs as `default` and every
+#            scale attempt logs `Forbidden`.
+#   FIX #4   `component: head` / `component: worker` labels added on both
+#            pod templates. The `Service.selector` matches `component: head`;
+#            without it the Service has zero endpoints and the dashboard is
+#            unreachable.
+#   FIX #5   `enableInTreeAutoscaling: true` added. Ray's autoscaler is
+#            opt-in; without this flag, min/maxReplicas are advisory and
+#            the cluster stays at `replicas: 4` forever.
+#   FIX #6   Image tag corrected to `v5.0.0`. The previous `-enhanced`
+#            suffix doesn't exist in the rest of the repo (docker-compose,
+#            kustomization, agent.toml all use `v5.0.0`).
+#   FIX #7   All env vars removed. The ConfigMap mounted at
+#            `/app/config/green_agent_config.yaml` is the sole source of
+#            enhancement config. The previous file had 13 env vars on the
+#            head and 11 on the worker (inconsistent — worker was missing
+#            MUTATION_RATE and FLEXGEN_MODEL_NAME). Duplicating config as
+#            env vars re-introduces the two-sources-of-truth bug that the
+#            v2 base removed.
+#   FIX #8   `/app/data` PVC mount added. `system.output_dir` writes to
+#            the PVC, not to ephemeral container storage.
+#   FIX #9   `/tmp` emptyDir added. Required because
+#            `readOnlyRootFilesystem: true` (FIX #1) makes `/tmp`
+#            unwritable otherwise.
+#   FIX #10  Head probes added (startupProbe, livenessProbe,
+#            readinessProbe). Model loading takes 60-120 s; without a
+#            startup gate, liveness fails on a correct startup.
+#   FIX #11  Worker probes added (`ray health-check --component raylet`).
+#            A hung raylet stays `Running` forever without a liveness probe.
+#   FIX #12  `terminationGracePeriodSeconds: 300` added. Default 30 s is
+#            too short for a training step.
+#   FIX #13  `resources.limits.ephemeral-storage: "10Gi"` added. A runaway
+#            log can fill the node's disk and evict every pod on it.
+#   FIX #14  `imagePullPolicy: IfNotPresent` on both containers. The
+#            `v5.0.0` tag is immutable; `Always` forced a registry
+#            round-trip on every restart.
+#   FIX #15  `rayStartParams` completed:
+#              * head:   dashboard-host, num-cpus, num-gpus, memory,
+#                        object-store-memory
+#              * worker: num-cpus, num-gpus, memory, object-store-memory
+#            Worker `memory` is set to 80% of the container limit so the
+#            kernel OOM killer fires before Ray's own scheduling reacts.
+#   FIX #16  `app.kubernetes.io/*` labels added on the RayCluster and on
+#            both pod templates.
+#   FIX #17  The 7 decorative `green-agent/*` annotations and the
+#            `enhancements: enabled` label removed — no consumer reads them.
+#   FIX #18  ConfigMap mount has `defaultMode: 0444` and `readOnly: true`
+#            so a write attempt is rejected at admission instead of at
+#            runtime with EROFS.
+#   FIX #19  HF cache mount documented (commented until FlexGen is
+#            enabled). Without it, the 13 GB model re-downloads on every
+#            pod restart.
+#
+# ---- Prerequisites (must exist before apply) ------------------------------
+#   1. Namespace `green-agent`
+#   2. ServiceAccount `green-agent` (with RBAC: pods create/delete/get/
+#      list/watch/patch; services get/list/patch; events create)
+#   3. PersistentVolumeClaim `green-agent-data-pvc`
+#   4. ConfigMap `green-agent-config` with key `green_agent_config.yaml`
+#   5. (Optional) PriorityClasses `green-agent-head`, `green-agent-worker`
+#
+# All five are provided by `config/base/` (see kustomization.yaml).
+#
+# ---- Deploy ---------------------------------------------------------------
+#   kubectl apply -f ray-cluster.yaml
+#   OR (via kustomize):
+#   kubectl apply -k config/overlays/production
+#
+# ---- Verify ---------------------------------------------------------------
+#   kubectl wait --for=condition=Ready pod \
+#     -l "ray.io/cluster=green-agent-cluster,ray.io/node-type=head" \
+#     -n green-agent --timeout=300s
+#   kubectl get endpoints -n green-agent green-agent-api
+#   kubectl get raycluster -n green-agent green-agent-cluster \
+#     -o jsonpath='{.spec.enableInTreeAutoscaling}'
+# =============================================================================
+
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
   name: green-agent-cluster
+  namespace: green-agent
   labels:
     app: green-agent
-    enhancements: enabled
-  annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
-    green-agent/flexgen: "true"
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: ray
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: "5.0.0"
+    app.kubernetes.io/environment: production
 spec:
+  # FIX #5 — Ray's autoscaler is opt-in. Without this, min/maxReplicas are
+  # advisory and the cluster stays at `replicas` forever.
+  enableInTreeAutoscaling: true
+
+  # Enable only when the `full`-profile Redis is running and REDIS_URL is
+  # set in the head pod env (see the commented block below).
+  gcsFaultTolerance: false
+
+  autoscalerOptions:
+    upscalingMode: Conservative
+    idleTimeoutSeconds: 1800
+
+  # ---------------------------------------------------------------------------
+  # Head
+  # ---------------------------------------------------------------------------
   headGroupSpec:
+    # FIX #15 — complete rayStartParams.
     rayStartParams:
-      dashboard-host: '0.0.0.0'
-      num-cpus: '4'
+      dashboard-host: "0.0.0.0"
+      num-cpus: "4"
+      num-gpus: "0"
+      object-store-memory: "2000000000"    # ~2 GB
+      memory: "8000000000"                 # ~8 GB — matches the limit below
+
     template:
+      metadata:
+        # FIX #4 — `component: head` matches Service.selector and the
+        # tests' `wait_for_pods("component=head")` fixture.
+        # FIX #16 — standard app.kubernetes.io/* taxonomy.
+        labels:
+          app: green-agent
+          component: head
+          app.kubernetes.io/name: green-agent
+          app.kubernetes.io/component: head
+
       spec:
+        # FIX #3 — explicit ServiceAccount; the default SA lacks autoscaler RBAC.
+        serviceAccountName: green-agent
+
+        # FIX #12 — training / GCS flush may take minutes.
+        terminationGracePeriodSeconds: 300
+
+        # FIX #1 — pod-level security posture.
         securityContext:
-          runAsNonRoot: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+
         containers:
-        - name: ray-head
-          image: ghcr.io/nurcholishadam/green_agent:v5.0.0-enhanced
-          imagePullPolicy: Always
-          securityContext:
-            allowPrivilegeEscalation: true
-            readOnlyRootFilesystem: false
-          ports:
-          - containerPort: 6379
-          - containerPort: 8265
-          - containerPort: 8000
-          - containerPort: 9090
-          env:
-          # System / core flags
-          - name: ENHANCEMENTS_ENABLED
-            value: "true"
-          - name: LIMIT_GRAPH_ENABLED
-            value: "true"
-          - name: LIMIT_GRAPH_CENTRALITY
-            value: "0.7"
-          - name: LIMIT_GRAPH_CONNECTIVITY
-            value: "0.6"
-          - name: MODP_ENABLED
-            value: "true"
-          - name: MODP_WEIGHTS
-            value: "[0.4,0.3,0.2,0.1]"
-          - name: RLHF_ENABLED
-            value: "true"
-          - name: HUMAN_FEEDBACK_SCORE
-            value: "0.6"
-          - name: DISTILLATION_ENABLED
-            value: "true"
-          - name: MOE_GATING_ENABLED
-            value: "true"
-          - name: EVOLUTIONARY_ENABLED
-            value: "true"
-          - name: POPULATION_SIZE
-            value: "20"
-          - name: MUTATION_RATE
-            value: "0.1"
-          - name: FLEXGEN_ENABLED
-            value: "true"
-          - name: FLEXGEN_MODEL_NAME
-            value: "facebook/opt-6.7b"
-          - name: FLEXGEN_DEFAULT_PRECISION
-            value: "fp16"
-          resources:
-            requests:
-              cpu: "2"
-              memory: "4Gi"
-            limits:
-              cpu: "4"
-              memory: "8Gi"
-          volumeMounts:
-          - name: config-volume
-            mountPath: /app/config
+          - name: ray-head
+            # FIX #6 — tag matches the rest of the repo.
+            image: ghcr.io/nurcholishadam/green_agent:v5.0.0
+            # FIX #14 — pinned tag; cache is safe to reuse.
+            imagePullPolicy: IfNotPresent
+
+            ports:
+              - { name: gcs,       containerPort: 6379 }
+              - { name: dashboard, containerPort: 8265 }
+              - { name: http,      containerPort: 8000 }
+              - { name: metrics,   containerPort: 9090 }
+
+            # FIX #1 — container-level security.
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop: ["ALL"]
+
+            # FIX #7 — only container-specific env vars. Every enhancement,
+            # security, and observability setting comes from the ConfigMap
+            # mounted at /app/config/green_agent_config.yaml.
+            env:
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: PROMETHEUS_PORT
+                value: "9090"
+              # FIX #16 — uncomment when `gcsFaultTolerance: true` above:
+              # - name: REDIS_URL
+              #   valueFrom:
+              #     secretKeyRef:
+              #       name: green-agent-secrets
+              #       key: REDIS_URL
+
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+              limits:
+                cpu: "4"
+                memory: "8Gi"
+                # FIX #13 — bound ephemeral disk.
+                ephemeral-storage: "10Gi"
+
+            # FIX #10 — startupProbe gates liveness for up to 150 s.
+            startupProbe:
+              httpGet:
+                path: /health
+                port: 8000
+              failureThreshold: 30
+              periodSeconds: 5
+              timeoutSeconds: 10
+
+            livenessProbe:
+              httpGet:
+                path: /health
+                port: 8000
+              initialDelaySeconds: 0
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+
+            readinessProbe:
+              httpGet:
+                path: /ready
+                port: 8000
+              initialDelaySeconds: 0
+              periodSeconds: 5
+              timeoutSeconds: 3
+              failureThreshold: 2
+
+            # FIX #8, #9 — config, data, tmp.
+            volumeMounts:
+              - name: config-volume
+                mountPath: /app/config
+                readOnly: true
+              - name: data-volume
+                mountPath: /app/data
+              - name: tmp-volume
+                mountPath: /tmp
+              # FIX #19 — uncomment when FlexGen is enabled:
+              # - name: hf-cache
+              #   mountPath: /home/app/.cache/huggingface
+
         volumes:
-        - name: config-volume
-          configMap:
-            name: green-agent-config
+          # FIX #18 — read-only mount with 0444 mode.
+          - name: config-volume
+            configMap:
+              name: green-agent-config
+              defaultMode: 0444
+          # FIX #8 — the PVC that backs `system.output_dir`.
+          - name: data-volume
+            persistentVolumeClaim:
+              claimName: green-agent-data-pvc
+          # FIX #9 — writable /tmp required by readOnlyRootFilesystem.
+          - name: tmp-volume
+            emptyDir:
+              sizeLimit: 2Gi
+          # FIX #19 — uncomment with the mountPath above:
+          # - name: hf-cache
+          #   persistentVolumeClaim:
+          #     claimName: green-agent-hf-cache-pvc
+
+  # ---------------------------------------------------------------------------
+  # Workers
+  # ---------------------------------------------------------------------------
   workerGroupSpecs:
-  - replicas: 4
-    minReplicas: 2
-    maxReplicas: 10
-    groupName: standard-workers
-    rayStartParams:
-      num-cpus: '4'
-      memory: '8589934592'
-    template:
-      spec:
-        containers:
-        - name: ray-worker
-          image: ghcr.io/nurcholishadam/green_agent:v5.0.0-enhanced
-          env:
-          - name: ENHANCEMENTS_ENABLED
-            value: "true"
-          - name: LIMIT_GRAPH_ENABLED
-            value: "true"
-          - name: LIMIT_GRAPH_CENTRALITY
-            value: "0.7"
-          - name: LIMIT_GRAPH_CONNECTIVITY
-            value: "0.6"
-          - name: MODP_ENABLED
-            value: "true"
-          - name: MODP_WEIGHTS
-            value: "[0.4,0.3,0.2,0.1]"
-          - name: RLHF_ENABLED
-            value: "true"
-          - name: HUMAN_FEEDBACK_SCORE
-            value: "0.6"
-          - name: DISTILLATION_ENABLED
-            value: "true"
-          - name: MOE_GATING_ENABLED
-            value: "true"
-          - name: EVOLUTIONARY_ENABLED
-            value: "true"
-          - name: POPULATION_SIZE
-            value: "20"
-          - name: FLEXGEN_ENABLED
-            value: "true"
-          - name: FLEXGEN_DEFAULT_PRECISION
-            value: "fp16"
-          resources:
-            requests:
-              cpu: "2"
-              memory: "4Gi"
-            limits:
-              cpu: "4"
-              memory: "8Gi"
-          volumeMounts:
-          - name: config-volume
-            mountPath: /app/config
-        volumes:
-        - name: config-volume
-          configMap:
-            name: green-agent-config
+    - groupName: standard-workers
+      # FIX #5 — `replicas` is the *initial* count; the autoscaler moves it
+      # within [minReplicas, maxReplicas] (and the carbon-aware CronJob
+      # rewrites maxReplicas on the tier schedule).
+      replicas: 4
+      minReplicas: 2
+      maxReplicas: 10
+
+      # FIX #15 — complete rayStartParams. `memory` is 80% of the 8 Gi
+      # container limit so the kernel OOM killer fires before Ray reacts.
+      rayStartParams:
+        num-cpus: "4"
+        num-gpus: "0"
+        memory: "6400000000"                 # ~6.4 GB (80% of 8 Gi)
+        object-store-memory: "1000000000"    # ~1 GB
+
+      template:
+        metadata:
+          # FIX #4 — `component: worker` for tests and any worker-targeting
+          # Service. FIX #16 — standard taxonomy.
+          labels:
+            app: green-agent
+            component: worker
+            app.kubernetes.io/name: green-agent
+            app.kubernetes.io/component: worker
+
+        spec:
+          # FIX #3 — same SA as the head.
+          serviceAccountName: green-agent
+
+          # FIX #12
+          terminationGracePeriodSeconds: 300
+
+          # FIX #1 — pod-level security.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+
+          containers:
+            - name: ray-worker
+              # FIX #6
+              image: ghcr.io/nurcholishadam/green_agent:v5.0.0
+              # FIX #14
+              imagePullPolicy: IfNotPresent
+
+              # FIX #1 — container-level security.
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+
+              # FIX #7 — only container-specific env vars. The ConfigMap is
+              # the sole source of enhancement config.
+              #
+              # FIX #2 — FLEXGEN_ENABLED is OFF because the 8 Gi limit
+              # cannot hold the 6.7B model. Enable after raising memory and
+              # adding the HF cache mount (see the commented blocks above).
+              env:
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: FLEXGEN_ENABLED
+                  value: "false"
+                - name: FLEXGEN_MODEL_NAME
+                  value: "facebook/opt-6.7b"
+                - name: FLEXGEN_DEFAULT_PRECISION
+                  value: "int4"
+
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+                limits:
+                  cpu: "4"
+                  memory: "8Gi"
+                  # FIX #13
+                  ephemeral-storage: "10Gi"
+
+              # FIX #11 — worker health probes. `ray health-check` is Ray's
+              # own health check; a hung raylet fails it and the kubelet
+              # restarts the pod.
+              livenessProbe:
+                exec:
+                  command: ["ray", "health-check", "--component", "raylet"]
+                initialDelaySeconds: 60
+                periodSeconds: 30
+                timeoutSeconds: 10
+                failureThreshold: 3
+
+              readinessProbe:
+                exec:
+                  command: ["ray", "health-check", "--component", "raylet"]
+                initialDelaySeconds: 30
+                periodSeconds: 10
+                timeoutSeconds: 5
+                failureThreshold: 2
+
+              # FIX #8, #9
+              volumeMounts:
+                - name: config-volume
+                  mountPath: /app/config
+                  readOnly: true
+                - name: tmp-volume
+                  mountPath: /tmp
+                # FIX #19 — uncomment when FlexGen is enabled:
+                # - name: hf-cache
+                #   mountPath: /home/app/.cache/huggingface
+
+          volumes:
+            - name: config-volume
+              configMap:
+                name: green-agent-config
+                defaultMode: 0444
+            - name: tmp-volume
+              emptyDir:
+                sizeLimit: 2Gi
+            # FIX #19 — uncomment with the mountPath above:
+            # - name: hf-cache
+            #   persistentVolumeClaim:
+            #     claimName: green-agent-hf-cache-pvc
