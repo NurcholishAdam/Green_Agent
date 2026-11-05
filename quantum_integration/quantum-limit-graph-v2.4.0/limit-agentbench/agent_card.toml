@@ -1,95 +1,302 @@
-[agent]
-name = "Green Sustainability Agent"
-version = "3.0.0"
-description = "Evaluates AI agents on performance and environmental impact"
-agent_type = "green"  # ✓ CRITICAL: Must be "green"
+# =============================================================================
+# Green Sustainability Agent — AgentBeats Registration Manifest (Enhanced v2)
+# =============================================================================
+# File: agent.toml
+#
+# ---- Fixes vs v1 ------------------------------------------------------------
+#   FIX #1   version 3.0.0 -> 5.0.0. Everything else in the repo (Dockerfile,
+#            kustomization, requirements, run_agent.py) is v5.0.0.
+#   FIX #2   Endpoints use `localhost` (dev default) with an explicit
+#            `public_base_url` override. `0.0.0.0` is a bind address, not a
+#            reachable host — the v1 URLs were unreachable.
+#   FIX #3   MCP removed from protocols until an MCP endpoint exists.
+#            v1 claimed MCP but declared no endpoint.
+#   FIX #4   FlexGen memory_limit_mb raised to 16384 to match OPT-6.7B in
+#            fp16, and int4 added to precision_options. v1 declared 4096 MB
+#            — the model alone needs ~13 GB.
+#   FIX #5   Added [evaluation] with task categories, schemas, timeout.
+#            v1 said "evaluates AI agents" but declared no evaluations.
+#   FIX #6   unique_metrics uses the actual Prometheus metric names
+#            (green_agent_*). v1 listed unprefixed names that no /metrics
+#            endpoint exposes.
+#   FIX #7   [endpoints].dashboard and feedback_submission_url added. v1
+#            pointed at `feedback_source = "dashboard"` with no dashboard.
+#   FIX #8   Added id / slug, authors, license, repository, homepage,
+#            docs_url, image, tags. v1 had none.
+#   FIX #9   hardware structured as { required, optional } so a CPU-only
+#            cluster knows it can run the agent.
+#   FIX #10  Indented [enhancements.*] sub-tables dedented to canonical TOML.
+#   FIX #11  epsilon is an object with the decay schedule implemented in the
+#            code (start / end / decay_steps).
+#   FIX #12  objective_names paired with objective_weights so the order is
+#            not silently re-interpreted by different modules.
+#   FIX #13  [backends.flexgen] replaces top-level [flexgen] so a second
+#            backend (vLLM, TensorRT-LLM) can be added without a schema
+#            change.
+#   FIX #14  Added [constraints] and [limitations].
+#   FIX #15  Added [security] with an explicit auth scheme and TLS posture.
+#   FIX #16  Added [observability] with the actual metrics/traces paths.
+#   FIX #17  Added [capabilities.robustness].handles — the failure classes
+#            the agent actually handles (the booleans in [scoring] are now
+#            backed by a list).
+#   FIX #18  Added [rate_limits].
+#   FIX #19  default_region and daily_budget_kg declared under [carbon].
+#   FIX #20  Teachers declared as objects with their output contract.
+#   FIX #21  Added [capabilities.a2a] with agent_card_url and methods.
+#   FIX #22  Added long_description and readme_url.
+# =============================================================================
 
-[capabilities]
-protocols = ["A2A", "MCP"]  # ✓ REQUIRED
-evaluation_domains = ["coding", "reasoning", "tool_use"]
-unique_metrics = [
-    "energy_efficiency",
-    "carbon_footprint",
-    "sustainability_index",
-    # Enhanced metrics
-    "modp_score",
-    "graph_centrality",
-    "graph_connectivity",
-    "rlhf_feedback_score",
-    "distillation_update_count",
-    "moe_gate_stddev",
-    "evolutionary_best_fitness"
+[agent]
+id               = "green-sustainability-agent"     # machine-safe slug
+name             = "Green Sustainability Agent"
+version          = "5.0.0"
+description      = "Green-aware AI agent evaluation: measures accuracy, energy, and carbon per task."
+long_description = """
+Evaluates AI agents on accuracy, energy consumption, and carbon footprint.
+Uses a multi-objective decision process (MODP) to rank evaluation candidates,
+a multi-teacher distillation policy with MoE gating for routing, and an
+RLHF feedback loop for continuous calibration. Backed by a carbon-aware
+runtime (RayCluster, per-task carbon accounting) and a Prometheus
+observability stack.
+"""
+agent_type  = "green"                              # required by AgentBeats
+license     = "Apache-2.0"
+authors     = [
+    { name = "Green Agent Team", email = "maintainers@green-agent.example" },
+]
+repository    = "https://github.com/nurcholishadam/green_agent"
+homepage      = "https://green-agent.example"
+docs_url      = "https://docs.green-agent.example"
+readme_url    = "https://github.com/nurcholishadam/green_agent/blob/main/README.md"
+changelog_url = "https://github.com/nurcholishadam/green_agent/blob/main/CHANGELOG.md"
+image         = "ghcr.io/nurcholishadam/green_agent:5.0.0"
+tags          = [
+    "sustainability",
+    "carbon-aware",
+    "green-ai",
+    "evaluation",
+    "a2a",
+    "modp",
 ]
 
+
+# -----------------------------------------------------------------------------
+# Capabilities
+# -----------------------------------------------------------------------------
+[capabilities]
+protocols          = ["A2A"]
+evaluation_domains = ["coding", "reasoning", "tool_use"]
+unique_metrics     = [
+    "green_agent_carbon_intensity",
+    "green_agent_carbon_emitted_kg",
+    "green_agent_energy_consumed_kwh",
+    "green_agent_modp_score",
+    "green_agent_graph_centrality",
+    "green_agent_graph_connectivity",
+    "green_agent_rlhf_feedback",
+    "green_agent_distillation_update_count",
+    "green_agent_moe_gate_weight",
+    "green_agent_evolutionary_best_fitness",
+]
+
+[capabilities.a2a]
+agent_card_url = "https://green-agent.example/.well-known/agent.json"
+streaming      = false
+methods        = ["send_task", "get_result", "cancel_task"]
+
+[capabilities.robustness]
+handles = [
+    "timeout",
+    "oom",
+    "invalid_input",
+    "rate_limit",
+    "upstream_5xx",
+]
+partial_credit   = true
+failure_handling = true
+
+
+# -----------------------------------------------------------------------------
+# Security
+# -----------------------------------------------------------------------------
+[security]
+auth_type        = "bearer"                        # "none" | "bearer" | "mtls"
+tls_enabled      = true
+jwt_algorithms   = ["RS256", "ES256"]              # HS* is not acceptable
+token_issuer_url = "https://auth.green-agent.example"
+
+
+# -----------------------------------------------------------------------------
+# Requirements
+# -----------------------------------------------------------------------------
 [requirements]
 python_version = ">=3.11"
-hardware = ["CPU", "GPU-optional"]
+hardware = {
+    required = ["CPU"],
+    optional = ["GPU"],
+}
 
+
+# -----------------------------------------------------------------------------
+# Endpoints
+# -----------------------------------------------------------------------------
+# Defaults target a local dev deployment. Deployments override
+# `public_base_url` via GREEN_AGENT_PUBLIC_BASE_URL (e.g. https://green.example).
 [endpoints]
-a2a = "http://0.0.0.0:8000/a2a/task"  # ✓ REQUIRED
-health = "http://0.0.0.0:8000/health"  # ✓ REQUIRED
+base_url        = "http://localhost:8000"
+public_base_url = ""                               # set by deployment
 
+a2a       = "http://localhost:8000/a2a/task"
+health    = "http://localhost:8000/health"
+ready     = "http://localhost:8000/ready"
+live      = "http://localhost:8000/live"
+metrics   = "http://localhost:9090/metrics"
+dashboard = "http://localhost:8501"
+
+
+# -----------------------------------------------------------------------------
+# Scoring
+# -----------------------------------------------------------------------------
 [scoring]
-primary_metric = "sustainability_index"
-secondary_metrics = ["accuracy", "energy_efficiency"]
-failure_handling = true  # ✓ REQUIRED
-partial_credit = true    # ✓ REQUIRED
+primary_metric    = "sustainability_index"
+secondary_metrics = ["accuracy", "energy_efficiency", "carbon_efficiency"]
+failure_handling  = true
+partial_credit    = true
 
-# ---------------------------------------------------------------------------
-# Advanced Enhancements (LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy
-# Distillation, Bio‑inspired Optimisation, MoE expert gating, FlexGen)
-# ---------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Evaluation — what this agent actually evaluates
+# -----------------------------------------------------------------------------
+[evaluation]
+task_categories   = ["coding", "reasoning", "tool_use"]
+max_input_tokens  = 8192
+max_output_tokens = 2048
+timeout_seconds   = 300
+input_schema_url  = "https://green-agent.example/schemas/evaluation-input.json"
+output_schema_url = "https://green-agent.example/schemas/evaluation-output.json"
+benchmark_set     = "green-agent-2025-v1"
+expected_accuracy = 0.85
+repeatable        = true                           # fixed seed -> same verdict
+
+
+# -----------------------------------------------------------------------------
+# Constraints
+# -----------------------------------------------------------------------------
+[constraints]
+carbon_budget_gco2_per_task = 5.0
+latency_sla_ms              = 5000
+cost_cap_usd                = 0.01
+max_concurrent_tasks        = 8
+
+
+# -----------------------------------------------------------------------------
+# Rate limits
+# -----------------------------------------------------------------------------
+[rate_limits]
+requests_per_minute = 60
+burst               = 10
+
+
+# -----------------------------------------------------------------------------
+# Observability
+# -----------------------------------------------------------------------------
+[observability]
+metrics_path      = "/metrics"
+metrics_port      = 9090
+prometheus_format = "text"
+traces_endpoint   = ""                             # OTLP endpoint when configured
+logs_format       = "json"
+
+
+# -----------------------------------------------------------------------------
+# Advanced enhancements
+# -----------------------------------------------------------------------------
 [enhancements]
-enabled = true                  # Master switch for all advanced features
+enabled = true
 
-  [enhancements.limit_graph]
-  enabled = true
-  centrality = 0.7
-  connectivity = 0.6
-  density = 0.5
-  update_interval_seconds = 60
+[enhancements.limit_graph]
+enabled                 = true
+centrality              = 0.7
+connectivity            = 0.6
+density                 = 0.5
+update_interval_seconds = 60
 
-  [enhancements.modp]
-  enabled = true
-  # Objective weights: [accuracy, energy, latency, carbon]
-  objective_weights = [0.4, 0.3, 0.2, 0.1]
-  normalize_weights = true
+[enhancements.modp]
+enabled           = true
+objective_names   = ["accuracy", "energy", "latency", "carbon"]
+objective_weights = [0.4, 0.3, 0.2, 0.1]
+normalize_weights = true
 
-  [enhancements.rlhf]
-  enabled = true
-  human_feedback_score = 0.6
-  collect_feedback = true
-  feedback_source = "dashboard"   # dashboard | api | manual
+[enhancements.rlhf]
+enabled                 = true
+human_feedback_score    = 0.6
+collect_feedback        = true
+feedback_source         = "dashboard"
+feedback_submission_url = "http://localhost:8501/feedback"
 
-  [enhancements.distillation]
-  enabled = true
-  use_moe_gating = true
-  distillation_lr = 0.01
-  gating_lr = 0.005
-  replay_size = 2000
-  train_every = 10
-  epsilon = 0.1
-  teachers = ["rule_based", "historical_ml", "q_learning", "rlhf"]
+[enhancements.distillation]
+enabled         = true
+use_moe_gating  = true
+distillation_lr = 0.01
+gating_lr       = 0.005
+replay_size     = 2000
+train_every     = 10
+epsilon = { start = 0.10, end = 0.01, decay_steps = 1000 }
+teachers = [
+    { name = "rule_based",    output = "probabilities" },
+    { name = "historical_ml", output = "probabilities" },
+    { name = "q_learning",    output = "probabilities" },
+    { name = "rlhf",          output = "probabilities" },
+]
 
-  [enhancements.bio_inspired]
-  enabled = true
-  use_evolutionary = true
-  population_size = 20
-  mutation_rate = 0.1
-  crossover_rate = 0.7
-  elitism = 2
+[enhancements.bio_inspired]
+enabled          = true
+use_evolutionary = true
+population_size  = 20
+mutation_rate    = 0.1
+crossover_rate   = 0.7
+elitism          = 2
 
-  [enhancements.moe_expert]
-  enabled = true
-  n_experts = 4
-  gating_lr = 0.005
+[enhancements.moe_expert]
+enabled   = true
+n_experts = 4
+gating_lr = 0.005
 
-# FlexGen integration (optional LLM execution backend)
-[flexgen]
-enabled = true                  # Set to true to use FlexGen as execution backend
-model_name = "facebook/opt-6.7b"
-batch_size = 16
-memory_limit_mb = 4096
-precision_options = ["fp32", "fp16", "int8"]
-default_precision = "fp16"
-delegation_policy = "adaptive"   # adaptive | always | never
+
+# -----------------------------------------------------------------------------
+# Execution backends
+# -----------------------------------------------------------------------------
+[backends]
+primary = "flexgen"
+
+[backends.flexgen]
+enabled           = true
+model_name        = "facebook/opt-6.7b"
+batch_size        = 16
+memory_limit_mb   = 16384                          # OPT-6.7B fp16 needs ~13 GB weights
+precision_options = ["fp32", "fp16", "int8", "int4"]
+default_precision = "fp16"                         # use "int4" for < 8 GB hosts
+delegation_policy = "adaptive"                     # adaptive | always | never
+
+
+# -----------------------------------------------------------------------------
+# Carbon
+# -----------------------------------------------------------------------------
+[carbon]
+default_region                  = "ID"
+api_provider                    = "simulated"
+eco_mode_threshold_gco2_per_kwh = 200
+defer_threshold_gco2_per_kwh    = 400
+daily_budget_kg                 = 100.0
+
+
+# -----------------------------------------------------------------------------
+# Limitations
+# -----------------------------------------------------------------------------
+[limitations]
+max_model_parameters     = "13B"
+unsupported_task_types   = ["multimodal_image", "video", "real_time_streaming"]
+unsupported_languages    = ["rtl_scripts_pending_validation"]
+requires_internet_access = false
+gpu_required             = false
+data_retention_days      = 0                       # zero retention by default
