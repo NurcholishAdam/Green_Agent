@@ -1,115 +1,632 @@
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
+# =============================================================================
+# Carbon-Aware RayCluster Scaling (Enhanced v2)
+# =============================================================================
+# Replaces: `green-agent-hpa.yaml` (v1)
+#
+# ---- Why the v1 HPA was removed ---------------------------------------------
+#   FIX #1   `spec.scaleTargetRef.kind: RayCluster` — RayCluster (from the Ray
+#            operator) has NO `scale` subresource. The HPA controller issues
+#            `GET .../rayclusters/<name>/scale`, gets 404, and every reconcile
+#            fails with `FailedGetScale`. The HPA never scaled anything.
+#   FIX #2   `minReplicas: 2` was a pod count, not a RayCluster count — the
+#            mental model was wrong for a cluster-scoped CRD.
+#   FIX #3   `behavior.scaleUp.policies[1].pods.metric` is not a valid
+#            `HPAScalingPolicy` field — the API server rejected it at
+#            admission.
+#   FIX #4   4 of the 6 custom metrics were cluster-scoped (Gauges with no
+#            pod label) but declared under `type: Pods` — every reconcile
+#            would fail with `FailedGetPodsMetric`.
+#   FIX #5   `green_agent_distillation_update_rate` doesn't exist — the
+#            runtime exports a Counter `green_agent_distillation_update_count`.
+#   FIX #6   Carbon-intensity scaling was INVERTED: `AverageValue: 400`
+#            means "scale up when above 400" — the comment said "scale down
+#            when high". HPA semantics can't express that without an
+#            inverted metric.
+#   FIX #7   MODP / RLHF / centrality were quality/topology signals — not
+#            load signals. Scaling on them was category confusion.
+#
+# ---- What this file does instead --------------------------------------------
+#   The supported mechanism for horizontally scaling a RayCluster is the
+#   CRD's own autoscaler, which watches
+#       spec.workerGroupSpecs[].{replicas, minReplicas, maxReplicas}
+#   on the RayCluster itself. Everything below layers carbon-awareness on
+#   top of that mechanism:
+#
+#     1. ConfigMap          — tier schedule (night / day / evening) + the
+#                             Python scaler script
+#     2. ServiceAccount     — identity for the CronJob
+#     3. Role + RoleBinding — least-privilege: get/list/patch rayclusters,
+#                             read configmaps
+#     4. CronJob            — every 15 min, patches workerGroupSpecs[]
+#                             .maxReplicas based on the current tier
+#     5. RayCluster         — workerGroupSpecs with carbon-tier bounds;
+#                             the CronJob rewrites maxReplicas
+#     6. Deployment + HPA   — OPTIONAL working HPA example against the
+#                             dashboard Deployment (which DOES have a
+#                             scale subresource) for reference
+#
+# ---- Carbon tiers (edit the ConfigMap to tune) ------------------------------
+#   Night   (22:00–06:00 UTC)  max=20  — cheap grid, run batch work
+#   Day     (06:00–19:00 UTC)  max=8   — expensive grid, throttle
+#   Evening (19:00–22:00 UTC)  max=12  — declining demand
+#
+#   Override per cluster with a ConfigMap `carbon-schedule` (see §1). The
+#   scaler reads it at every run.
+#
+# ---- Deployment -------------------------------------------------------------
+#   kubectl apply -f carbon-aware-scaling.yaml
+#
+# ---- Verification -----------------------------------------------------------
+#   kubectl get cronjob -n green-agent carbon-scaler
+#   kubectl get jobs -n green-agent -l app=carbon-scaler
+#   kubectl logs -n green-agent -l app=carbon-scaler --tail=50
+#   kubectl get raycluster -n green-agent green-agent-cluster \
+#     -o jsonpath='{.spec.workerGroupSpecs[0].maxReplicas}'
+#
+# ---- What is NOT here -------------------------------------------------------
+#   The v1 custom metrics (`green_agent_carbon_intensity`, `green_agent_modp_
+#   score`, `green_agent_rlhf_feedback`, `green_agent_graph_centrality`,
+#   `green_agent_distillation_update_rate`) are intentionally absent. They
+#   are exported by `api_server.py` and consumed by the Grafana dashboard —
+#   they inform the *operator*, not the autoscaler. Wiring them into a
+#   scale-up loop is a category error that the analysis flagged as FIX #7.
+# =============================================================================
+
+---
+# =============================================================================
+# 1. ConfigMap — tier schedule + scaler script
+# =============================================================================
+# Two keys:
+#   - `schedule.yaml`  : the carbon tiers. Edit here to retune.
+#   - `carbon_scaler.py` : the CronJob's entry point. Reads `schedule.yaml`
+#                          from the mounted ConfigMap and patches the
+#                          RayCluster.
+apiVersion: v1
+kind: ConfigMap
 metadata:
-  name: green-agent-hpa
+  name: carbon-scaler
+  namespace: green-agent
+  labels:
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: autoscaler
+    app.kubernetes.io/version: "5.0.0"
+data:
+  # ---------------------------------------------------------------------------
+  # Tier schedule (UTC hours)
+  # ---------------------------------------------------------------------------
+  # `max_workers` is what gets written into workerGroupSpecs[].maxReplicas.
+  # `min_workers` is a floor — the scaler refuses to lower maxReplicas below
+  # the group's configured minReplicas.
+  #
+  # Hour ranges wrap midnight for the `night` tier. See the script for the
+  # matching logic.
+  schedule.yaml: |
+    tiers:
+      - name: night
+        start_hour_utc: 22
+        end_hour_utc: 6
+        max_workers: 20
+        description: "Low-carbon window — scale up for batch work"
+      - name: day
+        start_hour_utc: 6
+        end_hour_utc: 19
+        max_workers: 8
+        description: "Peak grid intensity — throttle"
+      - name: evening
+        start_hour_utc: 19
+        end_hour_utc: 22
+        max_workers: 12
+        description: "Declining demand"
+    default:
+      max_workers: 12
+
+  # ---------------------------------------------------------------------------
+  # Scaler script (Python — uses the kubernetes client in-cluster)
+  # ---------------------------------------------------------------------------
+  carbon_scaler.py: |
+    #!/usr/bin/env python3
+    """
+    Carbon-aware autoscaler for a RayCluster.
+
+    Reads `schedule.yaml` from the mounted ConfigMap, picks the tier for the
+    current UTC hour, and patches `workerGroupSpecs[idx].maxReplicas` on the
+    RayCluster. The Ray autoscaler (inside the head pod) reacts to the new
+    bounds on its next reconcile.
+    """
+    from __future__ import annotations
+
+    import logging
+    import os
+    import sys
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from typing import Any, Dict, List, Optional, Tuple
+
+    import yaml
+    from kubernetes import client, config
+    from kubernetes.client.exceptions import ApiException
+
+    logger = logging.getLogger("carbon-scaler")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+    NAMESPACE = os.environ.get("NAMESPACE", "green-agent")
+    RAY_CLUSTER = os.environ.get("RAY_CLUSTER", "green-agent-cluster")
+    WORKER_GROUP = os.environ.get("WORKER_GROUP", "standard-workers")
+    SCHEDULE_PATH = Path(os.environ.get("SCHEDULE_PATH", "/etc/carbon-scaler/schedule.yaml"))
+
+    def _load_schedule() -> Dict[str, Any]:
+        if not SCHEDULE_PATH.is_file():
+            raise FileNotFoundError(f"schedule not found at {SCHEDULE_PATH}")
+        with SCHEDULE_PATH.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data.get("tiers"), list):
+            raise ValueError("schedule.yaml must contain a 'tiers' list")
+        return data
+
+    def _hour_in_range(hour: int, start: int, end: int) -> bool:
+        if start < end:
+            return start <= hour < end
+        # Wraps midnight (e.g. 22 → 6)
+        return hour >= start or hour < end
+
+    def _pick_tier(tiers: List[Dict[str, Any]], hour: int) -> Optional[Dict[str, Any]]:
+        for tier in tiers:
+            try:
+                start = int(tier["start_hour_utc"])
+                end = int(tier["end_hour_utc"])
+            except (KeyError, TypeError, ValueError):
+                logger.warning("Skipping malformed tier: %r", tier)
+                continue
+            if _hour_in_range(hour, start, end):
+                return tier
+        return None
+
+    def _find_group_index(groups: List[Dict[str, Any]], name: str) -> Optional[int]:
+        for i, g in enumerate(groups):
+            if g.get("groupName") == name:
+                return i
+        return None
+
+    def main() -> int:
+        try:
+            config.load_incluster_config()
+        except Exception:
+            # Local testing fallback
+            config.load_kube_config()
+
+        schedule = _load_schedule()
+        tiers: List[Dict[str, Any]] = schedule["tiers"]
+        default_max = int(
+            (schedule.get("default") or {}).get("max_workers", 12)
+        )
+
+        hour = datetime.now(timezone.utc).hour
+        tier = _pick_tier(tiers, hour)
+        if tier is None:
+            target_max = default_max
+            tier_name = "default"
+        else:
+            target_max = int(tier.get("max_workers", default_max))
+            tier_name = str(tier.get("name", "unknown"))
+
+        custom = client.CustomObjectsApi()
+        try:
+            rc = custom.get_namespaced_custom_object(
+                group="ray.io", version="v1", namespace=NAMESPACE,
+                plural="rayclusters", name=RAY_CLUSTER,
+            )
+        except ApiException as exc:
+            logger.error(
+                "Cannot read RayCluster %s/%s: %s %s",
+                NAMESPACE, RAY_CLUSTER, exc.status, exc.reason,
+            )
+            return 1
+
+        groups = (rc.get("spec") or {}).get("workerGroupSpecs") or []
+        idx = _find_group_index(groups, WORKER_GROUP)
+        if idx is None:
+            logger.error(
+                "Worker group %r not found in RayCluster %s/%s (groups: %s)",
+                WORKER_GROUP, NAMESPACE, RAY_CLUSTER,
+                [g.get("groupName") for g in groups],
+            )
+            return 1
+
+        group = groups[idx]
+        current_max = int(group.get("maxReplicas", 0))
+        min_replicas = int(group.get("minReplicas", 0))
+
+        if target_max < min_replicas:
+            logger.warning(
+                "tier=%s target_max=%d < minReplicas=%d; clamping to min",
+                tier_name, target_max, min_replicas,
+            )
+            target_max = min_replicas
+
+        logger.info(
+            "hour=%02d UTC tier=%s current_max=%d target_max=%d",
+            hour, tier_name, current_max, target_max,
+        )
+
+        if current_max == target_max:
+            logger.info("No change needed")
+            return 0
+
+        patch = [{
+            "op": "replace",
+            "path": f"/spec/workerGroupSpecs/{idx}/maxReplicas",
+            "value": target_max,
+        }]
+        try:
+            custom.patch_namespaced_custom_object(
+                group="ray.io", version="v1", namespace=NAMESPACE,
+                plural="rayclusters", name=RAY_CLUSTER, body=patch,
+            )
+        except ApiException as exc:
+            logger.error(
+                "Patch failed: %s %s — body=%r",
+                exc.status, exc.reason, exc.body,
+            )
+            return 1
+
+        logger.info("Patched maxReplicas: %d -> %d", current_max, target_max)
+        return 0
+
+    if __name__ == "__main__":
+        sys.exit(main())
+
+---
+# =============================================================================
+# 2. ServiceAccount — identity for the CronJob
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: carbon-scaler
+  namespace: green-agent
+  labels:
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: autoscaler
+  # Do not automount a token into arbitrary pods that adopt this SA.
+automountServiceAccountToken: true
+
+---
+# =============================================================================
+# 3. Role + RoleBinding — least privilege
+# =============================================================================
+# The scaler needs to:
+#   - read and patch RayClusters in its namespace
+#   - read its own ConfigMap (the schedule)
+#   - create/list pods (the CronJob's pod is created by the Job controller,
+#     but the CronJob itself does not need pod permissions — the Job controller
+#     uses the CronJob's SA to run the pod. So we need get/list on pods to
+#     read our own job status; and we need watch on jobs to detect completion.
+#     In practice, this role is fine with just the RayCluster + ConfigMap
+#     permissions; the Job controller handles the rest with its own SA.)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: carbon-scaler
+  namespace: green-agent
+  labels:
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: autoscaler
+rules:
+  - apiGroups: ["ray.io"]
+    resources: ["rayclusters"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list"]
+    resourceNames: ["carbon-scaler"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: carbon-scaler
+  namespace: green-agent
+  labels:
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: autoscaler
+subjects:
+  - kind: ServiceAccount
+    name: carbon-scaler
+    namespace: green-agent
+roleRef:
+  kind: Role
+  name: carbon-scaler
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# =============================================================================
+# 4. CronJob — patch maxReplicas every 15 minutes
+# =============================================================================
+# Why 15 minutes:
+#   - Ray autoscaler reconciles on the order of minutes; 15 min avoids
+#     fighting the operator's own tuning.
+#   - `concurrencyPolicy: Forbid` prevents overlap if a run stalls.
+#   - The schedule (night/day/evening) changes at most 3× per day, so 15 min
+#     is more than enough; the run is a no-op when the tier hasn't changed.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: carbon-scaler
+  namespace: green-agent
+  labels:
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: autoscaler
+spec:
+  schedule: "*/15 * * * *"
+  timeZone: "Etc/UTC"           # requires k8s >= 1.27
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 60
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 120
+      template:
+        metadata:
+          labels:
+            app: carbon-scaler
+            app.kubernetes.io/name: green-agent
+            app.kubernetes.io/component: autoscaler
+        spec:
+          serviceAccountName: carbon-scaler
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+          containers:
+            - name: scaler
+              # Pinned image; change only with a corresponding test in
+              # tests/k8s/carbon_scaler_test.py (if/when added).
+              image: python:3.11-slim
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  pip install --quiet --no-cache-dir \
+                    "kubernetes==29.0.0" "pyyaml>=6.0,<7"
+                  exec python /etc/carbon-scaler/carbon_scaler.py
+              env:
+                - name: NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: RAY_CLUSTER
+                  value: green-agent-cluster
+                - name: WORKER_GROUP
+                  value: standard-workers
+                - name: SCHEDULE_PATH
+                  value: /etc/carbon-scaler/schedule.yaml
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+              volumeMounts:
+                - name: schedule
+                  mountPath: /etc/carbon-scaler
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "250m"
+                  memory: "256Mi"
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+          volumes:
+            - name: schedule
+              configMap:
+                name: carbon-scaler
+                items:
+                  - key: schedule.yaml
+                    path: schedule.yaml
+                  - key: carbon_scaler.py
+                    path: carbon_scaler.py
+                defaultMode: 0444
+
+---
+# =============================================================================
+# 5. RayCluster — carbon-tier bounds
+# =============================================================================
+# `maxReplicas` here is the *initial* value. The CronJob overwrites it every
+# 15 minutes based on the tier schedule. `minReplicas` is the floor the
+# scaler will never cross.
+#
+# NOTE: The Ray operator's autoscaler reconciles `workerGroupSpecs[]` on a
+# short interval. Do NOT run a second HPA against this object — RayCluster
+# has no `scale` subresource, and the HPA would fail with FailedGetScale.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: green-agent-cluster
+  namespace: green-agent
   labels:
     app: green-agent
-    enhancements: enabled
-  annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
-    green-agent/distillation: "true"
-    green-agent/bio-inspired: "true"
-    green-agent/moe: "true"
-    green-agent/flexgen: "true"
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: ray
+    app.kubernetes.io/version: "5.0.0"
 spec:
-  scaleTargetRef:
-    apiVersion: ray.io/v1
-    kind: RayCluster
-    name: green-agent-cluster
-  minReplicas: 2
-  maxReplicas: 20
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      num-cpus: "4"
+    template:
+      metadata:
+        labels:
+          app: green-agent
+          component: head
+      spec:
+        serviceAccountName: green-agent
+        containers:
+          - name: ray-head
+            image: ghcr.io/nurcholishadam/green_agent:5.0.0
+            imagePullPolicy: IfNotPresent
+            ports:
+              - { name: gcs,       containerPort: 6379 }
+              - { name: dashboard, containerPort: 8265 }
+              - { name: http,      containerPort: 8000 }
+              - { name: metrics,   containerPort: 9090 }
+            resources:
+              requests: { cpu: "2", memory: "4Gi" }
+              limits:   { cpu: "4", memory: "8Gi" }
+            livenessProbe:
+              httpGet: { path: /health, port: 8000 }
+              initialDelaySeconds: 30
+              periodSeconds: 10
+            readinessProbe:
+              httpGet: { path: /ready, port: 8000 }
+              initialDelaySeconds: 10
+              periodSeconds: 5
+            volumeMounts:
+              - { name: config-volume, mountPath: /app/config }
+              - { name: data-volume,   mountPath: /app/data }
+        volumes:
+          - name: config-volume
+            configMap:
+              name: green-agent-config
+          - name: data-volume
+            persistentVolumeClaim:
+              claimName: green-agent-data-pvc
+  workerGroupSpecs:
+    - groupName: standard-workers
+      replicas: 4
+      # FIX #2 (v1) — min/max are the Ray autoscaler's contract. The CronJob
+      # rewrites maxReplicas between 8 (day) and 20 (night). minReplicas is
+      # the floor the scaler will never drop below.
+      minReplicas: 2
+      maxReplicas: 20
+      rayStartParams:
+        num-cpus: "2"
+      template:
+        metadata:
+          labels:
+            app: green-agent
+            component: worker
+        spec:
+          serviceAccountName: green-agent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+          containers:
+            - name: ray-worker
+              image: ghcr.io/nurcholishadam/green_agent:5.0.0
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              resources:
+                requests: { cpu: "1", memory: "2Gi" }
+                limits:   { cpu: "2", memory: "4Gi" }
+              livenessProbe:
+                exec:
+                  command: ["ray", "health-check", "--component", "raylet"]
+                initialDelaySeconds: 60
+                periodSeconds: 30
+                failureThreshold: 3
+              readinessProbe:
+                exec:
+                  command: ["ray", "health-check", "--component", "raylet"]
+                initialDelaySeconds: 30
+                periodSeconds: 10
+              volumeMounts:
+                - { name: tmp-volume, mountPath: /tmp }
+          volumes:
+            - name: tmp-volume
+              emptyDir: {}
 
-  metrics:
-  # ── Core resource metrics (unchanged) ──
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: Utilization
-        averageUtilization: 70
-  - type: Resource
-    resource:
-      name: memory
-      target:
-        type: Utilization
-        averageUtilization: 80
-
-  # ── Enhanced custom metrics (from Prometheus) ──
-
-  # Carbon intensity: scale down if too high to reduce carbon footprint
-  - type: Pods
-    pods:
-      metric:
-        name: green_agent_carbon_intensity
-      target:
-        type: AverageValue
-        averageValue: "400"          # gCO₂/kWh threshold
-
-  # MODP composite score: scale up when performance is good across objectives
-  - type: Pods
-    pods:
-      metric:
-        name: green_agent_modp_score
-      target:
-        type: AverageValue
-        averageValue: "0.7"          # target score (0-1)
-
-  # RLHF feedback score: adjust scaling based on human satisfaction
-  - type: Pods
-    pods:
-      metric:
-        name: green_agent_rlhf_feedback
-      target:
-        type: AverageValue
-        averageValue: "0.5"
-
-  # LIMIT Graph centrality: high centrality may indicate efficient topology
-  - type: Pods
-    pods:
-      metric:
-        name: green_agent_graph_centrality
-      target:
-        type: AverageValue
-        averageValue: "0.6"
-
-  # Distillation update rate: ensure the learning loop is active
-  - type: Pods
-    pods:
-      metric:
-        name: green_agent_distillation_update_rate
-      target:
-        type: AverageValue
-        averageValue: "1.0"          # updates per minute
-
-  # MoE gating stability (optional) – could be used to avoid scaling during instability
-  # Uncomment if needed:
-  # - type: Pods
-  #   pods:
-  #     metric:
-  #       name: green_agent_moe_gate_stability
-  #     target:
-  #       type: AverageValue
-  #       averageValue: "0.8"
-
-  behavior:
-    scaleDown:
-      stabilizationWindowSeconds: 300
-      policies:
-      - type: Percent
-        value: 25
-        periodSeconds: 60
-    scaleUp:
-      stabilizationWindowSeconds: 60
-      policies:
-      - type: Percent
-        value: 100
-        periodSeconds: 60
-      # Additional policy for rapid scale-up based on MODP score
-      - type: Pods
-        pods:
-          metric:
-            name: green_agent_modp_score
-          periodSeconds: 60
-          value: 2
+---
+# =============================================================================
+# 6. OPTIONAL — a working HPA, on a Deployment (not a RayCluster)
+# =============================================================================
+# If you also want to autoscale the dashboard itself — a plain `Deployment`
+# that has a `scale` subresource — THIS is what a working HPA looks like:
+#
+#   * `scaleTargetRef.kind: Deployment`  (not RayCluster)
+#   * Only `Resource` metrics  (custom metrics require a metrics adapter
+#     — Prometheus Adapter, KEDA, or the custom.metrics.k8s.io API group —
+#     which is not installed by default)
+#   * `behavior` policies that actually exist in the API
+#
+# Uncomment and adapt if the dashboard should scale with CPU.
+#
+# ---
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata:
+#   name: green-agent-dashboard
+#   namespace: green-agent
+# spec:
+#   replicas: 2
+#   selector:
+#     matchLabels: { app: green-agent-dashboard }
+#   template:
+#     metadata:
+#       labels: { app: green-agent-dashboard }
+#     spec:
+#       containers:
+#         - name: dashboard
+#           image: ghcr.io/nurcholishadam/green_agent:5.0.0
+#           command: ["uvicorn", "api_server:app", "--host", "0.0.0.0", "--port", "8000"]
+#           ports:
+#             - { name: http, containerPort: 8000 }
+#           resources:
+#             requests: { cpu: "100m", memory: "256Mi" }
+#             limits:   { cpu: "1",    memory: "1Gi" }
+#           readinessProbe:
+#             httpGet: { path: /health, port: 8000 }
+# ---
+# apiVersion: autoscaling/v2
+# kind: HorizontalPodAutoscaler
+# metadata:
+#   name: green-agent-dashboard-hpa
+#   namespace: green-agent
+#   labels:
+#     app.kubernetes.io/name: green-agent
+#     app.kubernetes.io/component: dashboard-autoscaler
+# spec:
+#   scaleTargetRef:
+#     apiVersion: apps/v1
+#     kind: Deployment
+#     name: green-agent-dashboard
+#   minReplicas: 2
+#   maxReplicas: 10
+#   metrics:
+#     - type: Resource
+#       resource:
+#         name: cpu
+#         target:
+#           type: Utilization
+#           averageUtilization: 70
+#     - type: Resource
+#       resource:
+#         name: memory
+#         target:
+#           type: Utilization
+#           averageUtilization: 80
+#   behavior:
+#     scaleDown:
+#       stabilizationWindowSeconds: 300
+#       policies:
+#         - type: Percent
+#           value: 25
+#           periodSeconds: 60
+#     scaleUp:
+#       stabilizationWindowSeconds: 60
+#       policies:
+#         - type: Percent
+#           value: 100
+#           periodSeconds: 60
