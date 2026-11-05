@@ -1,53 +1,285 @@
-# Green Agent Advanced Modules - Base Requirements (Enhanced)
+# =============================================================================
+# Green Agent Advanced Modules — Unified Requirements
+# =============================================================================
 # Location: requirements/base.txt
+#
+# This single file consolidates what was previously one monolithic list into
+# clearly delineated sections that map 1-to-1 to future split files:
+#
+#     base         → minimal runtime (core, config, logging, CLI)
+#     enhancements → ML, graph, green/carbon, evolutionary, resilience, security
+#     observability→ logging backends, metrics, tracing
+#     dev          → testing, linting, typing, profiling, pre-commit
+#     docs         → documentation build
+#     prod         → production-only runtime additions
+#     optional     → integrations only needed for specific deployments
+#
+# ---- Versioning policy -------------------------------------------------------
+# Every pin uses BOTH a lower AND an upper bound. The upper bound is the next
+# major version (or the next ABI-breaking minor for known offenders like numpy
+# and cryptography). This file is safe for ``pip install -r`` directly, and is
+# intended to be compiled into a lockfile (``uv pip compile`` or
+# ``pip-compile``) for reproducible deployments.
+#
+# ---- Python version ----------------------------------------------------------
+# Requires Python >= 3.10 (PEP 604 unions, ``match``, structural pattern
+# matching, ``zip(strict=...)``). If you rely on ``asyncio.TaskGroup`` or
+# ``typing.Self``, raise the floor to 3.11. Declare this in pyproject.toml:
+#
+#     [project]
+#     requires-python = ">=3.10"
+#
+# ---- Critical fixes vs. original file ---------------------------------------
+# * REMOVED ``asyncio>=3.4.3``  → shadowed stdlib; the PyPI package is an
+#   abandoned Python 3.3 backport and warns on install. ``asyncio`` ships
+#   with Python since 3.4.
+# * ADDED upper bounds on every dependency (original had only ``>=``, which
+#   allowed e.g. NumPy 2.x to break scikit-learn 1.x ABI on fresh installs).
+# * ADDED dev / test / lint / type dependencies (original had none).
+# * ADDED green/carbon telemetry deps — the project is called "Green Agent"
+#   but had no energy- or carbon-measurement library at all.
+# * ADDED evolutionary / multi-objective deps — ``use_evolutionary`` and
+#   MODP were advertised but had no backing library.
+# * ``pyjwt`` → ``pyjwt[crypto]`` so RS256/ES256/EdDSA actually work
+#   (plain pyjwt only supports HMAC algorithms).
+# * REMOVED ``dataclasses-json`` (superseded by pydantic v2, which was
+#   already present).
+# * REMOVED ``colorlog`` (redundant once ``rich`` is added).
+# * ADDED ``pybreaker``/``aiobreaker`` — the original comment promised
+#   circuit breakers, but only ``tenacity`` (retry) was present.
+# =============================================================================
 
-# Core dependencies
-numpy>=1.24.0
-pandas>=2.0.0
-scipy>=1.10.0
 
-# Async and concurrency
-asyncio>=3.4.3
-aiohttp>=3.8.0
-aiofiles>=23.0.0                 # Asynchronous file operations (persistence, logging)
+# =============================================================================
+# SECTION 1 — BASE (minimal runtime)
+# =============================================================================
+# These are required for every deployment. Keep this list small: anything
+# heavy or optional belongs in later sections.
 
-# Logging and monitoring
-python-json-logger>=2.0.7
-colorlog>=6.7.0
+# Core numerical / data stack
+numpy>=1.24,<3                   # 2.x ABI break vs. sklearn 1.x — keep bounded
+pandas>=2.0,<3                   # 3.0 is a breaking major
+scipy>=1.10,<2                   # sparse graphs, stats used by LIMIT/MODP
 
 # Configuration
-pyyaml>=6.0
-python-dotenv>=1.0.0
+pyyaml>=6.0,<7
+python-dotenv>=1.0,<2
+pydantic>=2.0,<3                 # v2 API only — v1 is EOL for new projects
+pydantic-settings>=2.0,<3
 
-# Data structures
-dataclasses-json>=0.6.0
+# CLI + progress
+click>=8.1,<9
+tqdm>=4.65,<5
 
-# Utilities
-tqdm>=4.65.0
-click>=8.1.0
 
-# ---------------------------------------------------------------------------
-# Dependencies for Advanced Enhancements
-# (LIMIT Graph, MODP, RLHF, Multi‑Teacher Distillation, Bio‑inspired, MoE)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# SECTION 2 — ENHANCEMENTS: ML / DISTILLATION / HISTORICAL TEACHERS
+# =============================================================================
+# Used by the multi-teacher distillation stack (RandomForest teacher,
+# joblib persistence, sklearn metrics).
 
-# Historical ML teachers (RandomForest) used in multi‑teacher distillation
-scikit-learn>=1.3.0
-joblib>=1.3.0
+scikit-learn>=1.3,<2
+joblib>=1.3,<2
 
-# Schema validation and settings management (Pydantic v2)
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
 
-# Zero Trust security: encryption, tokens, authentication
-cryptography>=41.0.0
-pyjwt>=2.8.0
+# =============================================================================
+# SECTION 3 — ENHANCEMENTS: GRAPH (LIMIT)
+# =============================================================================
+# networkx is great below ~1M edges; python-igraph covers larger LIMIT graphs
+# with a C++ backend (~10x faster centrality / clustering).
 
-# Telemetry and monitoring (Prometheus client for MODP/RLHF metrics)
-prometheus-client>=0.17.0
+networkx>=3.1,<4
+python-igraph>=0.11,<1           # Large-graph fallback; keep optional in CI matrix
 
-# Retry logic with exponential backoff (used in circuit breakers)
-tenacity>=8.2.0
 
-# Network analysis for LIMIT Graph (graph metrics, centrality)
-networkx>=3.1
+# =============================================================================
+# SECTION 4 — ENHANCEMENTS: MULTI-OBJECTIVE + BIO-INSPIRED OPTIMIZATION
+# =============================================================================
+# MODP is multi-objective → pymoo (NSGA-II/III, MOEA/D, TOPSIS helpers).
+# Bio-inspired tuning (use_evolutionary) → deap (GA, ES, GP).
+
+pymoo>=0.6,<1
+deap>=1.4,<2
+
+
+# =============================================================================
+# SECTION 5 — ENHANCEMENTS: GREEN / CARBON / ENERGY TELEMETRY
+# =============================================================================
+# This is what makes "Green Agent" mean something. MODP's energy and carbon
+# objectives should be backed by real measurements, not payload proxies.
+
+codecarbon>=2.3,<3               # Reference carbon accounting library
+psutil>=5.9,<7                   # CPU/RAM/disk/battery sensors
+pynvml>=11.5,<13                 # NVIDIA GPU power, utilization, temp
+py-cpuinfo>=9.0,<10              # CPU model → TDP lookup for energy models
+pyRAPL>=0.2,<1; sys_platform == "linux"   # Intel RAPL counters (Linux only)
+
+
+# =============================================================================
+# SECTION 6 — ENHANCEMENTS: ASYNC / CONCURRENCY
+# =============================================================================
+# asyncio itself is stdlib — do NOT list it. Only third-party helpers here.
+
+aiohttp>=3.8,<4                  # HTTP client / server for bus gateways
+aiofiles>=23.0,<25               # Async file I/O (persistence, logs)
+uvloop>=0.19,<1; sys_platform != "win32"  # 2-4x faster event loop
+httpx>=0.27,<1                   # Modern sync+async HTTP; HTTP/2; testable
+aiometer>=0.5,<1                 # Concurrency rate limiting for teacher fan-out
+
+
+# =============================================================================
+# SECTION 7 — ENHANCEMENTS: RESILIENCE
+# =============================================================================
+# tenacity covers retry; pybreaker/aiobreaker cover actual circuit breakers
+# (the original file promised breakers but only shipped retry).
+
+tenacity>=8.2,<10
+pybreaker>=1.0,<2
+aiobreaker>=1.2,<2
+
+
+# =============================================================================
+# SECTION 8 — ENHANCEMENTS: SECURITY (ZERO TRUST)
+# =============================================================================
+# pyjwt[crypto] pulls in the crypto extras required for RS/ES/EdDSA. Plain
+# pyjwt only supports HS256/384/512 — not acceptable for zero-trust.
+
+cryptography>=41,<46             # Majors occasionally break ABI — keep bounded
+pyjwt[crypto]>=2.8,<3
+email-validator>=2.1,<3          # Required by pydantic[email] / EmailStr fields
+
+
+# =============================================================================
+# SECTION 9 — OBSERVABILITY (metrics, logs, traces)
+# =============================================================================
+# Metrics (MODP / RLHF counters, drop rates, reward means)
+
+prometheus-client>=0.17,<1
+
+# Structured logging — structlog supersedes python-json-logger for context
+# propagation, async safety, and bound loggers. We keep python-json-logger
+# only if a downstream consumer requires its exact JSON shape.
+structlog>=24.1,<25
+python-json-logger>=2.0,<4
+
+# Rich console output (replaces colorlog, integrates with typer/click)
+rich>=13.7,<14
+
+# Distributed tracing (OTLP exporter for Jaeger/Tempo/Grafana Tempo)
+opentelemetry-api>=1.24,<2
+opentelemetry-sdk>=1.24,<2
+opentelemetry-exporter-otlp>=1.24,<2
+opentelemetry-instrumentation-asyncio>=0.45b0,<1
+
+
+# =============================================================================
+# SECTION 10 — OPTIONAL: PERSISTENCE / STATE
+# =============================================================================
+# Useful for replay buffers, dead-letter queues, and message persistence.
+
+aiosqlite>=0.19,<1               # Async SQLite — replay buffer / msg store
+diskcache>=5.6,<6                # Persistent LRU cache with eviction
+orjson>=3.10,<4                  # 5-10x faster JSON for hot paths
+msgspec>=0.18,<1                 # Fast serialization of replay records
+
+
+# =============================================================================
+# SECTION 11 — DEV: TESTING
+# =============================================================================
+# None of these were in the original file. Add to CI immediately.
+
+pytest>=8.0,<9
+pytest-asyncio>=0.23,<1
+pytest-cov>=5.0,<7
+pytest-xdist>=3.5,<4             # Parallel test execution
+pytest-benchmark>=4.0,<5         # Micro-benchmarks (message bus throughput)
+hypothesis>=6.98,<7              # Property-based tests for state/reward invariants
+faker>=24,<27                    # Realistic test fixtures
+factory-boy>=3.3,<4              # Factory fixtures for Message/MessageState
+respx>=0.21,<1                   # Mock httpx clients
+responses>=0.25,<1               # Mock aiohttp / requests clients
+freezegun>=1.4,<2                # Deterministic time (TTL, decay schedules)
+
+
+# =============================================================================
+# SECTION 12 — DEV: LINT / FORMAT / TYPE
+# =============================================================================
+# ruff replaces black + isort + flake8 + pyupgrade + autoflake.
+# mypy strict against public modules; pandas-stubs for typed DataFrames.
+
+ruff>=0.4,<1
+mypy>=1.10,<2
+pandas-stubs>=2.0,<3
+types-PyYAML>=6.0,<7
+types-requests>=2.31,<3
+types-psutil>=5.9,<7
+
+
+# =============================================================================
+# SECTION 13 — DEV: SECURITY / SUPPLY CHAIN
+# =============================================================================
+
+bandit>=1.7,<2                   # Static security lint
+pip-audit>=2.7,<3                # CVE scan of installed deps
+cyclonedx-bom>=4.1,<5            # SBOM generation (CycloneDX)
+pip-licenses>=4.4,<5             # License compliance report
+pre-commit>=3.7,<4               # Hook runner for ruff / mypy / bandit
+
+
+# =============================================================================
+# SECTION 14 — DEV: PROFILING / BENCHMARKING
+# =============================================================================
+# Green Agent tracks energy — also track *where* the energy goes.
+
+py-spy>=0.3,<1                   # Sampling profiler (no code changes)
+scalene>=1.5,<2                  # CPU + memory + GPU profiler
+memory-profiler>=0.61,<1         # Line-level memory profiling
+line-profiler>=4.1,<5            # Line-level time profiling
+asv>=0.6,<1                      # Long-term benchmark suite (optional)
+
+
+# =============================================================================
+# SECTION 15 — DOCS
+# =============================================================================
+
+mkdocs>=1.5,<2
+mkdocs-material>=9.5,<10
+mkdocstrings[python]>=0.24,<1
+mkdocs-gen-files>=0.5,<1         # Auto-generate API docs from source
+mkdocs-literate-nav>=0.6,<1      # Navigation from directory structure
+
+
+# =============================================================================
+# SECTION 16 — PROD (server deployments only)
+# =============================================================================
+# Only install on hosts that actually serve traffic or ship data to Sentry.
+
+gunicorn>=21,<24
+uvicorn[standard]>=0.29,<1
+fastapi>=0.110,<1                # Only if the bus is exposed over HTTP
+sentry-sdk>=2.0,<3
+
+
+# =============================================================================
+# SECTION 17 — OPTIONAL INTEGRATIONS
+# =============================================================================
+# Uncomment only when the corresponding deployment target is active.
+
+# --- Distributed / multi-process ---
+# ray>=2.9,<3                    # Distributed teacher inference / experiments
+# dask>=2024.1,<2025             # Parallel dataframes if pandas overflows
+# redis>=5.0,<6                  # Cross-process message bus backend
+# aiokafka>=0.10,<1              # Kafka transport for publish/subscribe
+
+# --- Alternative persistence ---
+# sqlalchemy>=2.0,<3             # If relational persistence is required
+# alembic>=1.13,<2               # Schema migrations
+
+# --- Notebook / research ---
+# jupyterlab>=4.0,<5
+# ipywidgets>=8.1,<9
+# matplotlib>=3.8,<4             # Pareto fronts, reward curves
+
+# --- Experiment tracking ---
+# mlflow>=2.10,<3
+# wandb>=0.16,<1
