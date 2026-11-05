@@ -1,47 +1,120 @@
-# Green Agent - Quantum Efficiency Requirements (Enhanced)
+# =============================================================================
+# Green Agent — Quantum Efficiency Requirements (Enhanced v2)
+# =============================================================================
 # Location: requirements/quantum.txt
+#
+# ---- Critical fixes vs. v1 --------------------------------------------------
+# * qiskit>=0.45.0 -> qiskit>=2.5,<3.
+#   Current Qiskit is 2.6.1 (Oct 2026); 1.x support ended March 2026.
+#   Every Qiskit ecosystem package now caps at <3 and requires >=2.x.
+# * qiskit-aer>=0.13.0 -> qiskit-aer>=0.17,<1.
+#   Current Aer is 0.17.2 and requires Qiskit >=1.1, highest supported 2.5.
+#   Aer 0.13 cannot install with Qiskit 2.x.
+# * numpy/scipy floors raised to match Qiskit 2.x:
+#   Qiskit 2.5 requires numpy>=2.0,<3 and scipy>=1.14.
+# * 13 duplicates of base.txt deleted — re-declaring them as >=X.0.0 was
+#   silently overriding the <next_major caps fixed in base.txt.
+# * pyjwt[crypto] inherited from base.txt (plain pyjwt is HMAC-only).
+#
+# ---- Inherits from base.txt -------------------------------------------------
+# numpy, scipy, pandas, pydantic, pydantic-settings, cryptography,
+# pyjwt[crypto], prometheus-client, tenacity, aiofiles, aiohttp,
+# scikit-learn, joblib — do NOT re-declare them with weaker bounds.
+# =============================================================================
 
 -r base.txt
 
-# Quantum simulation
-qiskit>=0.45.0
-qiskit-aer>=0.13.0
 
-# Linear algebra
-scipy>=1.10.0
-numpy>=1.24.0
+# =============================================================================
+# SECTION 1 — QISKIT CORE + SIMULATION
+# =============================================================================
+# Qiskit 2.6.1 is current. Qiskit 1.x support ended March 2026. All
+# ecosystem packages cap at <3 and require >=2.x. Aer 0.17.2 supports
+# Qiskit 2.5+ (current release 0.17.2 per Aer docs).
 
-# Network analysis (for quantum walks on graphs)
-networkx>=3.1
+qiskit>=2.5,<3
+qiskit-aer>=0.17,<1
 
-# ---------------------------------------------------------------------------
-# Advanced Enhancements (LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy
-# Distillation, Bio‑inspired Optimisation, Mixture‑of‑Experts expert gating)
-# ---------------------------------------------------------------------------
+# numpy>=2.0 and scipy>=1.14 come from base.txt (raised to Qiskit 2.x floors)
 
-# Historical ML teachers (RandomForest) used in multi‑teacher distillation
-scikit-learn>=1.3.0
-joblib>=1.3.0                 # model serialization for historical teachers
 
-# Data handling for interaction logs (CSV/JSON) and state vectors
-pandas>=2.0.0
+# =============================================================================
+# SECTION 2 — QUANTUM GRAPH ALGORITHMS (quantum walks on graphs)
+# =============================================================================
+# The file explicitly references "quantum walks on graphs" but had no
+# quantum-walk library. networkx is inherited from base.txt.
 
-# Schema validation and settings management (Pydantic v2)
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
+qiskit-graph-walks>=0.1,<1        # coined + continuous + discrete-time (Szegedy) walks
+QWAK>=1.0,<2                      # CTQW with open-system evolution + visualization
+# SQWLib>=0.1,<1                  # Szegedy walks on sparse graphs up to 1k nodes
 
-# Zero Trust security: encryption, tokens, authentication
-cryptography>=41.0.0
-pyjwt>=2.8.0
 
-# Telemetry and monitoring (Prometheus integration for MODP/RLHF metrics)
-prometheus-client>=0.17.0
+# =============================================================================
+# SECTION 3 — QUANTUM ML (teachers for multi-teacher distillation)
+# =============================================================================
 
-# Retry logic with exponential backoff (used in circuit breakers)
-tenacity>=8.2.0
+qiskit-machine-learning>=0.9,<1   # quantum kernels + quantum neural networks
+sQUlearn>=0.8,<1                  # NISQ-ready QML; scikit-learn compatible
 
-# Asynchronous file operations (persistence, logging)
-aiofiles>=23.0.0
 
-# Optional: for advanced async HTTP clients (e.g., carbon API calls)
-aiohttp>=3.8.0
+# =============================================================================
+# SECTION 4 — GPU ACCELERATION (critical for quantum efficiency)
+# =============================================================================
+# CPU simulation is the bottleneck above ~25 qubits. cuQuantum-backed Aer
+# accelerates statevector/density-matrix/unitary simulation by 10-100x.
+
+qiskit-aer-gpu>=0.17,<1; sys_platform == "linux"   # use -cu11/-cu12 variant as needed
+cuquantum-python>=24.0,<26; sys_platform == "linux"
+
+
+# =============================================================================
+# SECTION 5 — QUANTUM ANNEALING (if MODP is solved as a QUBO)
+# =============================================================================
+
+dwave-ocean-sdk>=7.0,<9           # D-Wave Ocean: annealers, samplers, QUBO tools
+
+
+# =============================================================================
+# SECTION 6 — QUANTUM MONTE CARLO
+# =============================================================================
+
+pyqmc>=0.8,<1                     # real-space VMC/DMC; interoperates with PySCF
+# pygfmc>=0.1,<1                  # Green's Function Monte Carlo in JAX (GPU)
+
+
+# =============================================================================
+# SECTION 7 — ERROR MITIGATION (near-term hardware runs)
+# =============================================================================
+
+qiskit-addon-mthree>=3.0,<4       # M3 matrix-free measurement mitigation
+
+
+# =============================================================================
+# SECTION 8 — QUANTUM RANDOMNESS (unbiased RLHF / QMC sampling)
+# =============================================================================
+
+lightrider>=0.1,<1                # QPU-backed QRNG with offline entropy pool
+# vqrng>=0.1,<1                   # verifiable QRNG with auditable evidence record
+
+
+# =============================================================================
+# SECTION 9 — GREEN AGENT QUANTUM TELEMETRY (the file's namesake)
+# =============================================================================
+# A "Green Agent" quantum runtime must measure the energy and carbon of its
+# simulation/synthesis workloads. Research on carbon-efficient quantum AI
+# explicitly frames the accuracy/complexity/energy trade-off.
+
+codecarbon>=2.3,<3                # carbon accounting for quantum-classical workloads
+psutil>=5.9,<8                    # live CPU/RAM power (7.x is a breaking major)
+nvidia-ml-py>=13,<14              # official NVML — replaces abandoned gputil/pynvml
+
+# Optional: energy-aware simulation planner
+# menos>=0.1,<1                   # estimates cost of multiple strategies, picks best
+
+
+# =============================================================================
+# SECTION 10 — PROFILING / OBSERVABILITY
+# =============================================================================
+
+memray>=1.13,<2                   # memory profiling for large statevectors
+py-spy>=0.3,<1                    # attach to simulation workers
