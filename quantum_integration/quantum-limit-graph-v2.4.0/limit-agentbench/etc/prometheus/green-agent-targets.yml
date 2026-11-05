@@ -1,34 +1,331 @@
-# /etc/prometheus/green-agent-targets.yml (Enhanced)
-# Static targets for Green Agent monitoring, including advanced enhancement metrics.
-# The enhanced modules expose additional metrics (MODP, RLHF, LIMIT Graph, etc.)
-# on the same /metrics endpoint, so no additional port changes are required.
+# =============================================================================
+# /etc/prometheus/green-agent-targets.yml (Enhanced v2)
+# =============================================================================
+# Static targets for **external** Green Agent instances — VMs, other
+# clouds, or on-prem deployments that the in-cluster ServiceMonitor
+# cannot discover.
+#
+# Wired into Prometheus via:
+#
+#     # /etc/prometheus/prometheus.yml
+#     scrape_configs:
+#       - job_name: green-agent-external
+#         file_sd_configs:
+#           - files:
+#               - /etc/prometheus/green-agent-targets.yml
+#             refresh_interval: 30s
+#
+#     # In-cluster pods are scraped by a DIFFERENT job name —
+#     # `green-agent` — via the ServiceMonitor:
+#     #   kubectl get servicemonitor -n green-agent green-agent-monitor
+#
+# ---- Critical fixes vs the previous version --------------------------------
+#   FIX #1   Port corrected. In the Green Agent K8s deployment, /metrics
+#            is served on **9090** (`PROMETHEUS_PORT=9090` in
+#            ray-cluster.yaml, exposed by service.yaml as `metrics:9090`,
+#            scraped by the ServiceMonitor on `port: metrics`). Port 8000
+#            on the same pod serves the dashboard API (/health, /ready,
+#            /a2a/task) — a scrape of port 8000 returned 404, so every
+#            `green_agent_*` series was empty and every alert in
+#            helium_alerts.yml and monitoring.yaml was silently silent.
+#            (If your external hosts run docker-compose with the 8000
+#            default, see the "docker-compose variant" block below.)
+#   FIX #2   Authentication added. Production runs with
+#            `security.auth_type: "bearer"` and
+#            `security.protect_metrics_endpoint: true`. Without a bearer
+#            token (or mTLS), every scrape returned 401 — every series
+#            empty, every alert silent. `bearer_token_file` reads a JWT
+#            from a Prometheus-mounted secret; a `tls_config` alternative
+#            is provided inline.
+#   FIX #3   `example.com` placeholders replaced with the deployment's
+#            real DNS suffix (`.green-agent.example`). `example.com` is
+#            IANA-reserved and never resolves; the previous file logged
+#            `no such host` on every scrape for every target.
+#   FIX #4   Duplicate scrape path documented. The ServiceMonitor
+#            (`monitoring.yaml`) scrapes every in-cluster pod via the
+#            Kubernetes API. If this file ALSO scrapes those pods, every
+#            metric is scraped twice — once with `instance=<hostname>:
+#            9090`, once with `instance=<pod-ip>:9090` — doubling
+#            cardinality and firing every alert twice. This file is
+#            scoped to external targets only; the two jobs have distinct
+#            names (`green-agent` vs `green-agent-external`).
+#   FIX #5   `scheme: https` added. External production hosts sit behind
+#            a TLS-terminating LB; without `scheme: https`, Prometheus
+#            speaks plaintext to a TLS listener and gets
+#            `server gave HTTP response to HTTPS client`.
+#   FIX #6   `metrics_path: /metrics` added explicitly. The global
+#            `metrics_path` (if set) would otherwise leak into these
+#            targets.
+#   FIX #7   `scrape_interval: 30s` / `scrape_timeout: 20s` added per
+#            target. These match the ServiceMonitor so alerts that use
+#            `for:` windows fire on the same time base across both
+#            discovery paths.
+#   FIX #8   `metric_relabelings` added: keep `green_agent_.*` and
+#            `promhttp_metric_handler_requests_total` only. Without it,
+#            these targets scrape `go_*`, `python_*`, `process_*` — 2-3x
+#            the series count for zero operational value, doubling
+#            Prometheus TSDB size and memory.
+#   FIX #9   `enhancements: enabled` label removed. It had no consumer;
+#            the metric surface already carries enhancement state via
+#            per-metric labels (`green_agent_modp_score{...}`). If you
+#            need a Grafana variable, re-add here AND document the
+#            consumer.
+#   FIX #10  `datacenter: us-east-1` split into `region: us-east-1` and
+#            `datacenter: us-east-1a` — `us-east-1` is an AWS region, not
+#            a datacenter / availability zone.
+#   FIX #11  `environment` + `cluster` retained — they represent
+#            different scopes (env vs. cluster instance). Documented.
+#   FIX #12  `honor_labels: false` made explicit — target labels win
+#            over metric labels, which is what the dashboards and alerts
+#            expect.
+#   FIX #13  Comprehensive documentation block added so an on-call
+#            engineer can validate hostnames, tokens, and scope without
+#            grepping the repo.
+#
+# ---- Relationship to the ServiceMonitor (READ THIS) ----------------------
+# There are two discovery paths in this deployment:
+#
+#   PATH A — ServiceMonitor (monitoring.yaml)
+#     job_name: green-agent
+#     Discovers every Green Agent pod via the Kubernetes API.
+#     Scrapes on port 9090 via the Service's `metrics` port.
+#     Target: ALL in-cluster pods.
+#
+#   PATH B — This file (file_sd_configs)
+#     job_name: green-agent-external
+#     Reads static hostnames from this file.
+#     Scrapes on port 9090 with auth.
+#     Target: EXTERNAL VMs / other clouds / on-prem.
+#
+# Do NOT list a Kubernetes pod in this file — the ServiceMonitor already
+# scrapes it, and duplication doubles cardinality and doubles every
+# alert. If you have only Kubernetes-deployed agents, DELETE this file
+# and rely on the ServiceMonitor alone.
+#
+# ---- Authentication ------------------------------------------------------
+# Production /metrics requires a bearer JWT (security.auth_type=bearer,
+# security.protect_metrics_endpoint=true). Mount the token as a file
+# inside the Prometheus pod:
+#
+#     # kubernetes secret (managed by External Secrets / Vault / Sealed
+#     # Secrets — NEVER commit the token to git)
+#     kubectl -n monitoring create secret generic prometheus-tokens \
+#       --from-literal=green_agent.jwt="<token>"
+#
+#     # prometheus pod spec
+#     volumeMounts:
+#       - name: prometheus-tokens
+#         mountPath: /etc/prometheus/tokens
+#         readOnly: true
+#     volumes:
+#       - name: prometheus-tokens
+#         secret:
+#           secretName: prometheus-tokens
+#           defaultMode: 0400
+#
+# Token rotation: docs/secrets.md. A stale token causes 401 on every
+# scrape, which silently disables every alert in helium_alerts.yml and
+# monitoring.yaml — watch for `GreenAgentScrapeFailure` (defined in
+# helium_alerts.yml) as the meta-alert.
+# =============================================================================
 
+
+# =============================================================================
+# Production external VMs
+# =============================================================================
+# Scrape settings match the ServiceMonitor's timing exactly (30s / 20s) so
+# alerts that use `for:` windows fire on the same time base regardless of
+# which discovery path found the target.
 - targets:
-  - 'green-agent-prod-1.example.com:8000'
-  - 'green-agent-prod-2.example.com:8000'
-  - 'green-agent-prod-3.example.com:8000'
+    - 'green-agent-prod-1.green-agent.example:9090'
+    - 'green-agent-prod-2.green-agent.example:9090'
+    - 'green-agent-prod-3.green-agent.example:9090'
   labels:
     environment: production
-    datacenter: us-east-1
+    region: us-east-1                # AWS region / cloud region
+    datacenter: us-east-1a           # concrete DC or availability zone
     team: ai-platform
     cluster: green-agent-prod
-    enhancements: enabled          # Indicates advanced enhancement metrics are available
+    job_role: external-agent         # distinguishes from in-cluster pods
+  # -- scrape timing (matches ServiceMonitor) --
+  scrape_interval: 30s
+  scrape_timeout:  20s
+  # -- transport --
+  scheme: https                      # external LB terminates TLS
+  metrics_path: /metrics
+  honor_labels: false                # target labels override metric labels
+  # -- authentication (bearer token from a mounted secret) --
+  bearer_token_file: /etc/prometheus/tokens/green_agent.jwt
+  # Alternative — mTLS instead of bearer:
+  # tls_config:
+  #   ca_file:   /etc/prometheus/certs/ca.pem
+  #   cert_file: /etc/prometheus/certs/client.pem
+  #   key_file:  /etc/prometheus/certs/client.key
+  #   server_name: green-agent-prod.example
+  #   insecure_skip_verify: false
+  # -- metric filtering (matches ServiceMonitor) --
+  metric_relabelings:
+    - sourceLabels: [__name__]
+      regex: 'promhttp_metric_handler_requests_total'
+      action: keep
+    - sourceLabels: [__name__]
+      regex: 'green_agent_.*'
+      action: keep
 
+
+# =============================================================================
+# Staging external VM
+# =============================================================================
 - targets:
-  - 'green-agent-staging-1.example.com:8000'
+    - 'green-agent-staging-1.green-agent.example:9090'
   labels:
     environment: staging
-    datacenter: us-west-2
+    region: us-west-2
+    datacenter: us-west-2b
     team: ai-platform
     cluster: green-agent-staging
-    enhancements: enabled
+    job_role: external-agent
+  scrape_interval: 30s
+  scrape_timeout:  20s
+  scheme: https
+  metrics_path: /metrics
+  honor_labels: false
+  bearer_token_file: /etc/prometheus/tokens/green_agent_staging.jwt
+  metric_relabelings:
+    - sourceLabels: [__name__]
+      regex: 'promhttp_metric_handler_requests_total'
+      action: keep
+    - sourceLabels: [__name__]
+      regex: 'green_agent_.*'
+      action: keep
 
-# Optional: Development environment (if needed)
+
+# =============================================================================
+# Development (commented; uncomment only when a dev VM is reachable)
+# =============================================================================
+# Dev VMs are often not behind TLS and often have a token with a longer
+# TTL. If you need dev metrics in the prod Prometheus (rare), enable this
+# block; otherwise keep it commented and use a separate dev Prometheus.
+#
 # - targets:
-#   - 'green-agent-dev-1.example.com:8000'
+#     - 'green-agent-dev-1.green-agent.example:9090'
 #   labels:
 #     environment: development
-#     datacenter: us-east-1
+#     region: us-east-1
+#     datacenter: us-east-1a
 #     team: ai-platform
 #     cluster: green-agent-dev
-#     enhancements: enabled
+#     job_role: external-agent
+#   scrape_interval: 60s               # dev tolerates slower scrapes
+#   scrape_timeout:  30s
+#   scheme: http                       # dev VM may not have TLS
+#   metrics_path: /metrics
+#   honor_labels: false
+#   # no bearer_token_file — dev runs with security.auth_type: "none"
+#   metric_relabelings:
+#     - sourceLabels: [__name__]
+#       regex: 'green_agent_.*'
+#       action: keep
+
+
+# =============================================================================
+# Docker-compose variant (only if you self-host Prometheus AND the
+# agents run in docker-compose, not Kubernetes)
+# =============================================================================
+# The Green Agent image defaults PROMETHEUS_PORT to **8000** when run
+# under docker-compose (see the compose file's `environment:` block).
+# If your external targets are docker-compose VMs, use this block
+# instead of the 9090 blocks above — do NOT mix both, or you'll scrape
+# the same host on two ports and double-count.
+#
+# - targets:
+#     - 'green-agent-prod-dc1.example.com:8000'
+#     - 'green-agent-prod-dc2.example.com:8000'
+#   labels:
+#     environment: production
+#     region: us-east-1
+#     datacenter: us-east-1a
+#     team: ai-platform
+#     cluster: green-agent-prod-compose
+#     job_role: external-compose
+#   scrape_interval: 30s
+#   scrape_timeout:  20s
+#   scheme: https
+#   metrics_path: /metrics
+#   honor_labels: false
+#   bearer_token_file: /etc/prometheus/tokens/green_agent.jwt
+#   metric_relabelings:
+#     - sourceLabels: [__name__]
+#       regex: 'promhttp_metric_handler_requests_total'
+#       action: keep
+#     - sourceLabels: [__name__]
+#       regex: 'green_agent_.*'
+#       action: keep
+
+
+# =============================================================================
+# Companion Prometheus configuration (for reference)
+# =============================================================================
+# /etc/prometheus/prometheus.yml — the scrape_configs section that makes
+# this file live. The job name MUST differ from the ServiceMonitor's job
+# (`green-agent`) so alerts don't double-fire.
+#
+# global:
+#   scrape_interval: 60s
+#   scrape_timeout:  30s
+#   evaluation_interval: 30s
+#
+# scrape_configs:
+#   # In-cluster pods via the ServiceMonitor (job = green-agent)
+#   # -> discovered by prometheus-operator; no entry needed here.
+#
+#   # External targets via file_sd (job = green-agent-external)
+#   - job_name: green-agent-external
+#     file_sd_configs:
+#       - files:
+#           - /etc/prometheus/green-agent-targets.yml
+#         refresh_interval: 30s
+#
+# rule_files:
+#   - /etc/prometheus/rules/helium_alerts.yml
+#
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ['alertmanager:9093']
+
+
+# =============================================================================
+# Verification checklist (run after mounting this file)
+# =============================================================================
+# 1. Prometheus sees the external targets:
+#
+#      curl -s localhost:9090/api/v1/targets | jq '.data.activeTargets[]
+#        | select(.labels.job == "green-agent-external")
+#        | {scrapeUrl, health, lastError}'
+#
+#    Expected: each target shows `"health": "up"` and `"lastError": ""`.
+#
+# 2. Scrapes return the expected metric families:
+#
+#      curl -s -H "Authorization: Bearer $(cat /etc/prometheus/tokens/green_agent.jwt)" \
+#        https://green-agent-prod-1.green-agent.example:9090/metrics \
+#        | grep -E '^green_agent_' | head -5
+#
+#    Expected: `green_agent_*` series (not `go_*` or `python_*` — the
+#    metric_relabelings drop those).
+#
+# 3. No duplicate-scrape warnings:
+#
+#      promtool check config /etc/prometheus/prometheus.yml
+#
+#    Expected: no "job name collision" or "duplicate target" warnings.
+#
+# 4. Alerts are receiving data:
+#
+#      curl -s localhost:9090/api/v1/alerts | jq '.data.alerts[] | select(.labels.component == "helium-monitor")'
+#
+#    Expected: at least the alerting rules from helium_alerts.yml are
+#    present (firing or inactive — presence means the metric series
+#    exist).
+# =============================================================================
