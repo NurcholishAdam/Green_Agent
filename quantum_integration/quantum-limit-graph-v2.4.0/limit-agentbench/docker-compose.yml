@@ -1,52 +1,382 @@
-version: '3.8'
+# =============================================================================
+# Green Agent — Docker Compose (Enhanced v2)
+# =============================================================================
+# This is the complete enhanced `docker-compose.yml`. It fixes every issue
+# identified in the v1 analysis and adds the observability / reliability /
+# security posture the rest of the stack already assumes.
+#
+# ---- Critical fixes vs v1 ---------------------------------------------------
+#   FIX #1   Removed `version: '3.8'` — deprecated in Compose V2 and triggers
+#            a warning on every command.
+#   FIX #2   Healthcheck replaced `curl` with `python -c urllib.request`.
+#            `curl` is not present in python:*-slim or distroless base images.
+#   FIX #3   Healthcheck now probes `/metrics` on 8000 (the endpoint the
+#            enhanced `run_agent.py` definitely serves) with a fallback
+#            note for `/health`.
+#   FIX #4   `start_period: 120s` added so a 90-second cold start is not
+#            marked unhealthy at t=90s.
+#   FIX #5   `AGENTBEATS_API_KEY` uses `${VAR:?reason}` — compose fails at
+#            parse time instead of letting the app silently accept an empty
+#            key.
+#   FIX #6   `MODP_WEIGHTS` default is quoted and documented as JSON. The
+#            companion `.env.example` documents scalar alternatives.
+#   FIX #7   Ports bind to `127.0.0.1` by default — override with `BIND_ADDR`
+#            only when intentional.
+#   FIX #8   `GRID_REGION` documented as `US-CA` (matches
+#            `green_agent_config.yaml`); the manifest's `ID` is flagged in
+#            comments for reconciliation.
+#   FIX #9   `mem_limit` set, with the FlexGen 16 GB requirement documented
+#            as the required override when `FLEXGEN_ENABLED=true`.
+#   FIX #10  `/app/data` named volume added (mirrors the k8s PVC).
+#   FIX #11  Runs as `1000:1000` (matches k8s `runAsNonRoot`/`runAsUser`).
+#   FIX #12  `read_only: true` with tmpfs for `/tmp` and `/var/tmp`
+#            (matches k8s `readOnlyRootFilesystem: true`).
+#   FIX #13  `cap_drop: [ALL]` (matches k8s `capabilities.drop`).
+#   FIX #14  `security_opt: no-new-privileges`.
+#   FIX #15  `secrets:` block documented — API key may be mounted from a
+#            file at `/run/secrets/agentbeats_api_key`.
+#   FIX #16  Dedicated `green_agent_net` bridge network — the default bridge
+#            is not shared with unrelated containers.
+#   FIX #17  Named volumes replace bind mounts — avoids root-owned host
+#            directories that break the uid 1000 container.
+#   FIX #18  `mem_limit`, `memswap_limit`, `cpus` set.
+#   FIX #19  json-file logging with `max-size: 50m` / `max-file: 5`.
+#   FIX #20  `stop_grace_period: 3m` — checkpoints before SIGKILL.
+#   FIX #21  `init: true` — PID 1 reaps zombies.
+#   FIX #22  Restart policy documented with the `on-failure:5` alternative.
+#   FIX #23  `depends_on` with `condition: service_healthy, required: false`
+#            for the optional Redis.
+#   FIX #24  `env_file: .env` with `required: false`.
+#   FIX #25  Image pinned — production uses
+#            `ghcr.io/nurcholishadam/green_agent:5.0.0` by default; `build`
+#            is kept for local iteration.
+#   FIX #26  `platform: ${DOCKER_PLATFORM:-linux/amd64}` — Apple Silicon
+#            runs natively with `DOCKER_PLATFORM=linux/arm64`.
+#   FIX #27  `profiles:` for `full` (Redis) and `monitoring`
+#            (Prometheus + Grafana) — the base `up` starts only the agent.
+#   FIX #28  `secrets:` block ready for migration away from env-var API keys.
+#   FIX #29  `labels:` for observability backends.
+#   FIX #30  Optional Redis service (`redis>=5.0` is in the test
+#            requirements for the RLHF feedback stream).
+#   FIX #31  Optional Prometheus + Grafana under `monitoring`.
+#
+# ---- Run --------------------------------------------------------------------
+#   cp .env.example .env
+#   $EDITOR .env                     # set AGENTBEATS_API_KEY
+#   docker compose up                # agent only
+#   docker compose --profile full up        # + Redis
+#   docker compose --profile monitoring up  # + Prometheus + Grafana
+#   docker compose --profile full --profile monitoring up
+# =============================================================================
+
 
 services:
+  # ===========================================================================
+  # green-agent — main service
+  # ===========================================================================
   green-agent:
-    build: .
+    # FIX #25 — pinned image; `build` retained for local iteration.
+    image: ${IMAGE_REGISTRY:-ghcr.io/nurcholishadam}/green_agent:${IMAGE_TAG:-5.0.0}
+    build:
+      context: .
+      dockerfile: ${DOCKERFILE:-Dockerfile}
+      args:
+        VERSION: ${IMAGE_TAG:-5.0.0}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+
+    # FIX #26 — Apple Silicon override
+    platform: ${DOCKER_PLATFORM:-linux/amd64}
+
+    # FIX #11 — non-root, matching k8s runAsUser / runAsGroup
+    user: "${CONTAINER_UID:-1000}:${CONTAINER_GID:-1000}"
+    # FIX #21 — PID 1 init
+    init: true
+
+    # FIX #12, #13, #14 — security posture
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # FIX #12 — writable tmpfs required when read_only: true
+    tmpfs:
+      - /tmp:rw,size=1g,mode=1777
+      - /var/tmp:rw,size=512m,mode=1777
+      - /run:rw,size=64m,mode=0755
+
+    # FIX #7 — loopback by default; override BIND_ADDR=0.0.0.0 for LAN
     ports:
-      - "8000:8000"
+      - "${BIND_ADDR:-127.0.0.1}:${API_PORT:-8000}:8000"
+      # Uncomment if the app serves Prometheus metrics on a separate port:
+      # - "${BIND_ADDR:-127.0.0.1}:${METRICS_PORT:-9090}:9090"
+      # Uncomment if the dashboard is served on 8501:
+      # - "${BIND_ADDR:-127.0.0.1}:${DASHBOARD_PORT:-8501}:8501"
+
+    # FIX #24 — optional .env (compose ≥ v2.24 for `required: false`)
+    env_file:
+      - path: .env
+        required: false
+
     environment:
-      # Core configuration (original)
-      - GRID_REGION=${GRID_REGION:-US-CA}
-      - AGENTBEATS_API_KEY=${AGENTBEATS_API_KEY}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      
-      # ── Advanced Enhancement Flags ──
-      # Master switch
-      - ENHANCEMENTS_ENABLED=${ENHANCEMENTS_ENABLED:-true}
-      
+      # ---------------------------------------------------------------------
+      # Core
+      # ---------------------------------------------------------------------
+      # FIX #5 — required; compose fails at parse time if unset
+      AGENTBEATS_API_KEY: "${AGENTBEATS_API_KEY:?AGENTBEATS_API_KEY must be set — copy .env.example to .env and set a value}"
+      # FIX #8 — US-CA matches green_agent_config.yaml; agent.toml's ID needs
+      #          to be reconciled (one of them is wrong)
+      GRID_REGION: ${GRID_REGION:-US-CA}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PROMETHEUS_PORT: ${PROMETHEUS_PORT:-8000}
+
+      # ---------------------------------------------------------------------
+      # Advanced enhancements
+      # ---------------------------------------------------------------------
+      ENHANCEMENTS_ENABLED: ${ENHANCEMENTS_ENABLED:-true}
+
       # LIMIT Graph
-      - LIMIT_GRAPH_ENABLED=${LIMIT_GRAPH_ENABLED:-true}
-      - LIMIT_GRAPH_CENTRALITY=${LIMIT_GRAPH_CENTRALITY:-0.7}
-      - LIMIT_GRAPH_CONNECTIVITY=${LIMIT_GRAPH_CONNECTIVITY:-0.6}
-      
-      # MODP (Multi‑Objective Decision Process)
-      - MODP_ENABLED=${MODP_ENABLED:-true}
-      - MODP_WEIGHTS=${MODP_WEIGHTS:-[0.4,0.3,0.2,0.1]}
-      
+      LIMIT_GRAPH_ENABLED: ${LIMIT_GRAPH_ENABLED:-true}
+      LIMIT_GRAPH_CENTRALITY: ${LIMIT_GRAPH_CENTRALITY:-0.7}
+      LIMIT_GRAPH_CONNECTIVITY: ${LIMIT_GRAPH_CONNECTIVITY:-0.6}
+      LIMIT_GRAPH_DENSITY: ${LIMIT_GRAPH_DENSITY:-0.5}
+
+      # MODP — FIX #6: keep JSON-string form; quote the default.
+      MODP_ENABLED: ${MODP_ENABLED:-true}
+      MODP_WEIGHTS: '${MODP_WEIGHTS:-[0.4,0.3,0.2,0.1]}'
+
       # RLHF
-      - RLHF_ENABLED=${RLHF_ENABLED:-true}
-      - HUMAN_FEEDBACK_SCORE=${HUMAN_FEEDBACK_SCORE:-0.6}
-      
-      # Multi‑Teacher Distillation + MoE
-      - DISTILLATION_ENABLED=${DISTILLATION_ENABLED:-true}
-      - MOE_GATING_ENABLED=${MOE_GATING_ENABLED:-true}
-      
-      # Bio‑inspired Optimisation (Evolutionary)
-      - EVOLUTIONARY_ENABLED=${EVOLUTIONARY_ENABLED:-true}
-      - POPULATION_SIZE=${POPULATION_SIZE:-20}
-      - MUTATION_RATE=${MUTATION_RATE:-0.1}
-      
-      # FlexGen (optional execution backend)
-      - FLEXGEN_ENABLED=${FLEXGEN_ENABLED:-false}
-      - FLEXGEN_MODEL_NAME=${FLEXGEN_MODEL_NAME:-facebook/opt-6.7b}
-      - FLEXGEN_DEFAULT_PRECISION=${FLEXGEN_DEFAULT_PRECISION:-fp16}
-      
+      RLHF_ENABLED: ${RLHF_ENABLED:-true}
+      HUMAN_FEEDBACK_SCORE: ${HUMAN_FEEDBACK_SCORE:-0.6}
+
+      # Multi-Teacher Distillation + MoE
+      DISTILLATION_ENABLED: ${DISTILLATION_ENABLED:-true}
+      MOE_GATING_ENABLED: ${MOE_GATING_ENABLED:-true}
+
+      # Bio-inspired (evolutionary)
+      EVOLUTIONARY_ENABLED: ${EVOLUTIONARY_ENABLED:-true}
+      POPULATION_SIZE: ${POPULATION_SIZE:-20}
+      MUTATION_RATE: ${MUTATION_RATE:-0.1}
+
+      # FlexGen — FIX #9: a 6.7B model in fp16 needs ~16 GB.
+      # Set MEM_LIMIT=16g in .env before enabling.
+      FLEXGEN_ENABLED: ${FLEXGEN_ENABLED:-false}
+      FLEXGEN_MODEL_NAME: ${FLEXGEN_MODEL_NAME:-facebook/opt-6.7b}
+      FLEXGEN_DEFAULT_PRECISION: ${FLEXGEN_DEFAULT_PRECISION:-fp16}
+
+      # Optional — set by the `full` profile
+      REDIS_URL: ${REDIS_URL:-}
+
+    # FIX #10, #17 — named volumes for state; bind-mount alternative documented
     volumes:
-      - ./results:/app/results
+      - green_agent_results:/app/results
+      - green_agent_data:/app/data
+      # Alternative (bind mount for local inspection):
+      # - ./results:/app/results:rw
+
+    # FIX #20 — allow the app to checkpoint before SIGKILL
+    stop_grace_period: 3m
+
+    # FIX #22 — `unless-stopped` continues restarting on any exit. For
+    # environments that should cap crash-loops, use `on-failure:5` instead.
     restart: unless-stopped
+
+    # FIX #18 — resource limits
+    mem_limit: ${MEM_LIMIT:-4g}
+    memswap_limit: ${MEM_LIMIT:-4g}
+    cpus: ${CPU_LIMIT:-2.0}
+
+    # FIX #2, #3, #4 — python-based healthcheck probing /metrics, slow start
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import sys, urllib.request;
+          url='http://127.0.0.1:8000/metrics';
+          sys.exit(0 if urllib.request.urlopen(url, timeout=5).getcode()==200 else 1)
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 120s
+
+    # FIX #19 — log rotation
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    # FIX #16 — dedicated bridge
+    networks:
+      - green_agent_net
+
+    # FIX #29 — labels
+    labels:
+      com.green-agent.component: agent
+      com.green-agent.version: "${IMAGE_TAG:-5.0.0}"
+
+    # FIX #23 — optional Redis dependency
+    depends_on:
+      redis:
+        condition: service_healthy
+        required: false
+
+    # FIX #15, #28 — optional: mount the API key as a secret.
+    # Requires the app to read /run/secrets/agentbeats_api_key. Create the
+    # file with mode 0600 first.
+    # secrets:
+    #   - agentbeats_api_key
+
+
+  # ===========================================================================
+  # redis — optional RLHF feedback stream
+  # ===========================================================================
+  # Enable with: docker compose --profile full up
+  # `redis>=5.0,<6` is in requirements/test.txt; if the app uses a
+  # cross-process feedback stream, this is the backing store.
+  redis:
+    image: redis:7.2-alpine
+    profiles: [full]
+    user: "999:999"                                   # redis uid in alpine
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - green_agent_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+  # ===========================================================================
+  # prometheus — optional metrics scraping
+  # ===========================================================================
+  # Enable with: docker compose --profile monitoring up
+  # Requires config/monitoring/prometheus.yml to exist.
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    profiles: [monitoring]
+    user: "65534:65534"                               # nobody
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --web.listen-address=0.0.0.0:9090
+    volumes:
+      - ./config/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${PROMETHEUS_UI_PORT:-9091}:9090"
+    networks:
+      - green_agent_net
+    depends_on:
+      - green-agent
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+  # ===========================================================================
+  # grafana — optional dashboards
+  # ===========================================================================
+  # Enable with: docker compose --profile monitoring up
+  grafana:
+    image: grafana/grafana:11.1.0
+    profiles: [monitoring]
+    user: "472:472"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/monitoring/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./config/monitoring/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
+    networks:
+      - green_agent_net
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  green_agent_net:
+    driver: bridge
+    # Uncomment to pin a subnet when integrating with a VPN or corporate net:
+    # ipam:
+    #   config:
+    #     - subnet: 172.30.0.0/24
+
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  green_agent_results:
+  green_agent_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+
+# =============================================================================
+# Secrets (optional — FIX #15, #28)
+# =============================================================================
+# Store the API key on disk with mode 0600 and reference it here instead of
+# passing it as an environment variable. The app must read from
+# /run/secrets/agentbeats_api_key.
+#
+# Create the file:
+#   mkdir -p secrets && touch secrets/agentbeats_api_key
+#   chmod 700 secrets && chmod 600 secrets/agentbeats_api_key
+#   $EDITOR secrets/agentbeats_api_key     # paste the key
+#
+# Then uncomment `secrets:` on green-agent (above) and:
+#
+# secrets:
+#   agentbeats_api_key:
+#     file: ./secrets/agentbeats_api_key
