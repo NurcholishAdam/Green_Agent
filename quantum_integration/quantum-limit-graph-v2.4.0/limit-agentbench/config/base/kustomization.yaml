@@ -1,141 +1,320 @@
+# =============================================================================
+# config/base/kustomization.yaml (Enhanced v2)
+# =============================================================================
+# The base kustomization for the Green Agent RayCluster deployment.
+#
+# Run:
+#   kustomize build config/base              # inspect the rendered output
+#   kubectl apply -k config/base             # apply
+#   kustomize build config/overlays/production | kubectl apply -f -
+#
+# ---- Critical fixes vs v1 ---------------------------------------------------
+#   FIX #1   ConfigMap hash now matches the RayCluster mount.
+#            v1 let kustomize hash the ConfigMap to
+#            `green-agent-config-<hash>` while `ray-cluster.yaml` kept
+#            referencing `green-agent-config`. Kustomize's built-in
+#            nameReference transformer has no rule for RayCluster's
+#            `spec.headGroupSpec.template.spec.volumes[].configMap.name`,
+#            so the mismatch survived to `kubectl apply` and the pod
+#            stalled in ContainerCreating with
+#            `configmap "green-agent-config" not found`.
+#
+#            Chosen fix: `disableNameSuffixHash: true` so the names match.
+#            Trade-off: config edits do not auto-restart pods. That is the
+#            correct behaviour for a RayCluster (workers are stateful;
+#            a silent rolling restart kills in-flight work). To pick up a
+#            change:
+#                kubectl rollout restart -n green-agent \
+#                    statefulset/green-agent-cluster-ray-head
+#
+#            Alternative: keep hashing and add a `configurations:` file
+#            that teaches kustomize about RayCluster nameReferences. A
+#            ready-to-use block is included below (commented out) for
+#            teams that prefer auto-rollout.
+#
+#   FIX #2   `hpa.yaml` removed from `resources:`.
+#            v1 shipped an HPA targeting the RayCluster. RayCluster has
+#            no `scale` subresource, so the HPA controller's
+#            `GET .../rayclusters/<name>/scale` returns 404 and every
+#            reconcile fails with `FailedGetScale`. The HPA never
+#            scaled anything.
+#
+#            Carbon-aware scaling is implemented instead by the
+#            CronJob in `config/scaling/carbon-scaler.yaml`, which
+#            patches `workerGroupSpecs[].maxReplicas` on a tier
+#            schedule (night / day / evening). See `docs/scaling.md`
+#            for the full mechanism and verification steps.
+#
+#   FIX #3   `pvc.yaml` added to `resources:`.
+#            `ray-cluster.yaml` mounts `green-agent-data-pvc`. Without
+#            the PVC the head pod is stuck in Pending with
+#            `persistentvolumeclaim "green-agent-data-pvc" not found`.
+#
+#   FIX #4   `serviceaccount.yaml` added to `resources:`.
+#            `ray-cluster.yaml` sets `serviceAccountName: green-agent`.
+#            Without the SA, pod admission fails with `Forbidden`, and
+#            without any SA the pod falls back to `default` which may
+#            lack the RBAC the Ray operator needs.
+#
+#   FIX #5   Inline env-var patch removed.
+#            v1 patched 17 env vars onto both the head and the worker
+#            containers with values identical to the ConfigMap literals.
+#            Two sources of truth; when they drifted, whichever the
+#            runtime read first won — silently. The ConfigMap
+#            (`green_agent_config.yaml`) is now the only source for
+#            *config* values. Env vars that a container genuinely needs
+#            (e.g. PYTHONUNBUFFERED) are declared in the base
+#            `ray-cluster.yaml` manifest, not in a kustomize patch.
+#
+#   FIX #6   `commonLabels` -> `labels: - includeSelectors: false`.
+#            v1's `commonLabels` included `version: "5.0.0"`. Kustomize
+#            v4 defaults `includeSelectors: true`, so this label
+#            propagated into Service selectors, HPA `scaleTargetRef`, and
+#            NetworkPolicy `podSelector`. Bumping the version would
+#            break service discovery between old and new pods on every
+#            release. v2 keeps only stable identifiers (`app`,
+#            `managed-by`, `enhancements`) in `labels`, with
+#            `includeSelectors: false` so they never leak into a
+#            selector.
+#
+#   FIX #7   `version` moved to `commonAnnotations`.
+#            A value that changes on every release is an annotation,
+#            not a label.
+#
+#   FIX #8   Seven `green-agent/*` annotations removed from
+#            `commonAnnotations`.
+#            They were applied to every object — Service, ConfigMap,
+#            NetworkPolicy, RayCluster. The intent belongs on the
+#            ConfigMap only, where it is already declared by
+#            `green-agent-config.yaml`. A reader looking at the
+#            rendered output no longer has to wade through 7
+#            annotations on every resource.
+#
+#   FIX #9   `pdb.yaml` and `monitoring.yaml` added.
+#            Without a PDB, a node drain during an upgrade takes out
+#            both the head and workers at the same time (full outage).
+#            Without a ServiceMonitor, nothing scrapes `/metrics`, so
+#            the Prometheus counters exported by `run_agent.py` and
+#            `api_server.py` are dead weight.
+#
+#   FIX #10  Base is secure by default.
+#            `ray-cluster.yaml` already sets:
+#                runAsNonRoot: true
+#                runAsUser: 1000
+#                fsGroup: 1000
+#                allowPrivilegeEscalation: false
+#                readOnlyRootFilesystem: true
+#                capabilities.drop: [ALL]
+#            on both head and worker containers. Production overlays may
+#            tighten further but not relax. If a future base manifest
+#            regresses this, `tests/k8s/test_pod_security.py` should
+#            catch it.
+#
+#   FIX #11  `MODP_WEIGHTS` literals removed.
+#            v1 shipped both a ConfigMap literal and a patch env var
+#            with the same value. If a future reader reintroduces
+#            literals, quote them (`'MODP_WEIGHTS=[0.4,0.3,0.2,0.1]'`)
+#            — unquoted, YAML may interpret the right side as a list.
+#
+#   FIX #12  Image tag convention documented.
+#            `newTag: v5.0.0` matches the GHCR tag. The
+#            `app.kubernetes.io/version` annotation is `5.0.0` with no
+#            `v` prefix. Both refer to the same release. If your
+#            release pipeline emits tags without the prefix, change
+#            `newTag` here and update the annotation to match.
+#
+# ---- Files that must exist alongside this one -------------------------------
+#   serviceaccount.yaml       ServiceAccount           `green-agent`
+#   pvc.yaml                  PersistentVolumeClaim    `green-agent-data-pvc`
+#   ray-cluster.yaml          RayCluster               `green-agent-cluster`
+#   service.yaml              Service                  `green-agent-dashboard`
+#   network-policy.yaml       NetworkPolicy            `green-agent-network-policy`
+#   pdb.yaml                  PodDisruptionBudget x2   `green-agent-head-pdb`,
+#                                                      `green-agent-worker-pdb`
+#   monitoring.yaml           ServiceMonitor + PrometheusRule
+#   green_agent_config.yaml   The YAML file mounted as the ConfigMap key
+#
+#   Files that are intentionally NOT in this base:
+#     hpa.yaml                 -> replaced by scaling/carbon-scaler.yaml
+#     secrets.yaml             -> overlay-scoped (secrets.env is env-specific)
+#     ingress.yaml             -> overlay-scoped (hostname is env-specific)
+#     grafana.yaml             -> disabled in green_agent_config.yaml;
+#                                 deploy config/monitoring/ separately
+# =============================================================================
+
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+# Base resources land in this namespace. Overlays override with their own
+# `namespace:` + `namePrefix:`.
 namespace: green-agent
 
-commonLabels:
-  app: green-agent
-  version: "5.0.0"
-  managed-by: kustomize
-  enhancements: enabled
+# -----------------------------------------------------------------------------
+# Labels — FIX #6
+# -----------------------------------------------------------------------------
+# `includeSelectors: false` is critical: without it, kustomize v4 propagates
+# these labels into every Service selector, HPA scaleTargetRef, and
+# NetworkPolicy podSelector. A version bump would then break service
+# discovery between old and new pods on every release. Only stable
+# identifiers live here.
+labels:
+  - includeSelectors: false
+    pairs:
+      app: green-agent
+      managed-by: kustomize
+      enhancements: enabled
 
+# -----------------------------------------------------------------------------
+# Annotations — FIX #7, #8
+# -----------------------------------------------------------------------------
+# Version lives here, not in `labels`. The seven `green-agent/*`
+# enhancement annotations were removed from `commonAnnotations` because
+# they applied to every object; their intent is already carried by the
+# ConfigMap manifest (`green-agent-config.yaml`) as a per-resource
+# annotation, which is the correct scope.
 commonAnnotations:
-  green-agent/limit-graph: "true"
-  green-agent/modp: "true"
-  green-agent/rlhf: "true"
-  green-agent/distillation: "true"
-  green-agent/bio-inspired: "true"
-  green-agent/moe: "true"
-  green-agent/flexgen: "true"
+  app.kubernetes.io/name: green-agent
+  app.kubernetes.io/part-of: green-agent
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/version: "5.0.0"
 
+# -----------------------------------------------------------------------------
+# Resources — FIX #2, #3, #4, #9
+# -----------------------------------------------------------------------------
+# Order does not matter for kustomize (it sorts by kind), but listing the
+# files in dependency order makes the dependency explicit for readers.
 resources:
-- ray-cluster.yaml
-- service.yaml
-- hpa.yaml
-- network-policy.yaml
+  # Identity + storage — must exist before the RayCluster is scheduled.
+  - serviceaccount.yaml
+  - pvc.yaml
+  # Workload.
+  - ray-cluster.yaml
+  # Service discovery + networking.
+  - service.yaml
+  - network-policy.yaml
+  # Availability + observability.
+  - pdb.yaml
+  - monitoring.yaml
+  # REMOVED: hpa.yaml — see FIX #2. Carbon-aware scaling lives in
+  #          config/scaling/carbon-scaler.yaml.
 
+# -----------------------------------------------------------------------------
+# ConfigMap — FIX #1, #5, #11
+# -----------------------------------------------------------------------------
+# Only the YAML file is generated. No `literals:` block (v1's 17 env-style
+# entries duplicated the ConfigMap contents) and no env-var patch (v1's
+# patch duplicated the same values a second time on both containers).
 configMapGenerator:
-- name: green-agent-config
-  files:
-  - green_agent_config.yaml
-  literals:
-  - ENHANCEMENTS_ENABLED=true
-  - LIMIT_GRAPH_ENABLED=true
-  - LIMIT_GRAPH_CENTRALITY=0.7
-  - LIMIT_GRAPH_CONNECTIVITY=0.6
-  - MODP_ENABLED=true
-  - MODP_WEIGHTS=[0.4,0.3,0.2,0.1]
-  - RLHF_ENABLED=true
-  - HUMAN_FEEDBACK_SCORE=0.6
-  - DISTILLATION_ENABLED=true
-  - MOE_GATING_ENABLED=true
-  - EVOLUTIONARY_ENABLED=true
-  - POPULATION_SIZE=20
-  - MUTATION_RATE=0.1
-  - FLEXGEN_ENABLED=true
-  - FLEXGEN_MODEL_NAME=facebook/opt-6.7b
-  - FLEXGEN_DEFAULT_PRECISION=fp16
+  - name: green-agent-config
+    files:
+      - green_agent_config.yaml
+    options:
+      # FIX #1 — disable the hash so the generated name matches what
+      # `ray-cluster.yaml` mounts. Kustomize's nameReference transformer
+      # has no default rule for RayCluster's
+      # `spec.headGroupSpec.template.spec.volumes[].configMap.name` or
+      # its worker equivalent, so a hashed name would not be rewritten
+      # into the mount path and the pod would fail with
+      # `configmap "green-agent-config" not found`.
+      #
+      # Trade-off: config edits do not auto-restart pods. That is the
+      # correct behaviour for a RayCluster — workers are stateful and a
+      # silent rolling restart kills in-flight training. Pick up a
+      # change with:
+      #     kubectl rollout restart -n green-agent \
+      #         statefulset/green-agent-cluster-ray-head
+      #
+      # If you want hashing + auto-rollout instead, comment out
+      # `disableNameSuffixHash: true`, add the `configurations:` block
+      # shown below, and accept that a config edit rolls all workers.
+      disableNameSuffixHash: true
 
-patches:
-- patch: |-
-    apiVersion: ray.io/v1
-    kind: RayCluster
-    metadata:
-      name: green-agent-cluster
-    spec:
-      headGroupSpec:
-        template:
-          spec:
-            containers:
-            - name: ray-head
-              env:
-              - name: ENHANCEMENTS_ENABLED
-                value: "true"
-              - name: LIMIT_GRAPH_ENABLED
-                value: "true"
-              - name: LIMIT_GRAPH_CENTRALITY
-                value: "0.7"
-              - name: LIMIT_GRAPH_CONNECTIVITY
-                value: "0.6"
-              - name: MODP_ENABLED
-                value: "true"
-              - name: MODP_WEIGHTS
-                value: "[0.4,0.3,0.2,0.1]"
-              - name: RLHF_ENABLED
-                value: "true"
-              - name: HUMAN_FEEDBACK_SCORE
-                value: "0.6"
-              - name: DISTILLATION_ENABLED
-                value: "true"
-              - name: MOE_GATING_ENABLED
-                value: "true"
-              - name: EVOLUTIONARY_ENABLED
-                value: "true"
-              - name: POPULATION_SIZE
-                value: "20"
-              - name: MUTATION_RATE
-                value: "0.1"
-              - name: FLEXGEN_ENABLED
-                value: "true"
-              - name: FLEXGEN_MODEL_NAME
-                value: "facebook/opt-6.7b"
-              - name: FLEXGEN_DEFAULT_PRECISION
-                value: "fp16"
-      workerGroupSpecs:
-      - groupName: standard-workers
-        template:
-          spec:
-            containers:
-            - name: ray-worker
-              env:
-              - name: ENHANCEMENTS_ENABLED
-                value: "true"
-              - name: LIMIT_GRAPH_ENABLED
-                value: "true"
-              - name: LIMIT_GRAPH_CENTRALITY
-                value: "0.7"
-              - name: LIMIT_GRAPH_CONNECTIVITY
-                value: "0.6"
-              - name: MODP_ENABLED
-                value: "true"
-              - name: MODP_WEIGHTS
-                value: "[0.4,0.3,0.2,0.1]"
-              - name: RLHF_ENABLED
-                value: "true"
-              - name: HUMAN_FEEDBACK_SCORE
-                value: "0.6"
-              - name: DISTILLATION_ENABLED
-                value: "true"
-              - name: MOE_GATING_ENABLED
-                value: "true"
-              - name: EVOLUTIONARY_ENABLED
-                value: "true"
-              - name: POPULATION_SIZE
-                value: "20"
-              - name: MUTATION_RATE
-                value: "0.1"
-              - name: FLEXGEN_ENABLED
-                value: "true"
-              - name: FLEXGEN_MODEL_NAME
-                value: "facebook/opt-6.7b"
-              - name: FLEXGEN_DEFAULT_PRECISION
-                value: "fp16"
-  target:
-    group: ray.io
-    version: v1
-    kind: RayCluster
-    name: green-agent-cluster
+# -----------------------------------------------------------------------------
+# Patches — FIX #5
+# -----------------------------------------------------------------------------
+# There are no base-level patches. `ray-cluster.yaml` sets the pod env
+# vars it needs (`PYTHONUNBUFFERED`, `PROMETHEUS_PORT`) directly, and the
+# ConfigMap is the sole source of *config* values.
+#
+# Overlay-specific overrides go in the overlay's `patches:`, not here.
+# Pattern (do NOT copy the whole ConfigMap into a patch — override only
+# the keys that differ):
+#
+#     # config/overlays/production/kustomization.yaml
+#     patches:
+#       - path: patches/ray-head-env.yaml
+#         target:
+#           kind: RayCluster
+#           name: green-agent-cluster
+#           group: ray.io
+#           version: v1
+#
+#     # config/overlays/production/patches/ray-head-env.yaml
+#     apiVersion: ray.io/v1
+#     kind: RayCluster
+#     metadata:
+#       name: green-agent-cluster
+#     spec:
+#       headGroupSpec:
+#         template:
+#           spec:
+#             containers:
+#               - name: ray-head
+#                 env:
+#                   - { name: PROMETHEUS_PORT, value: "9090" }
+#
+# A strategic-merge patch with only the changed env vars is the pattern;
+# a patch that lists every env var re-creates the two-sources-of-truth
+# problem that v1 had.
 
+# -----------------------------------------------------------------------------
+# Images — FIX #12
+# -----------------------------------------------------------------------------
+# `newTag: v5.0.0` matches the GHCR tag convention. The
+# `app.kubernetes.io/version` annotation above is `5.0.0` (no `v` prefix).
+# Both refer to the same release. Overlays override `newTag` to point at
+# development (`v5.0.0-dev`), staging (`v5.0.0-rc1`), or production
+# (`v5.0.0`).
 images:
-- name: ghcr.io/nurcholishadam/green_agent
-  newTag: v5.0.0
+  - name: ghcr.io/nurcholishadam/green_agent
+    newTag: v5.0.0
+
+# =============================================================================
+# OPTIONAL — hashing + auto-rollout instead of disableNameSuffixHash
+# =============================================================================
+# To let a config edit trigger a rolling restart of the RayCluster:
+#
+#   1. Comment out `disableNameSuffixHash: true` above.
+#   2. Uncomment the `configurations:` block below.
+#   3. Accept that every config change kills in-flight work on all
+#      workers. For production, prefer the manual
+#      `kubectl rollout restart` path instead.
+#
+# configurations:
+#   - configurations/raycluster-nameref.yaml
+#
+# Where `configurations/raycluster-nameref.yaml` is:
+#
+#     nameReference:
+#       - kind: ConfigMap
+#         version: v1
+#         fieldSpecs:
+#           - path: spec/headGroupSpec/template/spec/volumes/configMap/name
+#             kind: RayCluster
+#             group: ray.io
+#             version: v1
+#           - path: spec/workerGroupSpecs/template/spec/volumes/configMap/name
+#             kind: RayCluster
+#             group: ray.io
+#             version: v1
+#       - kind: ConfigMap
+#         version: v1
+#         fieldSpecs:
+#           - path: spec/headGroupSpec/template/spec/containers/envFrom/configMapRef/name
+#             kind: RayCluster
+#             group: ray.io
+#             version: v1
+#           - path: spec/workerGroupSpecs/template/spec/containers/envFrom/configMapRef/name
+#             kind: RayCluster
+#             group: ray.io
+#             version: v1
