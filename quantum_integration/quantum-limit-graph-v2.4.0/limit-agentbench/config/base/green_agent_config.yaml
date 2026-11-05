@@ -1,53 +1,175 @@
+# =============================================================================
+# Green Agent — Runtime Configuration (Enhanced v2)
+# =============================================================================
+# File: system.yaml (or green_agent_config.yaml when mounted)
+#
+# ---- Critical fixes vs v1 --------------------------------------------------
+#   FIX #1   `policy.weights` was missing `deadline_importance`. The runtime
+#            reads four weights; a 3-entry dict either KeyErrors or silently
+#            normalizes to 0.9. Added `deadline_importance: 0.1` to match the
+#            sibling `green-agent-config.yaml`.
+#   FIX #2   `flexgen.memory_limit_mb: 4096` was 3x too small for
+#            `facebook/opt-6.7b` in fp16 (~13 GB weights alone). Raised to
+#            16384. `int4` was added to `precision_options`; `fp16` requires
+#            a 20 Gi pod limit while `int4` fits under 8 Gi.
+#   FIX #3   `carbon.api_provider: "simulation"` with real thresholds
+#            (eco_mode 200, defer 400) was a semantic mismatch. Kept
+#            `simulation` as the *fallback* provider, promoted
+#            `electricitymap` as the *primary*, and added `api_key_env`
+#            plus `api_provider_fallback` so a missing key does not fail
+#            mid-evaluation.
+#   FIX #4   `distillation.epsilon: 0.1` was a scalar; the runtime reads a
+#            decay schedule. Now `{start, end, decay_steps}`.
+#   FIX #5   `system.seed` and `system.output_dir` were missing —
+#            runs were non-reproducible and results scattered to CWD.
+#   FIX #6   `ray.{num_workers, min_workers, max_workers}` documented as
+#            fallback; the CRD's `workerGroupSpecs` is authoritative.
+#   FIX #7   `modp.objective_names` added so the weight order is
+#            machine-readable across modules with different conventions.
+#   FIX #8   `distillation.teachers` are now `{name, output}` objects.
+#   FIX #9   `carbon.emergency_threshold` added (matches the sibling config
+#            and the three-tier logic in `EcoModeController`).
+#   FIX #10  `carbon.budget` block added (daily / weekly limits required by
+#            `NegawattReward` and `block_if_budget_exceeded`).
+#   FIX #11  `monitoring.logging.output: ["stdout"]` explicit; `"file"`
+#            documented as opt-in (requires a writable `/app/logs` mount).
+#   FIX #12  `monitoring.grafana: { enabled: false }` added — the runtime
+#            reads it and the previous version would KeyError.
+#   FIX #13  `dashboard.update_interval_seconds` and
+#            `dashboard.cors_origins` added so the API server has them.
+#   FIX #14  `system.public_base_url` and `system.enable_telemetry` added.
+#   FIX #15  `security`, `observability`, `constraints`, `rate_limits`,
+#            `evaluation`, `limitations` sections added — each is read by a
+#            specific component and its absence degraded behaviour silently.
+#   FIX #16  `backends` section added (canonical FlexGen location); the
+#            top-level `flexgen:` block is retained as an alias for
+#            backward-compatible readers.
+#   FIX #17  `system.strict_core_imports: true` — fail fast if a core
+#            module is missing instead of silently degrading.
+#
+# ---- Enhancements precedence -----------------------------------------------
+#   When `enhancements.enabled: false`, every `enhancements.<name>.enabled`
+#   is ignored. When `true`, a subsystem is active iff its own
+#   `enabled: true` AND its schema module imports successfully. A missing
+#   module logs a warning at startup and the subsystem is skipped; the
+#   rest of the pipeline continues.
+# =============================================================================
+
 system:
   version: "5.0.0"
   mode: "unified"
   debug: false
   log_level: "INFO"
+  # FIX #14 — telemetry, determinism, output redirection
+  enable_telemetry: true
+  # FIX #5 — reproducible runs across RL/PPO/Q-learning components
+  seed: 42
+  # FIX #5 — results land here instead of CWD
+  output_dir: "/app/results"
+  # FIX #14 — public URL for the registry and the RLHF feedback form.
+  # Deployments override via GREEN_AGENT_PUBLIC_BASE_URL.
+  public_base_url: ""
+  # FIX #17 — fail fast if a core module is missing
+  strict_core_imports: true
 
 dashboard:
   enabled: true
+  # "0.0.0.0" is a bind address; consumers must use public_base_url.
   host: "0.0.0.0"
   port: 8000
+  # FIX #13 — the API server reads these
+  update_interval_seconds: 5
+  enable_real_time: true
+  metrics_retention_hours: 168
+  cors_origins:
+    - "http://localhost:3000"
+    - "http://localhost:8501"
 
 ray:
+  # FIX #6 — the RayCluster CRD's workerGroupSpecs is authoritative. These
+  # values are read at startup as a fallback when the CRD is not available
+  # (local dev). Do NOT edit them expecting a scaling change — edit
+  # `workerGroupSpecs[].replicas` in the CRD instead.
   enabled: true
   num_workers: 4
   min_workers: 2
   max_workers: 20
+  dashboard_port: 8265
+  carbon_aware_scaling: true
 
 carbon:
+  # Reconcile with `agent.toml`'s `[carbon] default_region = "ID"` before
+  # submission. US-CA is the operator's declared grid here.
   default_region: "US-CA"
-  api_provider: "simulation"
+  # FIX #3 — electricitymap is the primary; simulation is the fallback.
+  # A missing CARBON_API_KEY or an electricitymap 5xx now degrades to
+  # simulation instead of failing the task mid-evaluation.
+  api_provider: "electricitymap"
+  api_provider_fallback: "simulation"
+  api_key_env: "CARBON_API_KEY"
+  forecast_days: 30
+  update_interval_hours: 1
+  # Three-tier thresholds — matches `EcoModeController` and `PolicyGraph`.
   eco_mode_threshold: 200
   defer_threshold: 400
+  # FIX #9 — emergency tier was missing in v1
+  emergency_threshold: 600
+  # FIX #10 — budget enforcement for `block_if_budget_exceeded`
+  budget:
+    enabled: true
+    daily_limit_kg: 71.4         # 71.4 * 7 = 499.8 ~= weekly_limit_kg
+    weekly_limit_kg: 500.0
 
 policy:
   mode: "moderate"
+  enforce_lora_above_1b_params: true
+  block_if_budget_exceeded: true
   weights:
+    # FIX #1 — 4 weights matching the sibling config and the runtime
     carbon_importance: 0.4
     performance_importance: 0.3
     cost_importance: 0.2
+    deadline_importance: 0.1
 
 quantum:
   enabled: false
   backend: "simulator"
+  error_mitigation:
+    enabled: true
+    # Qiskit primitive names — prose names ("zero_noise_extrapolation")
+    # raise ValueError from qiskit.primitives. Accepted: zne | pec | cdr | m3.
+    techniques:
+      - "zne"
+      - "pec"
+  vqc:
+    n_qubits: 4
+    n_layers: 3
+    encoding_type: "angle"                # angle | amplitude | data_reuploading
+    ansatz_type: "strongly_entangling"    # strongly_entangling | hardware_efficient | two_local
 
 monitoring:
   prometheus:
     enabled: true
     port: 9090
+  # FIX #12 — the runtime reads `monitoring.grafana.enabled`. Disabled
+  # until config/monitoring/ deploys Grafana.
+  grafana:
+    enabled: false
+    port: 3000
   logging:
     level: "INFO"
     format: "json"
+    # FIX #11 — pods run with readOnlyRootFilesystem: true. "file" is
+    # opt-in and requires a writable /app/logs mount.
+    output: ["stdout"]
+    # file_path: "logs/green_agent.log"   # uncomment only with a mount
 
 # ---------------------------------------------------------------------------
-# Advanced Enhancements (LIMIT Graph, MODP, RLHF, Multi‑Teacher Distillation,
-# Bio‑inspired Optimisation, Mixture‑of‑Experts)
+# Advanced Enhancements
 # ---------------------------------------------------------------------------
 enhancements:
-  enabled: true                # Master switch for all advanced features
+  enabled: true
 
-  # LIMIT Graph integration
   limit_graph:
     enabled: true
     graph_metrics:
@@ -56,20 +178,21 @@ enhancements:
       density: 0.4
     update_interval_seconds: 60
 
-  # Multi‑Objective Decision Process (MODP)
   modp:
     enabled: true
-    objective_weights: [0.4, 0.3, 0.2, 0.1]  # [accuracy, energy, latency, carbon]
+    # FIX #7 — pair names with weights so the order is unambiguous across
+    # modules with different conventions.
+    objective_names:   ["accuracy", "energy", "latency", "carbon"]
+    objective_weights: [0.4,        0.3,      0.2,       0.1]
     normalize_weights: true
 
-  # Reinforcement Learning from Human Feedback (RLHF)
   rlhf:
     enabled: true
     human_feedback_score: 0.5
     collect_feedback: true
     feedback_source: "dashboard"
+    feedback_submission_url: "http://localhost:8501/feedback"
 
-  # Multi‑Teacher On‑Policy Distillation with MoE
   distillation:
     enabled: true
     use_moe_gating: true
@@ -77,14 +200,18 @@ enhancements:
     gating_lr: 0.005
     replay_size: 2000
     train_every: 10
-    epsilon: 0.1
+    # FIX #4 — decay schedule, not a scalar
+    epsilon:
+      start: 0.10
+      end: 0.01
+      decay_steps: 1000
+    # FIX #8 — teachers declared with their output contract
     teachers:
-      - "rule_based"
-      - "historical_ml"
-      - "q_learning"
-      - "rlhf"
+      - { name: "rule_based",    output: "probabilities" }
+      - { name: "historical_ml", output: "probabilities" }
+      - { name: "q_learning",    output: "probabilities" }
+      - { name: "rlhf",          output: "probabilities" }
 
-  # Bio‑inspired Optimisation (Evolutionary)
   bio_inspired:
     enabled: true
     use_evolutionary: true
@@ -93,20 +220,103 @@ enhancements:
     crossover_rate: 0.7
     elitism: 2
 
-  # Mixture‑of‑Experts expert gating
   moe_expert:
     enabled: true
     n_experts: 4
     gating_lr: 0.005
 
 # ---------------------------------------------------------------------------
-# FlexGen Integration (Optional)
+# Security — zero-trust posture
 # ---------------------------------------------------------------------------
+security:
+  auth_type: "bearer"           # "none" | "bearer" | "mtls"
+  tls_enabled: true
+  # HS* is not acceptable for zero-trust — RS/ES/EdDSA only.
+  jwt_algorithms: ["RS256", "ES256"]
+  token_issuer_url: "https://auth.green-agent.example"
+  token_issuer_url_env: "GREEN_AGENT_TOKEN_ISSUER_URL"
+  protect_metrics_endpoint: true
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+observability:
+  metrics_path: "/metrics"
+  metrics_port: 9090
+  traces_endpoint: ""           # e.g. "http://otel-collector:4317"
+  traces_endpoint_env: "OTEL_EXPORTER_OTLP_ENDPOINT"
+  logs_format: "json"
+  sample_traces: false
+
+# ---------------------------------------------------------------------------
+# Constraints
+# ---------------------------------------------------------------------------
+constraints:
+  carbon_budget_gco2_per_task: 5.0
+  latency_sla_ms: 5000
+  cost_cap_usd: 0.01
+  max_concurrent_tasks: 8
+
+# ---------------------------------------------------------------------------
+# Rate limits
+# ---------------------------------------------------------------------------
+rate_limits:
+  requests_per_minute: 60
+  burst: 10
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+evaluation:
+  task_categories: ["coding", "reasoning", "tool_use"]
+  max_input_tokens: 8192
+  max_output_tokens: 2048
+  timeout_seconds: 300
+  input_schema_url:  "https://green-agent.example/schemas/evaluation-input.json"
+  output_schema_url: "https://green-agent.example/schemas/evaluation-output.json"
+  benchmark_set: "green-agent-2025-v1"
+  expected_accuracy: 0.85
+  repeatable: true
+
+# ---------------------------------------------------------------------------
+# Limitations
+# ---------------------------------------------------------------------------
+limitations:
+  max_model_parameters: "13B"
+  unsupported_task_types: ["multimodal_image", "video", "real_time_streaming"]
+  unsupported_languages:  ["rtl_scripts_pending_validation"]
+  requires_internet_access: false
+  gpu_required: false
+  data_retention_days: 0
+
+# ---------------------------------------------------------------------------
+# FlexGen backend
+# ---------------------------------------------------------------------------
+# FIX #2/#16 — FlexGen is a backend, not a top-level capability. The
+# runtime reads `backends.<name>`; `backends.primary` selects the active
+# one. The legacy top-level `flexgen:` key below mirrors the canonical
+# block so older readers that do `config["flexgen"]` keep working.
+backends:
+  primary: "flexgen"
+  flexgen:
+    enabled: false
+    model_name: "facebook/opt-6.7b"
+    batch_size: 16
+    # FIX #2 — 16384 MB for fp16 (~13 GB weights + overhead).
+    # Use 6144 MB with int4 (fits under a 8 Gi pod limit).
+    memory_limit_mb: 16384
+    precision_options: ["fp32", "fp16", "int8", "int4"]
+    # FIX #2 — fp16 needs a 20 Gi pod memory limit; int4 fits under 8 Gi.
+    # Set to "int4" on smaller hosts.
+    default_precision: "fp16"
+    delegation_policy: "adaptive"   # adaptive | always | never
+
+# Legacy alias — kept for backward compatibility. Mirrors `backends.flexgen`.
 flexgen:
-  enabled: false               # Set to true to use FlexGen as execution backend
+  enabled: false
   model_name: "facebook/opt-6.7b"
   batch_size: 16
-  memory_limit_mb: 4096
-  precision_options: ["fp32", "fp16", "int8"]
+  memory_limit_mb: 16384
+  precision_options: ["fp32", "fp16", "int8", "int4"]
   default_precision: "fp16"
-  delegation_policy: "adaptive"   # adaptive | always | never
+  delegation_policy: "adaptive"
