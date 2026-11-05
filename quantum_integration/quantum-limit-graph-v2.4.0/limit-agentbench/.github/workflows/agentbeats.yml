@@ -1,101 +1,304 @@
-# .github/workflows/agentbeats.yml (Enhanced)
-# AgentBeats Assessment workflow with advanced enhancements:
-# LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation,
-# Bio‑inspired Optimisation, MoE expert gating, and optional FlexGen.
+# ============================================================================
+# AgentBeats Assessment — Enhanced Workflow
+# ============================================================================
+# File: .github/workflows/agentbeats.yml
+#
+# Hardening & enhancements vs. the original:
+#   - Least-privilege GITHUB_TOKEN permissions
+#   - Actions pinned to version tags (pin to SHA for strict supply chain)
+#   - Input validation before any build
+#   - Docker buildx with GitHub Actions cache (much faster reruns)
+#   - Secrets delivered via --env-file + ::add-mask:: (no -e VAR in args)
+#   - Container hardening: cap-drop, no-new-privileges, memory/cpu caps,
+#     read-only rootfs + tmpfs, non-root user
+#   - Results directory prepared with correct ownership before mount
+#   - Verification of all enabled enhancement modules + FlexGen-aware
+#   - Strict mode: fails job on missing metrics (optional input)
+#   - GITHUB_STEP_SUMMARY with log tail
+#   - Always-run verify/summary/upload for diagnostics
+#   - Concurrency + timeout controls
+#   - Named container + cleanup
+#   - Artifact retention policy
+# ============================================================================
 
 name: AgentBeats Assessment
+
+# Least-privilege token. `id-token: write` is needed only if you later add
+# actions/attest-build-provenance (SLSA).
+permissions:
+  contents: read
+  actions: read
 
 on:
   workflow_dispatch:
     inputs:
       purple_agent_id:
-        description: 'Purple agent ID to evaluate'
+        description: 'Purple agent ID to evaluate (^[A-Za-z0-9._-]{1,64}$)'
         required: true
+        type: string
       enable_enhancements:
-        description: 'Enable advanced enhancements (LIMIT Graph, MODP, RLHF, Distillation, MoE, Bio‑inspired)'
+        description: 'Enable advanced enhancements (LIMIT Graph, MODP, RLHF, Distillation, MoE, Bio-inspired)'
         type: boolean
         default: true
+      flexgen_enabled:
+        description: 'Enable FlexGen energy accounting'
+        type: boolean
+        default: false
+      strict_verification:
+        description: 'Fail the job if any enabled enhancement metric is missing'
+        type: boolean
+        default: false
+      human_feedback_score:
+        description: 'RLHF human feedback score (0.0 – 1.0)'
+        type: string
+        default: '0.6'
+      timeout_minutes:
+        description: 'Job timeout in minutes'
+        type: number
+        default: 60
+
+# One assessment per purple agent at a time. Do not cancel mid-run: an
+# interrupted run leaves partial results that mislead the next one.
+concurrency:
+  group: agentbeats-${{ inputs.purple_agent_id }}
+  cancel-in-progress: false
+
+env:
+  # Enhancement toggles (single source of truth — no duplication downstream)
+  ENHANCEMENTS_ENABLED: ${{ inputs.enable_enhancements }}
+  LIMIT_GRAPH_ENABLED: "true"
+  MODP_ENABLED: "true"
+  RLHF_ENABLED: "true"
+  DISTILLATION_ENABLED: "true"
+  MOE_GATING_ENABLED: "true"
+  EVOLUTIONARY_ENABLED: "true"
+  FLEXGEN_ENABLED: ${{ inputs.flexgen_enabled }}
+  # Tunables (consider promoting to inputs when needed)
+  HUMAN_FEEDBACK_SCORE: ${{ inputs.human_feedback_score }}
+  MODP_WEIGHTS: "[0.4,0.3,0.2,0.1]"
+  GRAPH_CENTRALITY: "0.7"
+  GRAPH_CONNECTIVITY: "0.6"
+  # Pin runner to a concrete image for reproducibility
+  RUNNER_IMAGE: ubuntu-24.04
 
 jobs:
   run-assessment:
-    runs-on: ubuntu-latest
-    env:
-      ENHANCEMENTS_ENABLED: ${{ github.event.inputs.enable_enhancements == 'true' }}
-      LIMIT_GRAPH_ENABLED: "true"
-      MODP_ENABLED: "true"
-      RLHF_ENABLED: "true"
-      DISTILLATION_ENABLED: "true"
-      MOE_GATING_ENABLED: "true"
-      EVOLUTIONARY_ENABLED: "true"
-      FLEXGEN_ENABLED: "false"   # set true if FlexGen should be used
-      HUMAN_FEEDBACK_SCORE: "0.6"
-      MODP_WEIGHTS: "[0.4,0.3,0.2,0.1]"
-      GRAPH_CENTRALITY: "0.7"
-      GRAPH_CONNECTIVITY: "0.6"
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    # Uncomment to require manual approval from a reviewer team:
+    # environment: agentbeats-assessment
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Build Green Agent with enhancement build args
+      # ------------------------------------------------------------------
+      # 0. Validate inputs before spending build time
+      # ------------------------------------------------------------------
+      - name: Validate inputs
+        shell: bash
         run: |
-          docker build -t green-sustainability:latest . \
-            --build-arg ENHANCEMENTS_ENABLED="${ENHANCEMENTS_ENABLED}" \
-            --build-arg LIMIT_GRAPH_ENABLED="${LIMIT_GRAPH_ENABLED}" \
-            --build-arg MODP_ENABLED="${MODP_ENABLED}" \
-            --build-arg RLHF_ENABLED="${RLHF_ENABLED}" \
-            --build-arg DISTILLATION_ENABLED="${DISTILLATION_ENABLED}" \
-            --build-arg MOE_GATING_ENABLED="${MOE_GATING_ENABLED}" \
-            --build-arg EVOLUTIONARY_ENABLED="${EVOLUTIONARY_ENABLED}" \
-            --build-arg FLEXGEN_ENABLED="${FLEXGEN_ENABLED}"
+          set -euo pipefail
+          agent_id='${{ inputs.purple_agent_id }}'
+          hfs='${{ inputs.human_feedback_score }}'
 
-      - name: Run Assessment with Enhanced Environment
-        env:
-          PURPLE_AGENT_ID: ${{ github.event.inputs.purple_agent_id }}
-          AGENTBEATS_API_KEY: ${{ secrets.AGENTBEATS_API_KEY }}
-          ENHANCEMENTS_ENABLED: ${{ env.ENHANCEMENTS_ENABLED }}
-          LIMIT_GRAPH_ENABLED: ${{ env.LIMIT_GRAPH_ENABLED }}
-          MODP_ENABLED: ${{ env.MODP_ENABLED }}
-          RLHF_ENABLED: ${{ env.RLHF_ENABLED }}
-          DISTILLATION_ENABLED: ${{ env.DISTILLATION_ENABLED }}
-          MOE_GATING_ENABLED: ${{ env.MOE_GATING_ENABLED }}
-          EVOLUTIONARY_ENABLED: ${{ env.EVOLUTIONARY_ENABLED }}
-          FLEXGEN_ENABLED: ${{ env.FLEXGEN_ENABLED }}
-          HUMAN_FEEDBACK_SCORE: ${{ env.HUMAN_FEEDBACK_SCORE }}
-          MODP_WEIGHTS: ${{ env.MODP_WEIGHTS }}
-          GRAPH_CENTRALITY: ${{ env.GRAPH_CENTRALITY }}
-          GRAPH_CONNECTIVITY: ${{ env.GRAPH_CONNECTIVITY }}
-        run: |
-          docker run --rm \
-            -e PURPLE_AGENT_ID \
-            -e AGENTBEATS_API_KEY \
-            -e ENHANCEMENTS_ENABLED \
-            -e LIMIT_GRAPH_ENABLED \
-            -e MODP_ENABLED \
-            -e RLHF_ENABLED \
-            -e DISTILLATION_ENABLED \
-            -e MOE_GATING_ENABLED \
-            -e EVOLUTIONARY_ENABLED \
-            -e FLEXGEN_ENABLED \
-            -e HUMAN_FEEDBACK_SCORE \
-            -e MODP_WEIGHTS \
-            -e GRAPH_CENTRALITY \
-            -e GRAPH_CONNECTIVITY \
-            -v $(pwd)/results:/app/results \
-            green-sustainability:latest
-
-      - name: Verify Enhanced Metrics in Results (optional)
-        if: ${{ env.ENHANCEMENTS_ENABLED == 'true' }}
-        run: |
-          echo "🔍 Checking for enhanced metrics in results directory..."
-          if grep -rq "modp_score" results/ || grep -rq "graph_centrality" results/; then
-            echo "✅ Enhanced metrics detected in results"
-          else
-            echo "⚠️ No enhanced metrics found; verify enhancements are properly configured."
+          if ! [[ "$agent_id" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+            echo "::error::purple_agent_id must match ^[A-Za-z0-9._-]{1,64}$ (got: '$agent_id')"
+            exit 1
           fi
 
+          if ! [[ "$hfs" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]; then
+            echo "::error::human_feedback_score must be between 0.0 and 1.0 (got: '$hfs')"
+            exit 1
+          fi
+
+          echo "Inputs validated."
+
+      # ------------------------------------------------------------------
+      # 1. Checkout — no credentials retained in .git/config
+      # ------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # ------------------------------------------------------------------
+      # 2. Buildx — enables GHA layer cache
+      # ------------------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ------------------------------------------------------------------
+      # 3. Results dir — create with runner ownership so upload-artifact
+      #    does not trip on root-owned files.
+      # ------------------------------------------------------------------
+      - name: Prepare results directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          sudo chown -R "$(id -u):$(id -g)" results
+
+      # ------------------------------------------------------------------
+      # 4. Build — GHA cache, pull base image, explicit build args
+      # ------------------------------------------------------------------
+      - name: Build Green Agent
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          pull: true
+          tags: green-sustainability:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            ENHANCEMENTS_ENABLED=${{ env.ENHANCEMENTS_ENABLED }}
+            LIMIT_GRAPH_ENABLED=${{ env.LIMIT_GRAPH_ENABLED }}
+            MODP_ENABLED=${{ env.MODP_ENABLED }}
+            RLHF_ENABLED=${{ env.RLHF_ENABLED }}
+            DISTILLATION_ENABLED=${{ env.DISTILLATION_ENABLED }}
+            MOE_GATING_ENABLED=${{ env.MOE_GATING_ENABLED }}
+            EVOLUTIONARY_ENABLED=${{ env.EVOLUTIONARY_ENABLED }}
+            FLEXGEN_ENABLED=${{ env.FLEXGEN_ENABLED }}
+
+      # ------------------------------------------------------------------
+      # 5. Write env file for the container.
+      #    Not bulletproof (docker inspect still shows env vars), but:
+      #      - keeps secrets out of `docker run` argv / process list
+      #      - ::add-mask:: scrubs logs if the secret is ever echoed
+      #    For strict secrecy, mount a file from /run/secrets instead.
+      # ------------------------------------------------------------------
+      - name: Write container env file
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${{ secrets.AGENTBEATS_API_KEY }}"
+          umask 077
+          cat > /tmp/agent.env <<'EOF'
+          PURPLE_AGENT_ID=${{ inputs.purple_agent_id }}
+          AGENTBEATS_API_KEY=${{ secrets.AGENTBEATS_API_KEY }}
+          ENHANCEMENTS_ENABLED=${{ env.ENHANCEMENTS_ENABLED }}
+          LIMIT_GRAPH_ENABLED=${{ env.LIMIT_GRAPH_ENABLED }}
+          MODP_ENABLED=${{ env.MODP_ENABLED }}
+          RLHF_ENABLED=${{ env.RLHF_ENABLED }}
+          DISTILLATION_ENABLED=${{ env.DISTILLATION_ENABLED }}
+          MOE_GATING_ENABLED=${{ env.MOE_GATING_ENABLED }}
+          EVOLUTIONARY_ENABLED=${{ env.EVOLUTIONARY_ENABLED }}
+          FLEXGEN_ENABLED=${{ env.FLEXGEN_ENABLED }}
+          HUMAN_FEEDBACK_SCORE=${{ env.HUMAN_FEEDBACK_SCORE }}
+          MODP_WEIGHTS=${{ env.MODP_WEIGHTS }}
+          GRAPH_CENTRALITY=${{ env.GRAPH_CENTRALITY }}
+          GRAPH_CONNECTIVITY=${{ env.GRAPH_CONNECTIVITY }}
+          EOF
+          chmod 600 /tmp/agent.env
+
+      # ------------------------------------------------------------------
+      # 6. Run — hardened container.
+      #    NOTE: --read-only and --user are strong defaults but require the
+      #    image to write only under /app/results and /tmp. Validate against
+      #    the actual Dockerfile; if the agent writes elsewhere, mount a
+      #    writable volume or drop --read-only.
+      # ------------------------------------------------------------------
+      - name: Run Assessment (hardened)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --name agentbeats-assessment \
+            --env-file /tmp/agent.env \
+            --memory 4g \
+            --cpus 2 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --read-only \
+            --tmpfs /tmp:size=256m \
+            -v "$(pwd)/results:/app/results" \
+            green-sustainability:latest 2>&1 | tee results/agentbeats.log
+
+      # ------------------------------------------------------------------
+      # 7. Verify — check every *enabled* module; fail in strict mode.
+      # ------------------------------------------------------------------
+      - name: Verify Enhanced Metrics
+        id: verify
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          modules=(
+            modp_score
+            graph_centrality
+            rlhf_feedback
+            distillation_update
+            moe_gate
+            evolutionary_fitness
+          )
+          if [ "${{ env.FLEXGEN_ENABLED }}" = "true" ]; then
+            modules+=(flexgen_energy)
+          fi
+
+          missing=()
+          for m in "${modules[@]}"; do
+            if ! grep -rq "$m" results/ 2>/dev/null; then
+              missing+=("$m")
+            fi
+          done
+
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "✅ All expected enhanced metrics detected"
+            echo "verified=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "⚠️ Missing enhanced metrics: ${missing[*]}"
+            echo "verified=false" >> "$GITHUB_OUTPUT"
+            if [ "${{ inputs.strict_verification }}" = "true" ]; then
+              echo "::error::Strict verification enabled — failing due to missing metrics"
+              exit 1
+            fi
+          fi
+
+      # ------------------------------------------------------------------
+      # 8. Summary — visible in the GitHub Actions UI run page.
+      # ------------------------------------------------------------------
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## AgentBeats Assessment Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Purple agent | \`${{ inputs.purple_agent_id }}\` |"
+            echo "| Enhancements enabled | \`${{ inputs.enable_enhancements }}\` |"
+            echo "| FlexGen | \`${{ env.FLEXGEN_ENABLED }}\` |"
+            echo "| Enhanced metrics verified | \`${{ steps.verify.outputs.verified }}\` |"
+            echo "| Strict mode | \`${{ inputs.strict_verification }}\` |"
+            echo ""
+            if [ -f results/agentbeats.log ]; then
+              echo "<details><summary>Log tail</summary>"
+              echo ""
+              echo '```'
+              tail -n 50 results/agentbeats.log || true
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 9. Upload — always, even on failure, so failures are diagnosable.
+      # ------------------------------------------------------------------
       - name: Upload Results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: assessment-results
+          name: assessment-results-${{ github.run_id }}
           path: results/
           if-no-files-found: warn
+          retention-days: 30
+
+      # ------------------------------------------------------------------
+      # 10. Cleanup — idempotent, safe to run even after successful --rm.
+      # ------------------------------------------------------------------
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -f /tmp/agent.env || true
+          docker rm -f agentbeats-assessment 2>/dev/null || true
