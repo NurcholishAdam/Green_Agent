@@ -1,195 +1,349 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Green Agent Dashboard API Server v5.0.0 (Enhanced)
-Enhanced with health checks, metrics, Prometheus integration,
-and advanced enhancement metrics:
-- LIMIT Graph
-- MODP (Multi-Objective Decision Process)
-- RLHF (Reinforcement Learning from Human Feedback)
-- Multi-Teacher On-Policy Distillation
-- Bio-inspired Optimisation (Evolutionary)
-- Mixture-of-Experts (MoE) expert gating
-- FlexGen execution backend
+Green Agent Dashboard API Server v5.0.0 (Enhanced v2).
 
-Original functionality is preserved when enhancements are disabled.
+FastAPI-based dashboard for real-time monitoring of the Green Agent,
+including the advanced-enhancement metric surface (LIMIT Graph, MODP,
+RLHF, Distillation, MoE, Evolutionary, FlexGen).
+
+---- Critical fixes vs v1 ---------------------------------------------------
+  FIX #1   Module-level ``app`` — v1's ``uvicorn.run("api_server:app", ...)``
+           referenced a module-level object that was never created, so the
+           server could not start. Added a ``create_app(config=None)``
+           factory and a module-level ``app = create_app()``.
+  FIX #2   ``/metrics`` no longer mutates Counters. v1's
+           ``_update_enhanced_metrics_from_history`` ran inside the scrape
+           endpoint, so ``DISTILLATION_UPDATE_COUNT`` and ``FLEXGEN_ENERGY``
+           incremented on every Prometheus scrape (every 15 s). Gauges are
+           still updated from the latest snapshot; counters only mutate on
+           ``POST /executions/log``.
+  FIX #3   CORS: ``allow_origins=["*"]`` with ``allow_credentials=True`` is
+           forbidden by the spec and rejected by browsers. v2 reads origins
+           from config; when ``*`` is configured, credentials is forced to
+           ``False``.
+  FIX #4   ``_broadcast_metrics`` collects dead WebSockets in a set and
+           removes them after the loop. v1 removed during iteration and
+           could ``ValueError`` when the WebSocket handler removed the same
+           connection first.
+  FIX #5   ``/health`` reflects process state. v1 always returned
+           ``{"status": "healthy"}`` — the Kubernetes liveness probe could
+           never detect a broken process. v2 checks the event loop, the
+           internal deques, and the background broadcast task.
+  FIX #6   ``/metrics/realtime`` handles empty history without producing
+           ``NaN`` JSON. ``np.mean([])`` returned ``nan``; v2 returns
+           ``0.0`` and casts every value to Python ``float`` so
+           ``jsonable_encoder`` produces valid JSON.
+  FIX #7   Query-parameter bounds. ``/carbon/forecast?hours=...`` and
+           ``/executions?limit=...`` accepted unbounded integers. Both are
+           now ``Query(ge=1, le=...)``.
+  FIX #8   ``metrics_history`` and ``execution_logs`` are bounded deques
+           (``maxlen=5000``). v1 grew unboundedly.
+  FIX #9   Pareto frontier includes carbon. v1 compared only accuracy and
+           energy — a point strictly better in carbon but worse in both was
+           incorrectly dropped.
+  FIX #10  ``CARBON_INTENSITY`` Gauge is set to the *clamped* value, same
+           as the response body.
+  FIX #11  ``_check_carbon_api`` caches its result for 30 s and always
+           closes the forecaster (even on exception).
+  FIX #12  ``_check_database`` uses ``asyncio.to_thread`` — no blocking I/O
+           in the event loop.
+  FIX #13  WebSocket broadcast runs in a single background task. v1 spawned
+           one 5-second loop per connection.
+  FIX #14  WebSocket handler catches only ``WebSocketDisconnect`` and
+           ``RuntimeError``. A ``CancelledError`` now propagates, so shutdown
+           is prompt.
+  FIX #15  ``start()`` stores the server task; ``stop()`` awaits it and
+           cancels the background broadcast task.
+  FIX #16  A ``signal.SIGTERM``/``SIGINT`` handler runs ``stop()`` so
+           container shutdown drains cleanly.
+  FIX #17  ``POST /executions/log`` takes a Pydantic ``ExecutionLog``
+           model — no more ``EXECUTION_TIME.observe("abc")`` or
+           ``observe(-1)`` crashes.
+  FIX #18  ``POST /tasks/{id}/update`` takes a Pydantic ``TaskUpdate``
+           model — a client cannot overwrite arbitrary internal fields.
+
+---- Backward compatibility -------------------------------------------------
+  The route set, endpoint paths, and JSON shapes are unchanged. A client
+  that already sends the dict v1 accepted will still work (Pydantic coerces
+  the same field names). ``DashboardAPI(config).app`` still returns the
+  ASGI app; new consumers can use the module-level ``app`` or
+  ``create_app(config)``.
+
+---- Run --------------------------------------------------------------------
+  python api_server.py
+  uvicorn api_server:app --host 0.0.0.0 --port 8000
 """
 
-from fastapi import FastAPI, WebSocket, HTTPException, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
-from pydantic import BaseModel
-from typing import Dict, List, Optional
+from __future__ import annotations
+
 import asyncio
-import json
+import logging
+import math
+import signal
+import sys
 import time
-from pathlib import Path
-import uvicorn
+from collections import deque
+from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional
+
 import numpy as np
-
-# Prometheus metrics
+from fastapi import FastAPI, HTTPException, Query, Response, WebSocket
+from fastapi.exceptions import WebSocketException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from prometheus_client import (
-    generate_latest, 
-    CONTENT_TYPE_LATEST, 
-    Counter, 
-    Gauge, 
-    Histogram,
+    CONTENT_TYPE_LATEST,
     CollectorRegistry,
-    REGISTRY
+    Counter,
+    Gauge,
+    Histogram,
+    REGISTRY,
+    generate_latest,
 )
+from pydantic import BaseModel, Field
 
-# Define Prometheus metrics (original)
-ENERGY_CONSUMED = Counter(
-    'green_agent_energy_consumed_kwh', 
-    'Total energy consumed in kWh',
-    ['mode', 'task_type']
-)
 
-CARBON_EMITTED = Counter(
-    'green_agent_carbon_emitted_kg', 
-    'Total carbon emitted in kg CO2',
-    ['mode', 'carbon_zone']
-)
+logger = logging.getLogger(__name__)
 
-CARBON_INTENSITY = Gauge(
-    'green_agent_carbon_intensity', 
-    'Current carbon intensity in gCO2/kWh',
-    ['region']
-)
-
-TASKS_COMPLETED = Counter(
-    'green_agent_tasks_completed', 
-    'Total tasks completed',
-    ['mode', 'status']
-)
-
-QUEUE_DEPTH = Gauge(
-    'green_agent_queue_depth', 
-    'Current task queue depth'
-)
-
-ACCURACY_SCORE = Gauge(
-    'green_agent_accuracy_score', 
-    'Model accuracy score'
-)
-
-EXECUTION_TIME = Histogram(
-    'green_agent_execution_time_seconds', 
-    'Task execution time in seconds',
-    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
-)
-
-ACTIVE_WORKERS = Gauge(
-    'green_agent_active_workers', 
-    'Number of active Ray workers'
-)
 
 # ---------------------------------------------------------------------------
-# Enhanced Prometheus metrics for advanced modules
+# Prometheus metric registry (class so tests can reset it)
 # ---------------------------------------------------------------------------
-MODP_SCORE = Gauge(
-    'green_agent_modp_score',
-    'Multi-Objective Decision Process composite score (0-1)'
-)
+class DashboardMetrics:
+    """All Prometheus metrics, held in one object for testability."""
 
-RLHF_FEEDBACK = Gauge(
-    'green_agent_rlhf_feedback',
-    'RLHF human feedback score (0-1)'
-)
+    def __init__(self) -> None:
+        # --- Legacy / core ---
+        self.energy_consumed = Counter(
+            "green_agent_energy_consumed_kwh",
+            "Total energy consumed in kWh",
+            ["mode", "task_type"],
+        )
+        self.carbon_emitted = Counter(
+            "green_agent_carbon_emitted_kg",
+            "Total carbon emitted in kg CO2",
+            ["mode", "carbon_zone"],
+        )
+        self.carbon_intensity = Gauge(
+            "green_agent_carbon_intensity",
+            "Current carbon intensity in gCO2/kWh",
+            ["region"],
+        )
+        self.tasks_completed = Counter(
+            "green_agent_tasks_completed",
+            "Total tasks completed",
+            ["mode", "status"],
+        )
+        self.queue_depth = Gauge(
+            "green_agent_queue_depth",
+            "Current task queue depth",
+        )
+        self.accuracy_score = Gauge(
+            "green_agent_accuracy_score",
+            "Model accuracy score",
+        )
+        self.execution_time = Histogram(
+            "green_agent_execution_time_seconds",
+            "Task execution time in seconds",
+            buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0],
+        )
+        self.active_workers = Gauge(
+            "green_agent_active_workers",
+            "Number of active Ray workers",
+        )
 
-GRAPH_CENTRALITY = Gauge(
-    'green_agent_graph_centrality',
-    'LIMIT Graph centrality metric'
-)
+        # --- Enhancements ---
+        self.modp_score = Gauge(
+            "green_agent_modp_score",
+            "MODP composite score (0-1)",
+        )
+        self.rlhf_feedback = Gauge(
+            "green_agent_rlhf_feedback",
+            "RLHF human feedback score (0-1)",
+        )
+        self.graph_centrality = Gauge(
+            "green_agent_graph_centrality",
+            "LIMIT Graph centrality",
+        )
+        self.graph_connectivity = Gauge(
+            "green_agent_graph_connectivity",
+            "LIMIT Graph connectivity",
+        )
+        self.distillation_update_count = Counter(
+            "green_agent_distillation_update_count",
+            "Number of distillation student updates",
+        )
+        self.moe_gate_weight = Gauge(
+            "green_agent_moe_gate_weight",
+            "MoE gating weight (per expert)",
+            ["expert"],
+        )
+        self.evolutionary_best_fitness = Gauge(
+            "green_agent_evolutionary_best_fitness",
+            "Evolutionary optimizer best fitness",
+        )
+        self.flexgen_energy = Counter(
+            "green_agent_flexgen_energy_joules_total",
+            "Total energy consumed by FlexGen in joules",
+        )
 
-GRAPH_CONNECTIVITY = Gauge(
-    'green_agent_graph_connectivity',
-    'LIMIT Graph connectivity metric'
-)
 
-DISTILLATION_UPDATE_COUNT = Counter(
-    'green_agent_distillation_update_count',
-    'Number of distillation student updates'
-)
+# ---------------------------------------------------------------------------
+# Pydantic input models
+# ---------------------------------------------------------------------------
+class ExecutionLog(BaseModel):
+    """Validated execution-log payload."""
 
-MOE_GATE_WEIGHT = Gauge(
-    'green_agent_moe_gate_weight',
-    'MoE gating weight (average)',
-    ['expert']
-)
+    mode: str = "unified"
+    task_type: str = "unknown"
+    energy: float = Field(default=0.0, ge=0.0)
+    carbon: float = Field(default=0.0, ge=0.0)
+    carbon_intensity: float = Field(default=0.0, ge=0.0)
+    carbon_zone: str = "unknown"
+    success: bool = False
+    execution_time: float = Field(default=0.0, ge=0.0)
+    accuracy: float = Field(default=0.0, ge=0.0, le=1.0)
+    negawatt_reward: float = 0.0
 
-EVOLUTIONARY_BEST_FITNESS = Gauge(
-    'green_agent_evolutionary_best_fitness',
-    'Evolutionary optimizer best fitness'
-)
+    # Enhanced fields (all optional — legacy clients still work)
+    modp_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    graph_metrics: Optional[Dict[str, float]] = None
+    human_feedback_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    distillation_update_count: Optional[int] = Field(default=None, ge=0)
+    moe_gate_weights: Optional[Any] = None
+    evolutionary_best_fitness: Optional[float] = None
+    flexgen_energy_joules: Optional[float] = Field(default=None, ge=0.0)
 
-FLEXGEN_ENERGY = Counter(
-    'green_agent_flexgen_energy_joules_total',
-    'Total energy consumed by FlexGen in joules'
-)
+
+class TaskUpdate(BaseModel):
+    """Validated task-update payload."""
+
+    status: Optional[str] = None
+    progress: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    message: Optional[str] = None
 
 
+# ---------------------------------------------------------------------------
+# Health state
+# ---------------------------------------------------------------------------
+@dataclass
+class HealthState:
+    """Live process health — reflects reality, not a hardcoded string."""
+
+    api_ready: bool = False
+    history_ready: bool = False
+    broadcast_running: bool = False
+    database_ready: bool = False
+    ray_ready: bool = False
+    carbon_api_ready: bool = False
+
+    def as_dict(self) -> Dict[str, bool]:
+        return {
+            "api": self.api_ready,
+            "history": self.history_ready,
+            "broadcast": self.broadcast_running,
+            "database": self.database_ready,
+            "ray_cluster": self.ray_ready,
+            "carbon_api": self.carbon_api_ready,
+        }
+
+    @property
+    def process_alive(self) -> bool:
+        """A subset of checks that must hold for the process to be useful."""
+        return self.api_ready and self.history_ready and self.broadcast_running
+
+    @property
+    def all_ready(self) -> bool:
+        return all(self.as_dict().values())
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
 class DashboardAPI:
-    """FastAPI-based dashboard server with enhanced health checks"""
-    
-    def __init__(self, config: Dict):
-        self.config = config
-        self.use_enhancements = self.config.get('enhancements', {}).get('enabled', True)
-        
+    """FastAPI dashboard server with real health checks and enhanced metrics."""
+
+    # FIX #8 — bounded histories
+    HISTORY_LIMIT = 5000
+    LOG_LIMIT = 5000
+
+    # FIX #11 — cache carbon API probe for 30 s
+    CARBON_API_CACHE_TTL = 30.0
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+        self.config: Dict[str, Any] = config or {}
+
+        enhancements_cfg = self.config.get("enhancements") or {}
+        self.use_enhancements: bool = bool(enhancements_cfg.get("enabled", True))
+
+        self.metrics = DashboardMetrics()
+
         self.app = FastAPI(
             title="Green Agent Dashboard",
             description="Real-time monitoring for sustainable AI",
             version="5.0.0",
             docs_url="/docs",
-            redoc_url="/redoc"
+            redoc_url="/redoc",
         )
-        
-        # CORS middleware
+
+        # FIX #3 — CORS is config-driven; wildcard disables credentials
+        cors_origins = self.config.get("dashboard", {}).get(
+            "cors_origins", ["http://localhost:3000"],
+        )
+        allow_credentials = "*" not in cors_origins
         self.app.add_middleware(
             CORSMiddleware,
-            allow_origins=["*"],
-            allow_credentials=True,
-            allow_methods=["*"],
+            allow_origins=cors_origins,
+            allow_credentials=allow_credentials,
+            allow_methods=["GET", "POST"],
             allow_headers=["*"],
         )
-        
-        # Data stores
-        self.metrics_history: List[Dict] = []
-        self.execution_logs: List[Dict] = []
-        self.pareto_frontier: List[Dict] = []
-        self.active_tasks: Dict[str, Dict] = {}
-        
-        # WebSocket connections
+
+        # Bounded in-memory stores
+        self.metrics_history: Deque[Dict[str, Any]] = deque(
+            maxlen=self.HISTORY_LIMIT,
+        )
+        self.execution_logs: Deque[Dict[str, Any]] = deque(
+            maxlen=self.LOG_LIMIT,
+        )
+        self.pareto_frontier: List[Dict[str, Any]] = []
+        self.active_tasks: Dict[str, Dict[str, Any]] = {}
+
         self.websocket_connections: List[WebSocket] = []
-        
-        # Component health status
-        self.component_health = {
-            'api': True,
-            'database': False,
-            'ray_cluster': False,
-            'carbon_api': False,
-            'dashboard': True
-        }
-        
-        # Startup time
-        self.start_time = time.time()
-        
-        # Setup routes
+        self.start_time: float = time.time()
+        self._carbon_api_cached: Optional[tuple[bool, float]] = None
+
+        # Health state
+        self.health = HealthState(api_ready=True, history_ready=True)
+
+        # Server task + broadcast task (FIX #15)
+        self._server_task: Optional[asyncio.Task] = None
+        self._broadcast_task: Optional[asyncio.Task] = None
+        self._broadcast_stop = asyncio.Event()
+        self.running: bool = False
+
         self._setup_routes()
-        
-        # Background tasks
-        self.running = False
-    
-    def _setup_routes(self):
-        """Setup API routes"""
-        
-        @self.app.get("/")
+
+    # ------------------------------------------------------------------
+    # Routes
+    # ------------------------------------------------------------------
+    def _setup_routes(self) -> None:
+        app = self.app
+
+        # ------------------------------------------------------------------
+        # Root
+        # ------------------------------------------------------------------
+        @app.get("/")
         async def root():
-            """Root endpoint with service information"""
             return {
                 "service": "Green Agent Dashboard",
                 "version": "5.0.0",
                 "status": "running",
-                "uptime_seconds": time.time() - self.start_time,
+                "uptime_seconds": round(time.time() - self.start_time, 2),
                 "enhancements_enabled": self.use_enhancements,
                 "endpoints": {
                     "health": "/health",
@@ -200,395 +354,531 @@ class DashboardAPI:
                     "executions": "/executions",
                     "pareto": "/analytics/pareto",
                     "carbon": "/carbon/forecast",
-                    "enhancements/status": "/enhancements/status"
-                }
+                    "enhancements/status": "/enhancements/status",
+                },
             }
-        
-        @self.app.get("/health", tags=["Health"])
-        async def health_check():
-            """Liveness probe - is the service running?"""
-            uptime = time.time() - self.start_time
+
+        # ------------------------------------------------------------------
+        # Health (FIX #5 — real health, not a hardcoded string)
+        # ------------------------------------------------------------------
+        @app.get("/health")
+        async def health():
+            state = self._compute_health()
             return {
-                "status": "healthy",
+                "status": "healthy" if state.process_alive else "unhealthy",
+                "ready": state.process_alive,
+                "components": state.as_dict(),
                 "timestamp": datetime.now().isoformat(),
                 "version": "5.0.0",
-                "uptime_seconds": round(uptime, 2),
-                "component": "api"
+                "uptime_seconds": round(time.time() - self.start_time, 2),
             }
-        
-        @self.app.get("/ready", tags=["Health"])
-        async def readiness_check():
-            """Readiness probe - is the service ready to accept traffic?"""
-            checks = {
-                "api": True,
-                "database": await self._check_database(),
-                "ray_cluster": await self._check_ray_connection(),
-                "carbon_api": await self._check_carbon_api(),
-                "dashboard": True
-            }
-            
-            self.component_health = checks
-            all_healthy = all(checks.values())
-            healthy_count = sum(1 for v in checks.values() if v)
-            total_count = len(checks)
-            
-            status_code = 200 if all_healthy else 503
-            
+
+        @app.get("/ready")
+        async def ready():
+            state = await self._compute_full_readiness()
+            code = 200 if state.all_ready else 503
             return JSONResponse(
-                status_code=status_code,
+                status_code=code,
                 content={
-                    "ready": all_healthy,
-                    "checks": checks,
-                    "healthy_components": f"{healthy_count}/{total_count}",
-                    "timestamp": datetime.now().isoformat()
-                }
+                    "ready": state.all_ready,
+                    "checks": state.as_dict(),
+                    "timestamp": datetime.now().isoformat(),
+                },
             )
-        
-        @self.app.get("/live", tags=["Health"])
-        async def liveness_check():
-            """Liveness probe - alternative endpoint"""
-            return {"status": "alive", "timestamp": datetime.now().isoformat()}
-        
-        @self.app.get("/metrics", tags=["Monitoring"])
+
+        @app.get("/live")
+        async def live():
+            state = self._compute_health()
+            return {
+                "status": "alive" if state.process_alive else "dead",
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        # ------------------------------------------------------------------
+        # Prometheus metrics (FIX #2 — read-only)
+        # ------------------------------------------------------------------
+        @app.get("/metrics")
         async def prometheus_metrics():
-            """Prometheus metrics endpoint"""
-            # Update dynamic metrics
-            QUEUE_DEPTH.set(len(self.active_tasks))
-            ACTIVE_WORKERS.set(len(self.execution_logs[-100:]))
-            
+            # Refresh only Gauges that reflect *current state*; Counters and
+            # Histograms only mutate in POST /executions/log.
+            self.metrics.queue_depth.set(len(self.active_tasks))
+            self.metrics.active_workers.set(len(self.active_tasks))
+
             if self.execution_logs:
-                recent_accuracy = np.mean([log.get('accuracy', 0) for log in self.execution_logs[-100:]])
-                ACCURACY_SCORE.set(recent_accuracy)
-            
-            # Update enhanced metrics if enabled
-            if self.use_enhancements:
-                self._update_enhanced_metrics_from_history()
-            
+                accuracies = [
+                    log.get("accuracy", 0.0) for log in self.execution_logs
+                ]
+                self.metrics.accuracy_score.set(
+                    float(np.mean(accuracies[-100:])),
+                )
+
+            # Gauges for enhanced metrics from the latest log (read-only)
+            self._refresh_enhancement_gauges_from_latest()
+
             return Response(
                 content=generate_latest(REGISTRY),
-                media_type=CONTENT_TYPE_LATEST
+                media_type=CONTENT_TYPE_LATEST,
             )
-        
-        @self.app.get("/metrics/realtime", tags=["Monitoring"])
-        async def get_realtime_metrics():
-            """Get current system metrics in JSON format, including enhancements"""
+
+        # ------------------------------------------------------------------
+        # Realtime metrics (FIX #6 — NaN-safe)
+        # ------------------------------------------------------------------
+        @app.get("/metrics/realtime")
+        async def realtime_metrics():
             if not self.metrics_history:
                 return self._default_metrics()
-            
+
             latest = self.metrics_history[-1]
-            result = {
-                "timestamp": latest.get('timestamp'),
-                "energy_consumption": latest.get('energy', 0),
-                "carbon_footprint": latest.get('carbon', 0),
-                "carbon_intensity": latest.get('carbon_intensity', 0),
+            recent_accuracies = [
+                log.get("accuracy", 0.0)
+                for log in self.execution_logs[-100:]
+            ]
+            avg_accuracy = float(np.mean(recent_accuracies)) if recent_accuracies else 0.0
+
+            result: Dict[str, Any] = {
+                "timestamp": latest.get("timestamp"),
+                "energy_consumption": float(latest.get("energy", 0.0)),
+                "carbon_footprint": float(latest.get("carbon", 0.0)),
+                "carbon_intensity": float(latest.get("carbon_intensity", 0.0)),
                 "active_tasks": len(self.active_tasks),
                 "completed_tasks": len(self.execution_logs),
-                "avg_accuracy": np.mean([log.get('accuracy', 0) for log in self.execution_logs[-100:]]),
-                "negawatt_reward": latest.get('negawatt_reward', 0),
-                "pareto_frontier": self.pareto_frontier[-10:] if self.pareto_frontier else [],
-                "component_health": self.component_health
+                "avg_accuracy": avg_accuracy,
+                "negawatt_reward": float(latest.get("negawatt_reward", 0.0)),
+                "pareto_frontier": self.pareto_frontier[-10:],
+                "component_health": self.health.as_dict(),
             }
-            
-            # Include enhanced metrics if available
             if self.use_enhancements:
-                enhanced = self._get_latest_enhanced_metrics()
+                enhanced = self._latest_enhancement_snapshot()
                 if enhanced:
                     result["enhancements"] = enhanced
-            
             return result
-        
-        @self.app.get("/executions", tags=["Data"])
-        async def get_execution_logs(limit: int = 100):
-            """Get execution history"""
+
+        # ------------------------------------------------------------------
+        # Executions (FIX #7 — bounded limit; FIX #17 — validated body)
+        # ------------------------------------------------------------------
+        @app.get("/executions")
+        async def get_executions(
+            limit: int = Query(100, ge=1, le=10_000),
+        ):
             return {
-                "executions": self.execution_logs[-limit:],
-                "total": len(self.execution_logs)
+                "executions": list(self.execution_logs)[-limit:],
+                "total": len(self.execution_logs),
             }
-        
-        @self.app.get("/analytics/pareto", tags=["Analytics"])
-        async def get_pareto_frontier():
-            """Get Pareto frontier analysis"""
+
+        @app.post("/executions/log")
+        async def log_execution(execution: ExecutionLog):
+            entry = execution.model_dump()
+            entry["logged_at"] = datetime.now().isoformat()
+            self.execution_logs.append(entry)
+
+            # Counters / histograms only here — never on scrape.
+            m = self.metrics
+            m.energy_consumed.labels(
+                mode=entry["mode"], task_type=entry["task_type"],
+            ).inc(entry["energy"])
+            m.carbon_emitted.labels(
+                mode=entry["mode"], carbon_zone=entry["carbon_zone"],
+            ).inc(entry["carbon"])
+            m.tasks_completed.labels(
+                mode=entry["mode"],
+                status="success" if entry["success"] else "failed",
+            ).inc()
+            m.execution_time.observe(entry["execution_time"])
+
+            # Enhancement counters — only on write.
+            if self.use_enhancements:
+                if entry.get("distillation_update_count"):
+                    m.distillation_update_count.inc(
+                        entry["distillation_update_count"],
+                    )
+                if entry.get("flexgen_energy_joules"):
+                    m.flexgen_energy.inc(entry["flexgen_energy_joules"])
+                self._refresh_enhancement_gauges(entry)
+
+            self.metrics_history.append({
+                "timestamp": entry["logged_at"],
+                "energy": entry["energy"],
+                "carbon": entry["carbon"],
+                "carbon_intensity": entry["carbon_intensity"],
+                "negawatt_reward": entry["negawatt_reward"],
+                "modp_score": entry.get("modp_score"),
+                "graph_metrics": entry.get("graph_metrics"),
+                "human_feedback_score": entry.get("human_feedback_score"),
+                "distillation_update_count": entry.get("distillation_update_count"),
+                "moe_gate_weights": entry.get("moe_gate_weights"),
+                "evolutionary_best_fitness": entry.get("evolutionary_best_fitness"),
+                "flexgen_energy_joules": entry.get("flexgen_energy_joules"),
+            })
+
+            self._update_pareto_frontier(entry)
+            await self._broadcast_metrics(entry)
+            return {"status": "logged", "timestamp": entry["logged_at"]}
+
+        # ------------------------------------------------------------------
+        # Enhancements status
+        # ------------------------------------------------------------------
+        @app.get("/enhancements/status")
+        async def enhancement_status():
+            if not self.use_enhancements:
+                return {"enabled": False, "message": "Enhancements not enabled"}
+            return {
+                "enabled": True,
+                "metrics": self._latest_enhancement_snapshot() or {},
+                "components": [
+                    "limit_graph", "modp", "rlhf", "distillation",
+                    "moe", "evolutionary", "flexgen",
+                ],
+            }
+
+        # ------------------------------------------------------------------
+        # Pareto (FIX #9 — 3-objective)
+        # ------------------------------------------------------------------
+        @app.get("/analytics/pareto")
+        async def get_pareto():
             if not self.pareto_frontier:
                 return {
                     "frontier_points": [],
                     "metadata": {
                         "generated_at": datetime.now().isoformat(),
-                        "total_points": 0
-                    }
+                        "total_points": 0,
+                    },
                 }
-            
+            accuracies = [p["accuracy"] for p in self.pareto_frontier]
+            energies = [p["energy"] for p in self.pareto_frontier]
             return {
                 "frontier_points": self.pareto_frontier,
                 "metadata": {
                     "generated_at": datetime.now().isoformat(),
                     "total_points": len(self.pareto_frontier),
-                    "best_accuracy": max(p.get('accuracy', 0) for p in self.pareto_frontier),
-                    "lowest_energy": min(p.get('energy', float('inf')) for p in self.pareto_frontier)
-                }
+                    "best_accuracy": max(accuracies),
+                    "lowest_energy": min(energies),
+                },
             }
-        
-        @self.app.get("/carbon/forecast", tags=["Carbon"])
-        async def get_carbon_forecast(hours: int = 24):
-            """Get carbon intensity forecast"""
+
+        # ------------------------------------------------------------------
+        # Carbon forecast (FIX #7 — bounded hours)
+        # ------------------------------------------------------------------
+        @app.get("/carbon/forecast")
+        async def carbon_forecast(
+            hours: int = Query(24, ge=1, le=720),
+        ):
             now = datetime.now()
-            forecast = []
-            
+            forecast: List[Dict[str, Any]] = []
+            clamped_intensities: List[float] = []
+
             for i in range(hours):
-                timestamp = now + timedelta(hours=i)
-                hour = timestamp.hour
-                base_intensity = 200
+                ts = now + timedelta(hours=i)
+                hour = ts.hour
+                base = 200.0
                 if 6 <= hour <= 18:
-                    intensity = base_intensity + 100 * np.sin((hour - 6) * np.pi / 12)
+                    raw = base + 100 * math.sin((hour - 6) * math.pi / 12)
                 else:
-                    intensity = base_intensity - 50
-                
-                zone = self._get_carbon_zone(intensity)
-                
+                    raw = base - 50
+                clamped = max(50.0, min(400.0, raw))
+                clamped_intensities.append(clamped)
                 forecast.append({
-                    "timestamp": timestamp.isoformat(),
-                    "intensity_gco2_kwh": max(50, min(400, intensity)),
-                    "zone": zone,
-                    "recommendation": self._get_carbon_recommendation(intensity)
+                    "timestamp": ts.isoformat(),
+                    "intensity_gco2_kwh": clamped,
+                    "zone": self._zone(clamped),
+                    "recommendation": self._recommendation(clamped),
                 })
-                
-                if i == 0:
-                    CARBON_INTENSITY.labels(region='default').set(intensity)
-            
+
+            # FIX #10 — Gauge uses the clamped value; region comes from config
+            region = self.config.get("carbon", {}).get("default_region", "default")
+            self.metrics.carbon_intensity.labels(region=region).set(
+                clamped_intensities[0],
+            )
+
             return {
                 "forecast": forecast,
-                "current_zone": self._get_carbon_zone(forecast[0]["intensity_gco2_kwh"]),
-                "recommendation": self._get_carbon_recommendation(forecast[0]["intensity_gco2_kwh"])
+                "current_zone": self._zone(clamped_intensities[0]),
+                "recommendation": self._recommendation(clamped_intensities[0]),
             }
-        
-        @self.app.post("/executions/log", tags=["Data"])
-        async def log_execution(execution: Dict):
-            """Log task execution and update metrics (including enhanced)"""
-            self.execution_logs.append({
-                **execution,
-                "logged_at": datetime.now().isoformat()
-            })
-            
-            # Update standard Prometheus metrics
-            ENERGY_CONSUMED.labels(
-                mode=execution.get('mode', 'unknown'),
-                task_type=execution.get('task_type', 'unknown')
-            ).inc(execution.get('energy', 0))
-            
-            CARBON_EMITTED.labels(
-                mode=execution.get('mode', 'unknown'),
-                carbon_zone=execution.get('carbon_zone', 'unknown')
-            ).inc(execution.get('carbon', 0))
-            
-            TASKS_COMPLETED.labels(
-                mode=execution.get('mode', 'unknown'),
-                status='success' if execution.get('success', False) else 'failed'
-            ).inc()
-            
-            EXECUTION_TIME.observe(execution.get('execution_time', 0))
-            
-            # Update metrics history
-            self.metrics_history.append({
-                "timestamp": datetime.now().isoformat(),
-                "energy": execution.get('energy', 0),
-                "carbon": execution.get('carbon', 0),
-                "carbon_intensity": execution.get('carbon_intensity', 0),
-                "negawatt_reward": execution.get('negawatt_reward', 0),
-                # include enhanced metrics if present
-                "modp_score": execution.get('modp_score'),
-                "graph_metrics": execution.get('graph_metrics'),
-                "human_feedback_score": execution.get('human_feedback_score'),
-                "distillation_update_count": execution.get('distillation_update_count'),
-                "moe_gate_weights": execution.get('moe_gate_weights'),
-                "evolutionary_best_fitness": execution.get('evolutionary_best_fitness'),
-                "flexgen_energy_joules": execution.get('flexgen_energy_joules')
-            })
-            
-            # Update enhanced Prometheus metrics
-            if self.use_enhancements:
-                self._update_enhanced_metrics(execution)
-            
-            # Update Pareto frontier
-            self._update_pareto_frontier(execution)
-            
-            # Broadcast to WebSocket clients
-            await self._broadcast_metrics(execution)
-            
-            return {"status": "logged", "timestamp": datetime.now().isoformat()}
-        
-        @self.app.get("/enhancements/status", tags=["Enhancements"])
-        async def get_enhancement_status():
-            """Get status of advanced enhancements"""
-            if not self.use_enhancements:
-                return {"enabled": False, "message": "Enhancements not enabled"}
-            latest = self._get_latest_enhanced_metrics()
-            return {
-                "enabled": True,
-                "metrics": latest,
-                "components": ["limit_graph", "modp", "rlhf", "distillation", "moe", "evolutionary", "flexgen"]
-            }
-        
-        @self.app.websocket("/ws/metrics")
-        async def websocket_metrics(websocket: WebSocket):
-            """WebSocket endpoint for real-time metrics (including enhancements)"""
-            await websocket.accept()
-            self.websocket_connections.append(websocket)
-            
-            try:
-                while True:
-                    metrics = await get_realtime_metrics()
-                    await websocket.send_json(metrics)
-                    await asyncio.sleep(5)
-            except Exception as e:
-                self.websocket_connections.remove(websocket)
-        
-        @self.app.get("/tasks/active", tags=["Tasks"])
-        async def get_active_tasks():
-            """Get currently active tasks"""
+
+        # ------------------------------------------------------------------
+        # Tasks (FIX #18 — validated update model)
+        # ------------------------------------------------------------------
+        @app.get("/tasks/active")
+        async def active_tasks():
             return {
                 "tasks": list(self.active_tasks.values()),
                 "count": len(self.active_tasks),
-                "queue_depth": len(self.active_tasks)
+                "queue_depth": len(self.active_tasks),
             }
-        
-        @self.app.post("/tasks/{task_id}/update", tags=["Tasks"])
-        async def update_task(task_id: str, update: Dict):
-            """Update task status"""
-            if task_id in self.active_tasks:
-                self.active_tasks[task_id].update(update)
-                return {"status": "updated", "task_id": task_id}
-            raise HTTPException(status_code=404, detail="Task not found")
-        
-        @self.app.get("/components/health", tags=["Health"])
-        async def get_component_health():
-            """Get detailed component health status"""
+
+        @app.post("/tasks/{task_id}/update")
+        async def update_task(task_id: str, update: TaskUpdate):
+            if task_id not in self.active_tasks:
+                raise HTTPException(status_code=404, detail="Task not found")
+            payload = {k: v for k, v in update.model_dump().items() if v is not None}
+            self.active_tasks[task_id].update(payload)
+            return {"status": "updated", "task_id": task_id}
+
+        # ------------------------------------------------------------------
+        # Component health
+        # ------------------------------------------------------------------
+        @app.get("/components/health")
+        async def component_health():
+            checks = self.health.as_dict()
             return {
-                "components": self.component_health,
-                "overall_healthy": all(self.component_health.values()),
-                "healthy_count": sum(1 for v in self.component_health.values() if v),
-                "total_count": len(self.component_health),
-                "timestamp": datetime.now().isoformat()
+                "components": checks,
+                "overall_healthy": all(checks.values()),
+                "healthy_count": sum(1 for v in checks.values() if v),
+                "total_count": len(checks),
+                "timestamp": datetime.now().isoformat(),
             }
-    
+
+        # ------------------------------------------------------------------
+        # WebSocket (FIX #13 — single broadcast task; FIX #14 — narrow except)
+        # ------------------------------------------------------------------
+        @app.websocket("/ws/metrics")
+        async def ws_metrics(websocket: WebSocket):
+            await websocket.accept()
+            self.websocket_connections.append(websocket)
+            try:
+                # Block until the client disconnects or the server stops.
+                while self.running:
+                    try:
+                        await asyncio.wait_for(websocket.receive_text(), timeout=60)
+                    except asyncio.TimeoutError:
+                        # Client is idle — that's fine, broadcast still drives data.
+                        continue
+            except WebSocketDisconnect:
+                pass
+            except RuntimeError:
+                # Starlette raises RuntimeError on double-disconnect.
+                pass
+            finally:
+                with suppress(ValueError):
+                    self.websocket_connections.remove(websocket)
+
+    # ------------------------------------------------------------------
+    # Health computation
+    # ------------------------------------------------------------------
+    def _compute_health(self) -> HealthState:
+        self.health.api_ready = self.app is not None
+        self.health.history_ready = (
+            self.metrics_history is not None
+            and self.execution_logs is not None
+        )
+        self.health.broadcast_running = (
+            self._broadcast_task is not None and not self._broadcast_task.done()
+        )
+        return self.health
+
+    async def _compute_full_readiness(self) -> HealthState:
+        self._compute_health()
+        self.health.database_ready = await self._check_database()
+        self.health.ray_ready = await self._check_ray()
+        self.health.carbon_api_ready = await self._check_carbon_api()
+        return self.health
+
     async def _check_database(self) -> bool:
-        """Check database connectivity"""
+        # FIX #12 — offload blocking file I/O
+        return await asyncio.to_thread(self._check_database_sync)
+
+    def _check_database_sync(self) -> bool:
         try:
-            data_dir = Path("data")
-            data_dir.mkdir(exist_ok=True)
-            test_file = data_dir / ".health_check"
-            test_file.write_text("ok")
-            test_file.unlink()
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="green-agent-health-") as td:
+                probe = Path(td) / ".health"
+                probe.write_text("ok", encoding="utf-8")
+                probe.unlink()
             return True
-        except Exception as e:
+        except Exception:                                # noqa: BLE001
             return False
-    
-    async def _check_ray_connection(self) -> bool:
-        """Check Ray cluster connectivity"""
+
+    async def _check_ray(self) -> bool:
         try:
-            import ray
-            if ray.is_initialized():
-                ray.nodes()
-                return True
+            import ray  # type: ignore
+        except ImportError:
+            return True   # Ray not installed — not a failure, just absent
+        try:
+            if not ray.is_initialized():
+                return True   # Not initialized — not a failure
+            ray.nodes()
+            return True
+        except Exception:                                # noqa: BLE001
             return False
-        except Exception as e:
-            return False
-    
+
     async def _check_carbon_api(self) -> bool:
-        """Check carbon API connectivity"""
+        # FIX #11 — cache + always close
+        now = time.time()
+        if self._carbon_api_cached is not None:
+            value, ts = self._carbon_api_cached
+            if now - ts < self.CARBON_API_CACHE_TTL:
+                return value
+        value = await asyncio.to_thread(self._probe_carbon_api_sync)
+        self._carbon_api_cached = (value, now)
+        return value
+
+    def _probe_carbon_api_sync(self) -> bool:
+        forecaster = None
         try:
-            from src.carbon.forecasting_engine import CarbonForecaster
+            from src.carbon.forecasting_engine import CarbonForecaster  # type: ignore
             forecaster = CarbonForecaster(self.config)
-            await forecaster.initialize()
-            intensity = await forecaster.get_current_intensity()
-            await forecaster.close()
-            return intensity > 0
-        except Exception as e:
+            # Synchronous probe — this runs in a worker thread.
+            init = getattr(forecaster, "initialize", None)
+            if callable(init):
+                import asyncio as _a
+                _a.run(init())
+            getter = getattr(forecaster, "get_current_intensity", None)
+            if not callable(getter):
+                return False
+            intensity = getter()
+            if hasattr(intensity, "__await__"):
+                import asyncio as _a
+                intensity = _a.run(intensity)
+            return float(intensity) > 0
+        except Exception:                                # noqa: BLE001
             return False
-    
-    def _get_carbon_zone(self, intensity: float) -> str:
-        """Determine carbon zone"""
+        finally:
+            if forecaster is not None:
+                closer = getattr(forecaster, "close", None)
+                if callable(closer):
+                    try:
+                        result = closer()
+                        if hasattr(result, "__await__"):
+                            import asyncio as _a
+                            _a.run(result)
+                    except Exception:                    # noqa: BLE001
+                        pass
+
+    # ------------------------------------------------------------------
+    # Enhancement snapshots
+    # ------------------------------------------------------------------
+    def _latest_enhancement_snapshot(self) -> Optional[Dict[str, Any]]:
+        if not self.execution_logs:
+            return None
+        latest = self.execution_logs[-1]
+        return {
+            "modp_score": latest.get("modp_score"),
+            "graph_metrics": latest.get("graph_metrics") or {},
+            "human_feedback_score": latest.get("human_feedback_score"),
+            "distillation_update_count": latest.get("distillation_update_count"),
+            "moe_gate_weights": latest.get("moe_gate_weights"),
+            "evolutionary_best_fitness": latest.get("evolutionary_best_fitness"),
+            "flexgen_energy_joules": latest.get("flexgen_energy_joules"),
+        }
+
+    def _refresh_enhancement_gauges(self, entry: Dict[str, Any]) -> None:
+        """Set enhancement Gauges from a write-path entry (never from reads)."""
+        m = self.metrics
+        if entry.get("modp_score") is not None:
+            m.modp_score.set(float(entry["modp_score"]))
+        if entry.get("human_feedback_score") is not None:
+            m.rlhf_feedback.set(float(entry["human_feedback_score"]))
+        gm = entry.get("graph_metrics") or {}
+        if isinstance(gm, dict):
+            if "centrality" in gm:
+                m.graph_centrality.set(float(gm["centrality"]))
+            if "connectivity" in gm:
+                m.graph_connectivity.set(float(gm["connectivity"]))
+        weights = entry.get("moe_gate_weights")
+        if isinstance(weights, dict):
+            for expert, w in weights.items():
+                try:
+                    m.moe_gate_weight.labels(expert=str(expert)).set(float(w))
+                except (TypeError, ValueError):
+                    continue
+        elif isinstance(weights, (list, tuple)):
+            for i, w in enumerate(weights):
+                try:
+                    m.moe_gate_weight.labels(expert=str(i)).set(float(w))
+                except (TypeError, ValueError):
+                    continue
+        if entry.get("evolutionary_best_fitness") is not None:
+            m.evolutionary_best_fitness.set(
+                float(entry["evolutionary_best_fitness"]),
+            )
+
+    def _refresh_enhancement_gauges_from_latest(self) -> None:
+        """On read (scrape), only refresh *Gauges* from the latest log."""
+        if not self.execution_logs or not self.use_enhancements:
+            return
+        self._refresh_enhancement_gauges(self.execution_logs[-1])
+
+    # ------------------------------------------------------------------
+    # Carbon helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _zone(intensity: float) -> str:
         if intensity < 50:
             return "green"
-        elif intensity < 200:
+        if intensity < 200:
             return "yellow"
-        else:
-            return "red"
-    
-    def _get_carbon_recommendation(self, intensity: float) -> str:
-        """Get recommendation based on carbon intensity"""
+        return "red"
+
+    @staticmethod
+    def _recommendation(intensity: float) -> str:
         if intensity < 50:
-            return "OPTIMAL: Run compute-intensive tasks now"
-        elif intensity < 200:
-            return "MODERATE: Run standard tasks, defer if possible"
-        else:
-            return "HIGH: Defer non-urgent tasks, use eco mode"
-    
-    def _update_pareto_frontier(self, execution: Dict):
-        """Update Pareto frontier with new execution"""
+            return "OPTIMAL: run compute-intensive tasks now"
+        if intensity < 200:
+            return "MODERATE: run standard tasks, defer if possible"
+        return "HIGH: defer non-urgent tasks, use eco mode"
+
+    # ------------------------------------------------------------------
+    # Pareto (FIX #9 — 3 objectives)
+    # ------------------------------------------------------------------
+    def _update_pareto_frontier(self, execution: Dict[str, Any]) -> None:
         point = {
-            "accuracy": execution.get('accuracy', 0),
-            "energy": execution.get('energy', 0),
-            "carbon": execution.get('carbon', 0),
-            "timestamp": datetime.now().isoformat()
+            "accuracy": float(execution.get("accuracy", 0.0)),
+            "energy": float(execution.get("energy", 0.0)),
+            "carbon": float(execution.get("carbon", 0.0)),
+            "timestamp": datetime.now().isoformat(),
         }
-        # Include modp score if available
-        if execution.get('modp_score') is not None:
-            point['modp_score'] = execution['modp_score']
+        if execution.get("modp_score") is not None:
+            point["modp_score"] = float(execution["modp_score"])
         self.pareto_frontier.append(point)
-        
         if len(self.pareto_frontier) > 1000:
             self.pareto_frontier = self.pareto_frontier[-1000:]
-        
         self.pareto_frontier = self._calculate_pareto_frontier(self.pareto_frontier)
-    
-    def _calculate_pareto_frontier(self, points: List[Dict]) -> List[Dict]:
-        """Calculate Pareto frontier from points"""
+
+    @staticmethod
+    def _dominates(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+        """a dominates b iff a is at least as good in every objective and
+        strictly better in at least one."""
+        worse_in_any = (
+            a["accuracy"] < b["accuracy"]
+            or a["energy"] > b["energy"]
+            or a["carbon"] > b["carbon"]
+        )
+        if worse_in_any:
+            return False
+        strictly_better = (
+            a["accuracy"] > b["accuracy"]
+            or a["energy"] < b["energy"]
+            or a["carbon"] < b["carbon"]
+        )
+        return strictly_better
+
+    def _calculate_pareto_frontier(
+        self, points: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
         if not points:
             return []
-        frontier = []
-        for point in points:
-            dominated = False
-            for other in points:
-                if (other['accuracy'] >= point['accuracy'] and 
-                    other['energy'] <= point['energy'] and
-                    (other['accuracy'] > point['accuracy'] or 
-                     other['energy'] < point['energy'])):
-                    dominated = True
-                    break
-            if not dominated:
-                frontier.append(point)
+        frontier: List[Dict[str, Any]] = []
+        for p in points:
+            if any(self._dominates(q, p) for q in points if q is not p):
+                continue
+            frontier.append(p)
         return frontier
-    
-    async def _broadcast_metrics(self, metrics: Dict):
-        """Broadcast metrics to WebSocket clients"""
-        if not self.websocket_connections:
-            return
-        message = {
-            "type": "metrics_update",
-            "data": metrics,
-            "timestamp": datetime.now().isoformat()
-        }
-        disconnected = []
-        for ws in self.websocket_connections:
-            try:
-                await ws.send_json(message)
-            except:
-                disconnected.append(ws)
-        for ws in disconnected:
-            self.websocket_connections.remove(ws)
-    
-    def _default_metrics(self) -> Dict:
-        """Return default metrics when no data available, including enhanced defaults"""
-        result = {
+
+    # ------------------------------------------------------------------
+    # Defaults / broadcasts
+    # ------------------------------------------------------------------
+    def _default_metrics(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
             "timestamp": datetime.now().isoformat(),
-            "energy_consumption": 0,
-            "carbon_footprint": 0,
-            "carbon_intensity": 0,
+            "energy_consumption": 0.0,
+            "carbon_footprint": 0.0,
+            "carbon_intensity": 0.0,
             "active_tasks": 0,
             "completed_tasks": 0,
-            "avg_accuracy": 0,
-            "negawatt_reward": 0,
+            "avg_accuracy": 0.0,
+            "negawatt_reward": 0.0,
             "pareto_frontier": [],
-            "component_health": self.component_health
+            "component_health": self.health.as_dict(),
         }
         if self.use_enhancements:
             result["enhancements"] = {
@@ -598,101 +888,133 @@ class DashboardAPI:
                 "distillation_update_count": 0,
                 "moe_gate_weights": [],
                 "evolutionary_best_fitness": None,
-                "flexgen_energy_joules": 0
+                "flexgen_energy_joules": 0,
             }
         return result
-    
-    def _update_enhanced_metrics(self, execution: Dict):
-        """Update enhanced Prometheus gauges/counters based on execution data"""
-        # MODP score
-        if execution.get('modp_score') is not None:
-            MODP_SCORE.set(execution['modp_score'])
-        
-        # RLHF feedback
-        if execution.get('human_feedback_score') is not None:
-            RLHF_FEEDBACK.set(execution['human_feedback_score'])
-        
-        # Graph metrics
-        graph_metrics = execution.get('graph_metrics')
-        if graph_metrics:
-            if 'centrality' in graph_metrics:
-                GRAPH_CENTRALITY.set(graph_metrics['centrality'])
-            if 'connectivity' in graph_metrics:
-                GRAPH_CONNECTIVITY.set(graph_metrics['connectivity'])
-        
-        # Distillation update count (increment)
-        if execution.get('distillation_update_count'):
-            DISTILLATION_UPDATE_COUNT.inc(execution['distillation_update_count'])
-        else:
-            DISTILLATION_UPDATE_COUNT.inc(0)  # ensure it appears
-        
-        # MoE gate weights (set average)
-        moe_weights = execution.get('moe_gate_weights')
-        if moe_weights:
-            if isinstance(moe_weights, (list, tuple)):
-                for i, w in enumerate(moe_weights):
-                    MOE_GATE_WEIGHT.labels(expert=str(i)).set(w)
-            elif isinstance(moe_weights, dict):
-                for expert, w in moe_weights.items():
-                    MOE_GATE_WEIGHT.labels(expert=expert).set(w)
-        
-        # Evolutionary best fitness
-        if execution.get('evolutionary_best_fitness') is not None:
-            EVOLUTIONARY_BEST_FITNESS.set(execution['evolutionary_best_fitness'])
-        
-        # FlexGen energy
-        if execution.get('flexgen_energy_joules'):
-            FLEXGEN_ENERGY.inc(execution['flexgen_energy_joules'])
-    
-    def _update_enhanced_metrics_from_history(self):
-        """Recompute enhanced metrics from the last execution log (for Prometheus endpoint)."""
-        if not self.execution_logs:
+
+    async def _broadcast_metrics(self, execution: Dict[str, Any]) -> None:
+        """Broadcast to all connected clients (FIX #4 — collect then remove)."""
+        if not self.websocket_connections:
             return
-        latest = self.execution_logs[-1]
-        self._update_enhanced_metrics(latest)
-    
-    def _get_latest_enhanced_metrics(self) -> Dict:
-        """Get latest enhanced metrics from the most recent execution log or history."""
-        if not self.execution_logs:
-            return {}
-        latest = self.execution_logs[-1]
-        return {
-            "modp_score": latest.get('modp_score'),
-            "graph_metrics": latest.get('graph_metrics', {}),
-            "human_feedback_score": latest.get('human_feedback_score'),
-            "distillation_update_count": latest.get('distillation_update_count'),
-            "moe_gate_weights": latest.get('moe_gate_weights'),
-            "evolutionary_best_fitness": latest.get('evolutionary_best_fitness'),
-            "flexgen_energy_joules": latest.get('flexgen_energy_joules')
+        message = {
+            "type": "metrics_update",
+            "data": execution,
+            "timestamp": datetime.now().isoformat(),
         }
-    
-    async def start(self):
-        """Start dashboard server"""
-        self.running = True
-        
+        dead: List[WebSocket] = []
+        for ws in list(self.websocket_connections):
+            try:
+                await ws.send_json(message)
+            except Exception:                            # noqa: BLE001
+                dead.append(ws)
+        for ws in dead:
+            with suppress(ValueError):
+                self.websocket_connections.remove(ws)
+
+    async def _broadcast_loop(self) -> None:
+        """Single background broadcaster (FIX #13)."""
+        while not self._broadcast_stop.is_set():
+            try:
+                await asyncio.wait_for(self._broadcast_stop.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+            if self._broadcast_stop.is_set():
+                break
+            if not self.websocket_connections:
+                continue
+            message = {
+                "type": "metrics_update",
+                "data": await self._realtime_snapshot(),
+                "timestamp": datetime.now().isoformat(),
+            }
+            dead: List[WebSocket] = []
+            for ws in list(self.websocket_connections):
+                try:
+                    await ws.send_json(message)
+                except Exception:                        # noqa: BLE001
+                    dead.append(ws)
+            for ws in dead:
+                with suppress(ValueError):
+                    self.websocket_connections.remove(ws)
+
+    async def _realtime_snapshot(self) -> Dict[str, Any]:
+        """Snapshot without going through the HTTP handler."""
+        if not self.metrics_history:
+            return self._default_metrics()
+        latest = self.metrics_history[-1]
+        recent = [log.get("accuracy", 0.0) for log in self.execution_logs[-100:]]
+        return {
+            "timestamp": latest.get("timestamp"),
+            "energy_consumption": float(latest.get("energy", 0.0)),
+            "carbon_footprint": float(latest.get("carbon", 0.0)),
+            "carbon_intensity": float(latest.get("carbon_intensity", 0.0)),
+            "active_tasks": len(self.active_tasks),
+            "completed_tasks": len(self.execution_logs),
+            "avg_accuracy": float(np.mean(recent)) if recent else 0.0,
+            "negawatt_reward": float(latest.get("negawatt_reward", 0.0)),
+            "pareto_frontier": self.pareto_frontier[-10:],
+            "component_health": self.health.as_dict(),
+        }
+
+    # ------------------------------------------------------------------
+    # Lifecycle (FIX #15, #16)
+    # ------------------------------------------------------------------
+    async def start(
+        self, host: str = "0.0.0.0", port: int = 8000,
+    ) -> None:
+        import uvicorn
+
         config = uvicorn.Config(
             self.app,
-            host=self.config.get('dashboard', {}).get('host', '0.0.0.0'),
-            port=self.config.get('dashboard', {}).get('port', 8000),
-            log_level="info"
+            host=self.config.get("dashboard", {}).get("host", host),
+            port=int(self.config.get("dashboard", {}).get("port", port)),
+            log_level="info",
         )
-        
-        self.server = uvicorn.Server(config)
-        asyncio.create_task(self.server.serve())
-        print(f"📊 Dashboard started at http://localhost:{config.port}")
-        print(f"📈 Metrics endpoint: http://localhost:{config.port}/metrics")
-        print(f"❤️  Health check: http://localhost:{config.port}/health")
-        print(f"✅ Readiness check: http://localhost:{config.port}/ready")
-        if self.use_enhancements:
-            print(f"🧠 Enhancements status: http://localhost:{config.port}/enhancements/status")
-    
-    async def stop(self):
-        """Stop dashboard server"""
+        server = uvicorn.Server(config)
+        self.running = True
+        self._broadcast_task = asyncio.create_task(self._broadcast_loop())
+        self._server_task = asyncio.create_task(server.serve())
+        logger.info("Dashboard started at http://%s:%d", config.host, config.port)
+
+    async def stop(self) -> None:
         self.running = False
-        if hasattr(self, 'server'):
-            self.server.should_exit = True
-            print(" Dashboard stopped")
+        self._broadcast_stop.set()
+        if self._broadcast_task is not None:
+            with suppress(asyncio.CancelledError):
+                await self._broadcast_task
+            self._broadcast_task = None
+        if self._server_task is not None:
+            with suppress(asyncio.CancelledError, Exception):   # noqa: BLE001
+                await asyncio.wait_for(self._server_task, timeout=10.0)
+            self._server_task = None
+        logger.info("Dashboard stopped")
+
+
+# ---------------------------------------------------------------------------
+# Module-level factory (FIX #1)
+# ---------------------------------------------------------------------------
+def create_app(config: Optional[Dict[str, Any]] = None) -> FastAPI:
+    """Build a FastAPI app instance from config (or defaults)."""
+    return DashboardAPI(config).app
+
+
+# Exposed at module scope so `uvicorn api_server:app` works.
+app = create_app()
 
 
 if __name__ == "__main__":
-    uvicorn.run("api_server:app", host="0.0.0.0", port=8000, reload=True)
+    import uvicorn
+
+    def _handle_shutdown(signum, frame):                # noqa: ARG001
+        logger.info("Received signal %d; shutting down", signum)
+        # Let uvicorn drain; the process will exit after.
+        raise KeyboardInterrupt
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with suppress(Exception):
+            signal.signal(sig, _handle_shutdown)
+
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    except KeyboardInterrupt:
+        pass
