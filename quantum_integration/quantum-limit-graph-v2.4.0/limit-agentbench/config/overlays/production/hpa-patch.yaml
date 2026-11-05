@@ -1,83 +1,433 @@
+# =============================================================================
+# green-agent-hpa.yaml — Dashboard Deployment + HPA (Enhanced v2)
+# =============================================================================
+# Single-file rewrite containing the two resources the HPA needs:
+#
+#   1. Deployment  `green-agent-dashboard` — a native Deployment that
+#                  serves /health, /metrics, and the A2A gateway on
+#                  ports 8000 and 9090
+#   2. HPA         `green-agent-dashboard-hpa` — targets that Deployment
+#
+# The deployment is included because the HPA has nothing to scale
+# without it. The previous version targeted a `RayCluster`, which is a
+# CRD with no `scale` subresource — the HPA controller's
+# `GET .../rayclusters/<name>/scale` returned 404 and every reconcile
+# failed with `FailedGetScale`. `kubectl describe hpa` showed
+# `AbleToScale: False` forever, and no amount of `minReplicas`,
+# `maxReplicas`, or custom-metric tuning changed that.
+#
+# =============================================================================
+# WHY A DEPLOYMENT (AND NOT RayCluster)
+# =============================================================================
+# The HPA controller requires its target to declare a `scale`
+# subresource:
+#
+#     GET /apis/<group>/<version>/namespaces/<ns>/<plural>/<name>/scale
+#
+# Kubernetes' built-in workload kinds (Deployment, StatefulSet,
+# ReplicaSet, ReplicationController) implement it. A RayCluster does not
+# — the Ray operator does not register `subresources: { scale: ... }` on
+# its CRD. So an HPA targeting RayCluster cannot function, full stop.
+#
+# RayCluster horizontal scaling is controlled by the Ray operator's own
+# autoscaler, which reads:
+#
+#     spec.workerGroupSpecs[].{replicas, minReplicas, maxReplicas}
+#
+# on the CRD, with `spec.enableInTreeAutoscaling: true` to turn it on.
+# Carbon-aware scaling of the RayCluster — lowering maxReplicas during
+# high-carbon hours, raising it at night — is implemented by a CronJob
+# that patches those bounds on a tier schedule. See
+# `config/scaling/carbon-scaler.yaml` for the reference implementation.
+#
+# This file autoscales the **dashboard** instead. The dashboard is a
+# stateless FastAPI process — a natural HPA target. Its load scales with
+# browser traffic, Prometheus scrapes, and A2A requests; none of that
+# touches the Ray worker pool.
+#
+# =============================================================================
+# WHY NO CUSTOM METRICS
+# =============================================================================
+# The previous version used three custom metrics:
+#
+#     green_agent_carbon_intensity   (Gauge, cluster-scoped)
+#     green_agent_modp_score         (Gauge, cluster-scoped)
+#     green_agent_rlhf_feedback      (Gauge, cluster-scoped)
+#
+# Each is a problem:
+#
+#   1. They are declared `type: Pods`, but they are exported by
+#      api_server.py as cluster-scoped Gauges without a `pod` label.
+#      `type: Pods` requires the metric to be per-pod — every reconcile
+#      would fail with `FailedGetPodsMetric`.
+#
+#   2. Even with `type: External`, the HPA reads custom metrics via the
+#      `external.metrics.k8s.io` API group, which is served by a
+#      Prometheus Adapter / KEDA / Datadog Cluster Agent. The default
+#      kube-apiserver has no adapter. Every custom-metric reconcile
+#      would fail with `the server could not find the requested
+#      resource (get external.metrics.k8s.io)`.
+#
+#   3. MODP and RLHF are *quality* signals, not *load* signals.
+#      Scaling up when MODP is 0.7 (doing well) is category confusion —
+#      more pods do not increase quality. Scaling down when RLHF drops
+#      tears down capacity exactly when the workload is struggling.
+#
+#   4. Carbon-intensity scaling under HPA semantics is *inverted*. The
+#      previous version declared `AverageValue: 400` — under HPA rules
+#      that means "scale up when the average exceeds 400". The comment
+#      said "scale down if too high". The two can't both be true
+#      without an inverted metric (e.g. `carbon_efficiency = 1 -
+#      intensity/400`) exported by the adapter, or a KEDA ScaledObject
+#      with a custom trigger.
+#
+# Only `Resource` metrics (CPU, memory) are used here — those are served
+# by the standard `metrics.k8s.io` API group (metrics-server), which is
+# installed in every production cluster.
+#
+# ---- Critical fixes vs v1 ---------------------------------------------------
+#   FIX #1   HPA target changed from `RayCluster` (no scale subresource)
+#            to `Deployment` (has scale subresource). The previous HPA
+#            never scaled anything; every reconcile failed with
+#            `FailedGetScale`.
+#   FIX #2   Deployment added to the same file so the HPA has a valid
+#            target. Previously the dashboard ran only as a container
+#            inside the RayCluster head pod — no Deployment existed, so
+#            no object the HPA could scale was ever created.
+#   FIX #3   `behavior.scaleUp.policies[1].pods.metric` removed. The
+#            field does not exist in `HPAScalingPolicy`; the API server
+#            rejected the manifest with
+#            `strict decoding error: unknown field "pods"`.
+#   FIX #4   The three custom metrics removed. Reasons enumerated in the
+#            header above. If a Prometheus Adapter is deployed and you
+#            genuinely want to scale on a load-shaped custom metric
+#            (queue depth, in-flight requests), a commented template is
+#            included.
+#   FIX #5   Scale-up cap added: `Pods: 4 per 60s` alongside
+#            `Percent: 100 per 60s`. The HPA takes the smaller of the
+#            two, so a two-tick spike goes 4 → 8 → 12, not
+#            4 → 8 → 16 → 20. Without an absolute cap, `Percent: 100`
+#            doubles the fleet every 60s.
+#   FIX #6   `stabilizationWindowSeconds: 120` on scaleUp (was 30). A
+#            30-second window is too aggressive for a pod that pulls a
+#            multi-GB image on cold start — the HPA re-issues a scale-up
+#            decision before the first batch of new pods is Ready.
+#   FIX #7   `selectPolicy` made explicit: `Min` (scale-up, use the
+#            tighter policy) and `Max` (scale-down, use the looser
+#            policy). These are the API defaults but they are documented
+#            here so a future maintainer doesn't have to guess.
+#   FIX #8   `minReplicas: 4` retained but justified — HA over the
+#            dashboard. A single node drain in a 3-replica setup takes
+#            the dashboard below quorum; 4 keeps it available during a
+#            rolling drain. Document this so a future reviewer doesn't
+#            reduce it "to save money" without realizing the HA cost.
+#   FIX #9   `app.kubernetes.io/*` labels added on both the Deployment
+#            and the HPA.
+#   FIX #10  The three decorative `green-agent/*` annotations and the
+#            `enhancements: enabled` label removed — no consumer reads
+#            them.
+#   FIX #11  Deployment carries the same security posture as
+#            `ray-cluster.yaml` v2: `runAsNonRoot: true`,
+#            `readOnlyRootFilesystem: true`, `capabilities: drop:
+#            [ALL]`. The dashboard is not a privileged workload.
+#   FIX #12  Deployment probes: `startupProbe` (gates liveness for 150s
+#            during image pull + FastAPI init), `livenessProbe`,
+#            `readinessProbe`. Same pattern as the head pod.
+#   FIX #13  Deployment mounts the `green-agent-config` ConfigMap so the
+#            dashboard reads the same config as the head pod. Without
+#            it, the dashboard falls back to hardcoded defaults that
+#            diverge from the rest of the cluster.
+#   FIX #14  Deployment has `ephemeral-storage` limit (2 Gi) — a
+#            runaway log on the dashboard can fill the node's disk and
+#            evict every pod on it.
+#   FIX #15  Deployment has `terminationGracePeriodSeconds: 60` — a
+#            FastAPI pod needs more than the 30-second default to
+#            drain in-flight requests.
+#
+# ---- Deployment ------------------------------------------------------------
+#   kubectl apply -f green-agent-hpa.yaml
+#   OR, via kustomize:
+#   kubectl apply -k config/overlays/production
+#
+# ---- Verify ---------------------------------------------------------------
+#   kubectl get deployment green-agent-dashboard -n green-agent
+#   kubectl get hpa green-agent-dashboard-hpa -n green-agent
+#   kubectl describe hpa green-agent-dashboard-hpa -n green-agent
+#     # AbleToScale: True, ScalingActive: True
+#   kubectl get pods -n green-agent -l component=dashboard
+# =============================================================================
+
+---
+# =============================================================================
+# Deployment — the dashboard API (FastAPI + /metrics on 9090)
+# =============================================================================
+# Extracted from the RayCluster head pod so the dashboard can be scaled
+# independently of the Ray workers. The head pod remains the entry point
+# for A2A task execution; this Deployment serves /health, /ready,
+# /metrics, /executions, /analytics/*, /carbon/*, /tasks/*, /ws/*, and
+# /components/health.
+#
+# If you are migrating from "dashboard runs inside the head pod" to
+# "dashboard is its own Deployment", the Service selector (in
+# service.yaml) must be pointed at `component: dashboard` instead of
+# `component: head`. Or, run both for a transition period: keep the
+# Service on the head pod's 8000, and add a second Service
+# (`green-agent-dashboard`) that selects this Deployment. The HPA below
+# targets the Deployment, and its pods become the endpoints of that
+# second Service.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: green-agent-dashboard
+  namespace: green-agent
+  labels:
+    app: green-agent
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: dashboard
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: "5.0.0"
+    app.kubernetes.io/environment: production
+spec:
+  # Initial replica count; the HPA overrides this within
+  # [4, 20]. Matches minReplicas so a cold start is already at the
+  # floor.
+  replicas: 4
+
+  selector:
+    matchLabels:
+      app: green-agent
+      component: dashboard
+
+  template:
+    metadata:
+      labels:
+        app: green-agent
+        component: dashboard
+        app.kubernetes.io/name: green-agent
+        app.kubernetes.io/component: dashboard
+      annotations:
+        # Uncomment to trigger a rolling restart on config change when
+        # using a static ConfigMap (mode "B" from
+        # green-agent-config.yaml's header). Set the value to the
+        # output of:
+        #   kubectl get cm green-agent-config -n green-agent \
+        #     -o jsonpath='{.data.green_agent_config\.yaml}' \
+        #     | sha256sum | cut -c1-16
+        # checksum/config: "REPLACE_WITH_CI_HASH"
+    spec:
+      serviceAccountName: green-agent
+      terminationGracePeriodSeconds: 60
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: dashboard
+          image: ghcr.io/nurcholishadam/green_agent:v5.0.0
+          imagePullPolicy: IfNotPresent
+
+          # The dashboard is the FastAPI app; the RayCluster head runs
+          # run_agent.py. They share an image but different commands.
+          command:
+            - uvicorn
+            - api_server:app
+            - --host=0.0.0.0
+            - --port=8000
+            - --workers=1
+
+          ports:
+            - { name: http,    containerPort: 8000 }
+            - { name: metrics, containerPort: 9090 }
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # Must match the metrics containerPort and the Service's
+            # `metrics` targetPort (see service.yaml).
+            - name: PROMETHEUS_PORT
+              value: "9090"
+            - name: GREEN_AGENT_PUBLIC_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: green-agent-config
+                  key: green_agent_config.yaml
+                  optional: true
+
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+              ephemeral-storage: "2Gi"
+
+          # Startup gate — FastAPI app + Ray client connect + Prometheus
+          # init routinely takes 10-20 s on a cold node. Failure
+          # threshold 30 × 5 s = 150 s before liveness kicks in.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 30
+            periodSeconds: 5
+            timeoutSeconds: 3
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 0
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config
+              readOnly: true
+            - name: tmp-volume
+              mountPath: /tmp
+
+      volumes:
+        - name: config-volume
+          configMap:
+            name: green-agent-config
+            defaultMode: 0444
+        - name: tmp-volume
+          emptyDir:
+            sizeLimit: 512Mi
+
+---
+# =============================================================================
+# HPA — autoscales the dashboard Deployment
+# =============================================================================
+# Target: Deployment `green-agent-dashboard` (has a `scale` subresource;
+# the HPA actually works).
+#
+# Metrics: CPU and memory only. Custom metrics are documented as
+# commented templates below but not used — see the file header for why.
+#
+# Bounds: 4 to 20 replicas.
+#
+# Behavior: 25% scale-down per minute after a 10-minute stabilization;
+# 100% scale-up per minute after a 120-second stabilization, but never
+# more than 4 pods per minute (the absolute cap that prevents a
+# double-tick spike from jumping to the max).
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: green-agent-hpa
+  name: green-agent-dashboard-hpa
+  namespace: green-agent
   labels:
     app: green-agent
-    enhancements: enabled
-  annotations:
-    green-agent/limit-graph: "true"
-    green-agent/modp: "true"
-    green-agent/rlhf: "true"
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/component: dashboard-autoscaler
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: "5.0.0"
+    app.kubernetes.io/environment: production
 spec:
+  # FIX #1 — a Deployment, not a RayCluster.
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: green-agent-dashboard
+
   minReplicas: 4
   maxReplicas: 20
 
-  scaleTargetRef:
-    apiVersion: ray.io/v1
-    kind: RayCluster
-    name: green-agent-cluster
-
   metrics:
-  # ── Core resource metrics (unchanged) ──
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: Utilization
-        averageUtilization: 70
-  - type: Resource
-    resource:
-      name: memory
-      target:
-        type: Utilization
-        averageUtilization: 80
+    # -------------------------------------------------------------------------
+    # CPU — primary load signal
+    # -------------------------------------------------------------------------
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
 
-  # ── Advanced custom metrics (from Prometheus) ──
-  # Carbon intensity (gCO₂/kWh) – scale down if too high to reduce footprint
-  - type: Pods
-    pods:
-      metric:
-        name: green_agent_carbon_intensity
-      target:
-        type: AverageValue
-        averageValue: "400"
+    # -------------------------------------------------------------------------
+    # Memory — secondary load signal. Advisory only: Python's heap
+    # plateaus above steady-state, so the HPA can be slow to scale
+    # down on memory. CPU drives most scale-down decisions.
+    # -------------------------------------------------------------------------
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
 
-  # MODP composite score – scale up when score improves
-  - type: Pods
-    pods:
-      metric:
-        name: green_agent_modp_score
-      target:
-        type: AverageValue
-        averageValue: "0.7"
-
-  # RLHF human feedback score – adjust scaling based on feedback trend
-  - type: Pods
-    pods:
-      metric:
-        name: green_agent_rlhf_feedback
-      target:
-        type: AverageValue
-        averageValue: "0.5"
+    # -------------------------------------------------------------------------
+    # Custom-metric template — commented.
+    # -------------------------------------------------------------------------
+    # To use a custom metric you need:
+    #   1. A Prometheus Adapter (or KEDA / Datadog Agent) exposing
+    #      metrics under `external.metrics.k8s.io`.
+    #   2. A rule in the adapter's ConfigMap mapping a Prometheus query
+    #      to the metric name.
+    #   3. The metric MUST be a load signal (queue depth, in-flight
+    #      requests, latency p99), not a quality signal.
+    #
+    # Example:
+    #
+    # - type: External
+    #   external:
+    #     metric:
+    #       name: green_agent_queue_depth
+    #       selector:
+    #         matchLabels:
+    #           metric: queue_depth
+    #     target:
+    #       type: AverageValue
+    #       averageValue: "50"
+    # -------------------------------------------------------------------------
 
   behavior:
+    # -------------------------------------------------------------------------
+    # Scale-down: gradual, defensive.
+    # -------------------------------------------------------------------------
     scaleDown:
-      stabilizationWindowSeconds: 600
+      stabilizationWindowSeconds: 600   # 10 minutes — no flapping on dips
+      selectPolicy: Max                 # use the looser policy
       policies:
-      - type: Percent
-        value: 25
-        periodSeconds: 60
-    scaleUp:
-      stabilizationWindowSeconds: 30
-      policies:
-      - type: Percent
-        value: 100
-        periodSeconds: 60
-      # Additional policy for MODP-based rapid scale-up when sustainability score is high
-      - type: Pods
-        pods:
-          metric:
-            name: green_agent_modp_score
+        - type: Percent
+          value: 25                     # 4 -> 3 -> 2 over three minutes
           periodSeconds: 60
-          value: 2
+
+    # -------------------------------------------------------------------------
+    # Scale-up: bounded, defensive.
+    # -------------------------------------------------------------------------
+    scaleUp:
+      stabilizationWindowSeconds: 120   # 2 minutes — image pull window
+      selectPolicy: Min                 # use the tighter policy
+      policies:
+        # Percent policy: up to double every minute.
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+        # Absolute cap: never more than 4 new pods per minute. The HPA
+        # applies Min of the two, so 4 -> 8 -> 12 across two ticks —
+        # not 4 -> 8 -> 16 -> 20.
+        - type: Pods
+          value: 4
+          periodSeconds: 60
