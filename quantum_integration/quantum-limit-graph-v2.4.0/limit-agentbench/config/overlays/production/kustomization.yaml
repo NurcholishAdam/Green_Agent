@@ -1,117 +1,548 @@
+# =============================================================================
+# config/overlays/production/kustomization.yaml (Enhanced v2, single-file)
+# =============================================================================
+# The production overlay. Self-contained — all patches are inline so the
+# overlay can be applied with `kubectl apply -k config/overlays/production`
+# without any companion files.
+#
+# What this overlay produces:
+#   * Production config body (auth enforced via JWT, real carbon provider
+#     with API-key env + fallback, WARNING logs to stdout only, sized
+#     FlexGen, aligned carbon budget math, Qiskit mitigation names)
+#   * 8 Ray workers (base ships 4)
+#   * Production-sized pods: head 4/8 CPU, 8Gi/16Gi memory; worker 2/4
+#     CPU, 4Gi/8Gi memory
+#   * 50 Gi PVC (base ships 20 Gi)
+#   * Tighter worker PDB (maxUnavailable 25%, base 50%)
+#   * seccompProfile: RuntimeDefault (required by PodSecurityStandard
+#     "restricted")
+#   * 600-second termination grace (base 300)
+#   * Worker topology spread across nodes and zones
+#   * Same security posture as base (runAsNonRoot, readOnlyRootFilesystem,
+#     capabilities.drop: [ALL])
+#
+# ---- Critical fixes vs v1 ---------------------------------------------------
+#   FIX #1   `replicas:` removed. v1 targeted the RayCluster, which has no
+#            `scale` subresource — `kustomize build` failed with
+#            "no matches for OriginalId ray.io_v1_RayCluster". Replaced
+#            with an inline JSON 6902 patch on workerGroupSpecs[0]
+#            .{replicas, maxReplicas}.
+#   FIX #2   `configMapGenerator.literals:` removed. The 18 env-style keys
+#            were dead: the runtime reads `green_agent_config.yaml`, not
+#            env-style keys. Replaced with an inline ConfigMap patch
+#            that replaces the config body entirely with the production
+#            config.
+#   FIX #3   Inline env-var patch removed. It duplicated config, undoing
+#            the v2 base fix that made the ConfigMap the sole source of
+#            truth. Production overrides now live in the config body.
+#   FIX #4   Production config actually applies. The inline ConfigMap
+#            patch is a complete production config: auth_type "bearer"
+#            with RS256/ES256 JWKS, carbon.api_provider
+#            electricitymap with api_key_env + simulation fallback,
+#            log_level WARNING with format json and output ["stdout"]
+#            (readOnlyRootFilesystem-safe), FlexGen memory 16384 MB
+#            with int4 option, daily_limit_kg 71.4 to align with
+#            weekly_limit_kg 500, Qiskit mitigation techniques
+#            ["zne", "pec"].
+#   FIX #5   Worker count reaches 8 via JSON 6902 (replaces the dead
+#            `replicas: count: 8`).
+#   FIX #6   `namePrefix: prod-` removed. The namespace
+#            (green-agent-production) already disambiguates; the prefix
+#            broke external references to `green-agent-cluster`
+#            (cert-manager DNS, Prometheus jobLabel, kubectl exec into
+#            the StatefulSet by name).
+#   FIX #7   `commonLabels` -> `labels: - includeSelectors: false`. The
+#            environment: production label no longer propagates into
+#            Service selectors, NetworkPolicy podSelectors, or HPA
+#            scaleTargetRefs — a future promotion back to staging
+#            doesn't break service discovery.
+#   FIX #8   Production resource sizing added via JSON 6902: head 4/8
+#            CPU, 8Gi/16Gi memory; worker 2/4 CPU, 4Gi/8Gi memory. v1
+#            inherited base's smaller sizes — production would OOM under
+#            real load.
+#   FIX #9   Production PVC sizing: 50Gi (base 20Gi). v1 inherited base —
+#            production fills the disk in the first week under real
+#            checkpoints and logs.
+#   FIX #10  Worker PDB tightened: maxUnavailable 25% (base 50%). With
+#            8 workers, base's 50% tolerates 4 unavailable during a
+#            drain — a total outage of the inference tier.
+#   FIX #11  seccompProfile: RuntimeDefault on both pod templates and
+#            both containers. Required by PodSecurityStandard
+#            "restricted"; base's securityContext passes "baseline" but
+#            not "restricted".
+#   FIX #12  terminationGracePeriodSeconds 600 on both pod templates.
+#            Base is 300; production training steps need more time to
+#            checkpoint on SIGTERM.
+#   FIX #13  topologySpreadConstraints on the worker template. Spreads
+#            across nodes and zones so a single node or zone failure
+#            doesn't take the entire inference tier offline.
+#   FIX #14  `app.kubernetes.io/*` labels and `commonAnnotations` added
+#            for standard taxonomy.
+#   FIX #15  Immutable release tag v5.0.0 documented — the CI pipeline
+#            bumps the tag on release and uses `kubectl rollout restart`
+#            (or a config-hash annotation) to trigger the pull.
+#
+# ---- Deployment ------------------------------------------------------------
+#   kubectl apply -k config/overlays/production
+#   OR, for a diff-only review:
+#   kustomize build config/overlays/production | kubectl diff -f -
+#
+# ---- Verify ---------------------------------------------------------------
+#   kustomize build config/overlays/production \
+#     | kubeconform -strict -ignore-missing-schemas
+#   kubectl get raycluster -n green-agent-production green-agent-cluster \
+#     -o jsonpath='{.spec.workerGroupSpecs[0].replicas}'
+#   kubectl get pvc -n green-agent-production green-agent-data-pvc \
+#     -o jsonpath='{.spec.resources.requests.storage}'
+#   kubectl get pdb -n green-agent-production green-agent-worker-pdb \
+#     -o jsonpath='{.spec.maxUnavailable}'
+#   kubectl exec -n green-agent-production \
+#     statefulset/green-agent-cluster-ray-head -- \
+#     python -c "import yaml; c=yaml.safe_load(open('/app/config/green_agent_config.yaml')); print(c['security']['auth_type'])"
+# =============================================================================
+
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+# FIX #6 — namespace disambiguates; namePrefix removed.
 namespace: green-agent-production
-namePrefix: prod-
 
 resources:
-- ../../base
+  - ../../base
 
-commonLabels:
-  environment: production
-  criticality: high
+# FIX #7 — `labels` (kustomize v5), not `commonLabels`. `includeSelectors:
+# false` keeps these out of Service selectors and NetworkPolicy
+# podSelectors.
+labels:
+  - includeSelectors: false
+    pairs:
+      environment: production
+      criticality: high
+      app.kubernetes.io/environment: production
 
-configMapGenerator:
-- name: green-agent-config
-  behavior: merge
-  literals:
-  - LOG_LEVEL=WARNING
-  - RAY_ENABLED=true
-  - QUANTUM_ENABLED=true
-  - CARBON_API_PROVIDER=electricitymap
-  # ── Advanced Enhancements (LIMIT Graph, MODP, RLHF, Distillation, MoE, Bio‑inspired) ──
-  - ENHANCEMENTS_ENABLED=true
-  - LIMIT_GRAPH_ENABLED=true
-  - LIMIT_GRAPH_CENTRALITY=0.8
-  - LIMIT_GRAPH_CONNECTIVITY=0.7
-  - MODP_ENABLED=true
-  - MODP_WEIGHTS=[0.4,0.3,0.2,0.1]
-  - RLHF_ENABLED=true
-  - HUMAN_FEEDBACK_SCORE=0.6
-  - DISTILLATION_ENABLED=true
-  - MOE_GATING_ENABLED=true
-  - EVOLUTIONARY_ENABLED=true
-  - POPULATION_SIZE=30
-  - MUTATION_RATE=0.1
+commonAnnotations:
+  app.kubernetes.io/part-of: green-agent
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/version: "5.0.0"
+  app.kubernetes.io/environment: production
 
 patches:
-- patch: |-
-    apiVersion: ray.io/v1
-    kind: RayCluster
-    metadata:
+
+  # ===========================================================================
+  # 1. Production config body (replaces base's green_agent_config.yaml)
+  # ===========================================================================
+  # FIX #4 — this is what makes the overlay "production". Without it, the
+  # pod runs base's config (simulator carbon, INFO logs, auth possibly
+  # unenforced). With it, the runtime reads a config that matches
+  # production intent. Every section from base is present — the runtime
+  # never falls back to hardcoded defaults.
+  - target:
+      kind: ConfigMap
+      name: green-agent-config
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: green-agent-config
+      data:
+        green_agent_config.yaml: |
+          # Production environment configuration (complete)
+          system:
+            version: "5.0.0"
+            channel: "prod"
+            mode: "unified"
+            debug: false
+            log_level: "WARNING"
+            enable_telemetry: true
+            seed: 42
+            output_dir: "/app/data/results"
+            public_base_url: "https://green-agent.example"
+            strict_core_imports: true
+
+          dashboard:
+            enabled: true
+            host: "0.0.0.0"
+            port: 8000
+            update_interval_seconds: 5
+            enable_real_time: true
+            metrics_retention_hours: 168
+            cors_origins:
+              - "https://green-agent.example"
+
+          ray:
+            enabled: true
+            num_workers: 8
+            min_workers: 4
+            max_workers: 20
+            dashboard_port: 8265
+            carbon_aware_scaling: true
+
+          carbon:
+            default_region: "US-CA"
+            api_provider: "electricitymap"
+            api_key_env: "CARBON_API_KEY"
+            api_provider_fallback: "simulation"
+            forecast_days: 30
+            update_interval_hours: 1
+            eco_mode_threshold: 200
+            defer_threshold: 400
+            emergency_threshold: 600
+            budget:
+              enabled: true
+              daily_limit_kg: 71.4
+              weekly_limit_kg: 500.0
+
+          policy:
+            mode: "moderate"
+            enforce_lora_above_1b_params: true
+            block_if_budget_exceeded: true
+            weights:
+              carbon_importance: 0.4
+              performance_importance: 0.3
+              cost_importance: 0.2
+              deadline_importance: 0.1
+
+          quantum:
+            enabled: true
+            backend: "simulator"
+            error_mitigation:
+              enabled: true
+              techniques: ["zne", "pec"]
+            vqc:
+              n_qubits: 4
+              n_layers: 3
+              encoding_type: "angle"
+              ansatz_type: "strongly_entangling"
+
+          monitoring:
+            prometheus:
+              enabled: true
+              port: 9090
+            grafana:
+              enabled: false
+              port: 3000
+            logging:
+              level: "WARNING"
+              format: "json"
+              output: ["stdout"]
+
+          development:
+            enable_profiling: false
+            enable_debug_endpoints: false
+            mock_carbon_api: false
+
+          enhancements:
+            enabled: true
+            limit_graph:
+              enabled: true
+              graph_metrics:
+                centrality: 0.8
+                connectivity: 0.7
+                density: 0.6
+              update_interval_seconds: 60
+            modp:
+              enabled: true
+              objective_names:   ["accuracy", "energy", "latency", "carbon"]
+              objective_weights: [0.4,        0.3,      0.2,       0.1]
+              normalize_weights: true
+            rlhf:
+              enabled: true
+              human_feedback_score: 0.6
+              collect_feedback: true
+              feedback_source: "dashboard"
+              feedback_submission_url: "https://green-agent.example/feedback"
+            distillation:
+              enabled: true
+              use_moe_gating: true
+              distillation_lr: 0.01
+              gating_lr: 0.005
+              replay_size: 2000
+              train_every: 10
+              epsilon:
+                start: 0.10
+                end: 0.01
+                decay_steps: 1000
+              teachers:
+                - { name: "rule_based",    output: "probabilities" }
+                - { name: "historical_ml", output: "probabilities" }
+                - { name: "q_learning",    output: "probabilities" }
+                - { name: "rlhf",          output: "probabilities" }
+            bio_inspired:
+              enabled: true
+              use_evolutionary: true
+              population_size: 30
+              mutation_rate: 0.1
+              crossover_rate: 0.7
+              elitism: 2
+            moe_expert:
+              enabled: true
+              n_experts: 4
+              gating_lr: 0.005
+
+          security:
+            auth_type: "bearer"
+            tls_enabled: false
+            jwt_algorithms: ["RS256", "ES256"]
+            token_issuer_url: "https://auth.green-agent.example"
+            token_issuer_url_env: "GREEN_AGENT_TOKEN_ISSUER_URL"
+            protect_metrics_endpoint: true
+
+          observability:
+            metrics_path: "/metrics"
+            metrics_port: 9090
+            traces_endpoint: ""
+            traces_endpoint_env: "OTEL_EXPORTER_OTLP_ENDPOINT"
+            logs_format: "json"
+            sample_traces: false
+
+          constraints:
+            carbon_budget_gco2_per_task: 5.0
+            latency_sla_ms: 5000
+            cost_cap_usd: 0.01
+            max_concurrent_tasks: 8
+
+          rate_limits:
+            requests_per_minute: 60
+            burst: 10
+
+          evaluation:
+            task_categories: ["coding", "reasoning", "tool_use"]
+            max_input_tokens: 8192
+            max_output_tokens: 2048
+            timeout_seconds: 300
+            input_schema_url:  "https://green-agent.example/schemas/evaluation-input.json"
+            output_schema_url: "https://green-agent.example/schemas/evaluation-output.json"
+            benchmark_set: "green-agent-2025-v1"
+            expected_accuracy: 0.85
+            repeatable: true
+
+          limitations:
+            max_model_parameters: "13B"
+            unsupported_task_types: ["multimodal_image", "video", "real_time_streaming"]
+            unsupported_languages:  ["rtl_scripts_pending_validation"]
+            requires_internet_access: false
+            gpu_required: false
+            data_retention_days: 0
+
+          backends:
+            primary: "flexgen"
+            flexgen:
+              enabled: true
+              model_name: "facebook/opt-6.7b"
+              batch_size: 16
+              memory_limit_mb: 16384
+              precision_options: ["fp32", "fp16", "int8", "int4"]
+              default_precision: "fp16"
+              delegation_policy: "adaptive"
+
+          flexgen:
+            enabled: true
+            model_name: "facebook/opt-6.7b"
+            batch_size: 16
+            memory_limit_mb: 16384
+            precision_options: ["fp32", "fp16", "int8", "int4"]
+            default_precision: "fp16"
+            delegation_policy: "adaptive"
+
+  # ===========================================================================
+  # 2. Worker count (JSON 6902)
+  # ===========================================================================
+  # FIX #1, #5 — the `replicas:` transformer does not support RayCluster
+  # (no `scale` subresource). JSON 6902 targets the fields the Ray
+  # operator reads.
+  - target:
+      group: ray.io
+      version: v1
+      kind: RayCluster
       name: green-agent-cluster
-    spec:
-      headGroupSpec:
-        template:
-          spec:
-            containers:
-            - name: ray-head
-              env:
-              - name: ENHANCEMENTS_ENABLED
-                value: "true"
-              - name: LIMIT_GRAPH_ENABLED
-                value: "true"
-              - name: LIMIT_GRAPH_CENTRALITY
-                value: "0.8"
-              - name: LIMIT_GRAPH_CONNECTIVITY
-                value: "0.7"
-              - name: MODP_ENABLED
-                value: "true"
-              - name: MODP_WEIGHTS
-                value: "[0.4,0.3,0.2,0.1]"
-              - name: RLHF_ENABLED
-                value: "true"
-              - name: HUMAN_FEEDBACK_SCORE
-                value: "0.6"
-              - name: DISTILLATION_ENABLED
-                value: "true"
-              - name: MOE_GATING_ENABLED
-                value: "true"
-              - name: EVOLUTIONARY_ENABLED
-                value: "true"
-              - name: POPULATION_SIZE
-                value: "30"
-      workerGroupSpecs:
-      - groupName: standard-workers
-        template:
-          spec:
-            containers:
-            - name: ray-worker
-              env:
-              - name: ENHANCEMENTS_ENABLED
-                value: "true"
-              - name: LIMIT_GRAPH_ENABLED
-                value: "true"
-              - name: LIMIT_GRAPH_CENTRALITY
-                value: "0.8"
-              - name: LIMIT_GRAPH_CONNECTIVITY
-                value: "0.7"
-              - name: MODP_ENABLED
-                value: "true"
-              - name: MODP_WEIGHTS
-                value: "[0.4,0.3,0.2,0.1]"
-              - name: RLHF_ENABLED
-                value: "true"
-              - name: HUMAN_FEEDBACK_SCORE
-                value: "0.6"
-              - name: DISTILLATION_ENABLED
-                value: "true"
-              - name: MOE_GATING_ENABLED
-                value: "true"
-              - name: EVOLUTIONARY_ENABLED
-                value: "true"
-              - name: POPULATION_SIZE
-                value: "30"
-  target:
-    group: ray.io
-    version: v1
-    kind: RayCluster
-    name: green-agent-cluster
+    patch: |-
+      - op: replace
+        path: /spec/workerGroupSpecs/0/replicas
+        value: 8
+      - op: replace
+        path: /spec/workerGroupSpecs/0/maxReplicas
+        value: 20
+
+  # ===========================================================================
+  # 3. Container resources (JSON 6902)
+  # ===========================================================================
+  # FIX #8 — JSON 6902 rather than strategic merge because Ray's CRD does
+  # not guarantee `x-kubernetes-list-map-keys: [name]` on `containers`
+  # across operator versions. A strategic merge would replace the whole
+  # list and lose base's ports, probes, and volume mounts.
+  - target:
+      group: ray.io
+      version: v1
+      kind: RayCluster
+      name: green-agent-cluster
+    patch: |-
+      - op: replace
+        path: /spec/headGroupSpec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "4"
+            memory: "8Gi"
+          limits:
+            cpu: "8"
+            memory: "16Gi"
+            ephemeral-storage: "50Gi"
+      - op: replace
+        path: /spec/workerGroupSpecs/0/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+            ephemeral-storage: "50Gi"
+
+  # ===========================================================================
+  # 4. seccomp RuntimeDefault (FIX #11)
+  # ===========================================================================
+  # Required by PodSecurityStandard "restricted". Base's securityContext
+  # passes "baseline" but not "restricted". On a cluster with PSS
+  # restricted enforced in the production namespace, pods are rejected
+  # at admission without this.
+  - target:
+      group: ray.io
+      version: v1
+      kind: RayCluster
+      name: green-agent-cluster
+    patch: |-
+      apiVersion: ray.io/v1
+      kind: RayCluster
+      metadata:
+        name: green-agent-cluster
+      spec:
+        headGroupSpec:
+          template:
+            spec:
+              securityContext:
+                seccompProfile:
+                  type: RuntimeDefault
+              containers:
+                - name: ray-head
+                  securityContext:
+                    seccompProfile:
+                      type: RuntimeDefault
+        workerGroupSpecs:
+          - groupName: standard-workers
+            template:
+              spec:
+                securityContext:
+                  seccompProfile:
+                    type: RuntimeDefault
+                containers:
+                  - name: ray-worker
+                    securityContext:
+                      seccompProfile:
+                        type: RuntimeDefault
+
+  # ===========================================================================
+  # 5. Longer termination grace (FIX #12)
+  # ===========================================================================
+  - target:
+      group: ray.io
+      version: v1
+      kind: RayCluster
+      name: green-agent-cluster
+    patch: |-
+      apiVersion: ray.io/v1
+      kind: RayCluster
+      metadata:
+        name: green-agent-cluster
+      spec:
+        headGroupSpec:
+          template:
+            spec:
+              terminationGracePeriodSeconds: 600
+        workerGroupSpecs:
+          - groupName: standard-workers
+            template:
+              spec:
+                terminationGracePeriodSeconds: 600
+
+  # ===========================================================================
+  # 6. PVC size (FIX #9)
+  # ===========================================================================
+  - target:
+      kind: PersistentVolumeClaim
+      name: green-agent-data-pvc
+    patch: |-
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: green-agent-data-pvc
+      spec:
+        resources:
+          requests:
+            storage: 50Gi
+
+  # ===========================================================================
+  # 7. Worker PDB (FIX #10)
+  # ===========================================================================
+  # Base sets maxUnavailable: 50%. With 8 workers, that's 4 unavailable
+  # during a drain — a total outage of the inference tier. Production
+  # tolerates at most 2 (25%).
+  - target:
+      kind: PodDisruptionBudget
+      name: green-agent-worker-pdb
+    patch: |-
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: green-agent-worker-pdb
+      spec:
+        maxUnavailable: 25%
+        selector:
+          matchLabels:
+            app: green-agent
+            component: worker
+
+  # ===========================================================================
+  # 8. Worker topology spread (FIX #13)
+  # ===========================================================================
+  # Spread across nodes and zones so a single node or zone failure
+  # doesn't take the entire inference tier offline. `ScheduleAnyway`
+  # degrades gracefully on clusters that are too small to satisfy the
+  # spread.
+  - target:
+      group: ray.io
+      version: v1
+      kind: RayCluster
+      name: green-agent-cluster
+    patch: |-
+      apiVersion: ray.io/v1
+      kind: RayCluster
+      metadata:
+        name: green-agent-cluster
+      spec:
+        workerGroupSpecs:
+          - groupName: standard-workers
+            template:
+              spec:
+                topologySpreadConstraints:
+                  - maxSkew: 1
+                    topologyKey: kubernetes.io/hostname
+                    whenUnsatisfiable: ScheduleAnyway
+                    labelSelector:
+                      matchLabels:
+                        app: green-agent
+                        component: worker
+                  - maxSkew: 1
+                    topologyKey: topology.kubernetes.io/zone
+                    whenUnsatisfiable: ScheduleAnyway
+                    labelSelector:
+                      matchLabels:
+                        app: green-agent
+                        component: worker
 
 images:
-- name: ghcr.io/nurcholishadam/green_agent
-  newTag: v5.0.0
-
-replicas:
-- name: green-agent-cluster
-  count: 8
+  # FIX #15 — v5.0.0 is an immutable release tag. With the base's
+  # `imagePullPolicy: IfNotPresent`, updates require:
+  #   * a release pipeline that bumps to v5.0.1 (etc.) AND
+  #   * `kubectl rollout restart` (or a config-hash annotation)
+  # for the new image to be pulled.
+  - name: ghcr.io/nurcholishadam/green_agent
+    newTag: v5.0.0
