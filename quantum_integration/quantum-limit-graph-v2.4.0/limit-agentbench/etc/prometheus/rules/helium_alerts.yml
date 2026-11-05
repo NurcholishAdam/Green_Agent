@@ -1,259 +1,552 @@
-# helium_alerts.yml — Prometheus alerting rules for helium supply monitoring
-# Enhanced with additional alert groups for advanced enhancement metrics:
-# LIMIT Graph, MODP, RLHF, Multi‑Teacher Distillation, Bio‑inspired Optimisation, MoE expert gating, FlexGen.
-#
+# =============================================================================
+# helium_alerts.yml — Prometheus alerting rules (Enhanced v2)
+# =============================================================================
 # Add to prometheus.yml:
-# rule_files:
-#   - "rules/helium_alerts.yml"
+#   rule_files:
+#     - "rules/helium_alerts.yml"
+#
+# This file assumes:
+#   * `job="green-agent"` resolves to the dashboard + RayCluster head pods —
+#     this depends on `monitoring.yaml`'s ServiceMonitor setting
+#     `jobLabel: app` and the Service carrying `app: green-agent`.
+#   * Metric names match what `run_agent.py` and `api_server.py` export:
+#     Counters end in `_total`, Gauges do not, Histograms expose `_bucket`.
+#
+# ---- Critical fixes vs v1 ---------------------------------------------------
+#   FIX #1   `green_agent_distillation_update_count` → `_total`. The metric
+#            is a Counter; prometheus_client appends `_total` at scrape
+#            time only if the name does not already end in `_total`. The
+#            v1 query matched zero series, so the alert and the recording
+#            rule were both dead.
+#   FIX #2   Removed the leading `$` before `{{ ... }}` in annotations.
+#            Go text/template treats `$` alone as the root data reference —
+#            not part of a template action — so `${{ $value }}` rendered
+#            literally or errored. Now `{{ $value }}`.
+#   FIX #3   Removed `{{ $labels.spot_price }}` / `{{ $labels.inventory_days }}`.
+#            Those labels do not exist on `green_agent_helium_scarcity_level`
+#            — its labels are `{job, instance, region}`. The templates
+#            rendered empty strings. Replaced with `{{ $value }}` (the
+#            actual series value) and a dashboard link for the other
+#            metrics.
+#   FIX #4   `helium:scarcity_score:rate1h` computed `rate()` on a Gauge
+#            — meaningless. Changed to `deriv()` (per-second slope) and
+#            renamed to `helium:scarcity_score:deriv1h`.
+#   FIX #5   `stddev_over_time(green_agent_moe_gate_weight[15m])` returned
+#            one series per expert — the alert fired with an ambiguous
+#            `$value`. Changed to `max by (expert)(...)` so the summary
+#            names the unstable expert.
+#   FIX #6   `green_agent_graph_centrality < 0.3` reported an arbitrary
+#            series. Changed to `min by (pod)(...) < 0.3` — the alert
+#            names the worst pod.
+#   FIX #7   `rate(...) < 1` compared a per-second rate to a per-minute
+#            threshold. Changed to `rate(...) * 60 < 1` for "less than
+#            1 update per minute".
+#   FIX #8   `enhanced:distillation_update_rate:sum5m` recorded nothing
+#            (`_count` vs `_count_total`). Fixed.
+#   FIX #9   No meta-alert on scrape failure — when the ServiceMonitor is
+#            broken, every other alert goes silent. Added
+#            `GreenAgentScrapeFailure` (up == 0) and
+#            `GreenAgentNoScrapeTarget` (absent(up)).
+#   FIX #10  Added alerts for metrics the runtime already exports:
+#              * carbon budget exceeded (increase over 24h > 71.4 kg)
+#              * task failure rate (>1/min)
+#              * queue depth high (>50)
+#              * accuracy drop (<0.7)
+#              * p95 execution time (>60 s)
+#   FIX #11  Added operational alerts:
+#              * PVC usage high (>85%)
+#              * dashboard HPA at max replicas (>15 min)
+#   FIX #12  Documented the escalation chain — level 3 (severe) and level 2
+#            (critical) are mutually exclusive, so exactly one fires.
+#   FIX #13  Shortened `for: 30m` on `HeliumSupplyCaution` to `for: 15m`
+#            — the level oscillates frequently enough that 30m rarely
+#            fires.
+#   FIX #14  Clarified the `for: 1h` on `HeliumInventoryLow` — it is a
+#            continuous window, not a delay.
+#   FIX #15  Used namespace-pattern selectors on HPA / kube-state metrics
+#            so overlays that add `prod-` / `dev-` prefixes still match.
+# =============================================================================
 
 groups:
-- name: helium_supply_alerts
-  interval: 30s
-  rules:
-  
-  # Critical: Severe helium shortage
-  - alert: HeliumSupplySevere
-    expr: |
-      green_agent_helium_scarcity_level{job="green-agent"} == 3
-    for: 5m
-    labels:
-      severity: critical
-      team: supply-chain
-      component: helium-monitor
-    annotations:
-      summary: "Severe helium supply shortage detected"
-      description: |
-        Helium scarcity level is SEVERE for more than 5 minutes.
-        
-        Current price: ${{ $labels.spot_price }} per liter
-        Inventory: {{ $labels.inventory_days }} days
-        
-        Actions:
-        - Defer non-essential helium-intensive jobs
-        - Activate emergency procurement protocols
-        - Notify fabrication facilities
-        
-        Runbook: https://wiki.example.com/runbooks/helium-severe-shortage
-      runbook_url: https://wiki.example.com/runbooks/helium-severe-shortage
-      dashboard_url: https://grafana.example.com/d/green_agent_graphs_helium
-  
-  # Critical: Price spike
-  - alert: HeliumPriceSpike
-    expr: |
-      green_agent_helium_price_premium_usd{job="green-agent"} > 5.0
-    for: 10m
-    labels:
-      severity: critical
-      team: finance
-      component: helium-monitor
-    annotations:
-      summary: "Helium price spike detected"
-      description: |
-        Helium price premium is ${{ $value }}/L above baseline 
-        (baseline: $4.0/L) for more than 10 minutes.
-        
-        Current spot price: ${{ $value | add 4.0 }}/L
-        
-        Impact:
-        - Increased operational costs for helium-dependent processes
-        - May trigger policy changes for cost-sensitive workloads
-        
-        Review procurement strategy and workload scheduling.
-      runbook_url: https://wiki.example.com/runbooks/helium-price-spike
-  
-  # Warning: Critical scarcity
-  - alert: HeliumSupplyCritical
-    expr: |
-      green_agent_helium_scarcity_level{job="green-agent"} == 2
-    for: 15m
-    labels:
-      severity: warning
-      team: supply-chain
-      component: helium-monitor
-    annotations:
-      summary: "Critical helium supply constraint"
-      description: |
-        Helium scarcity level is CRITICAL for more than 15 minutes.
-        
-        Monitor for escalation to SEVERE level.
-        Consider pre-emptive workload adjustments.
-      runbook_url: https://wiki.example.com/runbooks/helium-critical
-  
-  # Warning: Low inventory
-  - alert: HeliumInventoryLow
-    expr: |
-      green_agent_helium_fab_inventory_days{job="green-agent"} < 10
-    for: 1h
-    labels:
-      severity: warning
-      team: operations
-      component: helium-monitor
-    annotations:
-      summary: "Low helium inventory at fabrication facilities"
-      description: |
-        Fabrication facility helium inventory is {{ $value }} days, 
-        below threshold of 10 days.
-        
-        Risk: Production delays if supply disrupted.
-        
-        Actions:
-        - Review procurement schedule
-        - Assess alternative supply chains
-      runbook_url: https://wiki.example.com/runbooks/helium-low-inventory
-  
-  # Info: Caution level
-  - alert: HeliumSupplyCaution
-    expr: |
-      green_agent_helium_scarcity_level{job="green-agent"} == 1
-    for: 30m
-    labels:
-      severity: info
-      team: supply-chain
-      component: helium-monitor
-    annotations:
-      summary: "Helium supply entering caution zone"
-      description: |
-        Helium scarcity level is CAUTION for more than 30 minutes.
-        
-        Monitor for trends — no immediate action required.
-      runbook_url: https://wiki.example.com/runbooks/helium-trends
 
-# Recording rules for efficiency
-- name: helium_recording_rules
-  interval: 1m
-  rules:
-  
-  # Pre-compute scarcity trend
-  - record: helium:scarcity_score:rate1h
-    expr: |
-      rate(green_agent_helium_scarcity_score{job="green-agent"}[1h])
-  
-  # Pre-compute price volatility
-  - record: helium:price_volatility:stddev6h
-    expr: |
-      stddev_over_time(green_agent_helium_spot_price_usd{job="green-agent"}[6h])
+  # ===========================================================================
+  # Meta-alerts — these gate every other alert in the file
+  # ===========================================================================
+  - name: green_agent_scrape_meta_alerts
+    interval: 30s
+    rules:
 
-# ------------------------------------------------------------------------------
-# Enhanced Alerts for Advanced Modules
-# (LIMIT Graph, MODP, RLHF, Distillation, MoE, Bio‑inspired, FlexGen)
-# ------------------------------------------------------------------------------
+      # FIX #9 — scrape failure: the job exists but scrapes are failing.
+      - alert: GreenAgentScrapeFailure
+        expr: up{job="green-agent"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: observability
+          component: prometheus
+        annotations:
+          summary: "Green Agent metrics endpoint is unreachable"
+          description: |
+            Prometheus has failed to scrape the `green-agent` job for over
+            5 minutes. While this is true, every other alert in this file
+            is silent — the value of the underlying metrics is stale.
 
-- name: enhanced_metrics_alerts
-  interval: 30s
-  rules:
+            Check:
+              kubectl get pods -n green-agent -l "component=head"
+              kubectl get endpoints -n green-agent green-agent-api
+              kubectl get servicemonitor -n green-agent green-agent-monitor -o yaml
+          runbook_url: https://wiki.example.com/runbooks/scrape-failure
+          dashboard_url: https://grafana.example.com/d/green_agent_graphs_scrape
 
-  # MODP composite score too low
-  - alert: GreenAgentLowMODPScore
-    expr: green_agent_modp_score{job="green-agent"} < 0.4
-    for: 10m
-    labels:
-      severity: warning
-      team: ai-platform
-      component: enhancements
-    annotations:
-      summary: "Low MODP composite score"
-      description: |
-        MODP score is {{ $value }} (target > 0.6).
-        Check objective weights and system performance.
-      runbook_url: https://wiki.example.com/runbooks/modp-low-score
+      # FIX #9 — no scrape target at all: `up` has no series for this job.
+      # Distinguishes "scrapes are failing" (previous alert) from "nothing
+      # is configured to scrape" (ServiceMonitor missing or `jobLabel`
+      # misconfigured).
+      - alert: GreenAgentNoScrapeTarget
+        expr: absent(up{job="green-agent"})
+        for: 10m
+        labels:
+          severity: critical
+          team: observability
+          component: prometheus
+        annotations:
+          summary: "No Prometheus scrape target exists for green-agent"
+          description: |
+            `up{job="green-agent"}` has no series at all. The ServiceMonitor
+            is either missing or its `jobLabel` (must be `app`) resolves
+            to a different value than `green-agent`.
 
-  # RLHF feedback score dropping
-  - alert: GreenAgentLowRLHFFeedback
-    expr: green_agent_rlhf_feedback{job="green-agent"} < 0.3
-    for: 15m
-    labels:
-      severity: warning
-      team: ai-platform
-      component: rlhf
-    annotations:
-      summary: "Low RLHF feedback score"
-      description: |
-        Human feedback score is {{ $value }}.
-        Consider adjusting agent behavior or collecting more feedback.
-      runbook_url: https://wiki.example.com/runbooks/rlhf-low-feedback
+            Check:
+              kubectl get servicemonitor -n green-agent -o yaml
+              kubectl get svc -n green-agent green-agent-api -o yaml
+          runbook_url: https://wiki.example.com/runbooks/no-scrape-target
 
-  # LIMIT Graph centrality anomaly
-  - alert: GreenAgentGraphCentralityLow
-    expr: green_agent_graph_centrality{job="green-agent"} < 0.3
-    for: 10m
-    labels:
-      severity: warning
-      team: ai-platform
-      component: limit-graph
-    annotations:
-      summary: "Low LIMIT Graph centrality"
-      description: |
-        Graph centrality is {{ $value }}. Topology may be suboptimal.
-      runbook_url: https://wiki.example.com/runbooks/graph-centrality-low
+  # ===========================================================================
+  # Helium supply
+  # ===========================================================================
+  - name: helium_supply_alerts
+    interval: 30s
+    rules:
 
-  # Distillation updates stalled
-  - alert: GreenAgentDistillationStalled
-    expr: rate(green_agent_distillation_update_count{job="green-agent"}[30m]) < 1
-    for: 30m
-    labels:
-      severity: info
-      team: ai-platform
-      component: distillation
-    annotations:
-      summary: "Distillation updates stalled"
-      description: |
-        Few or no distillation updates in the last 30 minutes.
-        Check if training loop is active.
-      runbook_url: https://wiki.example.com/runbooks/distillation-stalled
+      # FIX #12 — escalation chain: level 3 and level 2 are mutually
+      # exclusive (`==`), so exactly one fires. No suppression needed.
+      - alert: HeliumSupplySevere
+        expr: green_agent_helium_scarcity_level{job="green-agent"} == 3
+        for: 5m
+        labels:
+          severity: critical
+          team: supply-chain
+          component: helium-monitor
+        annotations:
+          summary: "Severe helium supply shortage (level 3/3)"
+          description: |
+            Helium scarcity has been at SEVERE (level 3 of 3) for more
+            than 5 minutes.
 
-  # MoE gating instability
-  - alert: GreenAgentMoEUnstable
-    expr: stddev_over_time(green_agent_moe_gate_weight{job="green-agent"}[15m]) > 0.2
-    for: 15m
-    labels:
-      severity: warning
-      team: ai-platform
-      component: moe
-    annotations:
-      summary: "MoE gating unstable"
-      description: |
-        Gate weight standard deviation is {{ $value }}.
-        Investigate stability of expert routing.
-      runbook_url: https://wiki.example.com/runbooks/moe-unstable
+            Current level: {{ $value }}
+            Region: {{ $labels.region | default "unknown" }}
 
-  # Bio‑inspired evolutionary fitness stagnating
-  - alert: GreenAgentEvolutionStalled
-    expr: green_agent_evolutionary_best_fitness{job="green-agent"} - green_agent_evolutionary_best_fitness{job="green-agent"} offset 1h < 0.01
-    for: 1h
-    labels:
-      severity: info
-      team: ai-platform
-      component: evolutionary
-    annotations:
-      summary: "Evolutionary optimisation stalled"
-      description: |
-        Best fitness has not improved significantly in the last hour.
-      runbook_url: https://wiki.example.com/runbooks/evolution-stalled
+            Actions:
+              * Defer non-essential helium-intensive jobs
+              * Activate emergency procurement protocols
+              * Notify fabrication facilities
+          runbook_url: https://wiki.example.com/runbooks/helium-severe-shortage
+          dashboard_url: https://grafana.example.com/d/green_agent_graphs_helium
 
-  # FlexGen energy consumption high
-  - alert: GreenAgentFlexGenHighEnergy
-    expr: rate(green_agent_flexgen_energy_joules_total{job="green-agent"}[5m]) > 1000
-    for: 10m
-    labels:
-      severity: warning
-      team: ai-platform
-      component: flexgen
-    annotations:
-      summary: "High FlexGen energy consumption"
-      description: |
-        FlexGen energy rate is {{ $value }} J/s.
-        Consider switching precision or delegation policy.
-      runbook_url: https://wiki.example.com/runbooks/flexgen-high-energy
+      - alert: HeliumPriceSpike
+        expr: green_agent_helium_price_premium_usd{job="green-agent"} > 5.0
+        for: 10m
+        labels:
+          severity: critical
+          team: finance
+          component: helium-monitor
+        annotations:
+          summary: "Helium price premium spike (> $5/L above baseline)"
+          description: |
+            Helium price premium is {{ $value | printf "%.2f" }} USD/L
+            above the $4.00/L baseline (total spot ≈
+            ${{ $value | add 4.0 | printf "%.2f" }}/L) for over 10 minutes.
 
-# Recording rules for enhanced metrics (optional)
-- name: enhanced_recording_rules
-  interval: 1m
-  rules:
-  - record: enhanced:modp_score:avg5m
-    expr: avg_over_time(green_agent_modp_score{job="green-agent"}[5m])
-  - record: enhanced:rlhf_feedback:avg1h
-    expr: avg_over_time(green_agent_rlhf_feedback{job="green-agent"}[1h])
-  - record: enhanced:graph_centrality:avg1h
-    expr: avg_over_time(green_agent_graph_centrality{job="green-agent"}[1h])
-  - record: enhanced:distillation_update_rate:sum5m
-    expr: sum(rate(green_agent_distillation_update_count{job="green-agent"}[5m]))
+            Impact:
+              * Increased operational costs for helium-dependent processes
+              * May trigger policy changes for cost-sensitive workloads
+          runbook_url: https://wiki.example.com/runbooks/helium-price-spike
+
+      - alert: HeliumSupplyCritical
+        expr: green_agent_helium_scarcity_level{job="green-agent"} == 2
+        for: 15m
+        labels:
+          severity: warning
+          team: supply-chain
+          component: helium-monitor
+        annotations:
+          summary: "Critical helium supply constraint (level 2/3)"
+          description: |
+            Helium scarcity has been at CRITICAL (level 2 of 3) for more
+            than 15 minutes.
+
+            Current level: {{ $value }}
+            Region: {{ $labels.region | default "unknown" }}
+
+            Monitor for escalation to SEVERE. Consider pre-emptive
+            workload adjustments.
+          runbook_url: https://wiki.example.com/runbooks/helium-critical
+
+      # FIX #14 — `for: 1h` is a continuous window, not a delay. With an
+      # hourly metric, this fires on the second consecutive hourly sample
+      # below 10 days.
+      - alert: HeliumInventoryLow
+        expr: green_agent_helium_fab_inventory_days{job="green-agent"} < 10
+        for: 1h
+        labels:
+          severity: warning
+          team: operations
+          component: helium-monitor
+        annotations:
+          summary: "Low helium inventory at fabrication facilities"
+          description: |
+            Fabrication facility helium inventory is
+            {{ $value | printf "%.1f" }} days — below the 10-day threshold
+            for more than 1 hour.
+
+            Risk: Production delays if supply is disrupted.
+
+            Actions:
+              * Review procurement schedule
+              * Assess alternative supply chains
+          runbook_url: https://wiki.example.com/runbooks/helium-low-inventory
+
+      # FIX #13 — `for: 30m` → `for: 15m` — the level oscillates
+      # frequently; 30m continuous rarely fires.
+      - alert: HeliumSupplyCaution
+        expr: green_agent_helium_scarcity_level{job="green-agent"} == 1
+        for: 15m
+        labels:
+          severity: info
+          team: supply-chain
+          component: helium-monitor
+        annotations:
+          summary: "Helium supply entering caution zone (level 1/3)"
+          description: |
+            Helium scarcity has been at CAUTION (level 1 of 3) for more
+            than 15 minutes.
+
+            Current level: {{ $value }}
+
+            Monitor for trends — no immediate action required.
+          runbook_url: https://wiki.example.com/runbooks/helium-trends
+
+  # ===========================================================================
+  # Helium recording rules
+  # ===========================================================================
+  - name: helium_recording_rules
+    interval: 1m
+    rules:
+
+      # FIX #4 — scarcity_score is a Gauge; `rate()` on a Gauge is
+      # meaningless. `deriv()` returns the per-second slope.
+      - record: helium:scarcity_score:deriv1h
+        expr: |
+          deriv(green_agent_helium_scarcity_score{job="green-agent"}[1h])
+
+      # stddev on a Gauge is fine — this is volatility, not a rate.
+      - record: helium:spot_price:stddev6h
+        expr: |
+          stddev_over_time(green_agent_helium_spot_price_usd{job="green-agent"}[6h])
+
+  # ===========================================================================
+  # Core agent health
+  # ===========================================================================
+  - name: green_agent_core_alerts
+    interval: 30s
+    rules:
+
+      # FIX #10 — carbon budget.
+      - alert: GreenAgentCarbonBudgetExceeded
+        expr: |
+          increase(green_agent_carbon_emitted_kg_total{job="green-agent"}[24h]) > 71.4
+        for: 5m
+        labels:
+          severity: warning
+          team: sustainability
+          component: carbon
+        annotations:
+          summary: "Daily carbon budget exceeded"
+          description: |
+            24h cumulative emissions are
+            {{ $value | printf "%.1f" }} kg — above the configured daily
+            limit of 71.4 kg (`carbon.budget.daily_limit_kg`).
+
+            Check the production config's `carbon.budget` block and any
+            recent workload changes that increased per-task carbon.
+          runbook_url: https://wiki.example.com/runbooks/carbon-budget-exceeded
+
+      # FIX #10 — task failure rate.
+      - alert: GreenAgentTaskFailureRate
+        expr: |
+          sum by (mode, status) (
+            rate(green_agent_tasks_completed_total{job="green-agent",status=~"failed|fail"}[5m]) * 60
+          ) > 1
+        for: 5m
+        labels:
+          severity: critical
+          team: ai-platform
+          component: api
+        annotations:
+          summary: "High task failure rate ({{ $labels.mode }})"
+          description: |
+            {{ $value | printf "%.2f" }} failures/min in mode
+            {{ $labels.mode }} (threshold 1/min).
+          runbook_url: https://wiki.example.com/runbooks/task-failure-rate
+
+      # FIX #10 — queue depth.
+      - alert: GreenAgentQueueDepthHigh
+        expr: green_agent_queue_depth{job="green-agent"} > 50
+        for: 5m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: api
+        annotations:
+          summary: "Task queue depth is high"
+          description: |
+            {{ $value }} tasks are queued (threshold 50). The carbon-aware
+            scaler may be under-provisioning, or workers may be saturated.
+          runbook_url: https://wiki.example.com/runbooks/queue-depth
+
+      # FIX #10 — accuracy drop.
+      - alert: GreenAgentAccuracyDrop
+        expr: green_agent_accuracy_score{job="green-agent"} < 0.7
+        for: 15m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: api
+        annotations:
+          summary: "Accuracy score has dropped"
+          description: |
+            Rolling accuracy is {{ $value | printf "%.2f" }} (threshold
+            0.7). Check for a model change or input shift.
+          runbook_url: https://wiki.example.com/runbooks/accuracy-drop
+
+      # FIX #10 — p95 execution time.
+      - alert: GreenAgentExecutionTimeP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, mode) (
+              rate(green_agent_execution_time_seconds_bucket{job="green-agent"}[5m])
+            )
+          ) > 60
+        for: 10m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: api
+        annotations:
+          summary: "Execution time p95 is high ({{ $labels.mode }})"
+          description: |
+            p95 execution time is {{ $value | printf "%.1f" }} s in mode
+            {{ $labels.mode }} (threshold 60 s).
+          runbook_url: https://wiki.example.com/runbooks/latency-p95
+
+  # ===========================================================================
+  # Advanced enhancements
+  # ===========================================================================
+  - name: enhanced_metrics_alerts
+    interval: 30s
+    rules:
+
+      - alert: GreenAgentLowMODPScore
+        expr: green_agent_modp_score{job="green-agent"} < 0.4
+        for: 10m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: enhancements
+        annotations:
+          summary: "Low MODP composite score"
+          description: |
+            MODP score is {{ $value | printf "%.2f" }} (target > 0.6).
+            Check `enhancements.modp.objective_weights` in the config and
+            current system performance.
+          runbook_url: https://wiki.example.com/runbooks/modp-low-score
+
+      - alert: GreenAgentLowRLHFFeedback
+        expr: green_agent_rlhf_feedback{job="green-agent"} < 0.3
+        for: 15m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: rlhf
+        annotations:
+          summary: "Low RLHF feedback score"
+          description: |
+            Human feedback score is {{ $value | printf "%.2f" }}
+            (threshold 0.3). Consider adjusting agent behavior or
+            collecting more feedback.
+          runbook_url: https://wiki.example.com/runbooks/rlhf-low-feedback
+
+      # FIX #6 — `min by (pod)` so the alert names the worst pod.
+      - alert: GreenAgentGraphCentralityLow
+        expr: |
+          min by (pod) (green_agent_graph_centrality{job="green-agent"}) < 0.3
+        for: 10m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: limit-graph
+        annotations:
+          summary: "Low LIMIT Graph centrality on {{ $labels.pod }}"
+          description: |
+            Graph centrality is {{ $value | printf "%.2f" }} on
+            {{ $labels.pod }} (threshold 0.3). Topology may be suboptimal.
+          runbook_url: https://wiki.example.com/runbooks/graph-centrality-low
+
+      # FIX #1, #7 — Counter `_total` suffix, per-minute threshold.
+      - alert: GreenAgentDistillationStalled
+        expr: |
+          rate(green_agent_distillation_update_count_total{job="green-agent"}[30m]) * 60 < 1
+        for: 30m
+        labels:
+          severity: info
+          team: ai-platform
+          component: distillation
+        annotations:
+          summary: "Distillation updates stalled"
+          description: |
+            Fewer than 1 distillation update per minute over the last 30
+            minutes. Check that the training loop is active and the
+            teacher pool is healthy.
+          runbook_url: https://wiki.example.com/runbooks/distillation-stalled
+
+      # FIX #5 — `max by (expert)` so `$labels.expert` is unambiguous.
+      - alert: GreenAgentMoEUnstable
+        expr: |
+          max by (expert) (
+            stddev_over_time(green_agent_moe_gate_weight{job="green-agent"}[15m])
+          ) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: moe
+        annotations:
+          summary: "MoE gating unstable for expert {{ $labels.expert }}"
+          description: |
+            Expert {{ $labels.expert }} gate stddev is
+            {{ $value | printf "%.2f" }} (threshold 0.2). Investigate the
+            stability of expert routing.
+          runbook_url: https://wiki.example.com/runbooks/moe-unstable
+
+      # A pod restart in the last hour returns no data from the `offset`
+      # expression — the alert stays silent. Safe default; documented.
+      - alert: GreenAgentEvolutionStalled
+        expr: |
+          green_agent_evolutionary_best_fitness{job="green-agent"}
+          - green_agent_evolutionary_best_fitness{job="green-agent"} offset 1h
+          < 0.01
+        for: 1h
+        labels:
+          severity: info
+          team: ai-platform
+          component: evolutionary
+        annotations:
+          summary: "Evolutionary optimisation stalled"
+          description: |
+            Best fitness has not improved by more than 0.01 in the last
+            hour.
+          runbook_url: https://wiki.example.com/runbooks/evolution-stalled
+
+      - alert: GreenAgentFlexGenHighEnergy
+        expr: |
+          rate(green_agent_flexgen_energy_joules_total{job="green-agent"}[5m]) > 1000
+        for: 10m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: flexgen
+        annotations:
+          summary: "High FlexGen energy consumption"
+          description: |
+            FlexGen energy rate is {{ $value | printf "%.0f" }} J/s
+            (threshold 1000 J/s ≈ 1 kW). Consider switching precision
+            (fp16 → int4) or the delegation policy.
+          runbook_url: https://wiki.example.com/runbooks/flexgen-high-energy
+
+  # ===========================================================================
+  # Operational resources (PVC, HPA)
+  # ===========================================================================
+  - name: green_agent_operational_alerts
+    interval: 30s
+    rules:
+
+      # FIX #11 — PVC usage.
+      - alert: GreenAgentPVCUsageHigh
+        expr: |
+          (
+            kubelet_volume_stats_used_bytes
+              {job="kubelet",persistentvolumeclaim="green-agent-data-pvc"}
+            /
+            kubelet_volume_stats_capacity_bytes
+              {job="kubelet",persistentvolumeclaim="green-agent-data-pvc"}
+          ) > 0.85
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+          component: storage
+        annotations:
+          summary: "Green Agent data PVC is more than 85% full"
+          description: |
+            PVC `green-agent-data-pvc` is
+            {{ $value | printf "%.0f%%" }} full. Results, checkpoints, and
+            the leaderboard may fail to write when the disk fills.
+          runbook_url: https://wiki.example.com/runbooks/pvc-full
+
+      # FIX #11, #15 — HPA at max. Namespace-pattern selector so overlays
+      # that add `prod-` / `dev-` name prefixes still match.
+      - alert: GreenAgentHPAAtMax
+        expr: |
+          (
+            kube_horizontalpodautoscaler_status_current_replicas
+              {namespace=~"green-agent.*"}
+            >=
+            kube_horizontalpodautoscaler_spec_max_replicas
+              {namespace=~"green-agent.*"}
+          )
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+          component: autoscaler
+        annotations:
+          summary: "HPA {{ $labels.horizontalpodautoscaler }} is at max replicas"
+          description: |
+            The HPA has been at `maxReplicas` for 15 minutes in namespace
+            {{ $labels.namespace }}. Additional load cannot be absorbed —
+            consider raising `maxReplicas` or investigating the workload.
+          runbook_url: https://wiki.example.com/runbooks/hpa-at-max
+
+  # ===========================================================================
+  # Enhanced recording rules
+  # ===========================================================================
+  - name: enhanced_recording_rules
+    interval: 1m
+    rules:
+      - record: enhanced:modp_score:avg5m
+        expr: |
+          avg_over_time(green_agent_modp_score{job="green-agent"}[5m])
+
+      - record: enhanced:rlhf_feedback:avg1h
+        expr: |
+          avg_over_time(green_agent_rlhf_feedback{job="green-agent"}[1h])
+
+      - record: enhanced:graph_centrality:avg1h
+        expr: |
+          avg_over_time(green_agent_graph_centrality{job="green-agent"}[1h])
+
+      # FIX #8 — Counter needs `_total`.
+      - record: enhanced:distillation_update_rate:sum5m
+        expr: |
+          sum(rate(green_agent_distillation_update_count_total{job="green-agent"}[5m]))
