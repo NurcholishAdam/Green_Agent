@@ -1,0 +1,120 @@
+"""
+tests/test_a2a_schema_conformance.py — Prove the §10 example validates and
+that the extended schema rejects obvious violations (e.g. `:latest` images).
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from jsonschema import Draft202012Validator
+
+SCHEMA = json.loads(
+    (Path(__file__).resolve().parent.parent / "schemas" / "a2a_response.v1_1.json").read_text()
+)
+VALIDATOR = Draft202012Validator(SCHEMA)
+
+
+def _check(doc: dict) -> None:
+    errors = sorted(VALIDATOR.iter_errors(doc), key=lambda e: list(e.path))
+    assert not errors, "\n".join(f"{list(e.path)}: {e.message}" for e in errors)
+
+
+def test_delivery_report_example_is_valid():
+    """The exact object printed in Delivery Report §10."""
+    doc = {
+        "task_id": "research_001",
+        "status": "success",
+        "version": "1.1",
+        "timestamp": "2026-01-20T10:30:00Z",
+        "execution_time_seconds": 2.9,
+        "output": {
+            "answer": "AI model training has significant environmental impacts...",
+            "sources": ["paper1.pdf", "article2.html"],
+            "confidence": 0.85,
+        },
+        "green_metrics": {
+            "energy_kwh": 0.042,
+            "carbon_kg": 0.018,
+            "sustainability_index": 0.73,
+            "efficiency_score": 0.85,
+            "comparative_baseline": {
+                "cohort_id": "green-agent-bench-v1",
+                "percentile": 75,
+                "vs_average_pct": 15.0,
+            },
+            "modp_score": 0.71,
+            "graph_centrality": 0.8,
+            "rlhf_feedback": 0.7,
+        },
+        "reasoning_trace": [
+            {"step": 0, "action": "search",     "tool": "web_search", "duration": 0.5},
+            {"step": 1, "action": "analyze",    "duration": 0.3},
+            {"step": 2, "action": "synthesize", "duration": 0.2},
+        ],
+        "metadata": {
+            "rlhf_feedback": {
+                "overall_score": 0.847,
+                "reasoning_quality": "good",
+                "reasoning_score": 0.85,
+                "efficiency_score": 0.78,
+                "completeness_score": 0.90,
+                "success_score": 1.0,
+                "feedback_items": [],
+                "improvement_suggestions": [
+                    "EFFICIENCY: Cache intermediate results",
+                    "REASONING: Add verification steps",
+                ],
+                "metrics": {
+                    "total_steps": 3,
+                    "avg_step_duration": 0.33,
+                    "redundant_steps": 0,
+                    "tool_usage_efficiency": 0.67,
+                },
+            },
+            "enhanced_decision": {
+                "selected_strategy": "carbon_first",
+                "selected_priority": "green",
+            },
+        },
+        "container_metadata": {
+            "image": "ghcr.io/example/limit-graph-agent@sha256:" + "a" * 64,
+            "exit_code": 0,
+            "execution_time": 2.9,
+            "resource_limits": {"cpu": "2.0", "memory": "4g"},
+        },
+    }
+    _check(doc)
+
+
+def test_missing_required_field_fails():
+    with pytest.raises(AssertionError):
+        _check({"task_id": "x", "status": "success"})
+
+
+def test_latest_tag_rejected():
+    """Schema refuses non-digest image refs in container_metadata."""
+    bad = {
+        "task_id": "x", "status": "success", "output": {},
+        "execution_time_seconds": 1.0,
+        "timestamp": "2026-01-20T10:30:00Z", "version": "1.1",
+        "container_metadata": {
+            "image": "limit-graph-agent:latest", "exit_code": 0,
+        },
+    }
+    with pytest.raises(AssertionError):
+        _check(bad)
+
+
+def test_comparative_baseline_requires_cohort():
+    bad = {
+        "task_id": "x", "status": "success", "output": {},
+        "execution_time_seconds": 1.0,
+        "timestamp": "2026-01-20T10:30:00Z", "version": "1.1",
+        "green_metrics": {
+            "comparative_baseline": {"percentile": 75, "vs_average_pct": 15.0},
+        },
+    }
+    with pytest.raises(AssertionError):
+        _check(bad)
