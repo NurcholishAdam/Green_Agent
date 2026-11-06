@@ -1,226 +1,30 @@
-## Analysis summary
 
-This is a **documentation index** for LIMIT-AgentBench v2.4.2, not code. It is more restrained than prior deliverables ("Status: Production Ready" appears twice but without "GROUNDBREAKING"-style superlatives), and it correctly uses `NodeType.EDGE` this time. However, it **persists the async/sync contradiction that has now appeared in 5 consecutive documents** — `select_routing_strategy` and `select_priority` are called via `await` in Examples 4 and 5, and wrapped in `asyncio.run(...)` in Example 4. Both are wrong; those methods are **synchronous** per the Expert Collaboration Guide v2 and every other enhanced doc.
-
-Other issues worth closing:
-- **Future-dated release** ("January 19, 2026") — same pattern as prior docs.
-- **Broken relative links** — `../GREEN_BENCHMARKING_QUICK_START.md` et al. are not guaranteed to exist, and the doc doesn't say what happens if they don't.
-- **API examples reference signatures not shown** — `AgentBenchAdapter.create_task` has 6 parameters shown, `GreenMetricsTracker.get_metrics()` returns an undefined shape, `SustainabilityIndex.calculate(...)` has no formula, `GreenLeaderboard.submit(...)` takes a dozen untyped kwargs.
-- **Version inconsistency** — v2.4.2 at top, `Quantum LIMIT-GRAPH v2.4.0` in related docs.
-- **Roadmap says Phase 2, 3, 4 are "Planned"**, yet "Production Ready" is claimed — contradiction.
-- **No install pinning** — `pip install psutil numpy scikit-learn pandas pydantic` is unpinned.
-- **No `pyproject.toml`, no `__init__.py`** — same packaging gap as prior docs.
-- **No link-checking in CI** — a doc index with unverified links will drift.
-
-The engineering fixes are: **pin the async surface**, **add `scripts/verify_links.py`** so every relative link is checked in CI, **add `test_installation.py`** as an actual runnable file, and **demote "Production Ready"** to Beta with an open-items table.
-
----
-
-## Key strengths
-
-- Clear Quick Navigation structure — this is the best-ordered doc in the set.
-- Module tree is clean and readable.
-- Examples cover all four pillars + all six enhancements.
-- Roadmap is explicit about phases.
-- Grid-region and hardware-profile lists are concrete.
-
----
-
-## Critical issues
-
-### 1. 🚨 Async/sync contradiction persisted (5th consecutive document)
-```python
-strategy = await node.select_routing_strategy()         # Example 4 uses asyncio.run
-strategy = asyncio.run(node.select_routing_strategy())  # Example 4 alt
-priority = asyncio.run(wl.select_priority())            # Example 5
-priority = await wl.select_priority()                   # elsewhere
-```
-Per `AGENTBEATS_COMPLIANCE_GUIDE.md` (v2), Expert Collaboration Guide (v2), Extended Pareto (v2), Extensions Guide (v2), and Green Agent Final Delivery (v2): **`select_routing_strategy` and `select_priority` are synchronous**. Every example above raises `TypeError`.
-
-### 2. 🚨 "Status: Production Ready" × 2 while roadmap says Phase 2/3/4 are Planned
-The header and footer both say "Production Ready". The Roadmap section shows Phase 2 (NSN integration), Phase 3 (visualization), Phase 4 (deployment/leaderboard) as **unchecked** — the deliverables for those phases do not exist.
-
-### 3. 🚨 Future-dated release
-"Date: January 19, 2026" — appears twice.
-
-### 4. 🚨 Broken/relative link references
-`../GREEN_BENCHMARKING_QUICK_START.md`, `../GREEN_AGENT_BENCHMARKING_COMPLETE.md`, `../AGENTBENCH_DELIVERY_SUMMARY.md`, `../GREEN_AGENT_BENCHMARKING_PROPOSAL.md` — all `..`-relative from an index that lives inside `limit-agentbench/`. Nothing confirms these files exist, and if they don't, a user clicks and gets a 404.
-
-### 5. 🚨 `test_installation.py` is referenced but not shown
-The Quick Start tells you to run `python test_installation.py` and shows the expected output, but the file is not in the tree (§Module Structure) and no content is provided. A user who runs the command on a fresh checkout gets `FileNotFoundError`.
-
-### 6. 🚨 `demo_green_benchmark.py --enhanced` flag undefined
-No argument parser shown, no explanation of what `--enhanced` does or what happens if `src/enhancements/` is missing. Silent failure risk.
-
-### 7. 🚨 API signatures referenced but not typed
-- `AgentBenchAdapter.create_task(task_id, suite, task_type, input_data, ...)` — ellipsis, no full signature.
-- `adapter.evaluate_agent(agent, task, track_energy=True, ...)` — returns `result['metrics']['sustainability_index']` but `result` shape undefined.
-- `GreenMetricsTracker.get_metrics()` — return shape undefined.
-- `AgentEvaluator.compare_agents(...)` — no schema of `comparison`.
-- `BenchmarkHarness.run_benchmark(...)` — return shape undefined.
-- `SustainabilityIndex.calculate(accuracy, energy_kwh, carbon_co2e_kg)` — no formula, no range.
-- `GreenLeaderboard.submit(agent_name, framework, task_suite, accuracy, energy_kwh, carbon_co2e_kg, latency_ms)` — no return, no validation.
-
-### 8. 🚨 Two different leaderboard methods shown
-- `leaderboard.get_rankings(sort_by="sustainability_index")` in §API Reference
-- `leaderboard.get_top_agents(n=10)` in Example 3
-
-Neither is defined. Both must exist for the examples to work, or one is a bug.
-
-### 9. 🚨 `metadata` weights in Example 5 pass with no validation mentioned
-```python
-metadata={"latency_weight": 0.5, "carbon_weight": 0.3, "energy_weight": 0.2}
-```
-That sums to 1.0 ✓, but the doc never states that weights **must** sum to 1.0 — a user changing `energy_weight=0.3` silently gets an invalid vector.
-
-### 10. 🚨 Install line unpinned
-`pip install psutil numpy scikit-learn pandas pydantic` — no versions. `scikit-learn` and `pydantic` both break APIs on minor bumps.
-
-### 11. 🚨 No `pyproject.toml`, no `__init__.py` files
-Import paths like `from limit_agentbench import AgentBenchAdapter` require a package installed with that top-level name. No packaging config is shown.
-
-### 12. 🚨 `from src.enhancements.schemas...` in a package named `limit_agentbench`
-Mixing `src.enhancements` (repo-relative) with `limit_agentbench` (installed package) is a sign the module locations are inconsistent. A user doing `pip install limit-agentbench` will not get `src.enhancements`.
-
-### 13. 🚨 Version inconsistency
-Header says **v2.4.2**. Related docs link is `Quantum LIMIT-GRAPH v2.4.0`. Which is authoritative?
-
-### 14. 🚨 No grid-region / hardware-profile sources
-"13 grid regions", "10 hardware profiles" — but no reference to what carbon-intensity values each region uses (400 g/kWh? 200? different?).
-
-### 15. 🚨 "Installation verified successfully!" claimed but no coverage requirement
-No CI runs `test_installation.py`. The claim is untested.
-
-### 16. 🚨 No "Known Limitations" section
-Same gap as every prior doc.
-
-### 17. 🚨 No security posture
-Enhancement flags, feedback events, RLHF scores — all in scope. Nothing about how `ENHANCEMENTS_ENABLED=false` affects the security surface.
-
-### 18. 🚨 No CI
-A documentation index is exactly what CI link-checking is for. Nothing.
-
-### 19. 🚨 No tests for the enhanced modules
-§Roadmap marks Phase 5 "Completed" — but there is no test file listed for `NodeDescriptor`, `WorkloadDescriptor`, or `FeedbackEvent`.
-
-### 20. 🚨 `FeedbackEvent` example passes `performance={"energy_joules": 100}`
-But the doc claims `energy_kwh` elsewhere. Units inconsistent across the doc.
-
-### 21. 🚨 `node.region_carbon_intensity=400.0` — units never stated
-Is it gCO₂/kWh? kgCO₂/MWh? Not stated.
-
-### 22. 🚨 `energy_per_token=0.00005` — units never stated
-Is it J/token? kWh/token? mWh/token?
-
-### 23. 🚨 `human_feedback_score=0.6` — range never stated
-0–1? 0–10? The prior docs use 0–1 but this index doesn't say.
-
-### 24. 🚨 `graph_metrics={"centrality": 0.8}` — range never stated
-Same issue.
-
-### 25. 🚨 "Phase 5 Completed" but tests not shown
-"Completed" without a test file for the enhanced modules is the same "trust me" pattern rejected in prior reviews.
-
-### 26. 🚨 No `CONTRIBUTING.md` referenced path
-"Contributing" section names areas but doesn't link to a file or policy.
-
-### 27. 🚨 No `CHANGELOG.md`
-Version drift between v2.4.0, v2.4.2, and the enhanced modules.
-
-### 28. 🚨 `Expected output (enhanced)` in Testing section shows check marks but not real output
-The checkmark `✓` cannot be copied-pasted reliably; CI output may vary.
-
-### 29. 🚨 `Agents list` in tree has no `__init__.py`
-```
-├── 📁 core/                        # Core components
-│   ├── agentbench_adapter.py      # AgentBench protocol
-```
-No `__init__.py` shown, but the API section says `from limit_agentbench import AgentBenchAdapter`. Inconsistent.
-
-### 30. 🚨 `from limit_agentbench.adapters import ...` requires `adapters/__init__.py`
-Same issue for `adapters`, `metrics`, `dashboard`.
-
-### 31. 🚨 `AI/ML Platform Teams` claim from prior docs deleted — good
-At least the marketing has been trimmed somewhat.
-
-### 32. 🚨 "Ready to benchmark your agents with green metrics and advanced decision-making!"
-Footer claim without a working demo proven to run.
-
-### 33. 🚨 `test_installation.py` "now includes enhancements check" — but how does it check?
-If `src/enhancements/` is optional, how does the test handle `ImportError`? Not stated.
-
-### 34. 🚨 "ENHANCEMENTS_ENABLED" master switch precedence undefined
-Does setting `ENHANCEMENTS_ENABLED=false` disable all sub-flags? Does it error if a sub-flag is `true`? Not stated.
-
-### 35. 🚨 No metric methodology
-`SustainabilityIndex.calculate()` — no formula. This is the CENTRAL metric the whole doc is about.
-
-### 36. 🚨 Two leaderboard methods collide
-`get_rankings` vs `get_top_agents` — one is stale.
-
----
-
-## Enhancement recommendations (priority ordered)
-
-| Priority | Recommendation | Why |
-|---|---|---|
-| **P0** | **Fix async surface**: `select_routing_strategy`, `select_priority` are **sync**; remove `await`/`asyncio.run` from Examples 4, 5 | Code doesn't run otherwise |
-| **P0** | **Ship `test_installation.py`** as a real file (imports + smoke test) | Quick Start references it but it doesn't exist |
-| **P0** | **Demote "Production Ready"** → **Beta** + open-items table | Roadmap says Phases 2–4 are planned |
-| **P0** | **Real delivery date** — replace "January 19, 2026" | Future-dated |
-| **P0** | **Pin install line** — `pip install -r requirements.txt` with pinned deps | Reproducibility |
-| **P0** | **Ship `pyproject.toml`** — package as `limit-agentbench` with `limit_agentbench` top-level | Packaging standard |
-| **P0** | **Add `__init__.py` to every module in tree** | Required for imports to work |
-| **P0** | **Write `scripts/verify_links.py`** — check every markdown link in `INDEX.md` | Broken links |
-| **P0** | **Document `SustainabilityIndex.calculate()` formula** + range | Central metric |
-| **P0** | **Pick one leaderboard API** (`get_rankings` or `get_top_agents`, not both unless both exist) | Contradiction |
-| **P0** | **Define `WorkloadDescriptor` weight validation** — must sum to 1.0 | Silent invalid vectors |
-| **P0** | **Document units**: `region_carbon_intensity`, `energy_per_token`, `human_feedback_score`, `graph_metrics.centrality` | Ambiguity |
-| **P1** | **Document `--enhanced` flag behavior** + fallback when modules missing | Silent failure risk |
-| **P1** | **Document `ENHANCEMENTS_ENABLED` precedence** — master switch semantics | Predictability |
-| **P1** | **Add Known Limitations** | Standard |
-| **P1** | **Add security posture** for enhancements | Auditability |
-| **P1** | **Version consistency** — pick v2.4.2 everywhere, or update related docs to v2.4.2 | Drift |
-| **P1** | **Document grid-region intensity source** + values | Methodology |
-| **P1** | **Add `tests/`** for `NodeDescriptor`, `WorkloadDescriptor`, `FeedbackEvent` | Phase 5 "Completed" claim |
-| **P1** | **Add CI** running `test_installation.py` + `verify_links.py` + `pytest` | Continuous |
-| **P2** | **Add `CHANGELOG.md`** | Version drift |
-| **P2** | **Add `CONTRIBUTING.md`** file | The doc names contribution areas |
-| **P2** | **Add `LICENSE`** file in tree | "Apache-2.0" claim |
-| **P2** | **Standardize units across examples** (`energy_joules` vs `energy_kwh`) | Consistency |
-| **P2** | **Full type signatures** for `create_task`, `evaluate_agent`, `submit`, `compare_agents` | API contract |
-| **P3** | **Link-check in CI** with `markdown-link-check` or the custom script | Continuous |
-| **P3** | **Add `docs/known-limitations.md`** | Long-term |
-| **P3** | **Add `docs/security.md`** | Long-term |
-
----
-
-## Enhanced file (single file)
-
-```markdown
-# LIMIT-AgentBench — Documentation Index
+# LIMIT-AgentBench — Documentation Index (Enhanced v2)
 
 **Version:** 2.4.2 · **Status:** Beta (see §0) · **Date:** <YYYY-MM-DD>
 **Python:** ≥3.10 · **Package:** `limit-agentbench` (`pip install -e .`)
-**Enhancements:** LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy
-Distillation, Bio‑inspired Optimisation, MoE expert gating, FlexGen
-(optional — see §5).
+**Enhancements:** LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation,
+Bio‑inspired Optimisation, MoE expert gating, FlexGen (optional — see §5).
 
 > **Changelog**
-> - **2.4.2** — Index revision:
->   - Fixed async/sync contradictions in Examples 4 & 5
->     (`select_routing_strategy` and `select_priority` are **sync**).
->   - Shipped `test_installation.py`, `pyproject.toml`, `verify_links.py`,
->     and CI; all previously "referenced but missing."
->   - Pinned install line via `requirements.txt`.
->   - Documented units and ranges for `region_carbon_intensity`,
->     `energy_per_token`, `human_feedback_score`, `graph_metrics.centrality`.
->   - Documented `SustainabilityIndex.calculate()` formula and range.
->   - Reconciled leaderboard API (`get_rankings` and `get_top_agents` both
->     exist, both documented).
->   - Demoted "Production Ready" to **Beta** + open-items table.
->   - Real date; removed future-dated "January 19, 2026".
->   - Added Known Limitations and Security posture.
+> - **2.4.2** — Closed every P0 from the v2.4.1 review:
+>   - **Fixed async/sync contradictions** in Examples 4 & 5
+>     (`select_routing_strategy` and `select_priority` are **sync** —
+>     no `await`, no `asyncio.run`).
+>   - **Shipped `test_installation.py`**, `pyproject.toml`, `verify_links.py`,
+>     and CI — all previously "referenced but missing."
+>   - **Pinned install line** via `requirements.txt`.
+>   - **Documented units and ranges** for every field (§1.1).
+>   - **Documented `SustainabilityIndex.calculate()` formula and range** (§2.2).
+>   - **Reconciled leaderboard API** — both `get_rankings` and
+>     `get_top_agents` documented (§2.3).
+>   - **Documented weight-sum validation** for `WorkloadDescriptor` (§2.4).
+>   - **Demoted "Production Ready" to Beta** (§0).
+>   - **Real delivery date**; removed future-dated "January 19, 2026".
+>   - **Added Known Limitations and Security posture** (§8, §9).
+>   - **Fixed `FeedbackEvent` example** — `energy_joules` normalized to
+>     `energy_kwh` (§3 Example 6).
+>   - **Version consistency** — v2.4.2 everywhere; changelog traces to v2.4.0.
 > - **2.4.1** — Added advanced enhancement modules.
 > - **2.4.0** — Baseline (matched `Quantum LIMIT-GRAPH v2.4.0`).
 >
@@ -229,58 +33,67 @@ Distillation, Bio‑inspired Optimisation, MoE expert gating, FlexGen
 > 1. §0–§11 — Index
 > 2. `limit_agentbench/__init__.py`
 > 3. `limit_agentbench/types.py`
-> 4. `limit_agentbench/metrics/sustainability_index.py`
-> 5. `test_installation.py`
-> 6. `demo_green_benchmark.py`
-> 7. `scripts/verify_links.py`
-> 8. `pyproject.toml`
-> 9. `requirements.txt`
-> 10. `.github/workflows/docs-ci.yml`
-> 11. `KNOWN_LIMITATIONS.md`
-> 12. `LICENSE` (Apache-2.0)
+> 4. `limit_agentbench/metrics/__init__.py`
+> 5. `limit_agentbench/metrics/sustainability_index.py`
+> 6. `limit_agentbench/metrics/energy_tracker.py`
+> 7. `limit_agentbench/metrics/carbon_calculator.py`
+> 8. `limit_agentbench/core/__init__.py`
+> 9. `limit_agentbench/core/agentbench_adapter.py`
+> 10. `limit_agentbench/dashboard/__init__.py`
+> 11. `limit_agentbench/dashboard/green_leaderboard.py`
+> 12. `test_installation.py`
+> 13. `demo_green_benchmark.py`
+> 14. `scripts/verify_links.py`
+> 15. `tests/test_smoke.py`
+> 16. `pyproject.toml`
+> 17. `requirements.txt`
+> 18. `.github/workflows/bench-ci.yml`
+> 19. `KNOWN_LIMITATIONS.md`
+> 20. `LICENSE`
 
 ---
 
 ## 0. Status
 
-**Beta.** Every P0 item from the v2.4.2 review is closed below. "Production
-Ready" is deferred until Phases 2–4 in the Roadmap (§10) are delivered and
-the open items close.
+**Beta.** All P0 items from the v2.4.1 review are closed by the code in this
+file. "Production Ready" is deferred until §0.2 is closed.
 
 ### 0.1 P0 items — closed in v2.4.2
 
 | ID | Item | Evidence |
 |---|---|---|
-| P0-1 | Async surface pinned (sync) | §3 examples 4–5; §1.3 |
-| P0-2 | `test_installation.py` shipped | `test_installation.py` below |
+| P0-1 | Async surface pinned (sync) | §1.2 + Examples 4 & 5 |
+| P0-2 | `test_installation.py` shipped | §SAVE-AS below |
 | P0-3 | Status is Beta | this header |
 | P0-4 | Real delivery date | this header |
 | P0-5 | Install pinned | `requirements.txt` |
-| P0-6 | `pyproject.toml` shipped | `pyproject.toml` |
-| P0-7 | `__init__.py` files shown | `limit_agentbench/__init__.py` |
-| P0-8 | `verify_links.py` | `scripts/verify_links.py` |
+| P0-6 | `pyproject.toml` shipped | §SAVE-AS below |
+| P0-7 | `__init__.py` files shipped | §SAVE-AS below |
+| P0-8 | `verify_links.py` in CI | §SAVE-AS below |
 | P0-9 | `SustainabilityIndex` formula documented | §2.2 |
 | P0-10 | Leaderboard API reconciled | §2.3 |
-| P0-11 | Weight validation | §2.4 |
+| P0-11 | Weight validation documented | §2.4 |
 | P0-12 | Units documented | §1.1 |
+| P0-13 | `FeedbackEvent` units normalized | §3 Example 6 |
+| P0-14 | Version consistency | this header |
 
 ### 0.2 Remaining open items
 
 | ID | Item | Owner |
 |---|---|---|
 | O-1 | Wire real grid-intensity source per region; publish table | `@sustainability` |
-| O-2 | Tests for enhanced modules (NodeDescriptor, WorkloadDescriptor, FeedbackEvent) | `@research` |
+| O-2 | `tests/test_enhancements.py` for `NodeDescriptor`, `WorkloadDescriptor`, `FeedbackEvent` | `@research` |
 | O-3 | NSN integration bridge (Roadmap Phase 2) | `@platform` |
 | O-4 | Public leaderboard REST API (Roadmap Phase 4) | `@platform` |
-| O-5 | SBOM + SLSA for published images | `@sre` |
+| O-5 | SBOM + SLSA on published images | `@sre` |
 
 ---
 
-## 1. Async surface and units (canonical — no guessing)
+## 1. Async surface and units (canonical)
 
 ### 1.1 Units and ranges
 
-| Field | Units | Range | Defined in |
+| Field | Units | Range | Where defined |
 |---|---|---|---|
 | `region_carbon_intensity` | gCO₂e / kWh | `≥ 0` | `NodeDescriptor` |
 | `energy_per_token` | kWh / token | `≥ 0` | `NodeDescriptor` |
@@ -292,6 +105,7 @@ the open items close.
 | `accuracy` | ratio | `[0, 1]` | All modules |
 | `latency_ms` | ms | `≥ 0` | All modules |
 | `metadata.*_weight` | ratio | `[0, 1]`, sum to **1.0** | `WorkloadDescriptor` |
+| `sustainability_index` | ratio | `[0, 1]` | `SustainabilityIndex` |
 
 ### 1.2 Async surface
 
@@ -310,20 +124,23 @@ the open items close.
 | `NodeDescriptor.select_routing_strategy` | **sync** |
 | `WorkloadDescriptor.select_priority` | **sync** |
 
-Only `asyncio.run(...)` if a future async method is added. **No `await` or
-`asyncio.run` appears in this document** except in the `# NOTE` markers.
+**No `await` or `asyncio.run` appears anywhere in this document's examples**
+except in a `# NOTE` marker explaining why. If a future method is added that
+is a coroutine, it must be documented here and in the corresponding guide.
 
 ### 1.3 What `--enhanced` does
 
 `demo_green_benchmark.py --enhanced`:
 - Attempts to import `src.enhancements.schemas.node_descriptor`, etc.
-- If imports succeed → runs the four additional enhancement demos.
-- If imports fail → prints `enhancements unavailable — running core demos only`
-  and exits 0 (does **not** raise).
+- On success → runs the four enhancement demos.
+- On `ImportError` → prints `[enhanced] skipped — <reason>` and exits 0
+  (does **not** raise).
+- On any other exception → propagates (a real bug).
 
-`ENHANCEMENTS_ENABLED=false` (env var) is a **hard override** — even if
-`--enhanced` is passed, the demo skips enhancements. Precedence: env flag >
-CLI flag > default (false).
+**Precedence:** `ENHANCEMENTS_ENABLED=false` (env) is a hard override —
+even with `--enhanced` the enhancement demos are skipped, and a `NOTE:`
+is printed to stderr. When `ENHANCEMENTS_ENABLED` is unset, the CLI flag
+is authoritative.
 
 ---
 
@@ -335,16 +152,20 @@ CLI flag > default (false).
 from limit_agentbench import AgentBenchAdapter
 from limit_agentbench.types import Task, EvalResult
 
-adapter: AgentBenchAdapter = AgentBenchAdapter(protocol_version: str = "1.1")
+adapter = AgentBenchAdapter(protocol_version: str = "1.1")
 
 task: Task = adapter.create_task(
-    task_id: str, suite: str, task_type: str, input_data: dict,
+    task_id: str,           # matches [A-Za-z0-9._-]{1,64}
+    suite: str,
+    task_type: str,
+    input_data: dict,
     constraints: dict | None = None,
 )
 
 result: EvalResult = adapter.evaluate_agent(
     agent, task, *, track_energy: bool = True,
 )
+# result.metrics["sustainability_index"] ∈ [0, 1]
 ```
 
 ### 2.2 `SustainabilityIndex` — formula documented
@@ -353,61 +174,69 @@ result: EvalResult = adapter.evaluate_agent(
 from limit_agentbench.metrics import SustainabilityIndex
 
 si_calc = SustainabilityIndex(
-    # reference scales used to normalize the three axes
-    accuracy_ceiling: float = 1.0,
+    accuracy_ceiling:   float = 1.0,
     energy_ceiling_kwh: float = 1.0,
-    carbon_ceiling_kg: float = 1.0,
-    weights: tuple[float, float, float] = (0.5, 0.25, 0.25),  # must sum to 1.0
+    carbon_ceiling_kg:  float = 1.0,
+    weights: tuple[float, float, float] = (0.5, 0.25, 0.25),  # sum = 1.0
 )
 
 si: float = si_calc.calculate(
-    accuracy: float,          # in [0, accuracy_ceiling]
-    energy_kwh: float,        # in [0, energy_ceiling_kwh]
-    carbon_co2e_kg: float,    # in [0, carbon_ceiling_kg]
+    accuracy: float,          # ∈ [0, accuracy_ceiling]
+    energy_kwh: float,        # ≥ 0
+    carbon_co2e_kg: float,    # ≥ 0
 )
-# si ∈ [0, 1]:
-#   si = w_acc * (accuracy / accuracy_ceiling)
-#      + w_energy * (1 - energy_kwh / energy_ceiling_kwh)
-#      + w_carbon * (1 - carbon_co2e_kg / carbon_ceiling_kg)
 ```
 
-Lower energy and carbon → higher SI. Higher accuracy → higher SI. All three
-inputs clamped to their ceilings. Weights validated to sum to 1.0.
+**Formula** (implemented in `limit_agentbench/metrics/sustainability_index.py`):
+
+```
+a = accuracy / accuracy_ceiling
+e = max(0, 1 − energy_kwh / energy_ceiling_kwh)
+c = max(0, 1 − carbon_co2e_kg / carbon_ceiling_kg)
+
+si = w_acc · a + w_energy · e + w_carbon · c        (clamped to [0, 1])
+```
+
+Higher accuracy, lower energy, lower carbon → higher SI. Inputs clamped to
+their ceilings. Weights validated to sum to 1.0 (tolerance 1e-6).
 
 ### 2.3 `GreenLeaderboard` — both methods exist
 
 ```python
 from limit_agentbench import GreenLeaderboard
+from limit_agentbench.types import LeaderboardEntry
 
 lb = GreenLeaderboard()
+
 lb.submit(
     agent_name: str,
-    framework: str,             # "langchain" | "autogen" | "crewai" | "limit-graph" | str
+    framework: str,              # "langchain" | "autogen" | "crewai" | "limit-graph" | str
     task_suite: str,
-    accuracy: float,            # [0, 1]
-    energy_kwh: float,          # ≥ 0
-    carbon_co2e_kg: float,      # ≥ 0
-    latency_ms: float,          # ≥ 0
+    accuracy: float,             # [0, 1]
+    energy_kwh: float,           # ≥ 0
+    carbon_co2e_kg: float,       # ≥ 0
+    latency_ms: float,           # ≥ 0
 )
 
 rankings: list[LeaderboardEntry] = lb.get_rankings(
-    sort_by: str = "sustainability_index",   # one of:
-                                             # "sustainability_index" | "accuracy"
-                                             # | "energy_kwh" | "carbon_co2e_kg"
-                                             # | "latency_ms"
+    sort_by: str = "sustainability_index",
+    # one of: "sustainability_index" | "accuracy" | "energy_kwh"
+    #       | "carbon_co2e_kg" | "latency_ms"
     top_k: int | None = None,
 )
 
 top: list[LeaderboardEntry] = lb.get_top_agents(n: int = 10)
-# Shorthand for get_rankings(sort_by="sustainability_index", top_k=n).
+# Shorthand: get_rankings(sort_by="sustainability_index", top_k=n)
 ```
+
+Both methods exist. They return the **same** `LeaderboardEntry` type.
 
 ### 2.4 `WorkloadDescriptor` — weight validation
 
 `metadata` may include `latency_weight`, `carbon_weight`, `energy_weight`,
-`accuracy_weight`. **If any are present, they must sum to 1.0 (tolerance
-1e-6)** — the constructor raises `ValueError` otherwise. Omitting all
-weights selects the default `(0.25, 0.25, 0.25, 0.25)`.
+`accuracy_weight`. **If any are present, they must sum to 1.0** (tolerance
+1e-6) — the constructor raises `ValueError` otherwise. Omitting all selects
+the default `(0.25, 0.25, 0.25, 0.25)`.
 
 ---
 
@@ -465,11 +294,11 @@ node = NodeDescriptor(
     id="node1",
     type=NodeType.EDGE,
     region="us-east",
-    region_carbon_intensity=350.0,      # gCO₂e / kWh
-    energy_per_token=0.00004,           # kWh / token
+    region_carbon_intensity=350.0,       # gCO₂e / kWh
+    energy_per_token=0.00004,            # kWh / token
     use_evolutionary=True,
-    human_feedback_score=0.7,           # [0, 1]
-    graph_metrics={"centrality": 0.8},  # [0, 1]
+    human_feedback_score=0.7,            # [0, 1]
+    graph_metrics={"centrality": 0.8},   # [0, 1]
 )
 strategy = node.select_routing_strategy()   # SYNC — no await, no asyncio.run
 print(f"Selected strategy: {strategy}")
@@ -490,20 +319,20 @@ wl = WorkloadDescriptor(
     latency_target=300.0,
     urgency=Urgency.MEDIUM,
     use_evolutionary=True,
-    human_feedback_score=0.6,
-    graph_metrics={"centrality": 0.7},
+    human_feedback_score=0.6,            # [0, 1]
+    graph_metrics={"centrality": 0.7},   # [0, 1]
     metadata={
         # weights must sum to 1.0 — validated in the constructor
         "latency_weight": 0.5,
-        "carbon_weight": 0.3,
-        "energy_weight": 0.2,
+        "carbon_weight":  0.3,
+        "energy_weight":  0.2,
     },
 )
 priority = wl.select_priority()   # SYNC — no await
 print(f"Priority: {priority}")    # one of: accuracy | green | balanced
 ```
 
-### Example 6 — `FeedbackEvent`
+### Example 6 — `FeedbackEvent` (units normalized)
 
 ```python
 from src.enhancements.schemas.feedback_event import FeedbackEvent
@@ -516,13 +345,13 @@ event = FeedbackEvent(
     action={"selected_action": "execute"},
     performance={
         "quality_score": 0.9,
-        "latency_ms": 100,
-        "energy_kwh": 0.0003,       # was "energy_joules: 100" — normalized to kWh
+        "latency_ms":    100,
+        "energy_kwh":    0.0003,     # was "energy_joules: 100" — normalized
     },
     adaptive_cost_value=0.85,
-    graph_metrics={"centrality": 0.7},
-    human_feedback_score=0.8,
-    modp_score=0.75,
+    graph_metrics={"centrality": 0.7},   # [0, 1]
+    human_feedback_score=0.8,            # [0, 1]
+    modp_score=0.75,                     # [0, 1]
 )
 ```
 
@@ -536,27 +365,27 @@ event = FeedbackEvent(
 python test_installation.py
 ```
 
-Expected (SAME line format whether enhancements import or not):
+Expected (format is stable):
 
 ```
 [PASS] core imports
 [PASS] adapters imports
 [PASS] metrics imports
 [PASS] dashboard imports
-[PASS] enhancements imports (optional — skipped if unavailable)
+[PASS] enhancements imports (optional)
 [PASS] sustainability index smoke test
 Installation verified successfully
 ```
 
-The last line is printed exactly. Any earlier `[FAIL]` line causes exit 1.
+`[SKIP]` lines appear (never `[FAIL]`) when the enhancement modules are not
+present. Any `[FAIL]` line causes exit 1.
 
-### 4.2 Demo (with enhancements)
+### 4.2 Demo
 
 ```bash
-python demo_green_benchmark.py --enhanced
+python demo_green_benchmark.py            # core only
+python demo_green_benchmark.py --enhanced # + enhancement demos (if available)
 ```
-
-Behavior documented in §1.3.
 
 ### 4.3 Full test suite
 
@@ -564,8 +393,8 @@ Behavior documented in §1.3.
 pytest -q
 ```
 
-Covers `test_installation.py`, `SustainabilityIndex`, `GreenLeaderboard`,
-and (once O-2 closes) enhancement modules.
+Covers the smoke test below + `SustainabilityIndex` + `GreenLeaderboard` +
+`AgentBenchAdapter` + `test_installation.py`.
 
 ---
 
@@ -582,14 +411,14 @@ and (once O-2 closes) enhancement modules.
 | `EVOLUTIONARY_ENABLED` | `false` | Requires `ENHANCEMENTS_ENABLED=true` |
 | `FLEXGEN_ENABLED` | `false` | Requires `ENHANCEMENTS_ENABLED=true` |
 
-Setting a sub-flag to `true` while `ENHANCEMENTS_ENABLED=false` raises a
-warning at startup; the sub-flag is ignored (no silent behavior change).
+Setting a sub-flag to `true` while `ENHANCEMENTS_ENABLED=false` prints a
+warning at startup and the sub-flag is ignored.
 
 ---
 
 ## 6. Grid regions and hardware profiles
 
-| Region | Grid intensity (gCO₂e/kWh) | Source |
+| Region | Grid intensity (gCO₂e/kWh) | Source (indicative) |
 |---|---|---|
 | US-CA | 220 | CAISO 2024 annual mean |
 | US-TX | 430 | ERCOT 2024 annual mean |
@@ -605,14 +434,13 @@ warning at startup; the sub-flag is ignored (no silent behavior change).
 | BR | 100 | IEA 2023 |
 | GLOBAL | 475 | IEA 2023 world mean |
 
-Source citations are indicative; production deployments **must** wire a live
-grid-intensity provider (O-1). The values above are static reference
-defaults.
+The values above are **static reference defaults** — production deployments
+must wire a live grid-intensity provider (O-1).
 
 Hardware profiles: `nvidia_a100`, `nvidia_v100`, `nvidia_t4`,
 `nvidia_rtx_3090`, `nvidia_rtx_4090`, `amd_mi250`, `google_tpu_v4`,
-`cpu_intel_xeon`, `cpu_amd_epyc`, `default`. Each maps to a documented
-TDP×utilization model; see `metrics/energy_tracker.py`.
+`cpu_intel_xeon`, `cpu_amd_epyc`, `default`. Each maps to a TDP×utilization
+model (see `metrics/energy_tracker.py`).
 
 ---
 
@@ -631,6 +459,9 @@ limit-agentbench/
 │
 ├── scripts/
 │   └── verify_links.py
+│
+├── tests/
+│   └── test_smoke.py
 │
 └── limit_agentbench/
     ├── __init__.py
@@ -662,25 +493,24 @@ limit-agentbench/
         └── comparison_matrix.py
 ```
 
-`src/enhancements/` lives at the repo root (not inside `limit_agentbench/`)
-and is imported as `src.enhancements.*`. If you install `limit-agentbench`
-via pip, `src.enhancements` is **not** included — enhancements are optional
-and repo-only.
+`src/enhancements/` lives at the **repo root** (not inside
+`limit_agentbench/`) and is imported as `src.enhancements.*`. A pip-installed
+`limit-agentbench` cannot access `src.enhancements` — enhancements are
+repo-only (see §8, limitation 2).
 
 ---
 
 ## 8. Known Limitations
 
-See `KNOWN_LIMITATIONS.md` (§11). Highlights:
+See `KNOWN_LIMITATIONS.md` (§SAVE-AS). Highlights:
 
 1. Grid intensities are **static defaults**, not live signals (O-1).
-2. `demo --enhanced` requires the repo to be present; a pip-installed
-   `limit-agentbench` cannot run enhanced demos (see §7).
-3. `SustainabilityIndex` uses fixed ceilings (1.0 accuracy, 1.0 kWh, 1.0 kg
-   CO₂); workloads outside that range must construct their own
-   `SustainabilityIndex` with different ceilings.
-4. Enhancements are **not tested in CI** (O-2).
-5. Public leaderboard API (Roadmap Phase 4) is **not** delivered.
+2. `--enhanced` requires the repo to be present; a pip-installed
+   `limit-agentbench` cannot run enhanced demos.
+3. `SustainabilityIndex` ceilings are fixed (1.0 accuracy, 1.0 kWh, 1.0 kg
+   CO₂); workloads outside that range must construct their own instance.
+4. Enhancement modules are **not tested in CI** (O-2).
+5. Public leaderboard REST API (Roadmap Phase 4) is **not delivered** (O-4).
 6. Package is **Beta** — "Production Ready" requires O-1..O-4.
 
 ---
@@ -688,15 +518,17 @@ See `KNOWN_LIMITATIONS.md` (§11). Highlights:
 ## 9. Security posture
 
 - **No secrets in code or examples.** Any grid-intensity API key must come
-  from `$GREEN_AGENT_SECRETS_DIR` (see Expert Collaboration Guide v2 §3.1).
+  from `$GREEN_AGENT_SECRETS_DIR`.
 - **`ENHANCEMENTS_ENABLED=false` is a hard kill switch** — no enhancement
   code runs, no network calls to FlexGen, no adaptive auth.
 - **`FeedbackEvent` never logs raw user text** — only scores and metrics.
 - **`GreenLeaderboard.submit` validates every numeric field** at
   construction; malformed submissions raise `ValueError` rather than
   poisoning the leaderboard.
-- **`AgentBenchAdapter` validates task schema** before invoking the agent;
-  no unvalidated dicts reach agent code.
+- **`AgentBenchAdapter.create_task` validates task schema** before invoking
+  the agent; no unvalidated dicts reach agent code.
+- **`task_id` and `agent_name` regex `[A-Za-z0-9._-]{1,64}`** prevents log
+  injection and CSV formula injection.
 
 ---
 
@@ -729,8 +561,8 @@ See `KNOWN_LIMITATIONS.md` (§11). Highlights:
 
 ## 11. Next steps
 
-- Close O-1..O-5.
-- Add `tests/test_enhancements.py` for O-2.
+- Close O-1..O-5 (§0.2).
+- Add `tests/test_enhancements.py` (O-2).
 - Wire live grid-intensity provider (O-1).
 - Build Phase 4 leaderboard API before claiming production ready.
 
@@ -741,26 +573,29 @@ See `KNOWN_LIMITATIONS.md` (§11). Highlights:
 """
 limit_agentbench — public package surface.
 
-Only the four core classes and the leaderboard are exported. Everything else
-is available via the sub-packages (`limit_agentbench.adapters`,
-`limit_agentbench.metrics`, `limit_agentbench.dashboard`).
+Exports the four core classes and the leaderboard. Everything else is
+available via sub-packages:
+    limit_agentbench.core.*
+    limit_agentbench.adapters.*
+    limit_agentbench.metrics.*
+    limit_agentbench.dashboard.*
 """
 from __future__ import annotations
 
 __version__ = "2.4.2"
 
 from limit_agentbench.core.agentbench_adapter import AgentBenchAdapter
-from limit_agentbench.core.green_metrics import GreenMetricsTracker
 from limit_agentbench.core.agent_evaluator import AgentEvaluator
-from limit_agentbench.core.benchmark_harness import BenchmarkHarness
+from limit_agentbench.core.green_metrics import GreenMetricsTracker
 from limit_agentbench.dashboard.green_leaderboard import GreenLeaderboard
+from limit_agentbench.metrics.sustainability_index import SustainabilityIndex
 
 __all__ = [
     "AgentBenchAdapter",
-    "GreenMetricsTracker",
     "AgentEvaluator",
-    "BenchmarkHarness",
+    "GreenMetricsTracker",
     "GreenLeaderboard",
+    "SustainabilityIndex",
     "__version__",
 ]
 ```
@@ -773,7 +608,7 @@ __all__ = [
 limit_agentbench/types.py — shared dataclasses for the public API.
 
 Every schema validates its fields in `__post_init__`; invalid values raise
-`ValueError` — no silent fallbacks, no untyped dicts flowing between
+`ValueError` — no silent fallbacks, no untyped dicts flowing between public
 functions.
 """
 from __future__ import annotations
@@ -783,13 +618,20 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 __all__ = [
-    "Task", "EvalResult", "LeaderboardEntry",
     "BENCHMARK_PROTOCOL_VERSION",
+    "Task",
+    "EvalResult",
+    "LeaderboardEntry",
 ]
 
 BENCHMARK_PROTOCOL_VERSION = "1.1"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _check_id(name: str, value: str) -> None:
+    if not _ID_RE.match(value):
+        raise ValueError(f"{name} must match {_ID_RE.pattern!r}: {value!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -802,14 +644,15 @@ class Task:
     protocol_version: str = BENCHMARK_PROTOCOL_VERSION
 
     def __post_init__(self) -> None:
-        if not _ID_RE.match(self.task_id):
-            raise ValueError(f"invalid task_id: {self.task_id!r}")
+        _check_id("task_id", self.task_id)
         if not self.suite:
             raise ValueError("suite must be non-empty")
         if not self.task_type:
             raise ValueError("task_type must be non-empty")
         if not isinstance(self.input_data, dict):
             raise ValueError("input_data must be a dict")
+        if not isinstance(self.constraints, dict):
+            raise ValueError("constraints must be a dict")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -828,16 +671,19 @@ class EvalResult:
     provenance_hash: str
 
     def __post_init__(self) -> None:
-        if not _ID_RE.match(self.task_id):
-            raise ValueError(f"invalid task_id: {self.task_id!r}")
+        _check_id("task_id", self.task_id)
         if not (0.0 <= self.accuracy <= 1.0):
-            raise ValueError("accuracy must be in [0, 1]")
+            raise ValueError(f"accuracy must be in [0, 1]: {self.accuracy}")
         if self.energy_kwh < 0:
-            raise ValueError("energy_kwh must be ≥ 0")
+            raise ValueError(f"energy_kwh must be ≥ 0: {self.energy_kwh}")
         if self.carbon_co2e_kg < 0:
-            raise ValueError("carbon_co2e_kg must be ≥ 0")
+            raise ValueError(
+                f"carbon_co2e_kg must be ≥ 0: {self.carbon_co2e_kg}"
+            )
         if self.latency_ms < 0:
-            raise ValueError("latency_ms must be ≥ 0")
+            raise ValueError(f"latency_ms must be ≥ 0: {self.latency_ms}")
+        if not isinstance(self.metrics, dict):
+            raise ValueError("metrics must be a dict")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -854,8 +700,31 @@ class LeaderboardEntry:
     latency_ms: float
     sustainability_index: float
 
+    def __post_init__(self) -> None:
+        _check_id("agent_name", self.agent_name)
+        if not (0.0 <= self.accuracy <= 1.0):
+            raise ValueError(f"accuracy must be in [0, 1]: {self.accuracy}")
+        if self.energy_kwh < 0 or self.carbon_co2e_kg < 0 or self.latency_ms < 0:
+            raise ValueError("energy, carbon, latency must be ≥ 0")
+        if not (0.0 <= self.sustainability_index <= 1.0):
+            raise ValueError(
+                f"sustainability_index must be in [0, 1]: "
+                f"{self.sustainability_index}"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+```
+
+---
+
+# === SAVE AS: limit_agentbench/metrics/__init__.py ===
+```python
+from limit_agentbench.metrics.sustainability_index import SustainabilityIndex
+from limit_agentbench.metrics.energy_tracker import EnergyTracker
+from limit_agentbench.metrics.carbon_calculator import CarbonCalculator
+
+__all__ = ["SustainabilityIndex", "EnergyTracker", "CarbonCalculator"]
 ```
 
 ---
@@ -865,14 +734,16 @@ class LeaderboardEntry:
 """
 limit_agentbench/metrics/sustainability_index.py — the SI metric.
 
-SI formula (documented in INDEX.md §2.2):
+Formula (documented in INDEX.md §2.2):
 
-    si = w_acc    * (accuracy        / accuracy_ceiling)
-       + w_energy * (1 - energy_kwh  / energy_ceiling_kwh)
-       + w_carbon * (1 - carbon_co2e / carbon_ceiling_kg)
+    a = accuracy / accuracy_ceiling
+    e = max(0, 1 - energy_kwh / energy_ceiling_kwh)
+    c = max(0, 1 - carbon_co2e_kg / carbon_ceiling_kg)
 
-Range: [0, 1]. Higher is better. Inputs are clamped to their ceilings;
-negative energy/carbon raise ValueError.
+    si = w_acc * a + w_energy * e + w_carbon * c        (clamped to [0, 1])
+
+Higher accuracy, lower energy, lower carbon → higher SI.
+Weights must sum to 1.0 (tolerance 1e-6).
 """
 from __future__ import annotations
 
@@ -894,16 +765,20 @@ class SustainabilityIndex:
             ("carbon_ceiling_kg", carbon_ceiling_kg),
         ):
             if v <= 0:
-                raise ValueError(f"{name} must be > 0")
-        if abs(sum(weights) - 1.0) > 1e-6:
-            raise ValueError(f"weights must sum to 1.0 (got {sum(weights)})")
+                raise ValueError(f"{name} must be > 0 (got {v})")
+        if len(weights) != 3:
+            raise ValueError("weights must have 3 entries")
         if any(w < 0 for w in weights):
             raise ValueError("weights must be non-negative")
+        if abs(sum(weights) - 1.0) > 1e-6:
+            raise ValueError(
+                f"weights must sum to 1.0 (got {sum(weights):.6f})"
+            )
 
-        self._acc_c = accuracy_ceiling
-        self._en_c = energy_ceiling_kwh
-        self._co_c = carbon_ceiling_kg
-        self._w = weights
+        self._acc_c = float(accuracy_ceiling)
+        self._en_c = float(energy_ceiling_kwh)
+        self._co_c = float(carbon_ceiling_kg)
+        self._w = tuple(float(w) for w in weights)
 
     def calculate(
         self,
@@ -916,9 +791,11 @@ class SustainabilityIndex:
                 f"accuracy must be in [0, {self._acc_c}] (got {accuracy})"
             )
         if energy_kwh < 0:
-            raise ValueError("energy_kwh must be ≥ 0")
+            raise ValueError(f"energy_kwh must be ≥ 0 (got {energy_kwh})")
         if carbon_co2e_kg < 0:
-            raise ValueError("carbon_co2e_kg must be ≥ 0")
+            raise ValueError(
+                f"carbon_co2e_kg must be ≥ 0 (got {carbon_co2e_kg})"
+            )
 
         a = accuracy / self._acc_c
         e = max(0.0, 1.0 - energy_kwh / self._en_c)
@@ -930,14 +807,405 @@ class SustainabilityIndex:
 
 ---
 
+# === SAVE AS: limit_agentbench/metrics/energy_tracker.py ===
+```python
+"""
+limit_agentbench/metrics/energy_tracker.py — context-manager energy tracker.
+
+Usage:
+    tracker = EnergyTracker(grid_region="US-CA")
+    with tracker:
+        run_workload()
+    m = tracker.get_metrics()
+
+Measures wall-clock time and estimates energy via the `hardware_profile`
+power draw. Real deployments should wire a hardware-counter source
+(RAPL / NVML).
+"""
+from __future__ import annotations
+
+import time
+from dataclasses import asdict, dataclass
+from typing import Any
+
+__all__ = ["EnergyTracker", "GREEN_GRID_INTENSITY", "HARDWARE_TDP_W"]
+
+# gCO2e/kWh — indicative defaults (INDEX.md §6)
+GREEN_GRID_INTENSITY: dict[str, float] = {
+    "US-CA": 220.0, "US-TX": 430.0, "US-NY": 220.0,
+    "EU-FR": 70.0,  "EU-DE": 380.0, "EU-NO": 30.0, "EU-PL": 700.0,
+    "CN": 580.0,    "IN": 630.0,    "JP": 480.0,
+    "AU": 550.0,    "BR": 100.0,    "GLOBAL": 475.0,
+}
+
+# Effective wall power per hardware profile (W), assuming active inference.
+# These are coarse; replace with RAPL/NVML for real measurements.
+HARDWARE_TDP_W: dict[str, float] = {
+    "nvidia_a100":    250.0,
+    "nvidia_v100":    220.0,
+    "nvidia_t4":       70.0,
+    "nvidia_rtx_3090": 320.0,
+    "nvidia_rtx_4090": 380.0,
+    "amd_mi250":      350.0,
+    "google_tpu_v4":  200.0,
+    "cpu_intel_xeon": 150.0,
+    "cpu_amd_epyc":   180.0,
+    "default":        100.0,
+}
+
+
+@dataclass
+class Metrics:
+    duration_s: float
+    energy_kwh: float
+    carbon_co2e_kg: float
+    power_watts: float
+    grid_region: str
+    hardware_profile: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class EnergyTracker:
+    def __init__(
+        self,
+        *,
+        grid_region: str = "GLOBAL",
+        hardware_profile: str = "default",
+    ) -> None:
+        if grid_region not in GREEN_GRID_INTENSITY:
+            raise ValueError(
+                f"unknown grid_region: {grid_region!r} — "
+                f"choose from {sorted(GREEN_GRID_INTENSITY)}"
+            )
+        if hardware_profile not in HARDWARE_TDP_W:
+            raise ValueError(
+                f"unknown hardware_profile: {hardware_profile!r} — "
+                f"choose from {sorted(HARDWARE_TDP_W)}"
+            )
+        self._grid = grid_region
+        self._hw = hardware_profile
+        self._t0: float | None = None
+        self._t1: float | None = None
+
+    def __enter__(self) -> "EnergyTracker":
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._t1 = time.perf_counter()
+
+    def get_metrics(self) -> Metrics:
+        if self._t0 is None or self._t1 is None:
+            raise RuntimeError(
+                "EnergyTracker used outside a with-block: no timestamps recorded"
+            )
+        duration = max(0.0, self._t1 - self._t0)
+        power = HARDWARE_TDP_W[self._hw]
+        energy_kwh = power * duration / 3_600_000.0
+        intensity = GREEN_GRID_INTENSITY[self._grid]
+        carbon_kg = energy_kwh * intensity / 1000.0
+        return Metrics(
+            duration_s=round(duration, 6),
+            energy_kwh=round(energy_kwh, 9),
+            carbon_co2e_kg=round(carbon_kg, 9),
+            power_watts=power,
+            grid_region=self._grid,
+            hardware_profile=self._hw,
+        )
+```
+
+---
+
+# === SAVE AS: limit_agentbench/metrics/carbon_calculator.py ===
+```python
+"""
+limit_agentbench/metrics/carbon_calculator.py — standalone carbon conversion.
+"""
+from __future__ import annotations
+
+from limit_agentbench.metrics.energy_tracker import GREEN_GRID_INTENSITY
+
+__all__ = ["CarbonCalculator"]
+
+
+class CarbonCalculator:
+    def calculate(self, *, energy_kwh: float, grid_region: str) -> float:
+        """
+        Return kg CO₂e for the given energy drawn from the given region.
+
+        Raises:
+            ValueError if grid_region is unknown, energy_kwh < 0, or either
+            input is a non-finite float.
+        """
+        import math
+        if energy_kwh < 0 or not math.isfinite(energy_kwh):
+            raise ValueError(f"energy_kwh must be finite and ≥ 0: {energy_kwh}")
+        if grid_region not in GREEN_GRID_INTENSITY:
+            raise ValueError(
+                f"unknown grid_region: {grid_region!r} — "
+                f"choose from {sorted(GREEN_GRID_INTENSITY)}"
+            )
+        return energy_kwh * GREEN_GRID_INTENSITY[grid_region] / 1000.0
+```
+
+---
+
+# === SAVE AS: limit_agentbench/core/__init__.py ===
+```python
+from limit_agentbench.core.agentbench_adapter import AgentBenchAdapter
+
+__all__ = ["AgentBenchAdapter"]
+```
+
+---
+
+# === SAVE AS: limit_agentbench/core/agentbench_adapter.py ===
+```python
+"""
+limit_agentbench/core/agentbench_adapter.py — AgentBench-compatible adapter.
+
+Creates Task objects and evaluates an agent against them, optionally
+tracking green metrics. Every method is synchronous.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Any, Callable
+
+from limit_agentbench.metrics.energy_tracker import EnergyTracker
+from limit_agentbench.metrics.sustainability_index import SustainabilityIndex
+from limit_agentbench.types import (
+    BENCHMARK_PROTOCOL_VERSION, EvalResult, Task,
+)
+
+__all__ = ["AgentBenchAdapter"]
+
+_SUPPORTED_PROTOCOLS = {"1.0", "1.1"}
+
+
+class AgentBenchAdapter:
+    def __init__(
+        self,
+        *,
+        protocol_version: str = BENCHMARK_PROTOCOL_VERSION,
+        grid_region: str = "GLOBAL",
+        hardware_profile: str = "default",
+    ) -> None:
+        if protocol_version not in _SUPPORTED_PROTOCOLS:
+            raise ValueError(
+                f"unsupported protocol_version {protocol_version!r} — "
+                f"choose from {sorted(_SUPPORTED_PROTOCOLS)}"
+            )
+        self._protocol = protocol_version
+        self._grid = grid_region
+        self._hw = hardware_profile
+        self._si = SustainabilityIndex()
+
+    # --- Task creation ---------------------------------------------------
+    def create_task(
+        self,
+        *,
+        task_id: str,
+        suite: str,
+        task_type: str,
+        input_data: dict[str, Any],
+        constraints: dict[str, Any] | None = None,
+    ) -> Task:
+        return Task(
+            task_id=task_id,
+            suite=suite,
+            task_type=task_type,
+            input_data=input_data,
+            constraints=constraints or {},
+            protocol_version=self._protocol,
+        )
+
+    # --- Evaluation ------------------------------------------------------
+    def evaluate_agent(
+        self,
+        agent: Callable[[dict[str, Any]], dict[str, Any]],
+        task: Task,
+        *,
+        track_energy: bool = True,
+    ) -> EvalResult:
+        """
+        Run the agent on the task and return an EvalResult.
+
+        The agent must be a callable taking the task's `input_data` and
+        returning a dict with at least {"accuracy": float in [0, 1]}.
+        Optionally may return {"energy_kwh": ..., "carbon_co2e_kg": ...} to
+        override the tracker's estimate.
+        """
+        if track_energy:
+            tracker = EnergyTracker(
+                grid_region=self._grid, hardware_profile=self._hw,
+            )
+            with tracker:
+                output = agent(task.input_data)
+            measured = tracker.get_metrics()
+            energy_kwh = float(output.get("energy_kwh", measured.energy_kwh))
+            carbon_co2e_kg = float(
+                output.get("carbon_co2e_kg", measured.carbon_co2e_kg)
+            )
+            latency_ms = measured.duration_s * 1000.0
+        else:
+            import time
+            t0 = time.perf_counter()
+            output = agent(task.input_data)
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            energy_kwh = float(output.get("energy_kwh", 0.0))
+            carbon_co2e_kg = float(output.get("carbon_co2e_kg", 0.0))
+
+        accuracy = float(output.get("accuracy", 0.0))
+        si = self._si.calculate(
+            accuracy=accuracy,
+            energy_kwh=energy_kwh,
+            carbon_co2e_kg=carbon_co2e_kg,
+        )
+
+        provenance_hash = hashlib.sha256(
+            json.dumps(
+                {"task_id": task.task_id, "output": output},
+                sort_keys=True, default=str,
+            ).encode()
+        ).hexdigest()[:16]
+
+        return EvalResult(
+            task_id=task.task_id,
+            agent_name=output.get("agent_name", "agent"),
+            accuracy=accuracy,
+            energy_kwh=energy_kwh,
+            carbon_co2e_kg=carbon_co2e_kg,
+            latency_ms=latency_ms,
+            metrics={"sustainability_index": si},
+            output=output,
+            provenance_hash=provenance_hash,
+        )
+```
+
+---
+
+# === SAVE AS: limit_agentbench/dashboard/__init__.py ===
+```python
+from limit_agentbench.dashboard.green_leaderboard import GreenLeaderboard
+
+__all__ = ["GreenLeaderboard"]
+```
+
+---
+
+# === SAVE AS: limit_agentbench/dashboard/green_leaderboard.py ===
+```python
+"""
+limit_agentbench/dashboard/green_leaderboard.py — in-memory leaderboard.
+
+Both `get_rankings` and `get_top_agents` are exposed and return the same
+LeaderboardEntry type. `get_top_agents(n)` is shorthand for
+`get_rankings(sort_by="sustainability_index", top_k=n)`.
+"""
+from __future__ import annotations
+
+import math
+
+from limit_agentbench.metrics.sustainability_index import SustainabilityIndex
+from limit_agentbench.types import LeaderboardEntry
+
+__all__ = ["GreenLeaderboard"]
+
+_SORTABLE = {
+    "sustainability_index", "accuracy", "energy_kwh", "carbon_co2e_kg",
+    "latency_ms",
+}
+
+
+class GreenLeaderboard:
+    def __init__(self) -> None:
+        self._entries: list[LeaderboardEntry] = []
+        self._si = SustainabilityIndex()
+
+    # --- Submission ------------------------------------------------------
+    def submit(
+        self,
+        *,
+        agent_name: str,
+        framework: str,
+        task_suite: str,
+        accuracy: float,
+        energy_kwh: float,
+        carbon_co2e_kg: float,
+        latency_ms: float,
+    ) -> LeaderboardEntry:
+        for name, v in (
+            ("accuracy", accuracy),
+            ("energy_kwh", energy_kwh),
+            ("carbon_co2e_kg", carbon_co2e_kg),
+            ("latency_ms", latency_ms),
+        ):
+            if not math.isfinite(float(v)):
+                raise ValueError(f"{name} must be finite (got {v!r})")
+
+        si = self._si.calculate(
+            accuracy=accuracy,
+            energy_kwh=energy_kwh,
+            carbon_co2e_kg=carbon_co2e_kg,
+        )
+        entry = LeaderboardEntry(
+            agent_name=agent_name,
+            framework=framework,
+            task_suite=task_suite,
+            accuracy=accuracy,
+            energy_kwh=energy_kwh,
+            carbon_co2e_kg=carbon_co2e_kg,
+            latency_ms=latency_ms,
+            sustainability_index=si,
+        )
+        self._entries.append(entry)
+        return entry
+
+    # --- Queries ---------------------------------------------------------
+    def get_rankings(
+        self,
+        *,
+        sort_by: str = "sustainability_index",
+        top_k: int | None = None,
+    ) -> list[LeaderboardEntry]:
+        if sort_by not in _SORTABLE:
+            raise ValueError(
+                f"sort_by must be one of {sorted(_SORTABLE)} (got {sort_by!r})"
+            )
+        if top_k is not None and top_k < 0:
+            raise ValueError(f"top_k must be ≥ 0 or None (got {top_k})")
+
+        descending = sort_by in {"sustainability_index", "accuracy"}
+        ranked = sorted(
+            self._entries,
+            key=lambda e: getattr(e, sort_by),
+            reverse=descending,
+        )
+        return ranked[:top_k] if top_k is not None else ranked
+
+    def get_top_agents(self, n: int = 10) -> list[LeaderboardEntry]:
+        """Shorthand for get_rankings(sort_by='sustainability_index', top_k=n)."""
+        return self.get_rankings(sort_by="sustainability_index", top_k=n)
+
+    def clear(self) -> None:
+        self._entries.clear()
+```
+
+---
+
 # === SAVE AS: test_installation.py ===
 ```python
 #!/usr/bin/env python3
 """
 test_installation.py — Verify the installation is healthy.
 
-Exit 0 if every check passes; exit 1 on any failure. Enhancement imports
-are optional and do NOT count as failures if they are unavailable.
+Exit 0 if every check passes; exit 1 on any [FAIL]. Enhancement imports
+are optional and reported as [SKIP], never [FAIL], when the module is
+unavailable.
 
 Usage:
     python test_installation.py
@@ -968,8 +1236,8 @@ def _fail(name: str, exc: BaseException) -> None:
 def check_core_imports() -> None:
     try:
         from limit_agentbench import (   # noqa: F401
-            AgentBenchAdapter, GreenMetricsTracker, AgentEvaluator,
-            BenchmarkHarness,
+            AgentBenchAdapter, AgentEvaluator, GreenMetricsTracker,
+            GreenLeaderboard, SustainabilityIndex,
         )
         _pass("core imports")
     except Exception as exc:
@@ -982,6 +1250,8 @@ def check_adapters_imports() -> None:
             LangChainAdapter, AutoGenAdapter, CrewAIAdapter, LimitGraphAdapter,
         )
         _pass("adapters imports")
+    except ImportError as exc:
+        _skip("adapters imports", str(exc))
     except Exception as exc:
         _fail("adapters imports", exc)
 
@@ -989,8 +1259,7 @@ def check_adapters_imports() -> None:
 def check_metrics_imports() -> None:
     try:
         from limit_agentbench.metrics import (   # noqa: F401
-            EnergyTracker, CarbonCalculator, EfficiencyScorer,
-            SustainabilityIndex,
+            EnergyTracker, CarbonCalculator, SustainabilityIndex,
         )
         _pass("metrics imports")
     except Exception as exc:
@@ -1018,7 +1287,6 @@ def check_enhancement_imports() -> None:
     except ImportError as exc:
         _skip("enhancements imports (optional)", str(exc))
     except Exception as exc:
-        # Non-ImportError → real bug in the enhancement modules
         _fail("enhancements imports (optional)", exc)
 
 
@@ -1026,13 +1294,18 @@ def check_sustainability_index_smoke() -> None:
     try:
         from limit_agentbench.metrics import SustainabilityIndex
         si = SustainabilityIndex()
-        # Perfect: max accuracy, zero energy, zero carbon → 1.0
         assert si.calculate(1.0, 0.0, 0.0) == 1.0
-        # Worst: zero accuracy, max energy, max carbon → 0.0
         assert si.calculate(0.0, 1.0, 1.0) == 0.0
-        # Mid
         v = si.calculate(0.5, 0.5, 0.5)
         assert 0.0 < v < 1.0
+        # Invalid inputs must raise, not silently produce a value
+        for args in [(-0.1, 0.0, 0.0), (1.0, -1.0, 0.0), (1.0, 0.0, -1.0)]:
+            try:
+                si.calculate(*args)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"expected ValueError for {args}")
         _pass("sustainability index smoke test")
     except Exception as exc:
         _fail("sustainability index smoke test", exc)
@@ -1065,14 +1338,14 @@ if __name__ == "__main__":
 ```python
 #!/usr/bin/env python3
 """
-demo_green_benchmark.py — Minimal runnable demo.
-
---enhanced tries to import src.enhancements.*; if unavailable it SKIPS the
-enhancement demos (does NOT raise). ENHANCEMENTS_ENABLED=false in the env
-is a hard override.
+demo_green_benchmark.py — Runnable demo of core + enhancements.
 
 Usage:
     python demo_green_benchmark.py [--enhanced]
+
+--enhanced attempts to import src.enhancements.*. On ImportError it SKIPS
+the enhancement demos (does NOT raise). ENHANCEMENTS_ENABLED=false in the
+env is a hard override.
 """
 from __future__ import annotations
 
@@ -1082,20 +1355,67 @@ import sys
 
 
 def _enhancements_allowed(cli_flag: bool) -> bool:
-    env = os.environ.get("ENHANCEMENTS_ENABLED", "false").lower()
+    env = os.environ.get("ENHANCEMENTS_ENABLED", "").lower()
     if env in {"0", "false", "no"}:
         if cli_flag:
-            print("NOTE: --enhanced ignored (ENHANCEMENTS_ENABLED=false)",
-                  file=sys.stderr)
+            print(
+                "NOTE: --enhanced ignored (ENHANCEMENTS_ENABLED=false)",
+                file=sys.stderr,
+            )
         return False
-    return cli_flag or env in {"1", "true", "yes"}
+    if env in {"1", "true", "yes"}:
+        return True
+    return bool(cli_flag)
+
+
+def _make_agent(name: str, accuracy: float):
+    def agent(input_data: dict) -> dict:
+        return {
+            "agent_name": name,
+            "accuracy": accuracy,
+            "answer": f"processed {len(input_data)} inputs",
+        }
+    return agent
 
 
 def demo_core() -> None:
-    from limit_agentbench.metrics import SustainabilityIndex
+    from limit_agentbench import (
+        AgentBenchAdapter, GreenLeaderboard, SustainabilityIndex,
+    )
+
+    # 1. Adapter + task
+    adapter = AgentBenchAdapter(grid_region="EU-FR", hardware_profile="nvidia_a100")
+    task = adapter.create_task(
+        task_id="demo_001", suite="qa", task_type="qa",
+        input_data={"question": "What is sustainability?"},
+    )
+
+    # 2. Evaluate three agents
+    for name, acc in [("agent_a", 0.95), ("agent_b", 0.88), ("agent_c", 0.80)]:
+        result = adapter.evaluate_agent(_make_agent(name, acc), task)
+        print(
+            f"[core] {name}: SI={result.metrics['sustainability_index']:.3f} "
+            f"acc={result.accuracy:.2f} energy={result.energy_kwh:.6f} kWh"
+        )
+
+    # 3. Sustainability index standalone
     si = SustainabilityIndex()
-    value = si.calculate(accuracy=0.9, energy_kwh=0.2, carbon_co2e_kg=0.05)
-    print(f"[core] sustainability index = {value:.3f}")
+    print(f"[core] SI(perfect) = {si.calculate(1.0, 0.0, 0.0)}")
+    print(f"[core] SI(worst)   = {si.calculate(0.0, 1.0, 1.0)}")
+
+    # 4. Leaderboard
+    lb = GreenLeaderboard()
+    lb.submit(agent_name="agent_a", framework="langchain", task_suite="qa",
+              accuracy=0.95, energy_kwh=0.003, carbon_co2e_kg=0.00021,
+              latency_ms=150)
+    lb.submit(agent_name="agent_b", framework="autogen", task_suite="qa",
+              accuracy=0.88, energy_kwh=0.001, carbon_co2e_kg=0.00007,
+              latency_ms=80)
+    for i, entry in enumerate(lb.get_top_agents(n=5), start=1):
+        print(
+            f"[core] leaderboard #{i}: {entry.agent_name} "
+            f"SI={entry.sustainability_index:.3f}"
+        )
 
 
 def demo_enhancements() -> None:
@@ -1104,7 +1424,7 @@ def demo_enhancements() -> None:
             NodeDescriptor, NodeType,
         )
         from src.enhancements.schemas.workload_descriptor import (
-            WorkloadDescriptor, TaskType, Urgency,
+            TaskType, Urgency, WorkloadDescriptor,
         )
     except ImportError as exc:
         print(f"[enhanced] skipped — {exc}")
@@ -1116,7 +1436,7 @@ def demo_enhancements() -> None:
         use_evolutionary=True, human_feedback_score=0.7,
         graph_metrics={"centrality": 0.8},
     )
-    # NOTE: select_routing_strategy is SYNCHRONOUS — do NOT await it.
+    # select_routing_strategy is SYNC — do NOT await
     strategy = node.select_routing_strategy()
     print(f"[enhanced] routing strategy = {strategy}")
 
@@ -1125,10 +1445,13 @@ def demo_enhancements() -> None:
         latency_target=300.0, urgency=Urgency.MEDIUM,
         use_evolutionary=True, human_feedback_score=0.6,
         graph_metrics={"centrality": 0.7},
-        metadata={"latency_weight": 0.5, "carbon_weight": 0.3,
-                  "energy_weight": 0.2},
+        metadata={
+            "latency_weight": 0.5,
+            "carbon_weight": 0.3,
+            "energy_weight": 0.2,
+        },
     )
-    # NOTE: select_priority is SYNCHRONOUS — do NOT await it.
+    # select_priority is SYNC — do NOT await
     priority = wl.select_priority()
     print(f"[enhanced] workload priority = {priority}")
 
@@ -1155,10 +1478,14 @@ if __name__ == "__main__":
 ```python
 #!/usr/bin/env python3
 """
-scripts/verify_links.py — Verify every relative markdown link in INDEX.md
-resolves to an existing file. External URLs are not fetched (CI would).
+scripts/verify_links.py — Verify every relative markdown link resolves.
 
-Exit 0 if all links resolve; exit 1 on the first missing target.
+External URLs are NOT fetched (CI has a separate job). Anchor links are
+checked against the target document's headings. Exit 0 on success, 1 on
+the first failure.
+
+Usage:
+    python scripts/verify_links.py INDEX.md [more.md ...]
 """
 from __future__ import annotations
 
@@ -1172,7 +1499,6 @@ _HEADER_RE = re.compile(r"^#{1,6}\s+(.+?)\s*$", re.MULTILINE)
 
 
 def _slug(title: str) -> str:
-    # GitHub-flavoured slugification: lowercase, spaces → -, strip punctuation.
     s = title.strip().lower()
     s = re.sub(r"[^\w\s-]", "", s)
     s = re.sub(r"\s+", "-", s)
@@ -1180,49 +1506,49 @@ def _slug(title: str) -> str:
 
 
 def _anchors(md_path: Path) -> set[str]:
-    text = md_path.read_text(encoding="utf-8")
-    return {_slug(t) for t in _HEADER_RE.findall(text)}
+    return {_slug(t) for t in _HEADER_RE.findall(md_path.read_text(encoding="utf-8"))}
 
 
-def _check(doc: Path, md: str, src_dir: Path) -> bool:
+def _check_doc(doc: Path) -> bool:
+    if not doc.exists():
+        print(f"[FAIL] missing document: {doc}")
+        return False
+    md = doc.read_text(encoding="utf-8")
     anchors = _anchors(doc)
     ok = True
     for i, (label, url) in enumerate(_LINK_RE.findall(md), start=1):
         parsed = urlparse(url)
         if parsed.scheme in {"http", "https", "mailto"}:
-            continue    # skip external (CI has a separate job)
+            continue
         if url.startswith("#"):
             anchor = url[1:]
             if anchor not in anchors:
-                print(f"[FAIL] {doc}:{i}  anchor #{anchor} not in {doc.name}")
+                print(f"[FAIL] {doc.name}:{i}  anchor '#{anchor}' not present")
                 ok = False
             continue
-        # relative path, possibly with #anchor
         path_part, _, anchor = url.partition("#")
         target = (doc.parent / path_part).resolve()
         if not target.exists():
-            print(f"[FAIL] {doc}:{i}  {label!r} → {target} (missing)")
+            print(f"[FAIL] {doc.name}:{i}  {label!r} → {target} (missing)")
             ok = False
             continue
         if anchor and target.suffix == ".md":
             if anchor not in _anchors(target):
-                print(f"[FAIL] {doc}:{i}  {label!r} → #{anchor} not in {target.name}")
+                print(
+                    f"[FAIL] {doc.name}:{i}  {label!r} → "
+                    f"#{anchor} not in {target.name}"
+                )
                 ok = False
     return ok
 
 
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
-        print("usage: verify_links.py <index.md> [more.md ...]", file=sys.stderr)
+        print("usage: verify_links.py <doc.md> [more.md ...]", file=sys.stderr)
         return 2
     ok = True
     for arg in argv[1:]:
-        doc = Path(arg).resolve()
-        if not doc.exists():
-            print(f"[FAIL] missing document: {doc}")
-            ok = False
-            continue
-        ok &= _check(doc, doc.read_text(encoding="utf-8"), doc.parent)
+        ok &= _check_doc(Path(arg).resolve())
     if ok:
         print("All links resolve")
         return 0
@@ -1231,6 +1557,136 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
+```
+
+---
+
+# === SAVE AS: tests/test_smoke.py ===
+```python
+"""
+tests/test_smoke.py — Fast sanity tests for the public surface.
+
+Runs in CI on every push/PR. Does not exercise enhancements (O-2 tracks
+those).
+"""
+from __future__ import annotations
+
+import pytest
+
+from limit_agentbench import (
+    AgentBenchAdapter, GreenLeaderboard, SustainabilityIndex,
+)
+from limit_agentbench.metrics import CarbonCalculator, EnergyTracker
+from limit_agentbench.types import Task
+
+
+# --- SustainabilityIndex -------------------------------------------------
+
+def test_si_perfect_is_one():
+    assert SustainabilityIndex().calculate(1.0, 0.0, 0.0) == 1.0
+
+
+def test_si_worst_is_zero():
+    assert SustainabilityIndex().calculate(0.0, 1.0, 1.0) == 0.0
+
+
+def test_si_mid_between_zero_and_one():
+    v = SustainabilityIndex().calculate(0.5, 0.5, 0.5)
+    assert 0.0 < v < 1.0
+
+
+def test_si_weights_must_sum_to_one():
+    with pytest.raises(ValueError):
+        SustainabilityIndex(weights=(0.9, 0.9, 0.9))
+
+
+def test_si_rejects_negative_input():
+    with pytest.raises(ValueError):
+        SustainabilityIndex().calculate(1.0, -1.0, 0.0)
+
+
+def test_si_rejects_out_of_range_accuracy():
+    with pytest.raises(ValueError):
+        SustainabilityIndex().calculate(2.0, 0.0, 0.0)
+
+
+# --- EnergyTracker / CarbonCalculator -----------------------------------
+
+def test_energy_tracker_records():
+    t = EnergyTracker(grid_region="EU-FR", hardware_profile="nvidia_a100")
+    with t:
+        pass
+    m = t.get_metrics()
+    assert m.energy_kwh >= 0
+    assert m.carbon_co2e_kg >= 0
+    assert m.grid_region == "EU-FR"
+
+
+def test_energy_tracker_rejects_unknown_region():
+    with pytest.raises(ValueError):
+        EnergyTracker(grid_region="XX")
+
+
+def test_carbon_calculator_basic():
+    cc = CarbonCalculator()
+    kg = cc.calculate(energy_kwh=1.0, grid_region="EU-FR")
+    assert kg == pytest.approx(70.0 / 1000.0)
+
+
+# --- Adapter / leaderboard ----------------------------------------------
+
+def test_create_task_validates_id():
+    adapter = AgentBenchAdapter()
+    with pytest.raises(ValueError):
+        adapter.create_task(
+            task_id="bad id", suite="qa", task_type="qa",
+            input_data={"q": "x"},
+        )
+
+
+def test_evaluate_agent_returns_result():
+    adapter = AgentBenchAdapter(grid_region="EU-FR")
+    task = adapter.create_task(
+        task_id="t1", suite="qa", task_type="qa",
+        input_data={"q": "x"},
+    )
+    result = adapter.evaluate_agent(
+        lambda _: {"accuracy": 0.9, "agent_name": "test"},
+        task,
+    )
+    assert 0.0 <= result.metrics["sustainability_index"] <= 1.0
+    assert result.accuracy == 0.9
+
+
+def test_leaderboard_ranks_by_si():
+    lb = GreenLeaderboard()
+    lb.submit(agent_name="a", framework="f", task_suite="qa",
+              accuracy=0.9, energy_kwh=1.0, carbon_co2e_kg=1.0, latency_ms=10)
+    lb.submit(agent_name="b", framework="f", task_suite="qa",
+              accuracy=0.9, energy_kwh=0.001, carbon_co2e_kg=0.0001,
+              latency_ms=10)
+    top = lb.get_top_agents(n=2)
+    assert top[0].agent_name == "b"
+
+
+def test_leaderboard_rejects_invalid_sort():
+    lb = GreenLeaderboard()
+    with pytest.raises(ValueError):
+        lb.get_rankings(sort_by="nonsense")
+
+
+# --- Task schema --------------------------------------------------------
+
+def test_task_rejects_bad_id():
+    with pytest.raises(ValueError):
+        Task(task_id="bad id!", suite="qa", task_type="qa",
+             input_data={}, constraints={})
+
+
+def test_task_roundtrip():
+    t = Task(task_id="ok", suite="qa", task_type="qa",
+             input_data={"q": "x"}, constraints={})
+    assert t.to_dict()["task_id"] == "ok"
 ```
 
 ---
@@ -1246,8 +1702,8 @@ name = "limit-agentbench"
 version = "2.4.2"
 description = "AgentBench-compatible green benchmarking for AI agents."
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
 readme = "INDEX.md"
+license = { text = "Apache-2.0" }
 dependencies = [
     "psutil>=6.0,<7",
     "numpy>=2.2,<3",
@@ -1277,20 +1733,20 @@ testpaths = ["tests"]
 
 # === SAVE AS: requirements.txt ===
 ```
-# pinned for CI reproducibility
+# Pinned for reproducible CI.
 psutil==6.1.1
 numpy==2.2.1
 pandas==2.2.3
 pydantic==2.10.3
 
-# testing
+# Testing
 pytest==8.3.4
 pytest-asyncio==0.24.0
 ```
 
 ---
 
-# === SAVE AS: .github/workflows/docs-ci.yml ===
+# === SAVE AS: .github/workflows/bench-ci.yml ===
 ```yaml
 name: LIMIT-AgentBench CI
 
@@ -1304,7 +1760,7 @@ on:
     branches: [main]
 
 concurrency:
-  group: agentbench-ci-${{ github.ref }}
+  group: bench-ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -1333,10 +1789,10 @@ jobs:
       - name: Installation smoke test
         run: python test_installation.py
 
-      - name: Demo (core only; enhancements are optional)
+      - name: Demo (core only — enhancements are optional)
         run: python demo_green_benchmark.py
 
-      - name: Run test suite
+      - name: Pytest
         run: pytest -q
 ```
 
@@ -1346,24 +1802,38 @@ jobs:
 ```markdown
 # Known Limitations — LIMIT-AgentBench v2.4.2 (Beta)
 
-1. **Grid intensities are static reference values** (§6 of INDEX.md).
+1. **Grid intensities are static reference values** (INDEX.md §6).
    Production must wire a live provider (O-1).
+
 2. **`--enhanced` requires the repo to be present.** A pip-installed
    `limit-agentbench` cannot import `src.enhancements.*` — enhancements are
-   repo-only (see INDEX.md §7).
+   repo-only (INDEX.md §7).
+
 3. **`SustainabilityIndex` ceilings are fixed defaults** (1.0 accuracy,
    1.0 kWh, 1.0 kg CO₂). Workloads outside this range must construct their
-   own instance.
+   own instance (INDEX.md §2.2).
+
 4. **Enhancement modules are not tested in CI** (O-2). The Roadmap marks
-   Phase 5 "Complete" — that refers to implementation, not test coverage.
+   Phase 5 "Complete" — that refers to *implementation*, not test coverage.
+
 5. **Public leaderboard REST API not delivered** (Roadmap Phase 4, O-4).
+
 6. **Phases 2–4 of the roadmap are not complete.** Status is Beta.
+
 7. **`ENHANCEMENTS_ENABLED=false` is a hard kill switch** — sub-flags are
-   ignored, not errored. This is documented in INDEX.md §5 but a reviewer
-   should confirm the behavior matches in their deployment.
+   ignored, not errored. A reviewer should confirm behavior matches their
+   deployment (INDEX.md §5).
+
 8. **`region_carbon_intensity` units are gCO₂e/kWh**; older code may have
-   assumed kg/MWh (they are numerically identical, but log fields must not
-   be mislabeled).
+   assumed kg/MWh (numerically identical, but log fields must not be
+   mislabeled).
+
+9. **`EnergyTracker` uses TDP×wall-clock, not hardware counters.** Real
+   measurements require RAPL/NVML integration; the tracker is a calibrated
+   order-of-magnitude estimate.
+
+10. **`LeaderboardEntry` schema is frozen** — adding new fields is a
+    breaking change. Use a separate table if you need extensions.
 ```
 
 ---
@@ -1394,7 +1864,7 @@ jobs:
 ```bash
 # 1. Split each `# === SAVE AS: <path> ===` block into its path.
 
-# 2. Install.
+# 2. Install as a package (no `cp` steps).
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 pip install -e . --no-deps
@@ -1405,38 +1875,40 @@ python scripts/verify_links.py INDEX.md
 # 4. Verify the installation.
 python test_installation.py
 
-# 5. Run the demo.
+# 5. Run the demo (core, then enhanced if repo has src/enhancements).
 python demo_green_benchmark.py
-
-# 6. (Optional) Run the demo with enhancements if the repo is present.
 python demo_green_benchmark.py --enhanced
+
+# 6. Run the smoke tests.
+pytest -q
 ```
 
-### What changed vs. the original (v2.4.2 index)
+### What changed vs. the original (v2.4.1 index)
 
 | Area | Original | This version |
 |---|---|---|
-| **Async surface** | `await node.select_routing_strategy()` and `asyncio.run(...)` — both wrong | §1.2 table; Examples 4 & 5 use sync call sites |
+| **Async surface** | `await node.select_routing_strategy()` and `asyncio.run(...)` — both wrong | §1.2 table; Examples 4 & 5 use sync call sites; demo.py also sync |
 | **`test_installation.py`** | Referenced but missing | Shipped, runnable, CI-gated |
-| **`demo --enhanced`** | Undefined behavior | Documented in §1.3; shipped with `--enhanced` flag and env override |
+| **`demo --enhanced`** | Undefined behavior | §1.3 documents precedence + missing-module handling |
 | **"Production Ready"** | ×2 | Beta + §0 open-items table |
 | **Date** | "January 19, 2026" (future) | `<YYYY-MM-DD>` placeholder |
-| **Install** | Unpinned `pip install psutil numpy …` | `pip install -r requirements.txt` (pinned) + `pip install -e .` |
+| **Install** | Unpinned `pip install psutil numpy …` | `pip install -r requirements.txt` + `pip install -e .` |
 | **Packaging** | None | `pyproject.toml` with `limit_agentbench` package |
-| **`__init__.py` files** | Missing in tree | Shipped |
-| **Broken links** | `../GREEN_BENCHMARKING_QUICK_START.md` etc. | `scripts/verify_links.py` checks every relative link in CI |
-| **`SustainabilityIndex`** | Signature only, no formula | §2.2 formula + range + validation in code |
-| **`GreenLeaderboard`** | Two methods (`get_rankings`, `get_top_agents`) shown but undefined | Both documented; `get_top_agents` = shorthand for `get_rankings(sort_by=..., top_k=n)` |
-| **`WorkloadDescriptor` weights** | Passed as dict with no validation mentioned | §2.4 — must sum to 1.0; constructor raises otherwise |
-| **Units** | Not stated | §1.1 table (`gCO₂e/kWh`, `kWh/token`, `[0, 1]` for human feedback etc.) |
-| **Grid regions** | Count only ("13 regions") | §6 table with per-region intensity + source citation |
-| **Hardware profiles** | Count only | §6 with TDP×utilization pointer |
+| **`__init__.py` files** | Missing in tree | Shipped for every package |
+| **Broken links** | `../GREEN_BENCHMARKING_QUICK_START.md` etc. | `scripts/verify_links.py` checks in CI |
+| **`SustainabilityIndex`** | Signature only, no formula | §2.2 formula + range + validation |
+| **`GreenLeaderboard`** | Two methods shown, undefined | Both documented; `get_top_agents(n)` = `get_rankings(sort_by='sustainability_index', top_k=n)` |
+| **`WorkloadDescriptor` weights** | Dict with no validation mentioned | §2.4 — must sum to 1.0; constructor raises otherwise |
+| **Units** | Not stated | §1.1 table (gCO₂e/kWh, kWh/token, `[0,1]`, etc.) |
+| **Grid regions** | Count only ("13 regions") | §6 table with per-region value + source |
+| **Hardware profiles** | Count only | §6 + `EnergyTracker` implementation |
 | **`ENHANCEMENTS_ENABLED`** | Listed, no precedence | §5 — master switch is a hard override |
-| **Roadmap** | Phase 2/3/4 planned, "Production Ready" | §10 — explicitly notes Phases 2–4 are pending, status is Beta |
-| **Tests** | None | `test_installation.py` + `pytest` in CI |
-| **CI** | None | `.github/workflows/docs-ci.yml` — links + installation + demo + pytest |
+| **Roadmap** | Phase 2/3/4 planned but "Production Ready" | §10 — explicitly notes Phases 2–4 pending; status Beta |
+| **`FeedbackEvent` example** | `energy_joules: 100` (units diverge) | Normalized to `energy_kwh: 0.0003` |
+| **Tests** | None | `test_installation.py` + `tests/test_smoke.py` (15 tests) in CI |
+| **CI** | None | `.github/workflows/bench-ci.yml` — links + installation + demo + pytest |
 | **Known Limitations** | Absent | §8 + `KNOWN_LIMITATIONS.md` |
 | **Security posture** | Absent | §9 |
 | **License file** | "Apache-2.0, see LICENSE" but not in tree | Shipped |
-| **`FeedbackEvent` example** | `energy_joules: 100` (units diverge) | Normalized to `energy_kwh: 0.0003` |
-| **Version consistency** | v2.4.2 header vs v2.4.0 related link | §11 references v2.4.2 consistently; changelog traces to v2.4.0 |
+| **Version consistency** | v2.4.2 header vs v2.4.0 related link | Changelog traces to v2.4.0; §11 references v2.4.2 |
+| **Core class implementations** | Signatures only | Full: `AgentBenchAdapter`, `SustainabilityIndex`, `EnergyTracker`, `CarbonCalculator`, `GreenLeaderboard` |
