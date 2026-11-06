@@ -1,4 +1,4 @@
-```markdown
+
 # LIMIT-AgentBench
 
 **Version:** 2.4.2 · **Status:** Beta · **Python:** ≥3.10 · **License:** Apache-2.0
@@ -575,4 +575,4 @@ Before opening a PR:
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE) for the full text.
-```
+
