@@ -1,4 +1,3 @@
-
 # AgentBeats Integration — Delivery Report (Enhanced v2)
 
 **Document version:** 2.0.0
