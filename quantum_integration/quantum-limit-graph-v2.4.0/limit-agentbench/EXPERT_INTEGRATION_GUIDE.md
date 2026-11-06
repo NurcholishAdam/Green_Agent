@@ -2313,4 +2313,3 @@ curl -sf -H "Authorization: Bearer $(cat secrets/api_bearer_tokens | head -1)" \
 | Known limitations | Absent | §8 (8 items) |
 | CI | Not shown | `.github/workflows/expert-collab-ci.yml` |
 | Changelog | Absent | Top of document |
-```
