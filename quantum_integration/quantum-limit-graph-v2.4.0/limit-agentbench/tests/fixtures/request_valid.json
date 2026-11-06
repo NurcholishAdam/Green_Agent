@@ -1,0 +1,7 @@
+{
+  "task_id": "task_001",
+  "task_type": "research",
+  "input_data": {"query": "What are the benefits of quantum computing?"},
+  "constraints": {"max_tokens": 500, "timeout_seconds": 30},
+  "version": "1.1"
+}
