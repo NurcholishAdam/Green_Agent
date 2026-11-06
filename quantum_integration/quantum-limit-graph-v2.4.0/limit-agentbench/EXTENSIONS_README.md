@@ -1,4 +1,3 @@
-```markdown
 # Green_Agent Extensions — Complete Guide (Enhanced v2)
 
 **Version:** 2.0.0 · **Status:** Beta (see §0) · **Date:** <YYYY-MM-DD>
@@ -1745,4 +1744,3 @@ python scripts/bench_extensions.py
 | **CI** | None | `.github/workflows/extensions-ci.yml` with coverage gate |
 | **Dependencies** | Unpinned | `requirements.txt` pinned |
 | **Path** | `quantum_integration/...` | Repo-relative references |
-```
