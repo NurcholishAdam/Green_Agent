@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentbeats.example.com/schemas/a2a_response.v1_1.json",
+  "title": "A2A Response v1.1",
+  "type": "object",
+  "required": ["task_id", "status", "output", "execution_time_seconds",
+               "timestamp", "version"],
+  "properties": {
+    "task_id": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": ["success","partial","timeout","invalid_output",
+               "oom","crash","failure"]
+    },
+    "output": { "type": ["object","null"] },
+    "execution_time_seconds": { "type": "number", "minimum": 0 },
+    "green_metrics": {
+      "type": "object",
+      "properties": {
+        "energy_kwh":           { "type": ["number","null"], "minimum": 0 },
+        "carbon_kg":            { "type": ["number","null"], "minimum": 0 },
+        "sustainability_index": { "type": ["number","null"], "minimum": 0, "maximum": 1 },
+        "efficiency_score":     { "type": ["number","null"], "minimum": 0, "maximum": 1 },
+        "modp_score":           { "type": ["number","null"], "minimum": 0, "maximum": 1 },
+        "graph_centrality":     { "type": ["number","null"], "minimum": 0, "maximum": 1 },
+        "rlhf_feedback":        { "type": ["number","null"], "minimum": 0, "maximum": 1 },
+        "measurement_source":   { "type": "string",
+                                  "enum": ["rapl","nvml","tdp_estimate","unknown"] },
+        "comparative_baseline": {
+          "type": "object",
+          "required": ["cohort_id", "percentile", "vs_average_pct"],
+          "properties": {
+            "cohort_id":      { "type": "string" },
+            "percentile":     { "type": "integer", "minimum": 0, "maximum": 100 },
+            "vs_average_pct": { "type": "number" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "reasoning_trace": { "type": "array" },
+    "metadata": {
+      "type": "object",
+      "description": "Opaque metadata (RLHF feedback, enhanced-decision stats, etc.)",
+      "additionalProperties": true
+    },
+    "container_metadata": {
+      "type": "object",
+      "required": ["image", "exit_code"],
+      "properties": {
+        "image":          { "type": "string",
+                            "pattern": ".+@sha256:[0-9a-f]{64}$",
+                            "description": "Image MUST be pinned by digest" },
+        "exit_code":      { "type": "integer" },
+        "execution_time": { "type": "number", "minimum": 0 },
+        "resource_limits": {
+          "type": "object",
+          "properties": {
+            "cpu":    { "type": "string" },
+            "memory": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "version":   { "type": "string", "enum": ["1.0", "1.1"] }
+  },
+  "additionalProperties": false
+}
