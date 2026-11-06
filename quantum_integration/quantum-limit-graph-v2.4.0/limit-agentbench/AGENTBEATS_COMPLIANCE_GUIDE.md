@@ -1374,4 +1374,3 @@ See `CONTRIBUTING.md`. All PRs must:
 ## 📄 License
 
 See `LICENSE`.
-```
