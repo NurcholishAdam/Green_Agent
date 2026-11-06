@@ -1,4 +1,4 @@
-```markdown
+
 # AgentBeats Compliance Guide (Enhanced v2)
 
 **Document version:** 2.0.0 · **A2A protocol:** 1.1 (accepts 1.0) · **Python:** ≥3.10
