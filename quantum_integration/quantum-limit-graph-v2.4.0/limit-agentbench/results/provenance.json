@@ -1,0 +1,9 @@
+{
+  "source_commit": "<FILL: git rev-parse HEAD>",
+  "release_tag": "v2.0.0-agentbeats",
+  "image": "ghcr.io/<org>/limit-graph-agent",
+  "image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "sbom_file": "results/sbom.cdx.json",
+  "slsa_provenance_file": "results/provenance.slsa.json",
+  "requirements_lock_sha256": "<FILL>"
+}
