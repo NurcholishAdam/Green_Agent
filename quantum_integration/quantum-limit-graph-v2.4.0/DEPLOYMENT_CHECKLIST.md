@@ -1,9 +1,9 @@
-```markdown
+
 # Green Agent Advanced Modules — Delivery Manifest
 
 **Package Version:** 2.5.0-alpha
 **Status:** Alpha
-**Release Date:** <YYYY-MM-DD>
+**Release Date:** <2026-11-9>
 **Python:** ≥3.10
 **License:** MIT
 **Delivery scope:** 3 of 8 modules (see §2)
@@ -540,6 +540,6 @@ quickly confirm the specific issues that were fixed.
 ---
 
 **Manifest Version:** 2.0
-**Last Updated:** <YYYY-MM-DD>
-**Next Review:** <YYYY-MM-DD + 1 week>
+**Last Updated:** <2026-11-9>
+**Next Review:** <2026-12-11 + 1 week>
 ```
