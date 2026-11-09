@@ -1,4 +1,4 @@
-```markdown
+
 # Green Agent Advanced Modules
 
 **Version:** 2.5.0-alpha · **Status:** Alpha · **Python:** ≥3.10 · **License:** MIT
@@ -585,4 +585,3 @@ External references:
 - [Prophet documentation](https://facebook.github.io/prophet/)
 - [WattTime API](https://www.watttime.org/api-documentation/)
 - [ElectricityMap API](https://static.electricitymap.org/api/docs/index.html)
-```
