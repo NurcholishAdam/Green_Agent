@@ -1,59 +1,184 @@
-FROM python:3.11-slim
+# syntax=docker/dockerfile:1.7
+
+# =============================================================================
+# Green Agent — Dockerfile (enhanced)
+#
+# Multi-stage build, non-root, healthcheck, ARG-driven enhancement toggles,
+# startup env validation, and full parity with lean-ctx enhanced-mode contract.
+#
+# Build variants:
+#   docker build -t green-agent:full .
+#   docker build --build-arg ENHANCEMENTS_ENABLED=false \
+#                --build-arg MODP_ENABLED=false \
+#                -t green-agent:lean .
+#
+# Recommended run flags:
+#   docker run --rm -p 8000:8000 \
+#     --read-only --tmpfs /tmp \
+#     -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+#     green-agent:full
+#
+# For full reproducibility, pin the base image by digest:
+#   FROM python:3.11-slim-bookworm@sha256:<digest>
+# =============================================================================
+
+# ------------------------------- Build stage --------------------------------
+FROM python:3.11-slim-bookworm AS builder
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip && \
+    pip install --prefix=/install -r requirements.txt && \
+    pip check
+
+# ------------------------------ Runtime stage -------------------------------
+FROM python:3.11-slim-bookworm AS runtime
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# tini = PID 1 with signal forwarding + zombie reaping
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 10001 -m appuser
 
 WORKDIR /app
 
-# System deps
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
-
-# Python deps (includes enhancements dependencies if added to requirements.txt)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Python deps from builder
+COPY --from=builder /install /usr/local
 
 # Source code (includes src/enhancements/ subfolder)
-COPY quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src ./src
-COPY run_agent.py .
-COPY docker_metrics_collector.py .
-COPY agentbeats.json .
+COPY --chown=appuser:appuser quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src ./src
+COPY --chown=appuser:appuser run_agent.py docker_metrics_collector.py agentbeats.json ./
 
-# Optionally copy any additional config files required by enhancements
-# COPY symbolic_policy.yaml .
-# COPY green_policy.yaml .
+# Optional enhancement config files (uncomment when required):
+# COPY --chown=appuser:appuser symbolic_policy.yaml green_policy.yaml ./
 
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
+# ----------------------------- Base environment -----------------------------
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app \
+    LANG=C.UTF-8 \
+    TZ=UTC \
+    LOG_LEVEL=INFO \
+    LOG_FORMAT=json \
+    LEAN_CTX_VERSION=0.1.0 \
+    AGENT_PORT=8000 \
+    AGENT_HEALTH_PATH=/health
 
-# ---------------------------------------------------------------
-# Advanced Enhancements Environment Variables
-# These toggles enable/disable the modules from src/enhancements/
-# Set to "true" to activate; they are defaulted to false for
-# minimal footprint unless overridden at runtime.
-# ---------------------------------------------------------------
-ENV ENHANCEMENTS_ENABLED=true
-ENV LIMIT_GRAPH_ENABLED=true
-ENV LIMIT_GRAPH_CENTRALITY=0.7
-ENV LIMIT_GRAPH_CONNECTIVITY=0.6
-ENV MODP_ENABLED=true
-ENV MODP_WEIGHTS=[0.4,0.3,0.2,0.1]
-ENV RLHF_ENABLED=true
-ENV HUMAN_FEEDBACK_SCORE=0.6
-ENV DISTILLATION_ENABLED=true
-ENV MOE_GATING_ENABLED=true
-ENV EVOLUTIONARY_ENABLED=true
-ENV POPULATION_SIZE=20
-ENV MUTATION_RATE=0.1
-ENV FLEXGEN_ENABLED=false
-ENV FLEXGEN_MODEL_NAME=facebook/opt-6.7b
-ENV FLEXGEN_DEFAULT_PRECISION=fp16
-ENV FLEXGEN_DELEGATION_POLICY=adaptive
+# ------------------------ Build-time toggles (ARG) --------------------------
+# CI can produce lean vs. full variants without editing this file.
+ARG ENHANCEMENTS_ENABLED=true
+ARG LIMIT_GRAPH_ENABLED=true
+ARG MODP_ENABLED=true
+ARG RLHF_ENABLED=true
+ARG DISTILLATION_ENABLED=true
+ARG MOE_ENABLED=true
+ARG EVOLUTIONARY_ENABLED=true
+ARG ZERO_TRUST_ENABLED=false
+ARG DIFFERENTIAL_PRIVACY_ENABLED=false
+ARG TRAINING_ENABLED=false
+ARG FLEXGEN_ENABLED=false
 
-# Volume for cgroup metrics (unchanged)
+# -------------------- Advanced Enhancements (runtime ENV) -------------------
+# NOTE: MODP_WEIGHTS is CSV, not JSON — Docker ENV does not parse JSON.
+# The entrypoint below validates the format and sum() ≈ 1.0 before starting.
+ENV ENHANCEMENTS_ENABLED=${ENHANCEMENTS_ENABLED} \
+    LIMIT_GRAPH_ENABLED=${LIMIT_GRAPH_ENABLED} \
+    LIMIT_GRAPH_CENTRALITY=0.7 \
+    LIMIT_GRAPH_CONNECTIVITY=0.6 \
+    MODP_ENABLED=${MODP_ENABLED} \
+    MODP_WEIGHTS="0.4,0.3,0.2,0.1" \
+    RLHF_ENABLED=${RLHF_ENABLED} \
+    HUMAN_FEEDBACK_SCORE=0.6 \
+    DISTILLATION_ENABLED=${DISTILLATION_ENABLED} \
+    MOE_ENABLED=${MOE_ENABLED} \
+    MOE_GATING_ENABLED=${MOE_ENABLED} \
+    EVOLUTIONARY_ENABLED=${EVOLUTIONARY_ENABLED} \
+    POPULATION_SIZE=20 \
+    MUTATION_RATE=0.1 \
+    ZERO_TRUST_ENABLED=${ZERO_TRUST_ENABLED} \
+    DIFFERENTIAL_PRIVACY_ENABLED=${DIFFERENTIAL_PRIVACY_ENABLED} \
+    TRAINING_ENABLED=${TRAINING_ENABLED} \
+    CHECKPOINT_DIR=/app/checkpoints \
+    FLEXGEN_ENABLED=${FLEXGEN_ENABLED} \
+    FLEXGEN_MODEL_NAME=facebook/opt-6.7b \
+    FLEXGEN_DEFAULT_PRECISION=fp16 \
+    FLEXGEN_DELEGATION_POLICY=adaptive
+
+# ----------------------- Entrypoint with validation -------------------------
+RUN cat > /usr/local/bin/docker-entrypoint.sh <<'ENTRYPOINT_EOF'
+#!/bin/bash
+set -euo pipefail
+
+# Validate MODP_WEIGHTS: must parse as a list of floats summing to ~1.0
+if [[ -n "${MODP_WEIGHTS:-}" ]]; then
+    if ! python - <<'PY'
+import os, sys
+raw = os.environ["MODP_WEIGHTS"]
+try:
+    parts = [p.strip() for p in raw.strip("[]").split(",") if p.strip()]
+    vals  = [float(p) for p in parts]
+    assert vals, "empty weight vector"
+    total = sum(vals)
+    assert abs(total - 1.0) < 1e-6, f"weights sum to {total}, expected ~1.0"
+except Exception as exc:
+    print(f"[entrypoint] MODP_WEIGHTS invalid ({raw!r}): {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+    then
+        echo "[entrypoint] fatal: MODP_WEIGHTS is not a valid weight vector" >&2
+        exit 1
+    fi
+fi
+
+# Warn about dead configuration
+if [[ "${FLEXGEN_ENABLED:-false}" == "false" && -n "${FLEXGEN_MODEL_NAME:-}" ]]; then
+    echo "[entrypoint] warn: FLEXGEN_ENABLED=false but FLEXGEN_* vars are set (ignored)" >&2
+fi
+
+# Report enabled enhancements for operability
+echo "[entrypoint] enhancement toggles:" >&2
+for flag in ENHANCEMENTS_ENABLED LIMIT_GRAPH_ENABLED MODP_ENABLED RLHF_ENABLED \
+            DISTILLATION_ENABLED MOE_ENABLED EVOLUTIONARY_ENABLED ZERO_TRUST_ENABLED \
+            DIFFERENTIAL_PRIVACY_ENABLED TRAINING_ENABLED FLEXGEN_ENABLED; do
+    printf '  %-30s = %s\n' "$flag" "${!flag:-unset}" >&2
+done
+
+exec "$@"
+ENTRYPOINT_EOF
+
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh \
+    && mkdir -p /app/checkpoints \
+    && chown -R appuser:appuser /app
+
+# -------------------------------- Metadata ----------------------------------
+LABEL org.green-agent.enhancements="true" \
+      org.opencontainers.image.title="green-agent" \
+      org.opencontainers.image.description="Green Agent with advanced enhancements" \
+      org.opencontainers.image.version="0.1.0" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+# cgroup metrics volume — mount read-only at run time:
+#   -v /sys/fs/cgroup:/sys/fs/cgroup:ro
 VOLUME ["/sys/fs/cgroup"]
 
-# Labels to indicate enhanced image
-LABEL org.green-agent.enhancements="true"
+# -------------------------------- Runtime -----------------------------------
+EXPOSE 8000
+STOPSIGNAL SIGTERM
 
-# Default command (unchanged, but enhancements can be controlled via env)
+USER appuser
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import os,sys,urllib.request; port=os.environ.get('AGENT_PORT','8000'); path=os.environ.get('AGENT_HEALTH_PATH','/health'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}{path}', timeout=3).status==200 else 1)"
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
 CMD ["python", "run_agent.py"]
