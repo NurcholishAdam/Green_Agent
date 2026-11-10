@@ -1,0 +1,17 @@
+# .github/workflows/digestabot.yml
+name: Digestabot
+on:
+  schedule:
+    - cron: "0 2 * * 1"  # Mondays at 02:00 UTC
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  digestabot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: chainguard-dev/digestabot@v0.1.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
