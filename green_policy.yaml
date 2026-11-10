@@ -1,148 +1,412 @@
-version: "2.0"
+# =============================================================================
+# Green Agent — Runtime Configuration (agent_config.yaml)
+# =============================================================================
+# Version:    2.1
+# Status:     Beta
+# Owner:      platform-team
+# Schema:     agent_config.schema.json (draft 2020-12)
+# Validator:  scripts/validate_agent_config.py
+#
+# This file is a single, self-contained runtime config for the
+# Meta-Cognitive Green Agent. All validation bounds, invariants, and
+# precedence rules are documented inline so the file can be read and
+# edited without external references.
+#
+# VALIDATE BEFORE DEPLOYING
+# -------------------------
+#   python scripts/validate_agent_config.py agent_config.yaml
+#
+# PRECEDENCE
+# ----------
+#   Environment variables  >  YAML (this file)  >  built-in defaults.
+#   Exceptions:
+#     * _meta is metadata only — never overridden by env.
+#     * ENHANCEMENTS_ENABLED env override wins over enhancements.enabled.
+#     * Per-module flags (LIMIT_GRAPH_ENABLED, etc.) can only DISABLE a
+#       module the master switch enables — never enable one the master
+#       switch disables. This is a "master kill switch" semantic.
+#     * GREEN_AGENT_ENV selects a block from environments (defaults to dev).
+#     * GREEN_AGENT_DATA_DIR overrides data_dir.
+#
+# SECRETS
+# -------
+#   No secrets belong in this file. Grid-API keys, database passwords,
+#   dashboard tokens all load from $GREEN_AGENT_SECRETS_DIR at startup.
+#   See SECURITY.md.
+#
+# WHAT CHANGED FROM v2.0
+# ----------------------
+#   - Added _meta block (owner, schema_version, updated_at, contact).
+#   - Fixed region: "US-West-2" → "US-CA" (not in the 13-region table of
+#     README.md §5.1). Added custom_region escape hatch + region_source.
+#   - Fixed grid_intensity_g_kwh: 385.0 → 220.0 (matches US-CA).
+#   - Reconciled enhancements.enabled default with README.md §0.2
+#     (master switch defaults OFF; opt-in via environments.production).
+#   - Documented the three weighting schemes and their layering.
+#   - Added timeouts: block (distillation, gating, RLHF, FlexGen, reflection).
+#   - Added environments: block (prod / staging / dev).
+#   - Added data_dir; all relative paths resolve against it.
+#   - Added # bounds: comments on every numeric field.
+#   - Added memory invariant between constraints.memory_limit_gb and
+#     enhancements.flexgen.memory_limit_mb.
+#   - Documented previously-undefined fields: mode, use_offset_logic,
+#     preferred_model_tier, fallback_to_expensive, pue_factor, teachers.
+#   - Documented modp.score_threshold_low == 0.4 as matching the
+#     GreenAgentLowMODPScore < 0.4 alert in green_agent_alerts.yml.
+# =============================================================================
 
+
+# -----------------------------------------------------------------------------
+# 1. Metadata
+# -----------------------------------------------------------------------------
+_meta:
+  owner: "platform-team"
+  schema_version: "2.1"
+  updated_at: "2024-01-01T00:00:00Z"
+  contact: "platform@example.com"
+  changelog_url: "https://wiki.example.com/green-agent/config-changelog"
+
+# Top-level version mirrors _meta.schema_version. Both must stay in sync —
+# the validator rejects mismatches.
+version: "2.1"
+
+
+# -----------------------------------------------------------------------------
+# 2. Agent identity
+# -----------------------------------------------------------------------------
 agent_identity:
   name: "Green-Auditor-Meta-Cognitive"
+
+  # role enum:
+  #   ESG_Compliance_Monitor                    — observe + report
+  #   ESG_Compliance_Monitor_With_Reflection    — observe + reflect + report
+  #   ESG_Enforcer                              — observe + reflect + enforce
   role: "ESG_Compliance_Monitor_With_Reflection"
+
+  # mode enum:
+  #   active_enforcement_with_self_awareness — default; full pipeline
+  #   passive_monitoring                     — observe only, no adjustments
+  #   dry_run                                — compute adjustments, apply none
   mode: "active_enforcement_with_self_awareness"
 
-constraints:
-  max_energy_per_task_wh: 5.0
-  max_carbon_per_task_kg: 0.002
-  max_latency_seconds: 120
-  memory_limit_gb: 4.0
 
+# -----------------------------------------------------------------------------
+# 3. Hard constraints (per task)
+# -----------------------------------------------------------------------------
+# Enforced by the runtime; exceeding any triggers the fallback path. Each
+# violation is recorded in the symbolic ledger and (for critical-severity
+# rules) fires the corresponding Prometheus alert in green_agent_alerts.yml.
+constraints:
+  max_energy_per_task_wh: 5.0     # bounds: (0, 1000]
+  max_carbon_per_task_kg: 0.002   # bounds: (0, 10]
+  max_latency_seconds: 120        # bounds: (0, 86400]
+  memory_limit_gb: 4.0            # bounds: (0, 1024]
+
+  # INVARIANT: enhancements.flexgen.memory_limit_mb
+  #           <= constraints.memory_limit_gb * 1024
+  # (validated at load time by scripts/validate_agent_config.py)
+
+
+# -----------------------------------------------------------------------------
+# 4. Carbon context
+# -----------------------------------------------------------------------------
 carbon_context:
-  region: "US-West-2"
-  grid_intensity_g_kwh: 385.0
-  pue_factor: 1.2
+  # region MUST be one of the 13 documented regions (README.md §5.1):
+  #   US-CA, US-TX, US-NY, EU-FR, EU-DE, EU-NO, EU-PL, CN, IN, JP, AU, BR,
+  #   GLOBAL
+  #
+  # To use a region outside that table, set custom_region: true below and
+  # provide an explicit source in region_source. The validator rejects
+  # unknown regions unless custom_region is true.
+  region: "US-CA"                 # documented default; 220 gCO2e/kWh
+  custom_region: false            # set true only for non-standard regions
+
+  # Static reference intensity. Ignored when a live provider is configured
+  # (see $GREEN_AGENT_SECRETS_DIR/watttime_* or electricitymap_*).
+  grid_intensity_g_kwh: 220.0     # bounds: [0, 5000]
+
+  # region_source is required when custom_region: true — it documents
+  # where the intensity came from. Uncomment if using a custom region:
+  # region_source: "custom — measured Q4 2023 by platform-team"
+
+  # PUE (Power Usage Effectiveness). Applied as:
+  #     effective_energy = raw_energy * pue_factor
+  # Applied per-task (not per-cluster) to keep accounting granular.
+  pue_factor: 1.2                 # bounds: (1.0, 3.0]
+
+  # use_offset_logic:
+  #   true  — carbon offsets purchased for any overshoot; overshoot is
+  #           recorded but does NOT trigger the symbolic violation path.
+  #   false — overshoot triggers symbolic violation (audit trail intact).
   use_offset_logic: false
 
+
+# -----------------------------------------------------------------------------
+# 5. Optimization weights
+# -----------------------------------------------------------------------------
+# THREE weighting schemes coexist at different decision layers:
+#
+#   1. optimization.priority_weight (this block) — coarse accuracy-vs-
+#      sustainability trade-off used for model-tier selection.
+#
+#   2. enhancements.modp.objective_weights (§9) — fine-grained scheduler
+#      trade-offs over accuracy, energy, latency, carbon.
+#
+#   3. SustainabilityIndex (README.md §2.2) — legacy composite
+#      (accuracy / energy / carbon) used for leaderboard ranking.
+#
+# These are NOT alternatives. They operate at different layers:
+#   - priority_weight       governs "which model class to invoke"
+#   - modp.objective_weights governs "how to schedule the chosen model"
+#   - SustainabilityIndex   reports post-hoc
+#
+# Changing one does not change the others.
 optimization:
   priority_weight:
-    accuracy: 0.6
-    sustainability: 0.4
+    accuracy: 0.6                 # bounds: [0, 1]
+    sustainability: 0.4           # bounds: [0, 1]
+    # INVARIANT: accuracy + sustainability == 1.0 (tolerance 1e-6)
+
+  # preferred_model_tier enum:
+  #   SLM — small language model (best-effort accuracy, minimal energy)
+  #   MLM — medium (balanced; used when accuracy > 0.5 and sustainability > 0.3)
+  #   LLM — large (used only when accuracy >= 0.8)
   preferred_model_tier: "SLM"
+
+  # fallback_to_expensive:
+  #   true  — if SLM underperforms the accuracy target, escalate to MLM/LLM.
+  #   false — stay on SLM even if below target (stricter sustainability).
   fallback_to_expensive: false
 
-# Meta-Cognitive Configuration
+
+# -----------------------------------------------------------------------------
+# 6. Meta-cognitive behavior
+# -----------------------------------------------------------------------------
 meta_cognitive:
-  # Reflection frequency: agent pauses every N steps to self-reflect
-  reflection_frequency: 5
-  
-  # Self-adjustment thresholds: trigger adaptive policy changes
+  reflection_frequency: 5         # bounds: [1, 100]; every N steps
+
   self_adjustment_thresholds:
-    energy_threshold_pct: 80      # Adjust if energy > 80% of budget
-    carbon_threshold_pct: 80      # Adjust if carbon > 80% of budget
-    latency_threshold_pct: 80     # Adjust if latency > 80% of budget
-    memory_threshold_pct: 80      # Adjust if memory > 80% of budget
-  
-  # Enable dynamic policy adjustments based on reflection outcomes
+    energy_threshold_pct: 80      # bounds: (0, 100]
+    carbon_threshold_pct: 80      # bounds: (0, 100]
+    latency_threshold_pct: 80     # bounds: (0, 100]
+    memory_threshold_pct: 80      # bounds: (0, 100]
+
   adaptive_policy_enabled: true
-  
-  # Long-context reasoning configuration
+
   long_context:
     enabled: true
-    history_window: 10            # Consider last 10 runs for pattern analysis
-    min_confidence_threshold: 0.7 # Minimum confidence for applying insights
-  
-  # Sustained reflection across runs
+    history_window: 10            # bounds: [1, 1000]; runs to consider
+    min_confidence_threshold: 0.7 # bounds: [0, 1]; insights below ignored
+
   sustained_reflection:
     enabled: true
     memory_persistence: true
     meta_policy_generation: true
     pattern_tracking: true
 
-# Interpretability Configuration
+
+# -----------------------------------------------------------------------------
+# 7. Interpretability + reporting
+# -----------------------------------------------------------------------------
 interpretability:
-  # Generate self-explanations at reflection checkpoints
   self_explanation_enabled: true
-  
-  # Store structured reflection logs
   reflection_logging: true
-  reflection_log_path: "reflections.json"
-  
-  # Dashboard and visualization
+  reflection_log_path: "reflections.json"   # resolved relative to data_dir
   dashboard_enabled: true
-  dashboard_output: "dashboard.html"
-  
-  # Dual-layer feedback (objective + subjective)
+  dashboard_output: "dashboard.html"        # resolved relative to data_dir
   dual_layer_feedback: true
 
 reporting:
-  alert_threshold_energy_pct: 80
-  output_format: "json_detailed"
+  alert_threshold_energy_pct: 80  # bounds: (0, 100]
+  output_format: "json_detailed"  # json_detailed | json_compact | text
   include_reflections: true
   include_patterns: true
   include_meta_policy: true
 
-# ---------------------------------------------------------------------------
-# Advanced Enhancements (LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy
-# Distillation, Bio‑inspired Optimisation, MoE expert gating, FlexGen integration)
-# ---------------------------------------------------------------------------
-enhancements:
-  enabled: true                # Master switch for all advanced features
 
-  # LIMIT Graph integration
+# -----------------------------------------------------------------------------
+# 8. Timeouts (per subsystem)
+# -----------------------------------------------------------------------------
+# Prevents a single hung subsystem from stalling the whole agent. All
+# timeouts are in seconds. On timeout the subsystem is abandoned and the
+# agent continues.
+timeouts:
+  distillation_step_s: 30         # bounds: (0, 600]
+  gating_step_s: 10               # bounds: (0, 60]
+  rlhf_fetch_s: 5                 # bounds: (0, 120]
+  flexgen_delegate_s: 60          # bounds: (0, 3600]
+  reflection_s: 20                # bounds: (0, 300]
+
+
+# -----------------------------------------------------------------------------
+# 9. Advanced enhancements — OPT-IN
+# -----------------------------------------------------------------------------
+# MASTER SWITCH defaults to false (matches README.md §0.2). Production
+# deploys opt in via environments.production below, which is explicit and
+# reviewable.
+#
+# When enabled, each sub-module can be disabled individually via its own
+# `enabled:` flag or its env var (LIMIT_GRAPH_ENABLED, etc.). Per-module
+# flags can only DISABLE, never enable — that preserves the master kill
+# switch semantic.
+enhancements:
+  enabled: false                  # OPT-IN; see environments.production
+
   limit_graph:
     enabled: true
     graph_metrics:
-      centrality: 0.7
-      connectivity: 0.6
-      density: 0.5
-    update_interval_seconds: 60
-    influence_weight: 0.3      # How much graph metrics influence decisions
+      centrality: 0.7             # bounds: [0, 1]
+      connectivity: 0.6           # bounds: [0, 1]
+      density: 0.5                # bounds: [0, 1]
+    update_interval_seconds: 60   # bounds: [1, 3600]
+    influence_weight: 0.3         # bounds: [0, 1]
 
-  # Multi‑Objective Decision Process (MODP)
   modp:
     enabled: true
-    objective_weights: [0.4, 0.3, 0.2, 0.1]  # [accuracy, energy, latency, carbon]
+    # objective_weights are [accuracy, energy, latency, carbon].
+    objective_weights: [0.4, 0.3, 0.2, 0.1]
+    # INVARIANT: weights sum to 1.0 (tolerance 1e-6)
     normalize_weights: true
-    score_threshold_low: 0.4
-    score_threshold_high: 0.7
+    score_threshold_low: 0.4      # bounds: [0, 1]
+                                  # aligned with GreenAgentLowMODPScore
+                                  # < 0.4 in green_agent_alerts.yml
+    score_threshold_high: 0.7     # bounds: [0, 1]
 
-  # Reinforcement Learning from Human Feedback (RLHF)
   rlhf:
     enabled: true
-    human_feedback_score: 0.6
+    human_feedback_score: 0.6     # bounds: [0, 1]
     collect_feedback: true
-    feedback_source: "dashboard"   # dashboard | api | manual
+    # feedback_source enum:
+    #   dashboard — poll the dashboard endpoint at feedback_url
+    #   api       — poll a custom HTTP API at feedback_url
+    #   manual    — read from $GREEN_AGENT_SECRETS_DIR/rlhf_manual_score
+    feedback_source: "dashboard"
+    # feedback_url is required when feedback_source is dashboard|api.
+    feedback_url: "http://127.0.0.1:8001/feedback"
 
-  # Multi‑Teacher On‑Policy Distillation with MoE gating
   distillation:
     enabled: true
     use_moe_gating: true
-    distillation_lr: 0.01
-    gating_lr: 0.005
-    replay_size: 2000
-    train_every: 10
-    epsilon: 0.1
+    distillation_lr: 0.01         # bounds: (0, 1]
+    gating_lr: 0.005              # bounds: (0, 1]
+    replay_size: 2000             # bounds: [100, 100000]
+    train_every: 10               # bounds: [1, 1000]
+    epsilon: 0.1                  # bounds: [0, 1]
+    # teachers enum — must match MANIFEST.md §1:
+    #   rule_based | historical_ml | q_learning | rlhf
     teachers:
       - "rule_based"
       - "historical_ml"
       - "q_learning"
       - "rlhf"
 
-  # Bio‑inspired Optimisation (Evolutionary)
   bio_inspired:
     enabled: true
     use_evolutionary: true
-    population_size: 20
-    mutation_rate: 0.1
-    crossover_rate: 0.7
-    elitism: 2
+    population_size: 20           # bounds: [10, 200]
+    mutation_rate: 0.1            # bounds: [0, 1]
+    crossover_rate: 0.7           # bounds: [0, 1]
+    elitism: 2                    # bounds: [0, population_size]
+    # INVARIANT: mutation_rate + crossover_rate <= 1.0
+    # INVARIANT: elitism <= population_size
 
-  # Mixture‑of‑Experts expert gating
   moe_expert:
     enabled: true
-    n_experts: 4
-    gating_lr: 0.005
+    n_experts: 4                  # bounds: [2, 16]
+    gating_lr: 0.005              # bounds: (0, 1]
 
-  # FlexGen integration (optional high‑throughput LLM execution backend)
   flexgen:
-    enabled: true               # Set to true to use FlexGen as execution backend
+    enabled: true
     model_name: "facebook/opt-6.7b"
-    batch_size: 16
-    memory_limit_mb: 4096
+    batch_size: 16                # bounds: [1, 256]
+    # INVARIANT: memory_limit_mb <= constraints.memory_limit_gb * 1024
+    memory_limit_mb: 4096         # bounds: (0, 1048576]
     precision_options: ["fp32", "fp16", "int8"]
-    default_precision: "fp16"
-    delegation_policy: "adaptive"   # adaptive | always | never
+    default_precision: "fp16"     # must be in precision_options
+    # delegation_policy enum:
+    #   adaptive — use FlexGen when workload is throughput-heavy
+    #   always   — always delegate to FlexGen (fall back to Ray on error)
+    #   never    — never delegate (Ray-only execution)
+    delegation_policy: "adaptive"
+
+
+# -----------------------------------------------------------------------------
+# 10. Output directories
+# -----------------------------------------------------------------------------
+# All relative paths in this file (reflection_log_path, dashboard_output)
+# are resolved relative to data_dir. data_dir may be overridden by the
+# GREEN_AGENT_DATA_DIR environment variable.
+data_dir: "./green_agent_data"
+
+
+# -----------------------------------------------------------------------------
+# 11. Environment overrides
+# -----------------------------------------------------------------------------
+# Selected via GREEN_AGENT_ENV (defaults to "dev"). Nested keys in the
+# selected block MERGE over the top-level values (deep merge for dicts,
+# replacement for lists). Add new environments here; no code change needed.
+environments:
+  production:
+    enhancements:
+      enabled: true               # opt in to advanced modules
+    meta_cognitive:
+      reflection_frequency: 3     # reflect more often in prod
+    reporting:
+      output_format: "json_detailed"
+    data_dir: "/var/lib/green-agent"
+
+  staging:
+    enhancements:
+      enabled: true
+      flexgen:
+        enabled: false            # FlexGen tested in prod, not staging
+    meta_cognitive:
+      reflection_frequency: 5
+    data_dir: "/var/lib/green-agent-staging"
+
+  dev:
+    enhancements:
+      enabled: false              # keep dev safe/fast by default
+    meta_cognitive:
+      reflection_frequency: 10    # reflect less often during dev
+    data_dir: "./green_agent_data"
+
+
+# =============================================================================
+# END OF CONFIG
+# =============================================================================
+# SEMANTIC INVARIANTS (enforced by the validator)
+# ----------------------------------------------
+#   1.  _meta.schema_version == version
+#   2.  optimization.priority_weight.accuracy
+#         + .sustainability == 1.0 ± 1e-6
+#   3.  enhancements.modp.objective_weights sum == 1.0 ± 1e-6
+#   4.  enhancements.flexgen.memory_limit_mb
+#         <= constraints.memory_limit_gb * 1024
+#   5.  enhancements.bio_inspired.mutation_rate
+#         + .crossover_rate <= 1.0
+#   6.  enhancements.bio_inspired.elitism <= .population_size
+#   7.  enhancements.modp.score_threshold_low < .score_threshold_high
+#   8.  enhancements.flexgen.default_precision
+#         is in .precision_options
+#   9.  if carbon_context.custom_region == false,
+#         carbon_context.region is one of the 13 documented regions
+#   10. if carbon_context.custom_region == true,
+#         carbon_context.region_source is present
+#   11. if GREEN_AGENT_ENV is set,
+#         it names a key in environments
+#   12. every # bounds: comment in this file matches an x-bounds in the
+#         schema (drift guard — validator warns on mismatch)
+#
+# VALIDATION
+# ----------
+#   python scripts/validate_agent_config.py agent_config.yaml
+#   GREEN_AGENT_ENV=production python scripts/validate_agent_config.py \\
+#       agent_config.yaml
+#
+# EXIT CODES
+# ----------
+#   0  config is valid (schema + invariants)
+#   1  config is invalid
+#   2  usage error (missing file, missing dependency)
+# =============================================================================
