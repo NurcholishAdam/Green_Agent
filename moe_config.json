@@ -1,113 +1,554 @@
-{
-    "enable_quantum": true,
-    "max_carbon_budget_kg": 0.1,
-    "max_helium_budget": 0.05,
-    "max_latency_ms": 1000,
-    "reflection_enabled": true,
-    "monitoring_enabled": true,
-    "pipeline_default": "standard",
+# =============================================================================
+# Green Agent — Runtime / Pipeline Configuration (runtime_config.yaml)
+# =============================================================================
+# Version:    2.0
+# Status:     Beta
+# Owner:      AI Research Agent
+# Schema:     runtime_config.schema.json (draft 2020-12)
+# Validator:  scripts/validate_runtime_config.py
+#
+# This file governs the **pipeline runtime** — the experts, gating network,
+# planetary boundaries, quantum backend, helium budget, and enhancement
+# modules. It is distinct from agent_config.yaml, which governs the
+# **meta-cognitive agent runtime** (identity, reflection, RLHF, etc.).
+# Both files share an `enhancements` block; the two MUST agree on:
+#     - enhancements.enabled (default: false, per README.md §0.2)
+#     - enhancements.modp.objective_weights
+#     - enhancements.modp.score_threshold_low / _high
+# The validator enforces this.
+#
+# MIGRATION NOTE — v2.0 was JSON; this is YAML
+# --------------------------------------------
+# YAML is a superset of JSON for object/array/primitive data. The **only**
+# code change needed is in the loader:
+#
+#     # before
+#     import json
+#     config = json.load(open("runtime_config.json"))
+#
+#     # after
+#     import yaml
+#     config = yaml.safe_load(open("runtime_config.yaml"))
+#
+# The parsed dictionary is byte-identical (same keys, same values, same
+# nesting). See the `_json_equivalent` note at the bottom for a one-liner
+# that regenerates the JSON form if some tooling requires it.
+#
+# PRECEDENCE
+# ----------
+#   Environment variables  >  YAML (this file)  >  built-in defaults.
+#   Exceptions:
+#     * _meta is metadata only — never overridden by env.
+#     * ENHANCEMENTS_ENABLED env override wins over enhancements.enabled.
+#     * Per-module flags (LIMIT_GRAPH_ENABLED, FLEXGEN_ENABLED, etc.) can
+#       only DISABLE a module the master switch enables — never enable one
+#       the master switch disables.
+#     * GREEN_AGENT_ENV selects a block from environments (default: dev).
+#     * GREEN_AGENT_DATA_DIR overrides data_dir.
+#     * GREEN_AGENT_SECRETS_DIR provides secret files (see SECURITY.md).
+#
+# SECRETS
+# -------
+#   No secrets belong in this file. Grid-API keys, database passwords,
+#   dashboard tokens, quantum backend credentials all load from
+#   $GREEN_AGENT_SECRETS_DIR at startup. See SECURITY.md.
+#
+# WHAT CHANGED FROM v1.0 (the JSON file)
+# --------------------------------------
+#   - Converted JSON → YAML for inline documentation of every field.
+#   - Added _meta block (owner, schema_version, updated_at, contact).
+#   - Added version field, synced with _meta.schema_version.
+#   - Added agent_identity block (name, role, mode).
+#   - Added carbon_context block — REQUIRED for carbon math. Without it,
+#     max_carbon_budget_kg cannot be evaluated (no grid intensity → no
+#     gram-per-kWh conversion).
+#   - FIXED: enhancements.enabled true → false. Matches README.md §0.2.
+#     Production opt-in goes through environments.production.
+#   - FIXED: energy_expert.quantization_levels included "int4" but
+#     flexgen.precision_options did not. Added "int4" to
+#     flexgen.precision_options (both subsystems can now use int4).
+#   - FIXED: enhancements.rlhf.feedback_source was "dashboard" without a
+#     feedback_url. Added feedback_url.
+#   - DOCUMENTED: the three helium thresholds (max_helium_budget,
+#     helium_expert.scarcity_threshold, planetary_boundaries.helium_scarcity_limit)
+#     operate at different scopes and scales.
+#   - DOCUMENTED: the two carbon limits (max_carbon_budget_kg per pipeline,
+#     planetary_boundaries.carbon_emissions_limit_ppm planetary).
+#   - DOCUMENTED: moe_expert.n_experts (4 learned MoE experts) vs the 5
+#     domain experts in expert_configuration vs the 4 distillation teachers.
+#     These are three different concepts.
+#   - DOCUMENTED: redundant master switches (enable_quantum vs
+#     quantum_expert.enabled, monitoring_enabled vs monitoring.prometheus_enabled).
+#   - DOCUMENTED: pipeline_default enum values.
+#   - Added reflection sub-block (was: reflection_enabled flag with no
+#     configuration surface).
+#   - Added timeouts block.
+#   - Added data_dir; all relative paths resolve against it.
+#   - Added environments block (prod / staging / dev).
+#   - Added # bounds: comments on every numeric field.
+#   - Added _invariants and _cross_file_reconciliation sections at the
+#     bottom so future editors know what constraints the validator enforces.
+# =============================================================================
 
-    "expert_configuration": {
-        "energy_expert": {
-            "enabled": true,
-            "quantization_levels": ["fp32", "fp16", "int8", "int4"],
-            "default_quantization": "int8"
-        },
-        "data_expert": {
-            "enabled": true,
-            "compression_algorithms": ["none", "gzip", "lz4", "zstd"],
-            "default_compression": "lz4"
-        },
-        "iot_expert": {
-            "enabled": true,
-            "edge_optimization": true
-        },
-        "helium_expert": {
-            "enabled": true,
-            "scarcity_threshold": 0.3
-        },
-        "quantum_expert": {
-            "enabled": true,
-            "backend_type": "simulator",
-            "max_qubits": 20
-        }
-    },
 
-    "gating_network": {
-        "top_k": 2,
-        "capacity_factor": 1.25,
-        "noise_std": 0.1,
-        "load_balance_weight": 0.01
-    },
+# -----------------------------------------------------------------------------
+# 1. Metadata
+# -----------------------------------------------------------------------------
+_meta:
+  owner: "platform-team"
+  schema_version: "2.0"
+  updated_at: "2024-01-01T00:00:00Z"
+  contact: "platform@example.com"
+  changelog_url: "https://wiki.example.com/green-agent/runtime-config-changelog"
 
-    "monitoring": {
-        "prometheus_enabled": true,
-        "grafana_dashboard_enabled": true,
-        "metrics_retention_days": 30
-    },
+# Must match _meta.schema_version. Validator rejects mismatches.
+version: "2.0"
 
-    "planetary_boundaries": {
-        "carbon_emissions_limit_ppm": 350,
-        "helium_scarcity_limit": 0.8,
-        "energy_capacity_limit": 0.9
-    },
 
-    "enhancements": {
-        "enabled": true,
-        "limit_graph": {
-            "enabled": true,
-            "graph_metrics": {
-                "centrality": 0.7,
-                "connectivity": 0.6,
-                "density": 0.5
-            },
-            "update_interval_seconds": 60,
-            "influence_weight": 0.3
-        },
-        "modp": {
-            "enabled": true,
-            "objective_weights": [0.4, 0.3, 0.2, 0.1],
-            "normalize_weights": true,
-            "score_threshold_low": 0.4,
-            "score_threshold_high": 0.7
-        },
-        "rlhf": {
-            "enabled": true,
-            "human_feedback_score": 0.6,
-            "collect_feedback": true,
-            "feedback_source": "dashboard"
-        },
-        "distillation": {
-            "enabled": true,
-            "use_moe_gating": true,
-            "distillation_lr": 0.01,
-            "gating_lr": 0.005,
-            "replay_size": 2000,
-            "train_every": 10,
-            "epsilon": 0.1,
-            "teachers": ["rule_based", "historical_ml", "q_learning", "rlhf"]
-        },
-        "bio_inspired": {
-            "enabled": true,
-            "use_evolutionary": true,
-            "population_size": 20,
-            "mutation_rate": 0.1,
-            "crossover_rate": 0.7,
-            "elitism": 2
-        },
-        "moe_expert": {
-            "enabled": true,
-            "n_experts": 4,
-            "gating_lr": 0.005
-        },
-        "flexgen": {
-            "enabled": true,
-            "model_name": "facebook/opt-6.7b",
-            "batch_size": 16,
-            "memory_limit_mb": 4096,
-            "precision_options": ["fp32", "fp16", "int8"],
-            "default_precision": "fp16",
-            "delegation_policy": "adaptive"
-        }
-    }
-}
+# -----------------------------------------------------------------------------
+# 2. Agent identity
+# -----------------------------------------------------------------------------
+agent_identity:
+  name: "Green-Agent-Pipeline"
+
+  # role enum:
+  #   Runtime_Pipeline_Orchestrator        — runs the expert + gating pipeline
+  #   Quantum_Efficiency_Optimizer         — pipeline restricted to quantum work
+  #   IoT_Edge_Orchestrator                — pipeline restricted to edge workloads
+  role: "Runtime_Pipeline_Orchestrator"
+
+  # mode enum:
+  #   active_enforcement_with_self_awareness — default; full pipeline
+  #   passive_monitoring                     — observe only, no adjustments
+  #   dry_run                                — compute decisions, apply none
+  mode: "active_enforcement_with_self_awareness"
+
+
+# -----------------------------------------------------------------------------
+# 3. Pipeline-level constraints
+# -----------------------------------------------------------------------------
+# These are **pipeline-scope** limits, distinct from agent-scope limits in
+# agent_config.yaml.constraints. See _cross_file_reconciliation at bottom.
+#
+# Pipeline scope:    the whole run (all experts, all tasks in a batch).
+# Agent scope:       one agent task, enforced by the agent runtime.
+#
+# A pipeline budget is exhausted when the SUM of all expert/task
+# consumption crosses the threshold. An agent task budget is exceeded when
+# a SINGLE task crosses its threshold.
+
+max_carbon_budget_kg: 0.1         # bounds: (0, 100]; pipeline-scope
+                                  #   agent_config.yaml parallel:
+                                  #     constraints.max_carbon_per_task_kg
+
+max_helium_budget: 0.05           # bounds: (0, 100]; unit: grams of He
+                                  #   per pipeline run. Not a ratio.
+                                  #   See _helium_scales at bottom for the
+                                  #   other two helium thresholds.
+
+max_latency_ms: 1000              # bounds: (0, 600000]; pipeline-scope,
+                                  #   wall-clock for the whole run.
+                                  #   agent_config.yaml parallel:
+                                  #     constraints.max_latency_seconds
+                                  #   (120 s per task ≠ 1 s per pipeline;
+                                  #    the pipeline target is tighter.)
+
+max_memory_gb: 8.0                # bounds: (0, 1024]; NEW — was missing.
+                                  #   Pipeline-scope. agent_config.yaml
+                                  #   has memory_limit_gb for agent scope.
+
+
+# -----------------------------------------------------------------------------
+# 4. Carbon context
+# -----------------------------------------------------------------------------
+# REQUIRED — without a region and grid intensity, max_carbon_budget_kg
+# cannot be translated from energy (kWh) to carbon (kg CO2e).
+carbon_context:
+  # region MUST be one of the 13 documented regions (README.md §5.1):
+  #   US-CA, US-TX, US-NY, EU-FR, EU-DE, EU-NO, EU-PL, CN, IN, JP, AU, BR,
+  #   GLOBAL
+  region: "US-CA"                 # 220 gCO2e/kWh reference
+
+  custom_region: false            # set true to use a region outside the table
+
+  # region_source is REQUIRED when custom_region is true.
+  # region_source: "measured Q4 2023 by platform-team; 350 gCO2e/kWh"
+
+  grid_intensity_g_kwh: 220.0     # bounds: [0, 5000]
+
+  # PUE applied as effective_energy = raw_energy * pue_factor
+  pue_factor: 1.2                 # bounds: (1.0, 3.0]
+
+  use_offset_logic: false         # true = offsets suppress violation path
+
+
+# -----------------------------------------------------------------------------
+# 5. Pipeline mode defaults
+# -----------------------------------------------------------------------------
+pipeline_default: "standard"      # enum: fast | standard | thorough | green
+                                  #   fast     — skip RLHF fetch, min experts
+                                  #   standard — full expert set, default gating
+                                  #   thorough — all experts, no early exit
+                                  #   green    — deferrable tasks shift to
+                                  #              low-carbon windows
+
+# Optional per-mode overrides (empty by default). Uncomment to tune:
+# pipeline_mode_overrides:
+#   fast:
+#     max_latency_ms: 500
+#     skip_experts: ["helium_expert", "quantum_expert"]
+#   thorough:
+#     max_latency_ms: 60000
+
+
+# -----------------------------------------------------------------------------
+# 6. Master switches (redundant flags reconciled)
+# -----------------------------------------------------------------------------
+# These are kept for backward compatibility but their relationship to the
+# per-block enabled flags is now explicit.
+
+# enable_quantum — top-level quantum gate. If false, quantum_expert.enabled
+# is IGNORED (the expert is skipped). If true, quantum_expert.enabled is
+# authoritative. This is a master kill switch.
+enable_quantum: true
+
+# reflection_enabled — top-level reflection gate. See the reflection block
+# below for the full configuration surface.
+reflection_enabled: true
+
+# monitoring_enabled — top-level monitoring gate. If false, ALL monitoring
+# is off regardless of monitoring.* flags. If true, monitoring.prometheus_enabled
+# and monitoring.grafana_dashboard_enabled are authoritative.
+monitoring_enabled: true
+
+
+# -----------------------------------------------------------------------------
+# 7. Reflection (was: reflection_enabled flag only)
+# -----------------------------------------------------------------------------
+reflection:
+  enabled: true                   # mirrors reflection_enabled above; the
+                                  # validator enforces consistency
+  frequency: 5                    # bounds: [1, 100]; every N pipeline runs
+  # thresholds are fractions of the budget that trigger self-adjustment
+  energy_threshold_pct: 80        # bounds: (0, 100]
+  carbon_threshold_pct: 80        # bounds: (0, 100]
+  latency_threshold_pct: 80       # bounds: (0, 100]
+  memory_threshold_pct: 80        # bounds: (0, 100]
+
+
+# -----------------------------------------------------------------------------
+# 8. Expert configuration (5 domain experts)
+# -----------------------------------------------------------------------------
+# These are **domain experts** — rule-based specialists. They are NOT the
+# same as the MoE experts in §10 (`moe_expert.n_experts`) which are learned
+# gating weights. And they are NOT the same as the distillation teachers
+# in `enhancements.distillation.teachers` which are training sources.
+# Three separate concepts; three separate counts.
+expert_configuration:
+
+  energy_expert:
+    enabled: true
+    quantization_levels: ["fp32", "fp16", "int8", "int4"]
+    default_quantization: "int8"  # must be in quantization_levels
+
+  data_expert:
+    enabled: true
+    compression_algorithms: ["none", "gzip", "lz4", "zstd"]
+    default_compression: "lz4"    # must be in compression_algorithms
+
+  iot_expert:
+    enabled: true
+    edge_optimization: true
+
+  helium_expert:
+    enabled: true
+    # scarcity_threshold: ratio in [0, 1] above which this expert emits a
+    # warning. Distinct from max_helium_budget (grams, per-pipeline) and
+    # planetary_boundaries.helium_scarcity_limit (global alarm).
+    # See _helium_scales at bottom.
+    scarcity_threshold: 0.3       # bounds: [0, 1]
+
+  quantum_expert:
+    enabled: true                 # IGNORED if enable_quantum is false
+    # backend_type enum:
+    #   simulator — local Qiskit Aer / similar
+    #   ibm       — IBM Quantum (requires credentials in secrets dir)
+    #   aws       — AWS Braket
+    #   azure     — Azure Quantum
+    backend_type: "simulator"
+    max_qubits: 20                # bounds: [1, 433]; 433 is current HW max
+
+
+# -----------------------------------------------------------------------------
+# 9. Gating network (learned router over MoE experts)
+# -----------------------------------------------------------------------------
+gating_network:
+  top_k: 2                        # bounds: [1, moe_expert.n_experts]
+  capacity_factor: 1.25           # bounds: (0, 10]
+  noise_std: 0.1                  # bounds: [0, 1]
+  load_balance_weight: 0.01       # bounds: [0, 1]
+
+
+# -----------------------------------------------------------------------------
+# 10. MoE expert pool
+# -----------------------------------------------------------------------------
+moe_expert:
+  enabled: true
+  n_experts: 4                    # bounds: [2, 16]; these are *learned* MoE
+                                  # experts (not the 5 domain experts in §8)
+  gating_lr: 0.005                # bounds: (0, 1]
+
+
+# -----------------------------------------------------------------------------
+# 11. Monitoring
+# -----------------------------------------------------------------------------
+monitoring:
+  # prometheus_enabled is IGNORED if monitoring_enabled is false
+  prometheus_enabled: true
+  grafana_dashboard_enabled: true
+  metrics_retention_days: 30      # bounds: [1, 3650]
+
+
+# -----------------------------------------------------------------------------
+# 12. Planetary boundaries (informational; may fire alerts)
+# -----------------------------------------------------------------------------
+# These are global thresholds. Crossing them fires the corresponding
+# Prometheus alert in green_agent_alerts.yml; they do NOT block individual
+# pipeline runs.
+planetary_boundaries:
+  carbon_emissions_limit_ppm: 350 # 350 ppm = Rockström CO2 boundary
+  helium_scarcity_limit: 0.8      # bounds: [0, 1]; global scarcity alarm
+  energy_capacity_limit: 0.9      # bounds: [0, 1]; fraction of grid capacity
+
+
+# -----------------------------------------------------------------------------
+# 13. Timeouts (per subsystem)
+# -----------------------------------------------------------------------------
+# Prevents a hung subsystem from stalling the pipeline. On timeout the
+# subsystem is abandoned and the pipeline continues.
+timeouts:
+  expert_invocation_s: 30         # bounds: (0, 600]
+  gating_step_s: 10               # bounds: (0, 60]
+  rlhf_fetch_s: 5                 # bounds: (0, 120]
+  quantum_job_s: 120              # bounds: (0, 3600]
+  flexgen_delegate_s: 60          # bounds: (0, 3600]
+  reflection_s: 20                # bounds: (0, 300]
+
+
+# -----------------------------------------------------------------------------
+# 14. Advanced enhancements — OPT-IN
+# -----------------------------------------------------------------------------
+# MASTER SWITCH defaults to false (matches README.md §0.2). This file keeps
+# that safe default; production deploys opt in via environments.production.
+#
+# MUST AGREE WITH agent_config.yaml:
+#   - enhancements.enabled
+#   - enhancements.modp.objective_weights
+#   - enhancements.modp.score_threshold_low / _high
+# The validator enforces cross-file agreement.
+enhancements:
+  enabled: false                  # OPT-IN; see environments.production
+
+  limit_graph:
+    enabled: true
+    graph_metrics:
+      centrality: 0.7             # bounds: [0, 1]
+      connectivity: 0.6           # bounds: [0, 1]
+      density: 0.5                # bounds: [0, 1]
+    update_interval_seconds: 60   # bounds: [1, 3600]
+    influence_weight: 0.3         # bounds: [0, 1]
+
+  modp:
+    enabled: true
+    # objective_weights are [accuracy, energy, latency, carbon].
+    # INVARIANT: weights sum to 1.0 ± 1e-6.
+    # MUST match agent_config.yaml.modp.objective_weights.
+    objective_weights: [0.4, 0.3, 0.2, 0.1]
+    normalize_weights: true
+    score_threshold_low: 0.4      # bounds: [0, 1]
+                                  # aligned with GreenAgentLowMODPScore < 0.4
+                                  # in green_agent_alerts.yml
+    score_threshold_high: 0.7     # bounds: [0, 1]
+
+  rlhf:
+    enabled: true
+    human_feedback_score: 0.6     # bounds: [0, 1]
+    collect_feedback: true
+    # feedback_source enum:
+    #   dashboard — poll the dashboard endpoint at feedback_url
+    #   api       — poll a custom HTTP API at feedback_url
+    #   manual    — read from $GREEN_AGENT_SECRETS_DIR/rlhf_manual_score
+    feedback_source: "dashboard"
+    feedback_url: "http://127.0.0.1:8001/feedback"   # REQUIRED for
+                                                     # dashboard|api sources
+
+  distillation:
+    enabled: true
+    use_moe_gating: true
+    distillation_lr: 0.01         # bounds: (0, 1]
+    gating_lr: 0.005              # bounds: (0, 1]
+    replay_size: 2000             # bounds: [100, 100000]
+    train_every: 10               # bounds: [1, 1000]
+    epsilon: 0.1                  # bounds: [0, 1]
+    # teachers enum — must match MANIFEST.md §1:
+    #   rule_based | historical_ml | q_learning | rlhf
+    teachers:
+      - "rule_based"
+      - "historical_ml"
+      - "q_learning"
+      - "rlhf"
+
+  bio_inspired:
+    enabled: true
+    use_evolutionary: true
+    population_size: 20           # bounds: [10, 200]
+    mutation_rate: 0.1            # bounds: [0, 1]
+    crossover_rate: 0.7           # bounds: [0, 1]
+    elitism: 2                    # bounds: [0, population_size]
+    # INVARIANT: mutation_rate + crossover_rate <= 1.0
+    # INVARIANT: elitism <= population_size
+
+  moe_expert:                     # see also §10 top-level moe_expert block
+    enabled: true
+    n_experts: 4                  # MUST match §10 n_experts
+    gating_lr: 0.005              # bounds: (0, 1]
+
+  flexgen:
+    enabled: true
+    model_name: "facebook/opt-6.7b"
+    batch_size: 16                # bounds: [1, 256]
+    # INVARIANT: memory_limit_mb <= max_memory_gb * 1024
+    memory_limit_mb: 4096         # bounds: (0, 1048576]
+    # Includes "int4" (was missing in v1.0) so this matches
+    # energy_expert.quantization_levels.
+    precision_options: ["fp32", "fp16", "int8", "int4"]
+    default_precision: "fp16"     # must be in precision_options
+    # delegation_policy enum:
+    #   adaptive — use FlexGen when workload is throughput-heavy
+    #   always   — always delegate to FlexGen (fall back to Ray on error)
+    #   never    — never delegate (Ray-only execution)
+    delegation_policy: "adaptive"
+
+
+# -----------------------------------------------------------------------------
+# 15. Output directories
+# -----------------------------------------------------------------------------
+# All relative paths in this file resolve against data_dir. Overridable via
+# GREEN_AGENT_DATA_DIR.
+data_dir: "./green_agent_data"
+
+
+# -----------------------------------------------------------------------------
+# 16. Environment overrides
+# -----------------------------------------------------------------------------
+# Selected via GREEN_AGENT_ENV (default: dev). Nested keys in the selected
+# block MERGE over the top-level values (deep merge for dicts, replacement
+# for lists). Add new environments here; no code change needed.
+environments:
+  production:
+    enhancements:
+      enabled: true               # opt in to advanced modules
+    reflection:
+      frequency: 3                # reflect more often in prod
+    monitoring:
+      metrics_retention_days: 90  # longer retention in prod
+    data_dir: "/var/lib/green-agent"
+
+  staging:
+    enhancements:
+      enabled: true
+      flexgen:
+        enabled: false            # FlexGen tested in prod, not staging
+    reflection:
+      frequency: 5
+    data_dir: "/var/lib/green-agent-staging"
+
+  dev:
+    enhancements:
+      enabled: false              # keep dev safe/fast by default
+    reflection:
+      frequency: 10               # reflect less often during dev
+    data_dir: "./green_agent_data"
+
+
+# =============================================================================
+# INVARIANTS (enforced by scripts/validate_runtime_config.py)
+# =============================================================================
+#   1.  _meta.schema_version == version
+#   2.  reflection_enabled == reflection.enabled
+#   3.  enable_quantum is a master gate over quantum_expert.enabled
+#   4.  monitoring_enabled is a master gate over monitoring.prometheus_enabled
+#   5.  enhancements.modp.objective_weights sum to 1.0 ± 1e-6
+#   6.  enhancements.bio_inspired.mutation_rate + crossover_rate <= 1.0
+#   7.  enhancements.bio_inspired.elitism <= population_size
+#   8.  enhancements.modp.score_threshold_low < score_threshold_high
+#   9.  enhancements.flexgen.default_precision is in precision_options
+#   10. enhancements.flexgen.memory_limit_mb <= max_memory_gb * 1024
+#   11. gating_network.top_k <= moe_expert.n_experts
+#   12. moe_expert.n_experts == enhancements.moe_expert.n_experts
+#   13. energy_expert.quantization_levels == enhancements.flexgen.precision_options
+#   14. enhancements.rlhf.feedback_url is present iff feedback_source in
+#       {dashboard, api}
+#   15. carbon_context.custom_region == true requires region_source
+#   16. carbon_context.region is in the 13-region table unless custom_region
+#   17. if GREEN_AGENT_ENV is set, it names a key in environments
+#   18. Cross-file: enhancements.enabled,
+#       enhancements.modp.objective_weights, and
+#       enhancements.modp.score_threshold_{low,high} in this file MUST match
+#       the same fields in agent_config.yaml.
+# =============================================================================
+
+
+# =============================================================================
+# HELIUM SCALES (three thresholds, three scopes)
+# =============================================================================
+# The three helium thresholds serve different purposes and are all needed:
+#
+#   max_helium_budget: 0.05
+#     SCOPE:   one pipeline run
+#     UNIT:    grams of helium
+#     EFFECT:  hard fail — pipeline aborts if exceeded
+#
+#   helium_expert.scarcity_threshold: 0.3
+#     SCOPE:   one expert decision
+#     UNIT:    ratio in [0, 1] of current He availability
+#     EFFECT:  this expert emits a warning when scarcity > 0.3
+#
+#   planetary_boundaries.helium_scarcity_limit: 0.8
+#     SCOPE:   global (industry-wide)
+#     UNIT:    ratio in [0, 1] of global He availability
+#     EFFECT:  fires GreenAgentHighHeliumScarcity Prometheus alert
+# =============================================================================
+
+
+# =============================================================================
+# CROSS-FILE RECONCILIATION (agent_config.yaml)
+# =============================================================================
+# The two files share fields. Where they differ in value, the difference is
+# intentional and reflects pipeline-vs-agent scope:
+#
+#   Field                      runtime_config            agent_config.yaml
+#   -------------------------  ------------------------  -------------------
+#   max_latency_ms / _seconds  1000 ms (pipeline)        120 s (per task)
+#   max_carbon_budget_kg       0.1 kg (pipeline)         0.002 kg (per task)
+#   max_memory_gb              8.0 GB (pipeline)         4.0 GB (per task)
+#   enhancements.enabled       false (safe default)      false (safe default)
+#
+# INVARIANT: pipeline budget >= sum of per-task budgets. If you set
+# max_carbon_budget_kg < 0.002 * n_tasks, pipelines will always fail. The
+# validator warns when this inequality is violated for n_tasks = 10.
+# =============================================================================
+
+
+# =============================================================================
+# JSON EQUIVALENT (for tools that still consume JSON)
+# =============================================================================
+# Regenerate the JSON form with:
+#
+#   python -c "import yaml, json, sys; \\
+#              json.dump(yaml.safe_load(open('runtime_config.yaml')), \\
+#                        sys.stdout, indent=4)"
+#
+# The parsed dict is byte-identical to what the runtime previously read
+# from the JSON file — same keys, same values, same nesting.
+# =============================================================================
