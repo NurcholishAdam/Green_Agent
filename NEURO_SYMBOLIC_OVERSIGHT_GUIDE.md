@@ -961,7 +961,7 @@ To add new rule categories or enhance the symbolic engine:
 practical integration with Green_Agent. It prioritizes pragmatic oversight over
 formal verification, making it suitable for sustainable AI agent development.
 
-**Last Updated**: 2026-04-10  
+**Last Updated**: 2026-11-10  
 **Version**: 1.2.0  
 **Test Coverage**: 19/19 (13 core + 6 enhancement, `skipUnless` when modules absent)  
 **Performance Impact**: ~14 ms per step (eval + trace; dashboard amortized)  
