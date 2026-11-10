@@ -2,7 +2,7 @@
 # Neuro-Symbolic Oversight for Green Agent
 
 **Version:** 1.2.0  
-**Last Updated:** 2026-04-10  
+**Last Updated:** 2026-11-10  
 **Status:** Production Ready  
 **Audience:** Operators, integrators, rule authors, and enhancement maintainers
 
