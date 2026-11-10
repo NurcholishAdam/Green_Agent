@@ -1,31 +1,130 @@
 {
-  "framework": "langchain",
-  "runtime": {
-    "model": "gpt-3.5-turbo",
-    "temperature": 0.7
+  "schema_version": "1.0",
+  "run_id": "example-run-001",
+
+  "_meta": {
+    "description": "Green Agent runtime configuration. Validated against example_config.schema.json in CI.",
+    "conventions": {
+      "units_grid_intensity": "gCO2e per kWh (NOT kgCO2/Wh — a 10^6 factor separates them)",
+      "units_energy": "kWh",
+      "units_carbon": "kgCO2e",
+      "units_latency": "milliseconds",
+      "units_memory": "MiB",
+      "modp_objective_weights_order": "[accuracy, energy, latency, carbon] — do NOT reorder",
+      "pue_application": "carbon_kg = energy_kwh_measured * grid_intensity_gco2_per_kwh * pue_factor / 1000. PUE multiplies measured energy BEFORE carbon conversion.",
+      "enhancement_precedence": "enhancements.enabled=false forces ALL sub-modules off, regardless of their individual enabled flag",
+      "chaos_note": "chaos_enabled must be false OR a chaos block must be present"
+    },
+    "field_units": {
+      "runtime.temperature": "ratio [0, 2]",
+      "runtime.max_retries": "count",
+      "grid_intensity_gco2_per_kwh": "gCO2e/kWh",
+      "pue_factor": "multiplier [1.0, 3.0] typical",
+      "timeout_seconds": "seconds",
+      "seed": "integer",
+      "distillation.distillation_lr": "learning rate (float > 0)",
+      "distillation.gating_lr": "learning rate (float > 0)",
+      "distillation.replay_size_transitions": "count",
+      "distillation.train_every_steps": "count of steps",
+      "distillation.epsilon_exploration": "ratio [0, 1] — epsilon-greedy exploration rate",
+      "bio_inspired.population_size": "count (>= elitism)",
+      "bio_inspired.mutation_rate": "ratio [0, 1]",
+      "bio_inspired.crossover_rate": "ratio [0, 1]",
+      "bio_inspired.elitism": "count (<= population_size)",
+      "flexgen.memory_limit_mib": "MiB",
+      "rlhf.human_feedback_score": "ratio [0, 1]",
+      "limit_graph.graph_metrics.*": "ratio [0, 1]",
+      "limit_graph.influence_weight": "ratio [0, 1] — how strongly graph metrics affect routing",
+      "modp.score_threshold_low": "ratio [0, 1] — below this, MODP triggers 'reject'",
+      "modp.score_threshold_high": "ratio [0, 1] — above this, MODP triggers 'accept'"
+    },
+    "modp_threshold_actions": {
+      "below_score_threshold_low": "action=reject (log warning, do not execute)",
+      "between_low_and_high": "action=warn (execute but flag in result)",
+      "above_score_threshold_high": "action=accept (execute normally)"
+    },
+    "reproducibility": "Set seed for deterministic runs. Temperature > 0 without a seed is non-reproducible."
   },
-  "grid_intensity": 385.0,
+
+  "framework": "langchain",
+  "framework_version": "0.3.28",
+
+  "runtime": {
+    "model": "gpt-4o-mini",
+    "temperature": 0.7,
+    "max_retries": 3,
+    "retry_backoff_seconds": 1.0,
+    "api_key_env": "OPENAI_API_KEY",
+    "timeout_seconds": 120
+  },
+
+  "region": "US-CA",
+  "grid_intensity_gco2_per_kwh": 220.0,
+  "_grid_intensity_note": "Resolved from region='US-CA' per README.md §5.1. Setting grid_intensity_gco2_per_kwh explicitly overrides the region-derived value.",
   "pue_factor": 1.2,
+
+  "output_dir": "demo_output",
+  "log_level": "INFO",
+  "seed": 42,
+  "max_concurrency": 1,
+
   "chaos_enabled": false,
+  "_chaos_note": "When true, a 'chaos' block must be present specifying: scenario, probability, duration_seconds, affected_module",
+
   "queries": [
     {
-      "id": "low-energy",
-      "task": "Summarize a document",
-      "max_tokens": 500
+      "task_id": "low-energy",
+      "suite": "summarization",
+      "task_type": "summarize",
+      "input_data": {
+        "document": "A 500-word article about renewable energy adoption."
+      },
+      "constraints": {
+        "max_tokens": 500,
+        "timeout_seconds": 60
+      },
+      "expected_output": {
+        "summary": "A concise 3-5 sentence summary covering the key points of the article."
+      }
     },
     {
-      "id": "balanced",
-      "task": "Answer complex question",
-      "max_tokens": 1000
+      "task_id": "balanced",
+      "suite": "question_answering",
+      "task_type": "qa",
+      "input_data": {
+        "question": "What are the main trade-offs between solar and wind power?",
+        "context": "Renewable energy comparison"
+      },
+      "constraints": {
+        "max_tokens": 1000,
+        "timeout_seconds": 120
+      },
+      "expected_output": {
+        "answer": "An answer discussing land use, intermittency, cost, and regional suitability for each source."
+      }
     },
     {
-      "id": "high-accuracy",
-      "task": "Detailed analysis",
-      "max_tokens": 2000
+      "task_id": "high-accuracy",
+      "suite": "analysis",
+      "task_type": "detailed_analysis",
+      "input_data": {
+        "topic": "Lifecycle carbon emissions of lithium-ion battery production",
+        "depth": "comprehensive"
+      },
+      "constraints": {
+        "max_tokens": 2000,
+        "timeout_seconds": 240
+      },
+      "expected_output": {
+        "analysis": "A structured analysis covering mining, manufacturing, use-phase, and end-of-life carbon contributions, with citations."
+      }
     }
   ],
+
   "enhancements": {
     "enabled": true,
+    "_precedence_note": "Setting enabled=false disables ALL sub-modules below, regardless of their individual flags.",
+
     "limit_graph": {
       "enabled": true,
       "graph_metrics": {
@@ -36,29 +135,39 @@
       "update_interval_seconds": 60,
       "influence_weight": 0.3
     },
+
     "modp": {
       "enabled": true,
+      "_objective_weights_note": "Order: [accuracy, energy, latency, carbon]. Must sum to 1.0 (tolerance 1e-6). Do NOT reorder.",
       "objective_weights": [0.4, 0.3, 0.2, 0.1],
       "normalize_weights": true,
+      "_threshold_action_note": "See _meta.modp_threshold_actions",
       "score_threshold_low": 0.4,
       "score_threshold_high": 0.7
     },
+
     "rlhf": {
       "enabled": true,
       "human_feedback_score": 0.6,
       "collect_feedback": true,
-      "feedback_source": "dashboard"
+      "feedback_source": {
+        "type": "dashboard",
+        "endpoint": "http://127.0.0.1:8001/helium",
+        "poll_interval_seconds": 300
+      }
     },
+
     "distillation": {
       "enabled": true,
       "use_moe_gating": true,
       "distillation_lr": 0.01,
-      "gating_lr": 0.005,
-      "replay_size": 2000,
-      "train_every": 10,
-      "epsilon": 0.1,
+      "_gating_lr_moved_note": "Moved to moe_expert.gating_lr (single source of truth). Do not add here.",
+      "replay_size_transitions": 2000,
+      "train_every_steps": 10,
+      "epsilon_exploration": 0.1,
       "teachers": ["rule_based", "historical_ml", "q_learning", "rlhf"]
     },
+
     "bio_inspired": {
       "enabled": true,
       "use_evolutionary": true,
@@ -67,19 +176,23 @@
       "crossover_rate": 0.7,
       "elitism": 2
     },
+
     "moe_expert": {
       "enabled": true,
+      "_gating_lr_note": "Single source of truth for gating learning rate. Consolidates distillation.gating_lr from v1.0.",
       "n_experts": 4,
       "gating_lr": 0.005
     },
+
     "flexgen": {
       "enabled": false,
       "model_name": "facebook/opt-6.7b",
       "batch_size": 16,
-      "memory_limit_mb": 4096,
+      "memory_limit_mib": 4096,
       "precision_options": ["fp32", "fp16", "int8"],
       "default_precision": "fp16",
-      "delegation_policy": "adaptive"
+      "delegation_policy": "adaptive",
+      "_delegation_policy_options": ["always", "never", "adaptive"]
     }
   }
 }
