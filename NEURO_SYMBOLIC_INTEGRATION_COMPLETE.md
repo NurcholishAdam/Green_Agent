@@ -1,4 +1,4 @@
-```markdown
+
 # Neuro-Symbolic Oversight Integration — Complete
 
 | Field | Value |
