@@ -1,302 +1,175 @@
+# 🌱 Green Agent
 
-# 🌱 Green Agent with Advanced Sustainability Orchestration
+**A sustainability-first, carbon-aware orchestration framework for AI workloads.**
 
-Green Agent is an open‑source framework for sustainable, intelligent orchestration of computing resources, built on a high‑throughput generation engine for large language models. It extends the core engine with carbon‑aware scheduling, helium tracking, predictive analytics, and a suite of reinforcement learning techniques to minimize environmental impact while maintaining performance and security.
+Green Agent is an open-source agentic AI runtime that decides *when, where, and how* to execute AI computation — continuously optimizing for energy, carbon, latency, cost, and quality, then **proving** what it achieved. It sits between AI workloads and the infrastructure that runs them: observing live signals, consulting specialized expert engines, learning from verified operational history, and recording every decision on an auditable governance trail.
 
-This repository includes an **Enhancements Folder** (`quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements`) that integrates the following advanced methods:
-
-- **LIMIT Graph** – topology‑aware decision making using graph representations of nodes and workloads.
-- **Multi‑Objective Decision Process (MODP)** – tunable trade‑offs between carbon, latency, cost, and energy.
-- **Reinforcement Learning from Human Feedback (RLHF)** – incorporating human preferences into routing, authentication, and priority selection.
-- **Multi‑Teacher On‑Policy Distillation** – distilling knowledge from multiple expert policies (rule‑based, historical ML, Q‑learning, RLHF) into a lightweight student model.
-- **Bio‑inspired Optimisation** – evolutionary algorithms for exploration and policy blending.
-- **Mixture‑of‑Experts (MoE)** – learnable gating networks that dynamically weight teacher contributions.
-
-All enhancements are designed to work seamlessly with the underlying generation engine, providing carbon‑aware, security‑conscious, and adaptive orchestration.
+Traditional green-software tools measure emissions *after* the job. Green Agent acts *before and during* execution — and grows measurably better at being green with every run.
 
 ---
 
-## 📁 Repository Structure
+## ✨ Highlights
 
-```
-quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/
-├── src/
-│   ├── enhancements/
-│   │   ├── feedback_event.py          # Canonical event schema (v2.2)
-│   │   ├── node_descriptor.py         # Adaptive node routing (distillation + MoE + RLHF)
-│   │   ├── workload_descriptor.py     # Adaptive workload priority (distillation + MoE + RLHF)
-│   │   ├── zero_trust_architecture.py # Zero Trust security with distillation and ledger
-│   │   └── async_message_queue.py     # Cross‑module communication
-│   └── integration/
-│       └── free_apis.py               # Community data hub and free API manager
-├── scripts/
-│   └── community_data_collector.py    # Enhanced data collection script
-└── README.md
-```
+- 🌍 **Carbon-aware routing** — live grid-intensity forecasting, eco-mode control, temporal shifting to greener windows, and Pareto-optimal route selection across edge INT8, cloud low-carbon regions, and deferred execution.
+- 🧠 **Learning decision core** — LIMIT Graph reasoning, Multi-Objective Decision Processes (MODP), Multi-Teacher On-Policy Distillation (MOPD), Mixture-of-Experts gating, RLHF, and bio-inspired optimization — fused into one control loop.
+- 🗂️ **Governed memory layer** — a 13-module, Supermemory-backed memory & context layer: recall-before-route, structured decision records, truth levels, bounded recall, write governance, feedback-loop protection, and MCP-exposed tools.
+- 🛡️ **Proof-of-Green governance** — event-sourced decision log, append-only carbon ledger, human-review approvals, policy versioning, enforcement, verification, and accountability subsystems — audit-ready by construction.
+- 📊 **Measurement & transparency** — efficiency accounting, metric governance, reproducibility rules, sustainable benchmarking, and a green leaderboard.
+- 🔌 **Open interfaces** — FastAPI server, Streamlit dashboards, telemetry loader, and Model Context Protocol (MCP) tools.
 
 ---
 
-## 🚀 Quick Start
+## 🆕 Recent upgrades
 
-### Installation
-
-```bash
-git clone https://github.com/NurcholishAdam/Green_Agent.git
-cd Green_Agent
-pip install -r requirements.txt
-```
-
-### Running the Community Data Collector
-
-```bash
-# Legacy mode (no advanced enhancements)
-python scripts/community_data_collector.py --contribute
-
-# Enhanced mode (Zero Trust, distillation, graph integration)
-python scripts/community_data_collector.py --contribute --enhanced
-```
-
-The enhanced mode activates the full pipeline:
-
-1. Authenticate using Zero Trust.
-2. Use `NodeDescriptor` to select the best region for carbon observation.
-3. Use `WorkloadDescriptor` to decide whether to contribute and with what priority.
-4. Record the action in the immutable ledger.
+| When | What landed |
+|---|---|
+| **Nov 10, 2026** | Ops hardening: `QUICK_START.md`, containerized benchmarking (`Dockerfile.benchmark`), dependency automation (Renovate / Digestabot), GPG-signed commits across the tree |
+| **Oct 28–30, 2026** | Governance & measurement sprint — `workload_interpreter`, `efficiency_calculator`, `metric_governance`, `reproducibility_rules`, `policy_decision`, `governance_event`, `human_review`, `green_leaderboard`, `helium_profile` |
+| **Oct 5, 2026** | Runtime expanded to 30+ module domains — orchestration, policy, scoring, reporting, runtime, retrieval, distributed execution, monitoring |
+| **Sep 19, 2026** | **Memory layer shipped** — 13 modules (~718 KB): Supermemory adapter v6.0.0, schemas, bounded recall, write governor, feedback-loop guard, memory tiers, policy memory, MCP tools, self-audit benchmark |
+| **Sep 17, 2026** | Lightweight `sustainability` package (carbon forecast → intensity provider → eco-mode controller → Pareto frontier → temporal shifter) + symbolic reasoning + dashboard revamp |
 
 ---
 
-## 🧠 How Enhancements Integrate with the Core Engine
+## 🧭 How it works
 
-The table below shows how each enhancement maps to the core engine's components and the requested technologies.
+Green Agent runs a continuous six-step loop on every routing event:
 
-| Enhancement Component       | Core Engine Integration Point | LIMIT Graph | MODP | RLHF | Distillation | Bio‑inspired | MoE |
-|-----------------------------|-------------------------------|-------------|------|------|--------------|--------------|-----|
-| `node_descriptor.py`        | Resource allocator / router    | ✔️          | ✔️   | ✔️   | ✔️           | ✔️           | ✔️  |
-| `workload_descriptor.py`    | Job scheduler                 | ✔️          | ✔️   | ✔️   | ✔️           | ✔️           | ✔️  |
-| `zero_trust_architecture.py`| Security layer                | ✔️          | ✔️   | ✔️   | ✔️           | ✔️           | ✔️  |
-| `feedback_event.py`         | Logging / audit trail         | ✔️          | ✔️   | ✔️   | –            | –            | –   |
-| `community_data_collector.py`| Data collection / sharing    | ✔️          | ✔️   | ✔️   | ✔️           | ✔️           | ✔️  |
+    1. OBSERVE   workload intent · device capacity · Arm Helium telemetry · grid carbon · latency targets
+    2. RECALL    3–5 comparable historical runs retrieved as cited evidence (bounded top-k recall)
+    3. PLAN      MoE expert panel + Pareto frontier compare routes: edge INT8 · cloud low-carbon · deferral · quantization
+    4. ACT       execute the policy-compliant route; human approval gates costly / irreversible actions
+    5. EVALUATE  predicted vs measured energy, CO2e, latency, cost, quality
+    6. REMEMBER  validated results promoted to durable memory — the system learns what actually worked
 
-### Detailed Correlations
-
-- **LIMIT Graph**  
-  - `node_descriptor.py` includes `graph_id`, `graph_embedding`, and `graph_metrics`. The graph’s `centrality` influences the node’s health score and, consequently, the routing state.  
-  - `workload_descriptor.py` also accepts graph fields and uses them to adjust historical performance estimates.  
-  - `zero_trust_architecture.py` can hold graph metadata and passes it to the carbon‑aware authenticator as `graph_health`.
-
-- **MODP**  
-  - In all decision‑making modules, objective weights (`carbon_weight`, `latency_weight`, `cost_weight`, `energy_weight`, `security_weight`, etc.) are configurable via `metadata` or `ZeroTrustConfig`.  
-  - Rewards are calculated as a weighted sum of normalized objectives, making them truly multi‑objective.
-
-- **RLHF**  
-  - A dedicated `RLHFTeacher` (or `RLHFPriorityTeacher`, `RLHFAuthTeacher`) is added to the teacher ensemble.  
-  - `human_feedback_score` is a field in state vectors; it biases the teacher’s predictions and contributes to the reward (typically 10% weight).
-
-- **Multi‑Teacher On‑Policy Distillation**  
-  - Each module maintains a `DistillationStudent` and a set of teachers (rule‑based, historical ML, Q‑learning, RLHF).  
-  - The student is updated online using a combination of distillation loss (KL‑like) and policy gradient (REINFORCE).  
-  - Historical ML teachers can be trained offline from logs.
-
-- **Bio‑inspired Optimisation**  
-  - `EvolutionaryOptimizer` classes implement a simple genetic algorithm.  
-  - When enabled (`use_evolutionary = True`), the evolutionary policy is blended with the distillation output (e.g., 70% distillation, 30% evolutionary).  
-  - The evolutionary optimizer’s fitness is updated with the same reward signal.
-
-- **MoE Expert Gating**  
-  - Instead of fixed confidence‑based teacher blending, a `MoEGatingNetwork` learns to weight each teacher based on the current state.  
-  - The gating network is updated together with the student using the same reward signal.  
-  - The number of experts equals the number of teachers (typically 4).
+Recalled evidence is *re-checked* against live telemetry before it can steer a decision — remembered recommendations are evidence, never ground truth.
 
 ---
 
-## 📚 Detailed Module Descriptions
+## 🏗️ Architecture
 
-### 1. `feedback_event.py`
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │ INTERFACE      FastAPI server · Streamlit dashboards · MCP tools       │
+    ├──────────────────────────────────────────────────────────────────────┤
+    │ GOVERNANCE     governance/ — carbon ledger · approvals · enforcement · │
+    │                verification · accountability · policy versions ·       │
+    │                human review                                            │
+    ├──────────────────────────────────────────────────────────────────────┤
+    │ MEMORY         memory/ — supermemory adapter v6.0.0 · schemas ·        │
+    │                bounded recall · write governor · feedback guard ·      │
+    │                memory tiers · policy memory · benchmark (13 modules)   │
+    ├──────────────────────────────────────────────────────────────────────┤
+    │ INTELLIGENCE   enhancements/ — LIMIT Graph · MODP · MOPD              │
+    │                distillation · MoE gating · RLHF · bio-inspired         │
+    ├──────────────────────────────────────────────────────────────────────┤
+    │ CARBON CORE    sustainability/ — carbon forecast · intensity         │
+    │                provider · eco-mode controller · Pareto frontier ·      │
+    │                temporal shifter        (+ legacy carbon/ module)         │
+    ├──────────────────────────────────────────────────────────────────────┤
+    │ DATA           telemetry · Arm Helium · grid carbon APIs ·              │
+    │                cloud / instance signals · device & helium profiles     │
+    └──────────────────────────────────────────────────────────────────────┘
 
-Canonical event schema for all feedback collectors. Supports:
+### Repository layout
 
-- Multi‑objective vectors.
-- Sub‑models for RLHF (`RLHFInfo`) and LIMIT Graph (`GraphInfo`).
-- Extended learning metrics (multi‑teacher loss).
-- Flexible metadata and tags.
-- Pydantic validation and JSON serialisation.
-- Database‑friendly serialisation (`to_db_dict`, `from_db_dict`).
-
-**Version:** 2.2
-
-### 2. `node_descriptor.py`
-
-Adaptive routing for compute nodes. Features:
-
-- **Distillation agent** with **MoE gating** over four teachers:
-  - Rule‑based (carbon/helium heuristics).
-  - Historical ML (RandomForest trained on logs).
-  - Stateful Q‑learning.
-  - RLHF (human feedback).
-- **Evolutionary optimizer** (bio‑inspired) can be blended with distillation.
-- **LIMIT Graph fields** (`graph_id`, `graph_embedding`, `graph_metrics`) influence state.
-- **MODP** via configurable reward weights (`carbon_weight`, `latency_weight`, `cost_weight`).
-- **Asynchronous persistence** of interaction logs and Q‑weights.
-
-**Example:**
-
-```python
-from enhancements.schemas.node_descriptor import NodeDescriptor, NodeType
-
-node = NodeDescriptor(
-    id="node-001",
-    type=NodeType.EDGE,
-    region="us-east",
-    region_carbon_intensity=0.42,
-    energy_per_token=0.00005,
-    use_evolutionary=True,               # Enable bio‑inspired optimisation
-    evolutionary_population_size=20,
-    human_feedback_score=0.6,            # RLHF input
-    graph_id="graph-node-001",           # LIMIT Graph integration
-    graph_metrics={"centrality": 0.75},
-    metadata={
-        "distillation_epsilon": 0.1,
-        "gating_learning_rate": 0.005,   # MoE learning rate
-        "rlhf_feedback_weight": 0.3,
-        "carbon_weight": 0.5,            # MODP objective weights
-        "latency_weight": 0.3,
-        "cost_weight": 0.2,
-    }
-)
-
-strategy = await node.select_routing_strategy()
-```
-
-### 3. `workload_descriptor.py`
-
-Adaptive priority selection for workloads. Features:
-
-- **Distillation agent** with **MoE gating** over four teachers.
-- **Evolutionary optimizer** for priority exploration.
-- **RLHF** integration via human feedback score.
-- **MODP** with metadata‑tunable weights (`latency_weight`, `carbon_weight`, `energy_weight`).
-- **LIMIT Graph integration** for topology awareness.
-
-**Example:**
-
-```python
-from enhancements.schemas.workload_descriptor import WorkloadDescriptor, TaskType
-
-wl = WorkloadDescriptor(
-    task_id="task-001",
-    task_type=TaskType.INFERENCE,
-    tokens=1024,
-    latency_target=150.0,
-    urgency=Urgency.HIGH,
-    estimated_energy_joules=0.1,
-    estimated_carbon_kg=0.0005,
-    use_evolutionary=True,
-    human_feedback_score=0.6,
-    graph_id="graph-task-001",
-    graph_metrics={"centrality": 0.7},
-    metadata={
-        "latency_weight": 0.5,
-        "carbon_weight": 0.3,
-        "energy_weight": 0.2,
-        "gating_learning_rate": 0.005,
-    }
-)
-
-priority = await wl.select_priority()
-```
-
-### 4. `zero_trust_architecture.py`
-
-Zero Trust security v4.2.0. Features:
-
-- **Adaptive authentication level** (light/standard/enhanced) selected via distillation.
-- **MoE gating** over teachers including RLHF.
-- **Evolutionary optimizer** for auth level selection.
-- **Immutable ledger** for all security events.
-- **Carbon & helium tracking** for sustainability‑aware security decisions.
-- **Predictive analytics** using online SGDRegressor.
-- **Integration** with `FeedbackEvent` and async message queue.
-
-**Example:**
-
-```python
-from enhancements.zero_trust_architecture import ZeroTrustArchitecture
-
-zta = ZeroTrustArchitecture()
-context = await zta.authenticate_request(
-    {"data_classification": "internal"},
-    {"identity": "alice", "authentication_method": "token", "token": "..."}
-)
-```
-
-### 5. `community_data_collector.py`
-
-Enhanced script for community data sharing. Supports:
-
-- Optional `--enhanced` flag to activate Zero Trust, distillation, and graph integration.
-- Region selection based on learned routing strategy.
-- Priority‑based contribution decisions.
-- Falls back to legacy behaviour when advanced modules are not available.
+    quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/
+    ├── enhancements/      # Learning core: LIMIT Graph, MODP, MOPD distillation, MoE, RLHF
+    ├── sustainability/    # Lightweight carbon-aware stack (the primary routing API surface)
+    ├── memory/            # 13-module governed memory layer (Supermemory-backed, offline fallback)
+    ├── governance/        # Proof-of-Green: carbon ledger, approvals, enforcement,
+    │                      # verification, accountability, contracts, benchmarks, policies
+    ├── decision/          # carbon_aware_decision_core · decision_request · policy_decision
+    ├── carbon/            # Legacy carbon module: telemetry, helium monitor, task profiling
+    ├── dashboard/         # FastAPI server · green + Streamlit dashboards · telemetry loader
+    ├── optimization/      # ML optimizers · synthetic-data optimizers
+    ├── symbolic/          # Symbolic reasoning engine + visualizer
+    ├── benchmarking/      # Sustainable benchmarking · efficiency accounting
+    ├── leaderboard/       # Green leaderboard
+    ├── ml_governance/     # Metric governance
+    ├── core/ · r1/ · rlhf/ · cognition/ · rewards/ · agentbeats/ · dpq/ · scripts/ · ...
+    └── ...                # 30+ module domains: orchestration, policy, scoring, reporting,
+                           # runtime, retrieval, distributed, monitoring, metrics,
+                           # instrumentation, integration, interpretation, visualization
 
 ---
 
-## 🧪 Advanced Usage
+## 🚀 Quick start
 
-### Training Historical Models
+### Install
 
-Historical ML teachers can be trained offline from interaction logs that contain state vectors and chosen actions.
+    git clone https://github.com/NurcholishAdam/Green_Agent.git
+    cd Green_Agent
+    pip install -r requirements.txt
 
-```python
-from enhancements.schemas.node_descriptor import train_historical_model
-from pathlib import Path
+The Supermemory SDK is **optional** — the memory layer automatically falls back to a local mirror when the SDK is absent. Point it at a local Supermemory instance (`:6767`, embedded graph engine, data stays on-device under `./.supermemory`) or a cloud endpoint via `supermemory_config`.
 
-train_historical_model(
-    log_paths=[Path("./node_logs/*.csv")],
-    model_path=Path("./routing_historical_model.pkl")
-)
-```
+### Run a module smoke test
 
-### Enabling MoE / RLHF / Evolutionary via Configuration
+Every module ships an executable smoke test:
 
-All modules accept parameters via their `metadata` dictionary or dedicated constructor arguments. For example, to enable evolutionary blending with a higher RLHF influence:
+    cd quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src
+    python -m memory.supermemory_adapter        # bridge + offline mirror
+    python -m memory.memory_schemas             # record schema round-trips
+    python -m governance.carbon_ledger          # append-only carbon ledger
 
-```python
-metadata = {
-    "use_evolutionary": True,
-    "evolutionary_population_size": 30,
-    "rlhf_feedback_weight": 0.5,
-    "gating_learning_rate": 0.01,
-}
-```
+### Launch the control plane & dashboards
 
-### Setting LIMIT Graph Data
+    python src/dashboard/api_server.py             # FastAPI server
+    streamlit run src/dashboard/streamlit_dashboard.py
 
-Graph data can be provided either at construction time or by directly assigning fields:
+### Containerized benchmarking
 
-```python
-node.graph_id = "graph-123"
-node.graph_embedding = [0.2, 0.5, 0.1]
-node.graph_metrics = {"centrality": 0.8, "connectivity": 0.9}
-```
+    docker build -f Dockerfile.benchmark -t green-agent-benchmark .
 
 ---
 
-## 📖 Testing
+## ⚙️ Configuration
 
-Unit tests for the distillation components (teachers, student, replay buffer, gating, evolutionary) are included in each module. Run them with:
+Key knobs live in `src/config.py`, `src/user_preferences.py`, and `src/memory/supermemory_config.py`:
 
-```bash
-cd path/to/enhancements
-python -m unittest discover -s schemas -p "*_test.py"
-```
+    from memory.supermemory_config import SupermemoryConfig
+
+    SupermemoryConfig(
+        mode="local",                        # or "cloud"
+        default_container_tag="org:green-agent",
+        recall_top_k=5,                      # bounded recall per decision
+        ttl_seconds={"grid_forecast": 3600}, # TTL per record kind; policies persist
+        write_retries=3,
+    )
+
+Decision objective weights (MODP) are tunable per workload via metadata — `carbon_weight`, `latency_weight`, `cost_weight`, `energy_weight`, `security_weight` — and the MoE gating network learns which expert to trust under each state.
+
+---
+
+## 🧪 Testing
+
+    cd quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench
+    python -m unittest discover -s src -p "*_test.py"
+
+Or run any module directly — each validates its own happy paths, error handling, and edge cases:
+
+    python -m enhancements.schemas.node_descriptor
+
+---
+
+## 🗺️ Roadmap
+
+- [ ] Orchestrator recall-before-route GA
+- [ ] Public benchmark results (memory-on vs baseline)
+- [ ] Enterprise audit pack (governance export, ESG reporting templates)
+- [ ] ASEAN data-centre & telco pilots
 
 ---
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
+Contributions are welcome — from new domain engines to governance adapters and memory tooling. Please open an issue or pull request; commits should be GPG-signed.
 
 ## 📄 License
 
-This project is licensed under the MIT License – see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE).
+
+## 🙏 Credits
+
+**Green Agent** is founded and led by **Nurcholish Adam** — *AI Research Agent* team.
+Co-created with the international open-source and research community.
