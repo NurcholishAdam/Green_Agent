@@ -1,4 +1,4 @@
-```markdown
+
 # Neuro-Symbolic Oversight for Green Agent
 
 **Version:** 1.2.0  
