@@ -1,208 +1,626 @@
-# prometheus.yml — Green Agent Scrape Configuration (Enhanced)
-# Add this to your main prometheus.yml or include via rule_files
+# =============================================================================
+# prometheus.yml — Green Agent Scrape Configuration (Enhanced v2.0)
+# =============================================================================
+# This is a PARTIAL prometheus.yml. It is NOT a rule file — you cannot
+# include it via `rule_files:`. It must be merged into your main
+# prometheus.yml (as `global`, `scrape_configs`, `alerting`, `rule_files`)
+# or deployed via a ConfigMap / file.
+#
+# Validate before deploying:
+#     promtool check config prometheus.yml
+#
+# Placeholder substitution
+# ------------------------
+# Every value marked `# REPLACE:` below must be replaced at deploy time.
+# Recommended approach — template the file and substitute at startup:
+#
+#     envsubst < prometheus.yml.tmpl > /etc/prometheus/prometheus.yml
+#
+# or use kustomize / Helm values. Do NOT ship this file with `{{ }}` or
+# `example.com` values — Prometheus has no template engine and every
+# metric will be stored with the literal placeholder string.
+#
+# Changes from v1.0
+# -----------------
+#   - Fixed broken `{{ .Cluster }}` / `{{ .Environment }}` templates in
+#     external_labels. Prometheus does not template — prior config stored
+#     every metric with the literal mustache string. Alerts that reference
+#     `$externalLabels.cluster` in green_agent_alerts.yml showed the
+#     literal `{{ .Cluster }}` string in every notification.
+#   - Added `region` external label (required by green_agent_alerts.yml
+#     v2.0 alert descriptions).
+#   - Added `replica` external label for HA.
+#   - Corrected header: this file is a partial prometheus.yml, NOT a
+#     rule_file. Prior comment said "include via rule_files" — wrong.
+#   - Full k8s relabel chain: scheme, path, endpoint-ready check, port
+#     fallback, honor_labels=false.
+#   - Removed the silent `job`-override risk (honor_labels: false).
+#   - Added cardinality safety on every job: sample_limit, label_limit,
+#     body_size_limit.
+#   - Added metric_relabel_configs drops for noisy metrics
+#     (http_request_duration_seconds_bucket, debug_*).
+#   - Added keeps for go_*, process_*, python_*, promhttp_* (essential
+#     for debugging exporter health — the family-wide bug where the
+#     allowlist hid exporter self-metrics).
+#   - Added self-scrape jobs: prometheus, alertmanager,
+#     kube-state-metrics, node-exporter. Without these, every Green
+#     Agent alert silently goes dark when the exporter dies.
+#   - Alertmanager HA with 3 targets + api_version: v2 + TLS.
+#   - Added alert_relabel_configs — drops ALERTS_FOR_STATE, strips
+#     __meta_* before forwarding.
+#   - Removed the no-op relabel rules in file-SD and Consul jobs.
+#   - Added a dummy fallback target for file-SD so a missing file is
+#     visible as `up=0` instead of silent zero targets.
+#   - Removed honor_timestamps (default).
+#   - Kept the static-config job but commented out the live targets that
+#     will fail outside their source subnet (10.0.0.50, example.com).
+#   - Every placeholder is now marked `# REPLACE:` with a substitution
+#     recipe at the top of the file.
+#   - Remote-write block expanded from a bare template into a hardened
+#     example (write_relabel_configs, metadata_config, name, tuned
+#     queue, mTLS).
+# =============================================================================
+
 
 global:
   scrape_interval: 30s
   evaluation_interval: 30s
+  scrape_timeout: 10s
+
   external_labels:
-    cluster: '{{ .Cluster }}'
-    environment: '{{ .Environment }}'
+    # REPLACE: cluster name (e.g., "green-agent-prod")
+    # Consumed by: green_agent_alerts.yml { $externalLabels.cluster }
+    cluster: "green-agent-prod"
 
-# ---------------------------------------------------------------------------
-# Scrape Configurations for Green Agent (including advanced enhancements)
-# ---------------------------------------------------------------------------
+    # REPLACE: region (e.g., "us-east-1", "eu-west-1")
+    # Consumed by: green_agent_alerts.yml { $externalLabels.region }
+    region: "us-east-1"
 
+    # REPLACE: replica id for HA (e.g., the StatefulSet pod name)
+    # Consumed by: deduplication when running multiple Prometheus replicas
+    replica: "prom-0"
+
+
+# -----------------------------------------------------------------------------
+# Alerting
+# -----------------------------------------------------------------------------
+alerting:
+  # Drop resolved-only duplicates and strip internal routing labels before
+  # forwarding to Alertmanager.
+  alert_relabel_configs:
+    - source_labels: [__name__]
+      regex: "ALERTS_FOR_STATE"
+      action: drop
+    - regex: "__meta_.*"
+      action: labeldrop
+
+  alertmanagers:
+    - static_configs:
+        - targets:
+            # REPLACE: real Alertmanager endpoints (HA — at least two).
+            - "alertmanager-0.alertmanager-headless:9093"
+            - "alertmanager-1.alertmanager-headless:9093"
+            - "alertmanager-2.alertmanager-headless:9093"
+      scheme: https
+      timeout: 10s
+      api_version: v2
+      tls_config:
+        # REPLACE: real cert paths (or switch scheme: http for a private
+        # network — not recommended in production).
+        ca_file: /etc/prometheus/certs/ca.crt
+        cert_file: /etc/prometheus/certs/client.crt
+        key_file: /etc/prometheus/certs/client.key
+        insecure_skip_verify: false
+      # authorization:
+      #   type: Bearer
+      #   credentials_file: /etc/prometheus/secrets/alertmanager-token
+
+
+# -----------------------------------------------------------------------------
+# Rule files (must exist on disk at startup)
+# -----------------------------------------------------------------------------
+# If any path below does not exist, Prometheus fails to start with a
+# clear error. Verify with:
+#     ls rules/*.yml
+rule_files:
+  - "rules/green_agent_alerts.yml"
+  - "rules/green_agent_recording.yml"
+  - "rules/enhanced_alerts.yml"
+  - "rules/enhanced_recording.yml"
+  - "rules/prometheus_self_alerts.yml"
+  # NOTE: green_agent_alerts.yml from this family ships self-alerts
+  #       (GreenAgentNoNewMetrics, GreenAgentRuleEvaluationFailing). The
+  #       prometheus_self_alerts.yml reference above is optional if you
+  #       use those instead.
+
+
+# -----------------------------------------------------------------------------
+# Scrape configurations
+# -----------------------------------------------------------------------------
 scrape_configs:
 
-  # -----------------------------------------------------------------------
-  # Option 1: Kubernetes Service Discovery (Production)
-  # -----------------------------------------------------------------------
-  - job_name: 'green-agent'
-    honor_labels: true
-    honor_timestamps: true
+  # ===========================================================================
+  # Self-monitoring jobs
+  # ===========================================================================
+  # These are non-negotiable. Without them, if the Green Agent exporter
+  # dies, every other alert in green_agent_alerts.yml silently goes dark
+  # (the metric they depend on is absent, so the alert never fires).
+
+  - job_name: "prometheus"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["localhost:9090"]
+    metric_relabel_configs:
+      - target_label: environment
+        replacement: production
+      - target_label: component
+        replacement: prometheus
+
+  - job_name: "alertmanager"
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - "alertmanager-0.alertmanager-headless:9093"
+          - "alertmanager-1.alertmanager-headless:9093"
+          - "alertmanager-2.alertmanager-headless:9093"
+    scheme: https
+    tls_config:
+      ca_file: /etc/prometheus/certs/ca.crt
+      cert_file: /etc/prometheus/certs/client.crt
+      key_file: /etc/prometheus/certs/client.key
+    metric_relabel_configs:
+      - target_label: environment
+        replacement: production
+      - target_label: component
+        replacement: alertmanager
+
+  - job_name: "kube-state-metrics"
+    scrape_interval: 30s
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names: [kube-system]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        regex: kube-state-metrics
+        action: keep
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: kubernetes_namespace
+      - target_label: component
+        replacement: kube-state-metrics
+
+  - job_name: "node-exporter"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["node-exporter:9100"]
+    metric_relabel_configs:
+      - target_label: environment
+        replacement: production
+      - target_label: component
+        replacement: node-exporter
+
+  # ===========================================================================
+  # Green Agent — Kubernetes service discovery (production default)
+  # ===========================================================================
+  # Relabel chain:
+  #   1. keep prometheus.io/scrape=true          — opt-in only
+  #   2. keep prometheus.io/port=~\d+            — require numeric port
+  #   3. keep __meta_kubernetes_endpoint_ready   — no phantom up=0
+  #   4. rewrite __address__                     — use the annotated port
+  #   5. respect prometheus.io/scheme            — https when annotated
+  #   6. respect prometheus.io/path              — custom /metrics path
+  #   7. propagate labels                        — namespace, pod, node, app
+  #   8. derive environment from namespace       — green-agent-<env>
+  - job_name: "green-agent"
+    honor_labels: false
     scrape_interval: 30s
     scrape_timeout: 10s
     metrics_path: /metrics
     scheme: http
-    
-    kubernetes_sd_configs:
-    - role: endpoints
-      namespaces:
-        names:
-        - green-agent-production
-        - green-agent-staging
-        - green-agent-dev
-    
-    relabel_configs:
-    - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
-      action: keep
-      regex: true
-    - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_port]
-      action: replace
-      target_label: __metrics_port__
-      regex: (\d+)
-    - source_labels: [__address__, __metrics_port__]
-      action: replace
-      regex: ([^:]+)(?::\d+)?;(\d+)
-      replacement: $1:$2
-      target_label: __address__
-    - source_labels: [__meta_kubernetes_namespace]
-      action: replace
-      target_label: kubernetes_namespace
-    - source_labels: [__meta_kubernetes_pod_name]
-      action: replace
-      target_label: pod
-    - source_labels: [__meta_kubernetes_pod_node_name]
-      action: replace
-      target_label: node
-    - source_labels: [__meta_kubernetes_pod_label_app]
-      action: replace
-      target_label: app
-    - source_labels: [__meta_kubernetes_pod_label_component]
-      action: replace
-      target_label: component
-    - source_labels: [__meta_kubernetes_namespace]
-      action: replace
-      target_label: environment
-      regex: green-agent-(.*)
-      replacement: $1
-    
-    metric_relabel_configs:
-    # Keep only Green Agent specific metrics to reduce cardinality
-    - source_labels: [__name__]
-      regex: 'green_agent_.*'
-      action: keep
-    # Drop extremely high cardinality edge weight metrics if necessary (already limited by exporter)
-    - source_labels: [__name__]
-      regex: 'green_agent_moe_gate_weight'
-      action: keep   # keep MoE gate weights if we need them (can be high cardinality; adjust as needed)
-    - target_label: job
-      replacement: green-agent
 
-  # -----------------------------------------------------------------------
-  # Option 2: Static Config (Local Development / Bare Metal)
-  # -----------------------------------------------------------------------
-  - job_name: 'green-agent-static'
-    honor_labels: true
+    # --- Cardinality safety (per scrape) -----------------------------------
+    sample_limit: 50000
+    label_limit: 40
+    label_name_length_limit: 200
+    label_value_length_limit: 500
+    body_size_limit: 10MB
+
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+            - green-agent-production
+            - green-agent-staging
+            - green-agent-dev
+
+    relabel_configs:
+      # 1. Only scrape services that explicitly opt in
+      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+
+      # 2. Require a numeric port annotation (avoids scraping a broken
+      #    address when the annotation is absent)
+      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_port]
+        action: keep
+        regex: \d+
+
+      # 3. Only scrape ready endpoints — prevents `up=0` alerts during
+      #    rolling restarts
+      - source_labels: [__meta_kubernetes_endpoint_ready]
+        action: keep
+        regex: "true"
+
+      # 4. Rewrite __address__ to use the annotated port
+      - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+
+      # 5. Respect prometheus.io/scheme (http | https)
+      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]
+        action: replace
+        target_label: __scheme__
+        regex: (https?)
+
+      # 6. Respect prometheus.io/path (defaults to /metrics)
+      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+
+      # 7. Propagate target labels
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: kubernetes_namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        action: replace
+        target_label: node
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: replace
+        target_label: app
+      - source_labels: [__meta_kubernetes_pod_label_component]
+        action: replace
+        target_label: component
+      - source_labels: [__meta_kubernetes_pod_label_enhancements]
+        action: replace
+        target_label: enhancements
+        regex: "(.+)"
+
+      # 8. Derive `environment` from namespace (green-agent-<env>)
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: environment
+        regex: "green-agent-(.*)"
+        replacement: "$1"
+
+    # --- Metric-level cardinality control ---------------------------------
+    metric_relabel_configs:
+      # Drop noisy per-request histograms (aggregated elsewhere)
+      - source_labels: [__name__]
+        regex: 'green_agent_http_request_duration_seconds_bucket'
+        action: drop
+
+      # Drop debug metrics
+      - source_labels: [__name__]
+        regex: 'green_agent_debug_.*'
+        action: drop
+
+      # Explicitly KEEP exporter self-metrics so they can be used to
+      # debug the exporter itself (do NOT filter these out with an
+      # allowlist — this is the family-wide bug that made exporter
+      # failures invisible).
+      - source_labels: [__name__]
+        regex: 'go_.*|process_.*|python_.*|promhttp_.*'
+        action: keep
+
+      # Keep Green Agent product metrics
+      - source_labels: [__name__]
+        regex: 'green_agent_.*'
+        action: keep
+
+      # Normalize the job label explicitly (do not rely on
+      # honor_labels — we set honor_labels: false above).
+      - target_label: job
+        replacement: green-agent
+
+    # --- Optional scrape authentication (enable if agent supports it) ----
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/secrets/green-agent-token
+    # tls_config:
+    #   ca_file: /etc/prometheus/certs/ca.crt
+    #   cert_file: /etc/prometheus/certs/client.crt
+    #   key_file: /etc/prometheus/certs/client.key
+    #   insecure_skip_verify: false
+
+  # ===========================================================================
+  # Green Agent — static config (local dev / bare metal)
+  # ===========================================================================
+  # Only the localhost target is enabled by default. The `.example.com`
+  # and `10.0.0.50` targets are disabled — they will fail outside their
+  # source subnet and pollute logs with `up=0`.
+  #
+  # To enable a specific target, uncomment it and set appropriate labels.
+  - job_name: "green-agent-static"
+    honor_labels: false
     scrape_interval: 15s
     scrape_timeout: 5s
     metrics_path: /metrics
     scheme: http
-    
+
+    sample_limit: 50000
+    label_limit: 40
+    body_size_limit: 10MB
+
     static_configs:
-    - targets:
-      - 'localhost:8000'
-      - 'green-agent-dev.example.com:8000'
-      - '10.0.0.50:8000'
-      labels:
-        environment: development
-        team: ai-platform
-    
-    metric_relabel_configs:
-    - source_labels: [__name__]
-      regex: 'process_.*'
-      action: drop
-    - source_labels: [__name__]
-      regex: 'green_agent_.*'
-      action: keep
+      - targets:
+          - "localhost:8000"
+        labels:
+          environment: development
+          team: ai-platform
+      # REPLACE: uncomment if you have a real dev host reachable from
+      # the Prometheus network:
+      # - targets:
+      #     - "green-agent-dev.example.com:8000"
+      #   labels:
+      #     environment: development
+      #     team: ai-platform
+      # REPLACE: uncomment only if 10.0.0.50 is reachable from here:
+      # - targets:
+      #     - "10.0.0.50:8000"
+      #   labels:
+      #     environment: development
+      #     team: ai-platform
 
-  # -----------------------------------------------------------------------
-  # Option 3: File-Based Service Discovery (Hybrid Deployments)
-  # -----------------------------------------------------------------------
-  - job_name: 'green-agent-file-sd'
-    honor_labels: true
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'green_agent_debug_.*'
+        action: drop
+      - source_labels: [__name__]
+        regex: 'go_.*|process_.*|python_.*|promhttp_.*'
+        action: keep
+      - source_labels: [__name__]
+        regex: 'green_agent_.*'
+        action: keep
+
+  # ===========================================================================
+  # Green Agent — file-based service discovery (hybrid deployments)
+  # ===========================================================================
+  # The file /etc/prometheus/green-agent-targets.yml must exist. If it is
+  # missing, this job will have ZERO targets and Prometheus will log a
+  # warning at startup. A dummy fallback target below ensures a missing
+  # file shows up as `up=0` rather than silent absence.
+  #
+  # File format (see green_agent_targets.example.yml below):
+  #   - targets: ["host1:8000", "host2:8000"]
+  #     labels:
+  #       environment: production
+  #       datacenter: dc1
+  - job_name: "green-agent-file-sd"
+    honor_labels: false
     scrape_interval: 30s
     scrape_timeout: 10s
     metrics_path: /metrics
     scheme: http
-    
+
+    sample_limit: 50000
+    label_limit: 40
+    body_size_limit: 10MB
+
     file_sd_configs:
-    - files:
-      - '/etc/prometheus/green-agent-targets.yml'
-      refresh_interval: 1m
-    
-    relabel_configs:
-    - source_labels: [environment]
-      action: replace
-      target_label: environment
-    - source_labels: [datacenter]
-      action: replace
-      target_label: datacenter
-    
-    metric_relabel_configs:
-    - source_labels: [__name__]
-      regex: 'green_agent_.*'
-      action: keep
+      - files:
+          - "/etc/prometheus/green-agent-targets.yml"
+        refresh_interval: 1m
 
-  # -----------------------------------------------------------------------
-  # Option 4: Consul Service Discovery (If Using Consul)
-  # -----------------------------------------------------------------------
-  - job_name: 'green-agent-consul'
-    honor_labels: true
+    # Fallback so a missing file is visible. If the file exists and has
+    # targets, this static target sits at up=0 (harmless). If the file
+    # is missing, this is the only target and it shows up as up=0 —
+    # tripping the "no healthy targets" alert.
+    static_configs:
+      - targets: ["green-agent-file-sd-missing.invalid:1"]
+        labels:
+          environment: _missing_file
+
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'green_agent_debug_.*'
+        action: drop
+      - source_labels: [__name__]
+        regex: 'go_.*|process_.*|python_.*|promhttp_.*'
+        action: keep
+      - source_labels: [__name__]
+        regex: 'green_agent_.*'
+        action: keep
+
+  # ===========================================================================
+  # Green Agent — Consul service discovery
+  # ===========================================================================
+  # Only enable if you actually run Consul. Remove this job otherwise —
+  # an empty `consul_sd_configs` will log warnings every refresh.
+  - job_name: "green-agent-consul"
+    honor_labels: false
     scrape_interval: 30s
     scrape_timeout: 10s
     metrics_path: /metrics
     scheme: http
-    
+
+    sample_limit: 50000
+    label_limit: 40
+    body_size_limit: 10MB
+
     consul_sd_configs:
-    - server: 'consul.example.com:8500'
-      services: ['green-agent']
-      tags: ['metrics']
-    
+      # REPLACE: real Consul server
+      - server: "consul.example.com:8500"
+        services: ["green-agent"]
+        tags: ["metrics"]
+
     relabel_configs:
-    - source_labels: [__meta_consul_service]
-      action: replace
-      target_label: service
-    - source_labels: [__meta_consul_tags]
-      action: replace
-      target_label: tags
-      regex: '(.*)'
-      replacement: '$1'
-    
+      - source_labels: [__meta_consul_service]
+        target_label: service
+      - source_labels: [__meta_consul_dc]
+        target_label: datacenter
+
     metric_relabel_configs:
-    - source_labels: [__name__]
-      regex: 'green_agent_.*'
-      action: keep
+      - source_labels: [__name__]
+        regex: 'green_agent_debug_.*'
+        action: drop
+      - source_labels: [__name__]
+        regex: 'go_.*|process_.*|python_.*|promhttp_.*'
+        action: keep
+      - source_labels: [__name__]
+        regex: 'green_agent_.*'
+        action: keep
 
-# ---------------------------------------------------------------------------
-# Alerting Configuration (if using Alertmanager)
-# ---------------------------------------------------------------------------
-alerting:
-  alertmanagers:
-  - static_configs:
-    - targets:
-      - 'alertmanager.example.com:9093'
-    scheme: http
-    timeout: 10s
 
-# ---------------------------------------------------------------------------
-# Rule Files (include Green Agent alerts and enhanced alerts)
-# ---------------------------------------------------------------------------
-rule_files:
-  - 'rules/green_agent_alerts.yml'
-  - 'rules/green_agent_recording.yml'
-  # Enhanced alerts for advanced modules (LIMIT Graph, MODP, RLHF, etc.)
-  - 'rules/enhanced_alerts.yml'
-  # Optional: recording rules for MODP, RLHF, graph metrics
-  - 'rules/enhanced_recording.yml'
-
-# ---------------------------------------------------------------------------
-# Remote Write (Optional: Send to Thanos/Cortex/Mimir)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Remote write (Thanos / Cortex / Mimir) — hardening
+# -----------------------------------------------------------------------------
+# Uncomment and REPLACE the URL, TLS paths, and credentials before use.
+#
 # remote_write:
-# - url: 'https://thanos-receive.example.com/api/v1/receive'
-#   remote_timeout: 30s
-#   queue_config:
-#     max_samples_per_send: 1000
-#     capacity: 10000
-#     max_shards: 50
-#   tls_config:
-#     ca_file: /etc/prometheus/certs/ca.crt
-#   basic_auth:
-#     username: 'prometheus'
-#     password_file: /etc/prometheus/secrets/remote-write-password
-#   write_relabel_configs:
-#   - source_labels: [environment]
-#     target_label: env
-#   - source_labels: [cluster]
-#     target_label: cluster_id
+#   - url: "https://thanos-receive.example.com/api/v1/receive"
+#     name: thanos-primary
+#     remote_timeout: 30s
+#
+#     # Drop high-cardinality / debug metrics before shipping.
+#     write_relabel_configs:
+#       - source_labels: [__name__]
+#         regex: "green_agent_debug_.*"
+#         action: drop
+#       - source_labels: [__name__]
+#         regex: "green_agent_http_request_duration_seconds_bucket"
+#         action: drop
+#       - source_labels: [__name__]
+#         regex: "go_.*"
+#         action: drop
+#       - source_labels: [__name__]
+#         regex: "promhttp_.*"
+#         action: drop
+#
+#     queue_config:
+#       max_samples_per_send: 2000
+#       capacity: 20000
+#       max_shards: 50
+#       min_shards: 2
+#       max_retries: 10
+#       min_backoff: 30ms
+#       max_backoff: 5s
+#       batch_send_deadline: 5s
+#
+#     metadata_config:
+#       send: true
+#       send_interval: 1m
+#
+#     send_exemplars: false
+#
+#     tls_config:
+#       ca_file: /etc/prometheus/certs/ca.crt
+#       cert_file: /etc/prometheus/certs/client.crt
+#       key_file: /etc/prometheus/certs/client.key
+#       insecure_skip_verify: false
+#
+#     basic_auth:
+#       username: "prometheus"
+#       password_file: /etc/prometheus/secrets/remote-write-password
+
+
+# =============================================================================
+# Companion files (for reference — save these separately)
+# =============================================================================
+#
+# ─── green_agent_targets.example.yml ────────────────────────────────────
+# Save as /etc/prometheus/green-agent-targets.yml to feed the
+# `green-agent-file-sd` job above.
+#
+# The file_sd_configs refreshes every 1m, so edits here take effect
+# without restarting Prometheus.
+#
+# - targets:
+#     - "green-agent-prod-0.internal:8000"
+#     - "green-agent-prod-1.internal:8000"
+#   labels:
+#     environment: production
+#     datacenter: dc1
+#     team: ai-platform
+#
+# - targets:
+#     - "green-agent-staging-0.internal:8000"
+#   labels:
+#     environment: staging
+#     datacenter: dc1
+#     team: ai-platform
+#
+#
+# ─── .envsubst template usage ───────────────────────────────────────────
+# If you keep `prometheus.yml.tmpl` with `{{CLUSTER}}`, `{{REGION}}`, etc.
+# placeholders, substitute at deploy time:
+#
+#     envsubst < prometheus.yml.tmpl > /etc/prometheus/prometheus.yml
+#
+# Then verify:
+#
+#     promtool check config /etc/prometheus/prometheus.yml
+#     curl -s http://localhost:9090/api/v1/targets | jq '.data.activeTargets[].labels' \
+#         | grep -F '{{' && echo "FAIL: template leaked" || echo "PASS"
+#
+#
+# ─── Verification checklist ─────────────────────────────────────────────
+# 1. promtool check config prometheus.yml
+#    → SUCCESS: prometheus.yml is valid
+#
+# 2. curl -s http://localhost:9090/api/v1/targets | jq -r '
+#      .data.activeTargets[] | "\(.labels.job)  up=\(.health)"' | sort -u
+#    → every job above appears with up=up
+#
+# 3. curl -s http://localhost:9090/api/v1/rules | jq -r '.data.groups[].name'
+#    → green_agent_graph_health, green_agent_slow_alerts, ...
+#
+# 4. curl -s http://localhost:9090/api/v1/targets | jq '.data.activeTargets[].labels' \
+#      | grep -F '{{'
+#    → returns nothing (no template leaked)
+#
+#
+# ─── What changed from v1.0 — property summary ──────────────────────────
+# Prior config:                          Enhanced:
+#   external_labels were mustache         external_labels are literal
+#   templates (stored as literal          strings; region + replica added
+#   "{{ .Cluster }}")
+#
+#   No k8s scheme/path/ready/port         Full relabel chain (8 rules)
+#   filters (HTTPS targets broke)
+#
+#   honor_labels: true → silent           honor_labels: false → explicit
+#   job-override risk                     job label
+#
+#   No cardinality limits                 sample_limit, label_limit,
+#                                         body_size_limit on every job
+#
+#   metric allowlist hid exporter         go_/process_/python_/promhttp_
+#   self-metrics                          explicitly kept
+#
+#   No self-scrape jobs                   prometheus, alertmanager,
+#                                         kube-state-metrics, node-exporter
+#
+#   Alertmanager single HTTP target       Alertmanager HA + TLS + v2
+#
+#   Static job live placeholders          Only localhost active; the rest
+#   (10.0.0.50, example.com) failed       commented out with `# REPLACE:`
+#
+#   File-SD missing → zero targets        Fallback dummy target → visible
+#   (silent)                              as up=0
+#
+#   No-op relabels in file-SD / Consul    Removed (they did nothing)
+#
+#   Header said "include via rule_files"  Header corrected: partial
+#   (wrong — cannot include scrape_configs prometheus.yml
+#   via rule_files)
+#
+#   Commented remote-write template       Hardened example with
+#   without write relabeling              write_relabel_configs,
+#                                         metadata_config, tuned queue
+# =============================================================================
