@@ -1,7 +1,7 @@
 
 # Agent Instructions
 
-**Version:** 2.0 · **Updated:** 2024-01-01
+**Version:** 2.0 · **Updated:** 2026-11-10
 **Applies to:** AI coding assistants (Claude Code, Cursor, Copilot, etc.)
 **Prerequisite:** lean-ctx MCP server configured in your client
 
