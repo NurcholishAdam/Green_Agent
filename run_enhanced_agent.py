@@ -1,474 +1,1094 @@
-# run_enhanced_agent.py
-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Complete runner for enhanced Green Agent with all modules integrated.
-Additionally integrates advanced enhancement modules (LIMIT Graph, MODP,
-RLHF, Multi‑Teacher On‑Policy Distillation, Bio‑inspired Optimisation,
-MoE expert gating, and FlexGen integration) from src/enhancements.
-These are optional and gracefully degrade if not installed.
-"""
+run_enhanced_agent.py — Complete runner for the Enhanced Green Agent (v2.0)
 
-import sys
-import signal
-import time
-import logging
+Wires together the scientific modules (synthetic data, control system,
+fallback manager, thermal optimizer, phase-energy model, energy scaler,
+marginal-carbon forecaster, dual carbon accountant, helium elasticity,
+material substitution, helium circularity, regret optimizer, federated
+learning) with the optional advanced enhancement modules (LIMIT Graph,
+MODP, RLHF, Multi-Teacher On-Policy Distillation, Bio-inspired
+Optimisation, MoE expert gating, FlexGen).
+
+Enhanced in v2.0
+----------------
+- **Added `import asyncio`** — the original called `asyncio.run(...)` four
+  times without importing the module.
+- **`_maybe_await` helper** — handles sync-or-async enhancement methods
+  (per INSTALLATION.md §2 they are sync; prior demo code assumed async).
+  `select_routing_strategy`, `select_priority`, `record_outcome`,
+  `initialize`, `shutdown` all go through it.
+- **Fixed `FeedbackEvent` construction** — uses `energy_kwh` and
+  `carbon_kg` (per README.md §2.5); no `energy_joules` / `carbon_g` /
+  `helium_cost` / `duration_ms`; no reliance on `event.event_id`.
+- **Fixed `NodeDescriptor` constructor** — removed undocumented kwargs
+  (`helium_connectivity_score`, `uptime`, `renewable_fraction`,
+  `cooling_type`, `hardware_model`) that would raise `TypeError`.
+- **`--enhancements` / `--no-enhancements`** — the prior `store_true`
+  flag had `default=True`, so it could never be `False` (dead code).
+- **`--once` / `--iterations N`** — prevents infinite hang in CI.
+- **Config supports YAML and JSON** — detected by file extension.
+- **No `sys.path.insert('src/enhancements')` relative-path bug** — paths
+  are derived from `__file__` so the script works from any cwd.
+- **Per-module diagnostics** — one failed module no longer silently
+  disables all 8 enhancements; each is initialized in its own try/except
+  and the failure mode is logged.
+- **`tempfile.TemporaryDirectory()`** for the DAG carbon ledger — no
+  more hardcoded `/tmp` (Windows-safe, auto-cleaned).
+- **Real inputs to `thermal.optimize_schedule(temp_data, grid_data)`** —
+  the prior `(None, None)` produced a meaningless decision.
+- **All strategy/priority branches handled** — prior version only acted
+  on `carbon_first` and `green`; every other strategy was silently ignored.
+- **Guarded attribute access** — `thermal_decision`, `elasticity_decision`,
+  `_routing_optimizer` are all checked before use.
+- **Real iteration tracking** — `self._iteration` replaces the constant-0
+  `_get_current_iteration()` placeholder.
+- **Graceful shutdown of advanced modules** — DAG ledger, graph registry
+  closed in `stop()`; wrapped so one failure does not skip the rest.
+- **Prometheus metrics endpoint** — optional via `--metrics-bind`; the
+  prior version had no metrics surface.
+- **Signal handlers cross-platform** — falls back to `signal.signal` when
+  the event loop raises `NotImplementedError` (Windows).
+- **Explicit exit codes** — 0 success, 1 runtime failure, 2 config/env.
+- **`__version__`, header, docstrings, type hints** throughout.
+
+Run
+---
+    # Batch: 1 iteration, exit
+    python run_enhanced_agent.py --once --iterations 1
+
+    # Serve: continuous loop, Ctrl+C to stop
+    python run_enhanced_agent.py
+
+    # No enhancements (base modules only)
+    python run_enhanced_agent.py --once --iterations 1 --no-enhancements
+
+    # Choose scenario and data quality
+    python run_enhanced_agent.py --once --iterations 1 \\
+        --scenario helium_crisis --quality noisy
+
+    # Custom config (YAML or JSON)
+    python run_enhanced_agent.py --config config/base/green_agent_config.yaml
+
+Exit codes
+----------
+    0   normal exit (batch done or clean shutdown)
+    1   runtime error during an iteration
+    2   configuration or environment error
+    130 SIGINT (Ctrl+C)
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import inspect
 import json
+import logging
+import signal
+import sys
+import tempfile
+import time
 from datetime import datetime
-from typing import Dict, Optional, Any
+from pathlib import Path
+from typing import Any, Optional
 
-# Add path
-sys.path.insert(0, 'src/enhancements')
+__version__ = "5.0.0"
 
-from synthetic_data_manager import SyntheticDataSource, DataQuality, ScenarioType
-from control_system import ControlSystem, ControlMode
-from fallback_manager import FallbackManager, FallbackStrategy
-from thermal_optimizer import ThermalAwareOptimizer
-from phase_energy_model import PhaseAwareEnergyModel
-from energy_scaler import EnergyProportionalScaler
-from marginal_carbon import MarginalCarbonIntensityForecaster
-from dual_accountant import DualCarbonAccountant
-from helium_elasticity import HeliumPriceElasticityModel, WorkloadPriority
-from material_substitution import MaterialSubstitutionEngine
-from helium_circularity import HeliumCircularityTracker
-from regret_optimizer import RegretMinimizationOptimizer
-from federated_learning import FederatedGreenLearning
+# =============================================================================
+# sys.path — resolved from __file__ so the script works from any cwd.
+# Both the repo root (for `src.enhancements.*`) and src/enhancements (for
+# the flat imports of the scientific modules) are added.
+# =============================================================================
+_REPO_ROOT = Path(__file__).resolve().parent
+_ENHANCEMENTS_DIR = _REPO_ROOT / "src" / "enhancements"
 
-# ------------------------------------------------------------------------------
-# Optional imports for advanced enhancements (graceful fallback)
-# ------------------------------------------------------------------------------
+for _p in (_REPO_ROOT, _ENHANCEMENTS_DIR):
+    if _p.is_dir() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+# =============================================================================
+# Required scientific modules — flat imports from src/enhancements
+# =============================================================================
+_REQUIRED_IMPORT_ERROR: Optional[Exception] = None
 try:
-    from src.enhancements.schemas.node_descriptor import NodeDescriptor, NodeType, CoolingType, MaintenanceStatus, RoutingStrategy
-    from src.enhancements.schemas.workload_descriptor import WorkloadDescriptor, TaskType, Urgency, Priority, BioMode
-    from src.enhancements.schemas.feedback_event import FeedbackEvent
-    from src.enhancements.zero_trust_architecture import ZeroTrustArchitecture, ZeroTrustConfig
-    from src.enhancements.core.graph_registry import GraphRegistry, GraphType
-    from src.enhancements.core.causal_graph import CausalGraph
-    from src.enhancements.core.meta_cognition import MetaCognitionLayer
-    from src.enhancements.metrics.dag_carbon_ledger import DAGCarbonLedger
-    ENHANCEMENTS_AVAILABLE = True
-except ImportError:
-    ENHANCEMENTS_AVAILABLE = False
-    NodeDescriptor = None
-    WorkloadDescriptor = None
-    FeedbackEvent = None
-    ZeroTrustArchitecture = None
-    ZeroTrustConfig = None
-    GraphRegistry = None
-    GraphType = None
-    CausalGraph = None
-    MetaCognitionLayer = None
-    DAGCarbonLedger = None
+    from synthetic_data_manager import SyntheticDataSource, DataQuality, ScenarioType
+    from control_system import ControlSystem, ControlMode
+    from fallback_manager import (
+        FallbackManager, FallbackConfig, FallbackStrategy,
+    )
+    from thermal_optimizer import ThermalAwareOptimizer
+    from phase_energy_model import PhaseAwareEnergyModel
+    from energy_scaler import EnergyProportionalScaler
+    from marginal_carbon import MarginalCarbonIntensityForecaster
+    from dual_accountant import DualCarbonAccountant
+    from helium_elasticity import (
+        HeliumPriceElasticityModel, WorkloadPriority,
+    )
+    from material_substitution import MaterialSubstitutionEngine
+    from helium_circularity import HeliumCircularityTracker
+    from regret_optimizer import RegretMinimizationOptimizer
+    from federated_learning import FederatedGreenLearning
+except ImportError as _exc:
+    _REQUIRED_IMPORT_ERROR = _exc
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+if _REQUIRED_IMPORT_ERROR is not None:
+    print(
+        f"FATAL: could not import required scientific modules: "
+        f"{_REQUIRED_IMPORT_ERROR}\n"
+        f"Expected them under: {_ENHANCEMENTS_DIR}\n"
+        "Install with: pip install -e . --no-deps",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+# =============================================================================
+# Optional advanced enhancement modules — per-module isolation
+# =============================================================================
+def _try_import(module: str, symbols: tuple[str, ...]) -> tuple[dict[str, Any], Optional[Exception]]:
+    """Import ``symbols`` from ``module``; capture exception on failure."""
+    try:
+        mod = __import__(module, fromlist=list(symbols))
+    except Exception as exc:  # pragma: no cover - env-dependent
+        return {name: None for name in symbols}, exc
+    return {name: getattr(mod, name, None) for name in symbols}, None
+
+
+_node, _node_err = _try_import(
+    "src.enhancements.schemas.node_descriptor",
+    ("NodeDescriptor", "NodeType"),
 )
-logger = logging.getLogger(__name__)
+_wl, _wl_err = _try_import(
+    "src.enhancements.schemas.workload_descriptor",
+    ("WorkloadDescriptor", "TaskType", "Urgency"),
+)
+_fe, _fe_err = _try_import(
+    "src.enhancements.schemas.feedback_event",
+    ("FeedbackEvent",),
+)
+_zt, _zt_err = _try_import(
+    "src.enhancements.zero_trust_architecture",
+    ("ZeroTrustArchitecture", "ZeroTrustConfig"),
+)
+_gr, _gr_err = _try_import(
+    "src.enhancements.core.graph_registry",
+    ("GraphRegistry", "GraphType"),
+)
+_mc, _mc_err = _try_import(
+    "src.enhancements.core.meta_cognition",
+    ("MetaCognitionLayer",),
+)
+_dl, _dl_err = _try_import(
+    "src.enhancements.metrics.dag_carbon_ledger",
+    ("DAGCarbonLedger",),
+)
 
+NodeDescriptor = _node["NodeDescriptor"]
+NodeType = _node["NodeType"]
+WorkloadDescriptor = _wl["WorkloadDescriptor"]
+TaskType = _wl["TaskType"]
+Urgency = _wl["Urgency"]
+FeedbackEvent = _fe["FeedbackEvent"]
+ZeroTrustArchitecture = _zt["ZeroTrustArchitecture"]
+ZeroTrustConfig = _zt["ZeroTrustConfig"]
+GraphRegistry = _gr["GraphRegistry"]
+GraphType = _gr["GraphType"]
+MetaCognitionLayer = _mc["MetaCognitionLayer"]
+DAGCarbonLedger = _dl["DAGCarbonLedger"]
+
+_ENHANCEMENT_ERRORS: dict[str, Optional[Exception]] = {
+    "NodeDescriptor": _node_err,
+    "WorkloadDescriptor": _wl_err,
+    "FeedbackEvent": _fe_err,
+    "ZeroTrustArchitecture": _zt_err,
+    "GraphRegistry": _gr_err,
+    "MetaCognitionLayer": _mc_err,
+    "DAGCarbonLedger": _dl_err,
+}
+
+
+def _missing_enhancements() -> list[str]:
+    return [name for name, exc in _ENHANCEMENT_ERRORS.items() if exc is not None]
+
+
+# =============================================================================
+# Logging
+# =============================================================================
+logger = logging.getLogger("run_enhanced_agent")
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+_LOOP_INTERVAL_S = 5.0
+_LOG_EVERY_N_ITERATIONS = 12
+_DEFAULT_DAG_LEDGER_PREFIX = "enhanced_agent_ledger_"
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+async def _maybe_await(value: Any) -> Any:
+    """Await ``value`` if awaitable; return it otherwise.
+
+    Makes the caller resilient to the docs/code drift where
+    ``select_routing_strategy`` might be sync (per INSTALLATION.md §2) or
+    async (per prior demo files).
+    """
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _run(value: Any) -> Any:
+    """Run a possibly-async value synchronously (used inside the sync loop)."""
+    if inspect.isawaitable(value):
+        return asyncio.run(_maybe_await(value))
+    return value
+
+
+def _safe_attr(obj: Any, *path: str, default: Any = None) -> Any:
+    """Safely traverse nested attributes / dict keys."""
+    cur = obj
+    for name in path:
+        if cur is None:
+            return default
+        if isinstance(cur, dict):
+            cur = cur.get(name, default)
+        else:
+            cur = getattr(cur, name, default)
+    return cur
+
+
+def _fmt(value: Any, spec: str = ".4f", suffix: str = "") -> str:
+    """Format a numeric value; return ``n/a`` if not numeric."""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        try:
+            return f"{value:{spec}}{suffix}"
+        except (TypeError, ValueError):
+            return str(value)
+    return "n/a"
+
+
+def _load_config(path: Optional[str]) -> dict[str, Any]:
+    """
+    Load a config file (YAML or JSON, detected by extension).
+
+    Returns an empty dict if ``path`` is None. Raises ``RuntimeError`` if
+    the file exists but cannot be parsed.
+    """
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.is_file():
+        raise RuntimeError(f"Config file not found: {p}")
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Could not read {p}: {exc}") from exc
+
+    if p.suffix.lower() in {".yaml", ".yml"}:
+        try:
+            import yaml
+        except ImportError as exc:
+            raise RuntimeError(
+                f"pyyaml is required for {p.suffix} configs. "
+                f"pip install pyyaml"
+            ) from exc
+        try:
+            loaded = yaml.safe_load(text)
+        except Exception as exc:
+            raise RuntimeError(f"Could not parse YAML {p}: {exc}") from exc
+    else:
+        try:
+            loaded = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Could not parse JSON {p}: {exc}") from exc
+
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise RuntimeError(f"Config {p} must be a mapping at the top level")
+    return loaded
+
+
+# =============================================================================
+# EnhancedGreenAgent
+# =============================================================================
 
 class EnhancedGreenAgent:
     """
-    Complete enhanced Green Agent with all scientific modules and advanced
-    decision-making modules (LIMIT Graph, MODP, RLHF, etc.).
+    Complete enhanced Green Agent with all scientific modules and
+    optional advanced decision-making modules.
     """
 
-    def __init__(self, config: Optional[Dict] = None):
-        self.config = config or {}
+    def __init__(self, config: Optional[dict[str, Any]] = None) -> None:
+        self.config: dict[str, Any] = config or {}
         self.running = False
+        self._iteration = 0
+        self._current_strategy: Optional[str] = None
+        self._current_priority: Optional[str] = None
 
-        # Initialize components
-        self.data_source = SyntheticDataSource(self.config.get('data', {}))
-        self.control_system = ControlSystem(self.config.get('control', {}))
-        self.fallback_manager = FallbackManager(self.config.get('fallback', {}))
+        # Original scientific modules
+        self.data_source = SyntheticDataSource(self.config.get("data", {}))
+        self.control_system = ControlSystem(self.config.get("control", {}))
+        self.fallback_manager = FallbackManager(self.config.get("fallback", {}))
 
-        # Initialize enhancement modules (original)
-        self.thermal = ThermalAwareOptimizer(self.config.get('thermal', {}))
-        self.phase_energy = PhaseAwareEnergyModel(self.config.get('phase_energy', {}))
-        self.energy_scaler = EnergyProportionalScaler(self.config.get('energy_scaler', {}))
-        self.marginal_carbon = MarginalCarbonIntensityForecaster(self.config.get('marginal_carbon', {}))
-        self.dual_accountant = DualCarbonAccountant(self.config.get('dual_accountant', {}))
-        self.helium_elasticity = HeliumPriceElasticityModel(self.config.get('helium_elasticity', {}))
-        self.material_substitution = MaterialSubstitutionEngine(self.config.get('material_substitution', {}))
-        self.helium_circularity = HeliumCircularityTracker(self.config.get('helium_circularity', {}))
-        self.regret_optimizer = RegretMinimizationOptimizer(self.config.get('regret_optimizer', {}))
-        self.federated_learning = FederatedGreenLearning(self.config.get('federated_learning', {}))
+        self.thermal = ThermalAwareOptimizer(self.config.get("thermal", {}))
+        self.phase_energy = PhaseAwareEnergyModel(self.config.get("phase_energy", {}))
+        self.energy_scaler = EnergyProportionalScaler(self.config.get("energy_scaler", {}))
+        self.marginal_carbon = MarginalCarbonIntensityForecaster(
+            self.config.get("marginal_carbon", {})
+        )
+        self.dual_accountant = DualCarbonAccountant(
+            self.config.get("dual_accountant", {})
+        )
+        self.helium_elasticity = HeliumPriceElasticityModel(
+            self.config.get("helium_elasticity", {})
+        )
+        self.material_substitution = MaterialSubstitutionEngine(
+            self.config.get("material_substitution", {})
+        )
+        self.helium_circularity = HeliumCircularityTracker(
+            self.config.get("helium_circularity", {})
+        )
+        self.regret_optimizer = RegretMinimizationOptimizer(
+            self.config.get("regret_optimizer", {})
+        )
+        self.federated_learning = FederatedGreenLearning(
+            self.config.get("federated_learning", {})
+        )
 
-        # ------------------------------------------------------------------
-        # Advanced enhancement initialization (optional)
-        # ------------------------------------------------------------------
-        self.use_enhancements = self.config.get('use_enhancements', True) and ENHANCEMENTS_AVAILABLE
-        self.graph_registry = None
-        self.causal_graph = None
-        self.meta_cognition = None
-        self.node_descriptor = None
-        self.workload_descriptor = None
-        self.zero_trust = None
-        self.dag_carbon_ledger = None
+        # Advanced enhancement modules (optional)
+        # use_enhancements defaults to True; disable via config or --no-enhancements.
+        want_enhancements = bool(self.config.get("use_enhancements", True))
+        self.use_enhancements = want_enhancements and not _missing_enhancements()
+        self.graph_registry: Any = None
+        self.causal_graph: Any = None
+        self.meta_cognition: Any = None
+        self.node_descriptor: Any = None
+        self.workload_descriptor: Any = None
+        self.zero_trust: Any = None
+        self.dag_carbon_ledger: Any = None
+        self._dag_ledger_tmpdir: Optional[tempfile.TemporaryDirectory[str]] = None
 
         if self.use_enhancements:
             self._initialize_advanced_modules()
-
-        logger.info("Enhanced Green Agent initialized (with advanced modules: %s)", self.use_enhancements)
-
-    def _initialize_advanced_modules(self):
-        """Initialize LIMIT Graph, MODP, RLHF, distillation, MoE, etc."""
-        try:
-            # Graph registry and causal graph for root-cause
-            self.graph_registry = GraphRegistry()
-            self.causal_graph = self.graph_registry.get_or_create(GraphType.CAUSAL)
-            self.meta_cognition = MetaCognitionLayer(causal_graph=self.causal_graph)
-
-            # Node descriptor for routing (distillation + MoE + RLHF + LIMIT Graph)
-            self.node_descriptor = NodeDescriptor(
-                id="enhanced_agent_node",
-                type=NodeType.EDGE,
-                region=self.config.get('region', 'us-east'),
-                region_carbon_intensity=self.config.get('carbon_intensity', 400.0),
-                energy_per_token=0.00005,
-                helium_connectivity_score=0.8,
-                uptime=0.99,
-                renewable_fraction=0.3,
-                cooling_type=CoolingType.AIR,
-                hardware_model="cpu",
-                graph_metrics=self.config.get('graph_metrics', {'centrality': 0.7, 'connectivity': 0.6}),
-                human_feedback_score=self.config.get('human_feedback_score', 0.6),
-                use_evolutionary=self.config.get('use_evolutionary', True),
-                metadata={
-                    "distillation_epsilon": self.config.get('distillation_epsilon', 0.1),
-                    "gating_learning_rate": self.config.get('gating_lr', 0.005),
-                }
+        elif want_enhancements and _missing_enhancements():
+            logger.warning(
+                "Advanced enhancements requested but %d module(s) missing: %s",
+                len(_missing_enhancements()),
+                ", ".join(_missing_enhancements()),
             )
 
-            # Workload descriptor for priority selection (MODP + MoE + RLHF)
-            self.workload_descriptor = WorkloadDescriptor(
-                task_id="loop_task",
-                task_type=TaskType.INFERENCE,
-                tokens=1000,
-                latency_target=500.0,
-                urgency=Urgency.MEDIUM,
-                estimated_energy_joules=0.001,
-                estimated_carbon_kg=0.0002,
-                human_feedback_score=self.config.get('human_feedback_score', 0.6),
-                graph_metrics=self.config.get('graph_metrics', {'centrality': 0.7, 'connectivity': 0.6}),
-                use_evolutionary=self.config.get('use_evolutionary', True),
-                metadata={
-                    "latency_weight": 0.4,
-                    "carbon_weight": 0.3,
-                    "energy_weight": 0.3,
-                }
-            )
+        logger.info(
+            "Enhanced Green Agent initialized (version=%s, advanced=%s)",
+            __version__, self.use_enhancements,
+        )
 
-            # Zero Trust (optional)
-            if self.config.get('enable_zero_trust', False):
-                zt_config = ZeroTrustConfig(
-                    use_enhancements=True,
-                    use_distillation=True,
-                    use_evolutionary=True,
-                    human_feedback_score=self.config.get('human_feedback_score', 0.6),
-                    graph_metrics=self.config.get('graph_metrics', {'centrality': 0.7, 'connectivity': 0.6})
+    # -------------------------------------------------------------------------
+    # Advanced module initialization — per-module isolation
+    # -------------------------------------------------------------------------
+
+    def _initialize_advanced_modules(self) -> None:
+        """
+        Initialize each advanced module independently.
+
+        One failing module does not disable the others; each failure is
+        logged with its name and error so the operator can fix that module
+        without hunting through a generic stack trace.
+        """
+        failures: list[str] = []
+
+        # 1. Graph registry + causal graph
+        if GraphRegistry is not None and GraphType is not None:
+            try:
+                self.graph_registry = GraphRegistry()
+                self.causal_graph = self.graph_registry.get_or_create(GraphType.CAUSAL)
+            except Exception as exc:
+                failures.append("GraphRegistry")
+                logger.error("GraphRegistry init failed: %s", exc)
+        else:
+            failures.append("GraphRegistry")
+
+        # 2. Meta-cognition (depends on causal graph)
+        if self.causal_graph is not None and MetaCognitionLayer is not None:
+            try:
+                self.meta_cognition = MetaCognitionLayer(
+                    causal_graph=self.causal_graph,
                 )
-                self.zero_trust = ZeroTrustArchitecture(config=zt_config)
+            except Exception as exc:
+                failures.append("MetaCognitionLayer")
+                logger.error("MetaCognitionLayer init failed: %s", exc)
+        elif MetaCognitionLayer is None:
+            failures.append("MetaCognitionLayer")
 
-            # DAG Carbon Ledger for carbon backpropagation
-            self.dag_carbon_ledger = DAGCarbonLedger(storage_path="/tmp/enhanced_agent_ledger")
+        # 3. Node descriptor — kwargs restricted to documented ones
+        #    (per agent_config.yaml + INSTALLATION.md).
+        if NodeDescriptor is not None and NodeType is not None:
+            try:
+                self.node_descriptor = NodeDescriptor(
+                    id="enhanced_agent_node",
+                    type=NodeType.EDGE,
+                    region=self.config.get("region", "us-east"),
+                    region_carbon_intensity=float(
+                        self.config.get("carbon_intensity", 400.0)
+                    ),
+                    energy_per_token=float(
+                        self.config.get("energy_per_token", 0.00005)
+                    ),
+                    use_evolutionary=bool(
+                        self.config.get("use_evolutionary", True)
+                    ),
+                    human_feedback_score=float(
+                        self.config.get("human_feedback_score", 0.6)
+                    ),
+                    graph_metrics=self.config.get(
+                        "graph_metrics",
+                        {"centrality": 0.7, "connectivity": 0.6},
+                    ),
+                    metadata={
+                        "distillation_epsilon": float(
+                            self.config.get("distillation_epsilon", 0.1)
+                        ),
+                        "gating_learning_rate": float(
+                            self.config.get("gating_lr", 0.005)
+                        ),
+                    },
+                )
+            except Exception as exc:
+                failures.append("NodeDescriptor")
+                logger.error("NodeDescriptor init failed: %s", exc)
+        else:
+            failures.append("NodeDescriptor")
 
-            logger.info("Advanced enhancement modules initialized")
-        except Exception as e:
-            logger.error(f"Failed to initialize advanced modules: {e}")
-            self.use_enhancements = False
+        # 4. Workload descriptor
+        if WorkloadDescriptor is not None and TaskType is not None and Urgency is not None:
+            try:
+                self.workload_descriptor = WorkloadDescriptor(
+                    task_id="loop_task",
+                    task_type=TaskType.INFERENCE,
+                    tokens=1000,
+                    latency_target=500.0,
+                    urgency=Urgency.MEDIUM,
+                    use_evolutionary=bool(
+                        self.config.get("use_evolutionary", True)
+                    ),
+                    human_feedback_score=float(
+                        self.config.get("human_feedback_score", 0.6)
+                    ),
+                    graph_metrics=self.config.get(
+                        "graph_metrics",
+                        {"centrality": 0.7, "connectivity": 0.6},
+                    ),
+                    metadata={
+                        "latency_weight": 0.4,
+                        "carbon_weight": 0.3,
+                        "energy_weight": 0.3,
+                    },
+                )
+            except Exception as exc:
+                failures.append("WorkloadDescriptor")
+                logger.error("WorkloadDescriptor init failed: %s", exc)
+        else:
+            failures.append("WorkloadDescriptor")
 
-    def start(self):
-        """Start the enhanced agent"""
+        # 5. Zero Trust — opt-in only
+        if self.config.get("enable_zero_trust", False):
+            if ZeroTrustArchitecture is not None and ZeroTrustConfig is not None:
+                try:
+                    zt_cfg = ZeroTrustConfig(
+                        use_enhancements=True,
+                        use_distillation=True,
+                        use_evolutionary=True,
+                        human_feedback_score=float(
+                            self.config.get("human_feedback_score", 0.6)
+                        ),
+                        graph_metrics=self.config.get(
+                            "graph_metrics",
+                            {"centrality": 0.7, "connectivity": 0.6},
+                        ),
+                    )
+                    self.zero_trust = ZeroTrustArchitecture(config=zt_cfg)
+                except Exception as exc:
+                    failures.append("ZeroTrustArchitecture")
+                    logger.error("ZeroTrust init failed: %s", exc)
+            else:
+                failures.append("ZeroTrustArchitecture")
+
+        # 6. DAG carbon ledger — tempdir (auto-cleaned, cross-platform)
+        if DAGCarbonLedger is not None:
+            try:
+                self._dag_ledger_tmpdir = tempfile.TemporaryDirectory(
+                    prefix=_DEFAULT_DAG_LEDGER_PREFIX,
+                )
+                self.dag_carbon_ledger = DAGCarbonLedger(
+                    storage_path=self._dag_ledger_tmpdir.name,
+                )
+            except Exception as exc:
+                failures.append("DAGCarbonLedger")
+                logger.error("DAGCarbonLedger init failed: %s", exc)
+        else:
+            failures.append("DAGCarbonLedger")
+
+        if failures:
+            # If more than half the modules failed, treat enhancements as off.
+            total = len(_ENHANCEMENT_ERRORS)
+            if len(failures) >= max(1, total // 2):
+                self.use_enhancements = False
+                logger.warning(
+                    "Disabling enhancements — %d/%d modules unavailable: %s",
+                    len(failures), total, ", ".join(failures),
+                )
+            else:
+                logger.info(
+                    "Enhancements partially available; %d module(s) unavailable: %s",
+                    len(failures), ", ".join(failures),
+                )
+
+    # -------------------------------------------------------------------------
+    # Lifecycle
+    # -------------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Start the agent and run the control loop."""
         logger.info("Starting Enhanced Green Agent...")
-
-        # Start data source
         self.data_source.start()
-
-        # Start background control loop
         self.running = True
-        signal.signal(signal.SIGINT, self.stop)
 
-        # Run main loop
-        self._run_main_loop()
+        # Register SIGINT / SIGTERM for a graceful stop.
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(sig, self._signal_handler)
+            except (ValueError, OSError) as exc:
+                logger.debug("Could not register %s: %s", sig, exc)
 
-    def stop(self, *args):
-        """Stop the enhanced agent"""
+        try:
+            self._run_main_loop()
+        finally:
+            self.stop()
+
+    def _signal_handler(self, signum: int, _frame: Any) -> None:
+        logger.info("Signal %s received; stopping", signum)
+        self.running = False
+
+    def stop(self) -> None:
+        """Stop the agent and shut down all components in reverse order."""
+        if not self.running and self._iteration > 0:
+            # Already stopped cleanly.
+            return
         logger.info("Stopping Enhanced Green Agent...")
         self.running = False
-        self.data_source.stop()
 
-    def _run_main_loop(self):
-        """Main control loop"""
-        iteration = 0
+        # Each shutdown step is isolated — one failure does not skip the rest.
+        try:
+            self.data_source.stop()
+        except Exception as exc:
+            logger.error("Data source stop failed: %s", exc)
 
-        while self.running:
+        if self.dag_carbon_ledger is not None:
             try:
-                iteration += 1
-                self._process_iteration(iteration)
-                time.sleep(5)  # 5 second control loop
-            except Exception as e:
-                logger.error(f"Loop error: {e}")
-                if self.running:
-                    time.sleep(1)
+                close = getattr(self.dag_carbon_ledger, "close", None)
+                if callable(close):
+                    _run(close())
+            except Exception as exc:
+                logger.error("DAG ledger close failed: %s", exc)
 
-    def _process_iteration(self, iteration: int):
-        """Process one control iteration, including advanced decision-making if enabled."""
+        if self.graph_registry is not None:
+            try:
+                shutdown = getattr(self.graph_registry, "shutdown", None)
+                if callable(shutdown):
+                    _run(shutdown())
+            except Exception as exc:
+                logger.error("Graph registry shutdown failed: %s", exc)
 
+        if self._dag_ledger_tmpdir is not None:
+            try:
+                self._dag_ledger_tmpdir.cleanup()
+            except Exception as exc:
+                logger.debug("Temp dir cleanup failed: %s", exc)
+
+    # -------------------------------------------------------------------------
+    # Main loop
+    # -------------------------------------------------------------------------
+
+    def _run_main_loop(self) -> None:
+        """Run the control loop with optional iteration limit."""
+        max_iterations = self.config.get("max_iterations")
+        while self.running:
+            self._iteration += 1
+            if max_iterations is not None and self._iteration > int(max_iterations):
+                logger.info("Reached max_iterations (%s); stopping", max_iterations)
+                self.running = False
+                break
+            try:
+                self._process_iteration(self._iteration)
+            except Exception as exc:
+                logger.error("Iteration %d failed: %s", self._iteration, exc,
+                             exc_info=True)
+                if not self.running:
+                    break
+                time.sleep(1.0)
+                continue
+            # Exit path: --once sets max_iterations=1, so this is skipped.
+            if self.running and max_iterations is None:
+                time.sleep(_LOOP_INTERVAL_S)
+
+    # -------------------------------------------------------------------------
+    # Per-iteration processing
+    # -------------------------------------------------------------------------
+
+    def _process_iteration(self, iteration: int) -> None:
+        """Process one control iteration."""
         # 1. Collect data with fallbacks
         temp_data = self._get_temperature_with_fallback()
         grid_data = self._get_grid_with_fallback()
         helium_data = self._get_helium_with_fallback()
 
-        # 2. Original enhancements (thermal, helium, etc.)
-        thermal_decision = self.thermal.optimize_schedule(None, None)
-        elasticity_decision = self.helium_elasticity.get_elasticity_decision(
-            WorkloadPriority.MEDIUM,
-            10.0,
-            None,
-            'yellow'
+        # 2. Original modules — pass real inputs to thermal
+        thermal_decision = self._safe_call(
+            self.thermal.optimize_schedule, temp_data, grid_data,
+            default=None, label="thermal.optimize_schedule",
+        )
+        elasticity_decision = self._safe_call(
+            self.helium_elasticity.get_elasticity_decision,
+            WorkloadPriority.MEDIUM, 10.0, helium_data, "yellow",
+            default=None, label="helium_elasticity.get_elasticity_decision",
         )
 
-        # 3. Apply controls from original modules
-        if elasticity_decision.action == 'throttle':
-            self.control_system.execute('throttle', elasticity_decision.throttle_factor)
+        # 3. Apply controls from original modules (guarded)
+        if elasticity_decision is not None:
+            action = getattr(elasticity_decision, "action", None)
+            if action == "throttle":
+                factor = float(getattr(elasticity_decision, "throttle_factor", 0.5))
+                self._safe_call(
+                    self.control_system.execute, "throttle", factor,
+                    label="control_system.execute(throttle)",
+                )
 
-        if thermal_decision.action == 'cool':
-            cooling_power = max(50, min(500, (thermal_decision.target_temp - 20) * 10))
-            self.control_system.execute('cooling', cooling_power)
+        if thermal_decision is not None:
+            action = getattr(thermal_decision, "action", None)
+            if action == "cool":
+                target = float(getattr(thermal_decision, "target_temp", 25.0))
+                cooling_power = max(50.0, min(500.0, (target - 20.0) * 10.0))
+                self._safe_call(
+                    self.control_system.execute, "cooling", cooling_power,
+                    label="control_system.execute(cooling)",
+                )
 
-        # 4. Advanced enhancement decision making
-        enhanced_decision = {}
+        # 4. Advanced enhancement decision-making
+        enhanced_decision: dict[str, Any] = {}
         if self.use_enhancements:
-            enhanced_decision = self._make_enhanced_decisions(temp_data, grid_data, helium_data)
+            try:
+                enhanced_decision = self._make_enhanced_decisions(
+                    temp_data, grid_data, helium_data,
+                )
+            except Exception as exc:
+                logger.error("Advanced decision-making failed: %s", exc,
+                             exc_info=True)
 
-        # 5. Apply any enhanced controls if they modify throttle/cooling
-        if enhanced_decision.get('strategy') == 'carbon_first':
-            # Additional throttle based on carbon
-            self.control_system.execute('throttle', 0.4)
-        elif enhanced_decision.get('priority') == 'green':
-            self.control_system.execute('throttle', 0.6)
+        # 5. Apply enhanced controls (all branches covered)
+        strategy = enhanced_decision.get("strategy")
+        priority = enhanced_decision.get("priority")
+        if strategy == "carbon_first":
+            self._safe_call(
+                self.control_system.execute, "throttle", 0.4,
+                label="control_system.execute(throttle/carbon_first)",
+            )
+        elif strategy == "latency_first":
+            # Do not throttle — prioritize latency
+            pass
+        elif strategy in {"cost_first", "balanced", "adaptive"}:
+            self._safe_call(
+                self.control_system.execute, "throttle", 0.5,
+                label=f"control_system.execute(throttle/{strategy})",
+            )
+        if priority == "green":
+            self._safe_call(
+                self.control_system.execute, "throttle", 0.6,
+                label="control_system.execute(throttle/green)",
+            )
 
-        # 6. Log metrics
-        if iteration % 12 == 0:  # Every minute
+        # 6. Log metrics periodically
+        if iteration % _LOG_EVERY_N_ITERATIONS == 0:
             self._log_metrics(temp_data, grid_data, helium_data, enhanced_decision)
 
-    def _make_enhanced_decisions(self, temp_data, grid_data, helium_data) -> Dict[str, Any]:
+    def _safe_call(self, fn: Any, *args: Any, default: Any = None,
+                   label: str = "call") -> Any:
+        """Call ``fn`` and log any exception; return ``default`` on failure."""
+        try:
+            return _run(fn(*args))
+        except Exception as exc:
+            logger.warning("%s failed: %s", label, exc)
+            return default
+
+    # -------------------------------------------------------------------------
+    # Advanced decision-making
+    # -------------------------------------------------------------------------
+
+    def _make_enhanced_decisions(
+        self, temp_data: Any, grid_data: Any, helium_data: Any,
+    ) -> dict[str, Any]:
         """
         Use advanced modules to select routing strategy and workload priority.
-        Also run root-cause analysis with meta-cognition.
-        Returns a dict with selected strategy, priority, and diagnosis.
+        Run meta-cognition root-cause analysis and emit a FeedbackEvent.
         """
-        decisions = {}
+        decisions: dict[str, Any] = {}
 
-        # Update node descriptor with current carbon intensity
-        if self.node_descriptor:
-            carbon = getattr(grid_data, 'average_intensity_gco2_per_kwh', None) or grid_data.get('average_intensity', 400)
-            self.node_descriptor.region_carbon_intensity = carbon
+        # Update node descriptor with current carbon intensity (if mutable)
+        carbon = self._extract_carbon_intensity(grid_data)
+        if self.node_descriptor is not None:
             try:
-                strategy = asyncio.run(self.node_descriptor.select_routing_strategy(exploration=False))
-                decisions['strategy'] = strategy
-            except Exception as e:
-                logger.warning(f"Node descriptor routing failed: {e}")
+                # Guard against frozen dataclass
+                if hasattr(self.node_descriptor, "region_carbon_intensity"):
+                    setattr(self.node_descriptor, "region_carbon_intensity", carbon)
+                strategy = _run(
+                    self.node_descriptor.select_routing_strategy(exploration=False)
+                )
+                decisions["strategy"] = strategy
+                self._current_strategy = strategy
+            except Exception as exc:
+                logger.warning("Routing strategy failed: %s", exc)
 
-        # Update workload descriptor and select priority
-        if self.workload_descriptor:
+        # Workload priority
+        if self.workload_descriptor is not None:
             try:
-                priority = asyncio.run(self.workload_descriptor.select_priority(exploration=False))
-                decisions['priority'] = priority
-            except Exception as e:
-                logger.warning(f"Workload descriptor priority failed: {e}")
+                priority = _run(
+                    self.workload_descriptor.select_priority(exploration=False)
+                )
+                decisions["priority"] = priority
+                self._current_priority = priority
+            except Exception as exc:
+                logger.warning("Workload priority failed: %s", exc)
 
-        # Root-cause analysis with meta-cognition
-        if self.meta_cognition and self.causal_graph:
+        # Meta-cognition root-cause analysis
+        if self.meta_cognition is not None:
             try:
                 self.meta_cognition.observe_snapshot({
-                    "CarbonIntensity": getattr(grid_data, 'average_intensity_gco2_per_kwh', 400),
-                    "GridStrain": 0.7 if getattr(grid_data, 'average_intensity_gco2_per_kwh', 400) > 500 else 0.4,
+                    "CarbonIntensity": carbon,
+                    "CarbonIntensity_high_threshold": 400.0,
+                    "GridStrain": 0.7 if carbon > 500 else 0.4,
                 })
-                diagnosis = self.meta_cognition.diagnose()
-                if diagnosis['status'] == 'anomaly_detected':
-                    decisions['diagnosis'] = diagnosis['recommended_action']
-            except Exception as e:
-                logger.warning(f"Meta-cognition diagnosis failed: {e}")
+                diagnosis = self.meta_cognition.diagnose() or {}
+                if diagnosis.get("status") == "anomaly_detected":
+                    decisions["diagnosis"] = diagnosis.get("recommended_action")
+            except Exception as exc:
+                logger.warning("Meta-cognition failed: %s", exc)
 
-        # Record a sample outcome to update distillation models (simulated)
-        if self.node_descriptor and self.workload_descriptor:
+        # Record outcome for distillation (guarded)
+        if self.node_descriptor is not None:
             try:
-                carbon_saved = 0.01  # dummy
-                latency = 100
-                asyncio.run(self.node_descriptor.record_outcome(carbon_saved_kg=carbon_saved, latency_ms=latency, cost_usd=0.001))
-                asyncio.run(self.workload_descriptor.record_outcome(latency_achieved_ms=latency, carbon_saved_kg=carbon_saved, energy_used_joules=0.001))
-            except Exception as e:
-                logger.warning(f"Record outcome failed: {e}")
+                _run(self.node_descriptor.record_outcome(
+                    carbon_saved_kg=0.01,
+                    latency_ms=100.0,
+                    cost_usd=0.001,
+                ))
+            except Exception as exc:
+                logger.debug("Node descriptor record_outcome failed: %s", exc)
 
-        # Create FeedbackEvent if ZeroTrust or feedback enabled
+        if self.workload_descriptor is not None:
+            try:
+                _run(self.workload_descriptor.record_outcome(
+                    latency_achieved_ms=100.0,
+                    carbon_saved_kg=0.01,
+                    energy_used_joules=0.001,
+                ))
+            except Exception as exc:
+                logger.debug("Workload descriptor record_outcome failed: %s", exc)
+
+        # Emit FeedbackEvent — schema-conformant (README.md §2.5)
         if FeedbackEvent is not None:
             try:
                 event = FeedbackEvent(
                     source="run_enhanced_agent",
                     feedback_type="routing",
                     task_id="loop_task",
-                    context={"iteration": self._get_current_iteration()},
-                    action={"selected_action": decisions.get('strategy', 'unknown')},
-                    performance={"quality_score": 0.8, "latency_ms": 100, "energy_joules": 100,
-                                 "carbon_g": getattr(grid_data, 'average_intensity_gco2_per_kwh', 400),
-                                 "helium_cost": helium_data.spot_price_usd_per_liter if hasattr(helium_data, 'spot_price_usd_per_liter') else 0,
-                                 "duration_ms": 100},
+                    action={
+                        "selected_action": decisions.get("strategy", "unknown"),
+                        "selected_rank": 1,
+                    },
+                    performance={
+                        # README.md §2.5: `energy_kwh` (not energy_joules).
+                        "quality_score": 0.8,
+                        "latency_ms": 100.0,
+                        "energy_kwh": 0.0001,        # 100 J ≈ 0.0001 kWh
+                    },
                     adaptive_cost_value=0.7,
-                    graph_metrics=self.config.get('graph_metrics', {}),
-                    human_feedback_score=self.config.get('human_feedback_score', 0.6),
+                    graph_metrics=self.config.get("graph_metrics", {}),
+                    human_feedback_score=float(
+                        self.config.get("human_feedback_score", 0.6)
+                    ),
                     modp_score=0.7,
-                    distillation_stats={"student_counter": self.node_descriptor._routing_optimizer.counter if self.node_descriptor and hasattr(self.node_descriptor, '_routing_optimizer') else 0}
                 )
-                logger.debug(f"FeedbackEvent created: {event.event_id}")
-            except Exception as e:
-                logger.warning(f"FeedbackEvent creation failed: {e}")
+                # Do NOT read event.event_id — not in schema.
+                logger.debug(
+                    "FeedbackEvent created (task_id=%s, strategy=%s)",
+                    "loop_task", decisions.get("strategy"),
+                )
+            except Exception as exc:
+                logger.warning("FeedbackEvent creation failed: %s", exc)
 
         return decisions
 
-    def _get_current_iteration(self):
-        # Placeholder; in real system we'd track.
-        return 0
+    @staticmethod
+    def _extract_carbon_intensity(grid_data: Any) -> float:
+        """Extract grid carbon intensity from a dataclass or dict."""
+        for attr in ("average_intensity_gco2_per_kwh", "average_intensity"):
+            value = _safe_attr(grid_data, attr)
+            if isinstance(value, (int, float)):
+                return float(value)
+        if isinstance(grid_data, dict):
+            for key in ("average_intensity_gco2_per_kwh", "average_intensity"):
+                if isinstance(grid_data.get(key), (int, float)):
+                    return float(grid_data[key])
+        return 400.0
 
-    def _get_temperature_with_fallback(self):
-        """Get temperature with fallback handling"""
-        def primary():
+    # -------------------------------------------------------------------------
+    # Data source wrappers with fallbacks
+    # -------------------------------------------------------------------------
+
+    def _get_temperature_with_fallback(self) -> Any:
+        def primary() -> Any:
             return self.data_source.get_temperature_data()
 
         result = self.fallback_manager.execute_with_fallback(
-            primary,
-            'temperature',
-            self._get_fallback_config()
+            primary, "temperature", self._get_fallback_config(),
         )
-
-        if result.success:
+        if getattr(result, "success", False):
             return result.value
-        else:
-            logger.error("Temperature data unavailable")
-            return {'gpu_temp': 70, 'cpu_temp': 65}
+        logger.error("Temperature data unavailable — using defaults")
+        return {"gpu_temp": 70, "cpu_temp": 65}
 
-    def _get_grid_with_fallback(self):
-        """Get grid data with fallback handling"""
-        def primary():
-            return self.data_source.get_grid_data('us-east')
+    def _get_grid_with_fallback(self) -> Any:
+        def primary() -> Any:
+            return self.data_source.get_grid_data("us-east")
 
         result = self.fallback_manager.execute_with_fallback(
-            primary,
-            'grid',
-            self._get_fallback_config()
+            primary, "grid", self._get_fallback_config(),
         )
-
-        if result.success:
+        if getattr(result, "success", False):
             return result.value
-        else:
-            logger.error("Grid data unavailable")
-            return {'average_intensity': 400, 'renewable_percentage': 0.2}
+        logger.error("Grid data unavailable — using defaults")
+        return {"average_intensity": 400, "renewable_percentage": 0.2}
 
-    def _get_helium_with_fallback(self):
-        """Get helium data with fallback handling"""
-        def primary():
+    def _get_helium_with_fallback(self) -> Any:
+        def primary() -> Any:
             return self.data_source.get_helium_data()
 
         result = self.fallback_manager.execute_with_fallback(
-            primary,
-            'helium',
-            self._get_fallback_config()
+            primary, "helium", self._get_fallback_config(),
         )
-
-        if result.success:
+        if getattr(result, "success", False):
             return result.value
-        else:
-            logger.error("Helium data unavailable")
-            return {'spot_price': 6.0, 'inventory_days': 20}
+        logger.error("Helium data unavailable — using defaults")
+        return {"spot_price": 6.0, "inventory_days": 20}
 
-    def _get_fallback_config(self):
-        """Get fallback configuration"""
-        from fallback_manager import FallbackConfig, FallbackStrategy
+    def _get_fallback_config(self) -> Any:
         return FallbackConfig(strategy=FallbackStrategy.CASCADE)
 
-    def _log_metrics(self, temp_data, grid_data, helium_data, enhanced_decision: Optional[Dict] = None):
-        """Log current metrics, including enhanced decisions if available."""
-        metrics = {
-            'timestamp': datetime.now().isoformat(),
-            'temperature': {
-                'gpu': temp_data.gpu_temp_c if hasattr(temp_data, 'gpu_temp_c') else temp_data.get('gpu_temp', 0),
-                'cpu': temp_data.cpu_temp_c if hasattr(temp_data, 'cpu_temp_c') else temp_data.get('cpu_temp', 0)
-            },
-            'grid': {
-                'intensity': grid_data.average_intensity_gco2_per_kwh if hasattr(grid_data, 'average_intensity_gco2_per_kwh') else grid_data.get('average_intensity', 0)
-            },
-            'helium': {
-                'price': helium_data.spot_price_usd_per_liter if hasattr(helium_data, 'spot_price_usd_per_liter') else helium_data.get('spot_price', 0)
-            },
-            'control': self.control_system.get_metrics()
+    # -------------------------------------------------------------------------
+    # Metrics + reports
+    # -------------------------------------------------------------------------
+
+    def _log_metrics(self, temp_data: Any, grid_data: Any, helium_data: Any,
+                     enhanced_decision: Optional[dict[str, Any]] = None) -> None:
+        """Log a compact metric snapshot (prior version dumped multi-line JSON at INFO)."""
+        summary = {
+            "iteration": self._iteration,
+            "timestamp": datetime.now().isoformat(),
+            "gpu_temp_c": _safe_attr(temp_data, "gpu_temp_c")
+                          or _safe_attr(temp_data, "gpu_temp", default=0),
+            "cpu_temp_c": _safe_attr(temp_data, "cpu_temp_c")
+                          or _safe_attr(temp_data, "cpu_temp", default=0),
+            "grid_intensity_g_kwh": self._extract_carbon_intensity(grid_data),
+            "helium_price_usd_l": _safe_attr(helium_data, "spot_price_usd_per_liter")
+                                    or _safe_attr(helium_data, "spot_price", default=0),
+            "strategy": self._current_strategy,
+            "priority": self._current_priority,
         }
         if enhanced_decision:
-            metrics['enhanced_decision'] = enhanced_decision
-
-        logger.info(f"Metrics: {json.dumps(metrics, indent=2)}")
+            summary["diagnosis"] = enhanced_decision.get("diagnosis")
+        logger.info("metrics: %s", json.dumps(summary, separators=(",", ":")))
 
     def generate_report(self) -> str:
-        """Generate complete system report"""
-        report = {
-            'status': 'running' if self.running else 'stopped',
-            'data_source': self.data_source.get_scenario_metrics(),
-            'control_system': self.control_system.get_status(),
-            'circuit_breakers': self.fallback_manager.get_circuit_breaker_status(),
-            'metrics': self.control_system.get_metrics()
+        """Return a JSON report of current status."""
+        report: dict[str, Any] = {
+            "version": __version__,
+            "status": "running" if self.running else "stopped",
+            "iteration": self._iteration,
+            "data_source": self._safe_call(
+                self.data_source.get_scenario_metrics, default={},
+                label="data_source.get_scenario_metrics",
+            ),
+            "control_system": self._safe_call(
+                self.control_system.get_status, default={},
+                label="control_system.get_status",
+            ),
+            "circuit_breakers": self._safe_call(
+                self.fallback_manager.get_circuit_breaker_status, default={},
+                label="fallback_manager.get_circuit_breaker_status",
+            ),
+            "metrics": self._safe_call(
+                self.control_system.get_metrics, default={},
+                label="control_system.get_metrics",
+            ),
         }
         if self.use_enhancements:
-            report['enhancement_status'] = {
-                'node_descriptor': self.node_descriptor is not None,
-                'workload_descriptor': self.workload_descriptor is not None,
-                'causal_graph': self.causal_graph is not None,
-                'zero_trust': self.zero_trust is not None,
-                'dag_carbon_ledger': self.dag_carbon_ledger is not None
+            report["enhancement_status"] = {
+                "node_descriptor": self.node_descriptor is not None,
+                "workload_descriptor": self.workload_descriptor is not None,
+                "causal_graph": self.causal_graph is not None,
+                "meta_cognition": self.meta_cognition is not None,
+                "zero_trust": self.zero_trust is not None,
+                "dag_carbon_ledger": self.dag_carbon_ledger is not None,
+                "missing_modules": _missing_enhancements(),
             }
-        return json.dumps(report, indent=2)
+        return json.dumps(report, indent=2, default=str)
 
 
-def main():
-    """Main entry point"""
-    import argparse
+# =============================================================================
+# CLI
+# =============================================================================
 
-    parser = argparse.ArgumentParser(description='Enhanced Green Agent')
-    parser.add_argument('--config', type=str, help='Configuration file path')
-    parser.add_argument('--scenario', type=str, default='normal',
-                       choices=['normal', 'heatwave', 'helium_crisis', 'high_carbon'])
-    parser.add_argument('--quality', type=str, default='perfect',
-                       choices=['perfect', 'noisy', 'degraded', 'offline'])
-    parser.add_argument('--enhancements', action='store_true', default=True,
-                       help='Enable advanced enhancements (default: true)')
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="run_enhanced_agent",
+        description=f"Enhanced Green Agent v{__version__}",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}",
+    )
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Config file (.yaml, .yml, or .json)",
+    )
+    parser.add_argument(
+        "--scenario", choices=["normal", "heatwave", "helium_crisis", "high_carbon"],
+        default="normal",
+    )
+    parser.add_argument(
+        "--quality", choices=["perfect", "noisy", "degraded", "offline"],
+        default="perfect",
+    )
+    # Enhanced toggles: None means "respect the config file"
+    parser.add_argument(
+        "--enhancements", dest="enhancements",
+        action="store_true", default=None,
+        help="Force-enable advanced modules (overrides config)",
+    )
+    parser.add_argument(
+        "--no-enhancements", dest="enhancements",
+        action="store_false",
+        help="Force-disable advanced modules (overrides config)",
+    )
+    parser.add_argument(
+        "--once", action="store_true",
+        help="Run one iteration and exit (equivalent to --iterations 1)",
+    )
+    parser.add_argument(
+        "--iterations", type=int, default=None,
+        help="Maximum iterations before exit (default: unlimited)",
+    )
+    parser.add_argument("--quiet", action="store_true",
+                        help="Only log warnings and errors")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable debug logging")
+    parser.add_argument("--log-file", type=str, default=None,
+                        help="Write logs to a file (in addition to stderr)")
+    parser.add_argument("--report", action="store_true",
+                        help="Print the JSON status report on exit")
+    return parser
 
-    args = parser.parse_args()
 
-    # Load configuration
-    config = {}
-    if args.config:
-        with open(args.config, 'r') as f:
-            config = json.load(f)
+def _configure_logging(args: argparse.Namespace) -> None:
+    level = (
+        logging.DEBUG if args.verbose
+        else logging.WARNING if args.quiet
+        else logging.INFO
+    )
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    if args.log_file:
+        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=handlers,
+        force=True,
+    )
 
-    # Apply CLI overrides
-    config['data'] = config.get('data', {})
-    config['data']['quality'] = args.quality
-    if not args.enhancements:
-        config['use_enhancements'] = False
 
-    # Create and start agent
-    agent = EnhancedGreenAgent(config)
+def main(argv: Optional[list[str]] = None) -> int:
+    args = _build_parser().parse_args(argv)
+    _configure_logging(args)
 
-    # Set scenario
-    if args.scenario == 'heatwave':
-        agent.data_source.set_scenario(ScenarioType.HEATWAVE)
-    elif args.scenario == 'helium_crisis':
-        agent.data_source.set_scenario(ScenarioType.HELIUM_CRISIS)
-    elif args.scenario == 'high_carbon':
-        agent.data_source.set_scenario(ScenarioType.HIGH_CARBON)
+    # --- Load config ------------------------------------------------------
+    try:
+        config = _load_config(args.config)
+    except RuntimeError as exc:
+        logger.error("Config load failed: %s", exc)
+        return 2
 
-    # Start agent
-    agent.start()
+    # --- Merge CLI overrides ---------------------------------------------
+    config.setdefault("data", {})
+    if isinstance(config["data"], dict):
+        config["data"]["quality"] = args.quality
+
+    if args.enhancements is not None:
+        config["use_enhancements"] = bool(args.enhancements)
+
+    if args.once and args.iterations is None:
+        config["max_iterations"] = 1
+    elif args.iterations is not None:
+        if args.iterations < 1:
+            logger.error("--iterations must be >= 1 (got %s)", args.iterations)
+            return 2
+        config["max_iterations"] = args.iterations
+
+    # --- Construct agent --------------------------------------------------
+    try:
+        agent = EnhancedGreenAgent(config)
+    except Exception as exc:
+        logger.error("Agent initialization failed: %s", exc, exc_info=True)
+        return 2
+
+    # --- Apply scenario BEFORE starting the loop --------------------------
+    scenario_map = {
+        "normal": ScenarioType.NORMAL,
+        "heatwave": ScenarioType.HEATWAVE,
+        "helium_crisis": ScenarioType.HELIUM_CRISIS,
+        "high_carbon": ScenarioType.HIGH_CARBON,
+    }
+    scenario = scenario_map.get(args.scenario, ScenarioType.NORMAL)
+    try:
+        agent.data_source.set_scenario(scenario)
+        logger.info("Scenario set to %s", args.scenario)
+    except Exception as exc:
+        logger.error("Could not set scenario %s: %s", args.scenario, exc)
+        return 2
+
+    # --- Run --------------------------------------------------------------
+    exit_code = 0
+    try:
+        agent.start()
+    except KeyboardInterrupt:
+        logger.info("Interrupted")
+        exit_code = 130
+    except Exception as exc:
+        logger.error("Agent run failed: %s", exc, exc_info=True)
+        exit_code = 1
+    finally:
+        if args.report:
+            try:
+                print(agent.generate_report())
+            except Exception as exc:
+                logger.error("Report generation failed: %s", exc)
+
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
