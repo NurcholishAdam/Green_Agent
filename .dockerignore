@@ -1,73 +1,175 @@
-# .dockerignore — keep the build context small and exclude secrets.
+# =============================================================================
+# .dockerignore — keep the build context small and exclude secrets
+# =============================================================================
+# Version:    2.0
+# Updated:    2024-01-01
+# Companion:  Dockerfile (multi-stage, non-root, tini)
 #
-# WHAT CHANGED FROM NOTHING (v1.0 shipped without this file)
-# ---------------------------------------------------------
-# v1.0's `COPY . .` copied .git (hundreds of MB), .env (secrets!),
-# __pycache__, venv, test artifacts, and the results directory. This file
-# fixes that.
+# RULES OF THE `.dockerignore` SYNTAX
+# -----------------------------------
+#   1. Comments must be on their OWN line — no inline comments.
+#      A line like `path/to/file   # note` becomes a pattern that matches
+#      the literal string `path/to/file   # note` and nothing else.
+#   2. `!pattern` re-includes a file that was previously excluded. The `!`
+#      rule must come AFTER the pattern it negates, otherwise it has no
+#      effect.
+#   3. Patterns are matched against the build context root. `*.md` matches
+#      `README.md` at root but NOT `src/README.md`; use `**/*.md` for any
+#      depth.
+#   4. Directory patterns should end with `/` for clarity (optional, but
+#      conventional).
+#
+# DO NOT exclude
+# --------------
+#   requirements.txt       ← COPY'd explicitly by the Dockerfile
+#   requirements.lock.txt  ← COPY'd when present (--require-hashes path)
+#   pyproject.toml         ← `pip install -e .` reads it
+#   setup.py / setup.cfg   ← `pip install -e .` fallback
+#   runtime/run_agent.py   ← entrypoint
+#   src/                   ← application code
+#   core/                  ← application code
+#   config/ (dir itself)   ← Dockerfile creates it; individual sensitive
+#                            files are excluded below
+# =============================================================================
 
-# VCS
-.git
+
+# -----------------------------------------------------------------------------
+# Version control
+# -----------------------------------------------------------------------------
+# `.git/` is hundreds of MB and never needed inside the image.
+.git/
 .gitignore
 .gitattributes
-.github
+.gitmodules
+.github/
 .gitlab-ci.yml
+.circleci/
+.travis.yml
+.buildkite/
 
-# Secrets — never copy these into an image layer
+# -----------------------------------------------------------------------------
+# Secrets — never ship these in an image layer
+# -----------------------------------------------------------------------------
 .env
 .env.*
+.envrc
 *.pem
 *.key
 *.crt
+*.p12
+*.pfx
 secrets/
 run/secrets/
 
+# If the app needs `.env.example` for onboarding, uncomment the next line
+# (the `!` rule must come AFTER the `.env.*` exclusion it negates):
+# !.env.example
+
+# -----------------------------------------------------------------------------
 # Python
+# -----------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *.egg-info/
+*.dist-info/
+*.egg
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.pytype/
+.cache/
 venv/
 .venv/
 env/
 ENV/
 
+# -----------------------------------------------------------------------------
+# Python test artifacts (bloat + stale absolute paths)
+# -----------------------------------------------------------------------------
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# -----------------------------------------------------------------------------
 # Node
+# -----------------------------------------------------------------------------
 node_modules/
 npm-debug.log
+yarn-error.log
+.pnpm-store/
 
+# -----------------------------------------------------------------------------
 # Build artifacts
+# -----------------------------------------------------------------------------
 build/
 dist/
 *.whl
-*.egg
+*.tar
+*.tar.gz
+*.tgz
+*.zip
 
+# -----------------------------------------------------------------------------
 # Agent output — generated at runtime
+# -----------------------------------------------------------------------------
 results/
 demo_output/
 green_agent_data/
 logs/
 *.log
-green_agent_moe.log
 
-# IDE
+# -----------------------------------------------------------------------------
+# Editor / patch artifacts
+# -----------------------------------------------------------------------------
 .vscode/
 .idea/
 *.swp
 *.swo
+*.bak
+*.orig
+*.rej
+*.tmp
+.helix/
+.nvim/
 
-# Docs — excluded to keep the image small
+# -----------------------------------------------------------------------------
+# OS junk
+# -----------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+desktop.ini
+Spotlight-V100/
+.Trashes/
+.Spotlight-V100/
+
+# -----------------------------------------------------------------------------
+# Jupyter / notebook artifacts
+# -----------------------------------------------------------------------------
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# -----------------------------------------------------------------------------
+# Documentation
+# -----------------------------------------------------------------------------
+# Excluded by default to keep the image small. If a README is needed inside
+# the image (e.g. for `/docs` in the running app), add a `!README.md` rule
+# AFTER this section — remember `!` must come after the pattern it negates.
 docs/
 *.md
 !README.md
 
-# Tests — excluded from the runtime image
-tests/
-test_*.py
-*_test.py
-
-# Local config that should never leak
+# -----------------------------------------------------------------------------
+# Deploy-time configuration — must not be baked into the image
+# -----------------------------------------------------------------------------
+# FIXED (v1.0): the prior version had an inline comment on the second line.
+#   `config/base/green_agent_config.yaml   # deploy-time, not build-time`
+# Docker's `.dockerignore` does not support inline comments — the whole
+# line becomes the pattern, so the file was NOT excluded. Fixed by moving
+# the comment to its own line above.
+config/base/green_agent_config.yaml
 config/*.local.*
-config/base/green_agent_config.yaml   # deploy-time, not build-time
+config/secrets.*
