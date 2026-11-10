@@ -1,428 +1,611 @@
 # green_agent_alerts.yml
-# Prometheus alerting rules for Green Agent anomalies
-# 
-# Usage:
-#   1. Save this file in your Prometheus config directory
-#   2. Add to prometheus.yml:
-#      rule_files:
-#        - "green_agent_alerts.yml"
-#   3. Reload Prometheus: kill -HUP <prometheus_pid> or use /-/reload endpoint
+# Prometheus alerting + recording rules for Green Agent (v2.0)
+# =============================================================================
 #
-# Alert routing (example for Alertmanager):
+# Usage
+# -----
+#   1. Save this file in your Prometheus config directory.
+#   2. Add to prometheus.yml:
+#        rule_files:
+#          - "green_agent_alerts.yml"
+#   3. Validate:
+#        promtool check rules green_agent_alerts.yml
+#   4. Reload Prometheus:
+#        curl -X POST http://localhost:9090/-/reload
+#        (or: kill -HUP $(pidof prometheus))
+#
+# Alert routing (Alertmanager)
+# ----------------------------
 #   route:
-#     group_by: ['alertname', 'severity']
+#     group_by: ['alertname', 'severity', 'cluster']
 #     routes:
-#     - match:
-#         severity: critical
-#       receiver: 'pagerduty-critical'
-#     - match:
-#         severity: warning
-#       receiver: 'slack-warnings'
+#       - matchers: [ severity = "critical" ]
+#         receiver: pagerduty-critical
+#       - matchers: [ severity = "warning" ]
+#         receiver: slack-warnings
+#       - matchers: [ severity = "info" ]
+#         receiver: slack-info
+#         group_wait: 5m
+#         repeat_interval: 12h
+#
+# Metric type reference (must match the exporter)
+# -----------------------------------------------
+#   Gauge      : green_agent_anomalies_active
+#                green_agent_execution_graphs_active
+#                green_agent_graph_nodes
+#                green_agent_graph_edges
+#                green_agent_causal_edge_weight
+#                green_agent_policy_edge_weight
+#                green_agent_modp_score
+#                green_agent_rlhf_feedback
+#                green_agent_graph_centrality
+#                green_agent_moe_gate_weight
+#                green_agent_evolutionary_best_fitness
+#
+#   Counter    : green_agent_ideal_paths_total
+#                green_agent_distillation_update_count
+#                green_agent_flexgen_energy_joules_total
+#
+#   Histogram  : green_agent_policy_edge_weight_bucket
+#                (present only if the exporter emits
+#                 green_agent_policy_edge_weight as a *histogram*.
+#                 If it emits a gauge instead, remove the
+#                 green_agent:policy_edge_weight:p90 recording rule
+#                 — it will silently produce no data.)
+#
+# Units — critical
+# ----------------
+#   deriv() and rate() both return **per-second** values.
+#   To compare against a "per hour" threshold, multiply by 3600.
+#   To compare against a "per day" threshold,  multiply by 86400.
+#   Every alert below that references a rate/deriv threshold does this
+#   multiplication explicitly, and the annotation states the same units.
+#
+# Changes from v1.0
+# -----------------
+#   - Fixed 3600x / 86400x units mismatch between promql and annotations
+#     (PolicyEdgeWeightDrift, GraphSizeGrowingRapidly, IdealPathsGrowth).
+#   - Replaced rate() with deriv() on gauges (graph nodes/edges).
+#   - Reconciled green_agent_policy_edge_weight type ambiguity (documented).
+#   - Added division-by-zero guard to anomaly_rate recording rule.
+#   - changes() on counters replaced with increase(...) == 0.
+#   - Added absent() alerts (NoNewMetrics, RuleEvaluationFailing).
+#   - Reduced for: 24h to for: 1h with matching window.
+#   - Split evolutionary alert into Stagnation vs Regression.
+#   - Aggregated high-cardinality alerts by job to prevent alert storms.
+#   - Standardised printf() formatting (%.2f ratios, %.1f durations,
+#     %.0f counts).
+#   - Added externalLabels (cluster/region) to descriptions.
+#   - Added dashboard_url to every critical and metric-bearing warning.
+#   - Reconciled component: labels (causal-graph, one value).
+#   - Recording rule names follow `level:metric:operations`
+#     (:avg, :stddev, :p90, :rate5m).
+#   - Split slow-moving alerts into a separate group with interval: 5m.
+# =============================================================================
+
 
 groups:
-- name: green_agent_graph_health
-  interval: 30s  # Evaluate rules every 30 seconds
-  rules:
-  
-  # -----------------------------------------------------------------------
-  # Critical Alerts (page on-call)
-  # -----------------------------------------------------------------------
-  
-  - alert: GreenAgentHighAnomalyRate
-    expr: |
-      green_agent_anomalies_active{graph_type="causal"} > 10
-    for: 5m
-    labels:
-      severity: critical
-      team: ai-platform
-      component: causal-graph
-    annotations:
-      summary: "High anomaly rate in causal graph"
-      description: |
-        {{ $labels.graph_type }} graph has {{ $value }} active anomalies 
-        (threshold: 10) for more than 5 minutes.
-        
-        This may indicate:
-        - Data quality issues in carbon forecasting
-        - Policy constraint violations
-        - Unexpected execution patterns
-        
-        Investigate: 
-        - Grafana dashboard: Green Agent — Graph Health
-        - Logs: grep "anomaly" in green-agent logs
-      runbook_url: https://wiki.example.com/runbooks/green-agent-anomalies
-      dashboard_url: https://grafana.example.com/d/green_agent_graphs
-  
-  - alert: GreenAgentExecutionGraphsStalled
-    expr: |
-      # No change in active execution graphs for 10 minutes
-      changes(green_agent_execution_graphs_active[10m]) == 0
-      and
-      green_agent_execution_graphs_active > 0
-    for: 10m
-    labels:
-      severity: critical
-      team: ai-platform
-      component: orchestration
-    annotations:
-      summary: "Green Agent execution graphs appear stalled"
-      description: |
-        Active execution graphs count has not changed for 10 minutes 
-        while showing {{ $value }} active graphs.
-        
-        Possible causes:
-        - Ray cluster workers not responding
-        - Task queue backup
-        - Resource exhaustion
-        
-        Check:
-        - Ray dashboard: http://<head-node>:8265
-        - Kubernetes pods: kubectl get pods -l app=green-agent
-        - Metrics: green_agent_graph_nodes, green_agent_graph_edges
-      runbook_url: https://wiki.example.com/runbooks/green-agent-stalled
-  
-  - alert: GreenAgentCarbonLedgerWriteFailure
-    expr: |
-      # No new ideal paths registered for 30 minutes while executions ongoing
-      changes(green_agent_ideal_paths_total[30m]) == 0
-      and
-      green_agent_execution_graphs_active > 0
-    for: 30m
-    labels:
-      severity: critical
-      team: ai-platform
-      component: carbon-ledger
-    annotations:
-      summary: "Carbon ledger may not be recording executions"
-      description: |
-        No new ideal paths registered in 30 minutes despite 
-        {{ $value }} active execution graphs.
-        
-        This may indicate:
-        - DAG carbon ledger write failures
-        - Database connectivity issues
-        - Permission errors
-        
-        Investigate:
-        - Logs: grep "ledger" or "write" in green-agent logs
-        - Database: check connectivity and disk space
-        - Metrics: any error counters in green_agent_* metrics
-      runbook_url: https://wiki.example.com/runbooks/green-agent-ledger-failure
-  
-  # -----------------------------------------------------------------------
-  # Warning Alerts (notify team, no page)
-  # -----------------------------------------------------------------------
-  
-  - alert: GreenAgentHighCausalEdgeWeightVariance
-    expr: |
-      # High variance in causal edge weights may indicate instability
-      stddev by (label) (green_agent_causal_edge_weight) > 0.3
-    for: 15m
-    labels:
-      severity: warning
-      team: ai-platform
-      component: causal-inference
-    annotations:
-      summary: "High variance in causal edge weights"
-      description: |
-        Causal edge weights for label "{{ $labels.label }}" 
-        have high variance (stddev > 0.3).
-        
-        This may indicate:
-        - Model retraining in progress
-        - Data distribution shift
-        - Insufficient training data for certain edges
-        
-        Monitor:
-        - Grafana panel: "Causal edge weights (top edges)"
-        - Check if variance decreases after model update
-      runbook_url: https://wiki.example.com/runbooks/green-agent-edge-variance
-  
-  - alert: GreenAgentPolicyEdgeWeightDrift
-    expr: |
-      # Policy edge weights changing rapidly may indicate policy instability
-      abs(deriv(green_agent_policy_edge_weight[1h])) > 0.1
-    for: 1h
-    labels:
-      severity: warning
-      team: ai-platform
-      component: policy-engine
-    annotations:
-      summary: "Policy edge weights drifting rapidly"
-      description: |
-        Policy edge weight for {{ $labels.source }} → {{ $labels.target }} 
-        is changing by > 0.1 per hour.
-        
-        This may indicate:
-        - Policy adaptation in response to new data
-        - Overfitting to recent patterns
-        - Configuration changes
-        
-        Review:
-        - Recent policy updates in version control
-        - Carbon zone distribution changes
-        - Grafana panel: "Policy edge weights"
-      runbook_url: https://wiki.example.com/runbooks/green-agent-policy-drift
-  
-  - alert: GreenAgentGraphSizeGrowingRapidly
-    expr: |
-      # Graph growing faster than expected may indicate memory leak or data issue
-      rate(green_agent_graph_nodes[1h]) > 10
-      or
-      rate(green_agent_graph_edges[1h]) > 20
-    for: 1h
-    labels:
-      severity: warning
-      team: ai-platform
-      component: graph-registry
-    annotations:
-      summary: "Graph size growing rapidly"
-      description: |
-        {{ $labels.graph_type }} graph is growing at 
-        {{ printf "%.1f" $value }} nodes/edges per hour.
-        
-        Expected growth: < 10 nodes/hour, < 20 edges/hour
-        
-        Possible causes:
-        - Memory leak in graph construction
-        - Duplicate node/edge registration
-        - Unbounded cache growth
-        
-        Check:
-        - Memory usage: container_memory_usage_bytes{container="green-agent"}
-        - Registry logs: grep "register" for duplicate warnings
-      runbook_url: https://wiki.example.com/runbooks/green-agent-graph-growth
-  
-  - alert: GreenAgentMetricsExporterLatencyHigh
-    expr: |
-      # Prometheus scrape duration for green-agent metrics is high
-      scrape_duration_seconds{job="green-agent"} > 5
-    for: 5m
-    labels:
-      severity: warning
-      team: ai-platform
-      component: metrics-exporter
-    annotations:
-      summary: "Green Agent metrics exporter responding slowly"
-      description: |
-        Prometheus scrape of green-agent metrics took {{ $value }}s 
-        (threshold: 5s).
-        
-        This may indicate:
-        - GraphRegistry.collect() is slow (large graphs)
-        - Network latency to exporter
-        - Exporter resource constraints
-        
-        Investigate:
-        - Exporter logs for slow queries
-        - Reduce max_edges_export if graphs are large
-        - Check exporter CPU/memory usage
-      runbook_url: https://wiki.example.com/runbooks/green-agent-exporter-latency
-  
-  # -----------------------------------------------------------------------
-  # Info Alerts (log only, for trending)
-  # -----------------------------------------------------------------------
-  
-  - alert: GreenAgentCarbonZoneDistributionChange
-    expr: |
-      # Significant change in anomaly distribution across carbon zones
-      abs(
-        green_agent_anomalies_active{graph_type="causal", carbon_zone="green"}
-        - ignoring(carbon_zone) group_left
-        green_agent_anomalies_active{graph_type="causal", carbon_zone="green"} offset 1h
-      ) > 5
-    for: 1h
-    labels:
-      severity: info
-      team: ai-platform
-      component: carbon-monitoring
-    annotations:
-      summary: "Anomaly distribution across carbon zones changed"
-      description: |
-        Anomaly count in {{ $labels.carbon_zone }} zone changed by 
-        {{ printf "%.0f" $value }} compared to 1 hour ago.
-        
-        This is informational — monitor for patterns:
-        - More anomalies in red zones may indicate carbon-aware scheduling working
-        - More anomalies in green zones may indicate data quality issues
-        
-        No action required unless correlated with other alerts.
-      runbook_url: https://wiki.example.com/runbooks/green-agent-zone-trends
-  
-  - alert: GreenAgentIdealPathsGrowth
-    expr: |
-      # Track growth rate of ideal paths (informational)
-      rate(green_agent_ideal_paths_total[24h]) > 100
-    for: 24h
-    labels:
-      severity: info
-      team: ai-platform
-      component: carbon-ledger
-    annotations:
-      summary: "Ideal paths registered growing steadily"
-      description: |
-        {{ printf "%.1f" $value }} ideal paths registered per day 
-        over the last 24 hours.
-        
-        This is expected growth as the system learns — 
-        no action required unless growth is unexpected.
-        
-        Use for capacity planning:
-        - Ledger storage requirements
-        - Query performance monitoring
-      runbook_url: https://wiki.example.com/runbooks/green-agent-capacity-planning
 
-# -----------------------------------------------------------------------
-# Recording Rules (pre-compute expensive queries)
-# -----------------------------------------------------------------------
-- name: green_agent_recording_rules
-  interval: 1m
-  rules:
-  
-  # Pre-compute anomaly rate per graph type for dashboards
-  - record: green_agent:anomaly_rate:per_graph_type
-    expr: |
-      sum by (graph_type) (green_agent_anomalies_active) 
-      / 
-      sum by (graph_type) (green_agent_graph_nodes)
-    
-  # Pre-compute edge weight statistics for causal graph
-  - record: green_agent:causal_edge_weight:stats
-    expr: |
-      avg(green_agent_causal_edge_weight) without (source, target, label)
-    
-  # Pre-compute policy edge weight distribution
-  - record: green_agent:policy_edge_weight:percentile_90
-    expr: |
-      histogram_quantile(0.90, 
-        sum by (le) (
-          rate(green_agent_policy_edge_weight_bucket[5m])
-        )
-      )
+  # ===========================================================================
+  # Group 1 — Graph health (fast-moving critical + warning)
+  # ===========================================================================
+  - name: green_agent_graph_health
+    interval: 30s
+    rules:
 
-# -----------------------------------------------------------------------
-# NEW: Enhanced Alerts for Advanced Modules
-# (LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy Distillation,
-# Bio‑inspired Optimisation, MoE expert gating, FlexGen)
-# -----------------------------------------------------------------------
-- name: green_agent_enhanced
-  interval: 30s
-  rules:
+      # -----------------------------------------------------------------------
+      # Critical alerts (page on-call)
+      # -----------------------------------------------------------------------
 
-  # MODP composite score too low
-  - alert: GreenAgentLowMODPScore
-    expr: green_agent_modp_score < 0.4
-    for: 10m
-    labels:
-      severity: warning
-      team: ai-platform
-      component: modp
-    annotations:
-      summary: "Low MODP composite score"
-      description: |
-        MODP score is {{ $value }} (target > 0.6). 
-        Check objective weights and system performance.
-      runbook_url: https://wiki.example.com/runbooks/modp-low-score
+      - alert: GreenAgentHighAnomalyRate
+        expr: |
+          sum by (graph_type) (green_agent_anomalies_active) > 10
+        for: 5m
+        labels:
+          severity: critical
+          team: ai-platform
+          component: causal-graph
+        annotations:
+          summary: "High anomaly rate in {{ $labels.graph_type }} graph"
+          description: |
+            {{ $labels.graph_type }} graph has {{ printf "%.0f" $value }}
+            active anomalies (threshold: > 10) for more than 5 minutes.
+            Cluster: {{ $externalLabels.cluster }} / region: {{ $externalLabels.region }}.
 
-  # RLHF feedback score dropping
-  - alert: GreenAgentLowRLHFFeedback
-    expr: green_agent_rlhf_feedback < 0.3
-    for: 15m
-    labels:
-      severity: warning
-      team: ai-platform
-      component: rlhf
-    annotations:
-      summary: "Low RLHF feedback score"
-      description: |
-        Human feedback score is {{ $value }}. 
-        Consider adjusting agent behavior or collecting more feedback.
-      runbook_url: https://wiki.example.com/runbooks/rlhf-low-feedback
+            This may indicate:
+            - Data quality issues in carbon forecasting
+            - Policy constraint violations
+            - Unexpected execution patterns
 
-  # LIMIT Graph centrality anomaly
-  - alert: GreenAgentGraphCentralityLow
-    expr: green_agent_graph_centrality < 0.3
-    for: 10m
-    labels:
-      severity: warning
-      team: ai-platform
-      component: limit-graph
-    annotations:
-      summary: "Low LIMIT Graph centrality"
-      description: |
-        Graph centrality is {{ $value }}. Topology may be suboptimal.
-      runbook_url: https://wiki.example.com/runbooks/graph-centrality-low
+            Investigate:
+            - Grafana dashboard: Green Agent — Graph Health
+            - Logs: grep "anomaly" in green-agent logs
+          runbook_url: https://wiki.example.com/runbooks/green-agent-anomalies
+          dashboard_url: https://grafana.example.com/d/green_agent_graphs
 
-  # Distillation updates stalled
-  - alert: GreenAgentDistillationStalled
-    expr: rate(green_agent_distillation_update_count[30m]) < 1
-    for: 30m
-    labels:
-      severity: info
-      team: ai-platform
-      component: distillation
-    annotations:
-      summary: "Distillation updates stalled"
-      description: |
-        Few or no distillation updates in the last 30 minutes. 
-        Check if training loop is active.
-      runbook_url: https://wiki.example.com/runbooks/distillation-stalled
+      - alert: GreenAgentExecutionGraphsStalled
+        expr: |
+          changes(green_agent_execution_graphs_active[10m]) == 0
+          and
+          max(green_agent_execution_graphs_active) > 0
+        for: 10m
+        labels:
+          severity: critical
+          team: ai-platform
+          component: orchestration
+        annotations:
+          summary: "Green Agent execution graphs appear stalled"
+          description: |
+            Active execution graphs count has not changed for 10 minutes
+            while showing {{ printf "%.0f" $value }} active graphs.
 
-  # MoE gating instability
-  - alert: GreenAgentMoEUnstable
-    expr: stddev_over_time(green_agent_moe_gate_weight[15m]) > 0.2
-    for: 15m
-    labels:
-      severity: warning
-      team: ai-platform
-      component: moe
-    annotations:
-      summary: "MoE gating unstable"
-      description: |
-        Gate weight standard deviation is {{ $value }}. 
-        Investigate stability of expert routing.
-      runbook_url: https://wiki.example.com/runbooks/moe-unstable
+            Possible causes:
+            - Ray cluster workers not responding
+            - Task queue backup
+            - Resource exhaustion
 
-  # Bio‑inspired evolutionary fitness stagnating
-  - alert: GreenAgentEvolutionStalled
-    expr: green_agent_evolutionary_best_fitness - green_agent_evolutionary_best_fitness offset 1h < 0.01
-    for: 1h
-    labels:
-      severity: info
-      team: ai-platform
-      component: evolutionary
-    annotations:
-      summary: "Evolutionary optimisation stalled"
-      description: |
-        Best fitness has not improved significantly in the last hour.
-      runbook_url: https://wiki.example.com/runbooks/evolution-stalled
+            Check:
+            - Ray dashboard: http://<head-node>:8265
+            - Kubernetes pods: kubectl get pods -l app=green-agent
+            - Metrics: green_agent_graph_nodes, green_agent_graph_edges
+          runbook_url: https://wiki.example.com/runbooks/green-agent-stalled
+          dashboard_url: https://grafana.example.com/d/green_agent_orchestration
 
-  # FlexGen energy consumption high
-  - alert: GreenAgentFlexGenHighEnergy
-    expr: rate(green_agent_flexgen_energy_joules_total[5m]) > 1000
-    for: 10m
-    labels:
-      severity: warning
-      team: ai-platform
-      component: flexgen
-    annotations:
-      summary: "High FlexGen energy consumption"
-      description: |
-        FlexGen energy rate is {{ $value }} J/s. 
-        Consider switching precision or delegation policy.
-      runbook_url: https://wiki.example.com/runbooks/flexgen-high-energy
+      - alert: GreenAgentCarbonLedgerWriteFailure
+        expr: |
+          increase(green_agent_ideal_paths_total[30m]) == 0
+          and
+          max(green_agent_execution_graphs_active) > 0
+        for: 30m
+        labels:
+          severity: critical
+          team: ai-platform
+          component: carbon-ledger
+        annotations:
+          summary: "Carbon ledger may not be recording executions"
+          description: |
+            No new ideal paths registered in 30 minutes despite
+            {{ printf "%.0f" $value }} active execution graphs.
 
-# -----------------------------------------------------------------------
-# Enhanced Recording Rules (optional, for dashboards)
-# -----------------------------------------------------------------------
-- name: green_agent_enhanced_recording_rules
-  interval: 1m
-  rules:
-  - record: green_agent:modp_score:avg5m
-    expr: avg_over_time(green_agent_modp_score[5m])
-  - record: green_agent:rlhf_feedback:avg1h
-    expr: avg_over_time(green_agent_rlhf_feedback[1h])
-  - record: green_agent:graph_centrality:avg1h
-    expr: avg_over_time(green_agent_graph_centrality[1h])
-  - record: green_agent:distillation_update_rate:sum5m
-    expr: sum(rate(green_agent_distillation_update_count[5m]))
+            This may indicate:
+            - DAG carbon ledger write failures
+            - Database connectivity issues
+            - Permission errors
+
+            Investigate:
+            - Logs: grep "ledger" or "write" in green-agent logs
+            - Database: check connectivity and disk space
+            - Metrics: any error counters in green_agent_* metrics
+          runbook_url: https://wiki.example.com/runbooks/green-agent-ledger-failure
+          dashboard_url: https://grafana.example.com/d/green_agent_ledger
+
+      # -----------------------------------------------------------------------
+      # Warning alerts (notify, no page)
+      # -----------------------------------------------------------------------
+
+      - alert: GreenAgentHighCausalEdgeWeightVariance
+        expr: |
+          stddev by (label) (green_agent_causal_edge_weight) > 0.3
+        for: 15m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: causal-graph
+        annotations:
+          summary: "High variance in causal edge weights for {{ $labels.label }}"
+          description: |
+            Causal edge weights for label "{{ $labels.label }}"
+            have high variance (stddev {{ printf "%.2f" $value }} > 0.3).
+
+            This may indicate:
+            - Model retraining in progress
+            - Data distribution shift
+            - Insufficient training data for certain edges
+
+            Monitor:
+            - Grafana panel: "Causal edge weights (top edges)"
+            - Check if variance decreases after model update
+          runbook_url: https://wiki.example.com/runbooks/green-agent-edge-variance
+          dashboard_url: https://grafana.example.com/d/green_agent_graphs
+
+      - alert: GreenAgentPolicyEdgeWeightDrift
+        expr: |
+          # deriv() is per-second. Threshold is 0.1 per hour → multiply by 3600.
+          abs(deriv(green_agent_policy_edge_weight[1h])) * 3600 > 0.1
+          and
+          count_over_time(green_agent_policy_edge_weight[1h]) > 2
+        for: 1h
+        labels:
+          severity: warning
+          team: ai-platform
+          component: policy-engine
+        annotations:
+          summary: "Policy edge weights drifting rapidly"
+          description: |
+            Policy edge weight for {{ $labels.source }} → {{ $labels.target }}
+            is changing by more than 0.1 per hour
+            (current: {{ printf "%.4f" $value }} per hour).
+
+            This may indicate:
+            - Policy adaptation in response to new data
+            - Overfitting to recent patterns
+            - Configuration changes
+
+            Review:
+            - Recent policy updates in version control
+            - Carbon zone distribution changes
+            - Grafana panel: "Policy edge weights"
+          runbook_url: https://wiki.example.com/runbooks/green-agent-policy-drift
+          dashboard_url: https://grafana.example.com/d/green_agent_policy
+
+      - alert: GreenAgentGraphSizeGrowingRapidly
+        expr: |
+          # Nodes/edges are gauges. Use deriv() (not rate()).
+          # Thresholds: 10 nodes/hour, 20 edges/hour → multiply by 3600.
+          (
+            deriv(green_agent_graph_nodes[1h]) * 3600 > 10
+          )
+          or
+          (
+            deriv(green_agent_graph_edges[1h]) * 3600 > 20
+          )
+        for: 1h
+        labels:
+          severity: warning
+          team: ai-platform
+          component: graph-registry
+        annotations:
+          summary: "Graph size growing rapidly"
+          description: |
+            {{ $labels.graph_type }} graph is growing at
+            {{ printf "%.1f" $value }} nodes-or-edges per hour.
+            Expected growth: < 10 nodes/hour, < 20 edges/hour.
+
+            Possible causes:
+            - Memory leak in graph construction
+            - Duplicate node/edge registration
+            - Unbounded cache growth
+
+            Check:
+            - Memory usage: container_memory_usage_bytes{container="green-agent"}
+            - Registry logs: grep "register" for duplicate warnings
+          runbook_url: https://wiki.example.com/runbooks/green-agent-graph-growth
+          dashboard_url: https://grafana.example.com/d/green_agent_graphs
+
+      - alert: GreenAgentMetricsExporterLatencyHigh
+        expr: |
+          scrape_duration_seconds{job="green-agent"} > 5
+        for: 5m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: metrics-exporter
+        annotations:
+          summary: "Green Agent metrics exporter responding slowly"
+          description: |
+            Prometheus scrape of green-agent metrics took
+            {{ printf "%.1f" $value }}s (threshold: 5s).
+
+            This may indicate:
+            - GraphRegistry.collect() is slow (large graphs)
+            - Network latency to exporter
+            - Exporter resource constraints
+
+            Investigate:
+            - Exporter logs for slow queries
+            - Reduce max_edges_export if graphs are large
+            - Check exporter CPU/memory usage
+          runbook_url: https://wiki.example.com/runbooks/green-agent-exporter-latency
+          dashboard_url: https://grafana.example.com/d/green_agent_exporter
+
+      # -----------------------------------------------------------------------
+      # Info alerts (trending, no page)
+      # -----------------------------------------------------------------------
+
+      - alert: GreenAgentCarbonZoneDistributionChange
+        expr: |
+          abs(
+            green_agent_anomalies_active{graph_type="causal", carbon_zone="green"}
+            -
+            green_agent_anomalies_active{graph_type="causal", carbon_zone="green"} offset 1h
+          ) > 5
+        for: 1h
+        labels:
+          severity: info
+          team: ai-platform
+          component: carbon-monitoring
+        annotations:
+          summary: "Anomaly distribution in green carbon zone changed"
+          description: |
+            Anomaly count in the "green" carbon zone changed by
+            {{ printf "%.0f" $value }} compared to 1 hour ago.
+
+            Informational — monitor for patterns:
+            - More anomalies in red zones may indicate carbon-aware
+              scheduling working as designed.
+            - More anomalies in green zones may indicate data quality issues.
+
+            No action required unless correlated with other alerts.
+          runbook_url: https://wiki.example.com/runbooks/green-agent-zone-trends
+
+      - alert: GreenAgentIdealPathsGrowth
+        expr: |
+          # rate() is per-second. Threshold is 100/day → multiply by 86400.
+          rate(green_agent_ideal_paths_total[1h]) * 86400 > 100
+        for: 1h
+        labels:
+          severity: info
+          team: ai-platform
+          component: carbon-ledger
+        annotations:
+          summary: "Ideal paths registered growing steadily"
+          description: |
+            {{ printf "%.1f" $value }} ideal paths registered per day
+            (rate over the last hour, extrapolated to 24h).
+
+            Expected growth as the system learns — no action required
+            unless growth is unexpected.
+
+            Use for capacity planning:
+            - Ledger storage requirements
+            - Query performance monitoring
+          runbook_url: https://wiki.example.com/runbooks/green-agent-capacity-planning
+
+  # ===========================================================================
+  # Group 2 — Slow-moving safety alerts (evaluated less often)
+  # ===========================================================================
+  - name: green_agent_slow_alerts
+    interval: 5m
+    rules:
+
+      - alert: GreenAgentNoNewMetrics
+        # Safety net: fires if the exporter disappears. Without this, every
+        # other alert in this file silently goes dark when the exporter dies.
+        expr: |
+          absent(up{job="green-agent"} == 1)
+        for: 5m
+        labels:
+          severity: critical
+          team: ai-platform
+          component: metrics-exporter
+        annotations:
+          summary: "All Green Agent scrape targets are down"
+          description: |
+            No Green Agent target has been up for 5 minutes.
+            Every other Green Agent alert is now silent because its
+            underlying metric is absent.
+
+            Check:
+            - Kubernetes: kubectl get pods -l app=green-agent
+            - Exporter logs
+            - Network connectivity from Prometheus to exporter
+          runbook_url: https://wiki.example.com/runbooks/green-agent-scrape-down
+
+      - alert: GreenAgentRuleEvaluationFailing
+        # Self-monitoring: fires if Prometheus itself cannot evaluate this
+        # rules file. A broken rules file goes unnoticed without this.
+        expr: |
+          rate(prometheus_rule_evaluation_failures_total{rule_group="green_agent_graph_health"}[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: prometheus
+        annotations:
+          summary: "Prometheus rule evaluation failures for Green Agent"
+          description: |
+            Prometheus has been failing to evaluate the
+            green_agent_graph_health rule group for 10 minutes.
+            Recent sample rate of failures: {{ printf "%.4f" $value }}/s.
+
+            Check:
+            - promtool check rules green_agent_alerts.yml
+            - Prometheus logs for evaluation errors
+            - Metric name changes in the exporter
+          runbook_url: https://wiki.example.com/runbooks/prometheus-rule-eval
+
+  # ===========================================================================
+  # Group 3 — Base recording rules
+  # ===========================================================================
+  - name: green_agent_recording_rules
+    interval: 1m
+    rules:
+
+      - record: green_agent:anomaly_rate:ratio_by_graph_type
+        # Guarded division — drops series where graph_nodes == 0 so the
+        # result is not NaN on dashboards.
+        expr: |
+          sum by (graph_type) (green_agent_anomalies_active)
+          /
+          (sum by (graph_type) (green_agent_graph_nodes) > 0)
+
+      - record: green_agent:causal_edge_weight:avg
+        expr: |
+          avg by (label) (green_agent_causal_edge_weight)
+
+      - record: green_agent:causal_edge_weight:stddev
+        expr: |
+          stddev by (label) (green_agent_causal_edge_weight)
+
+      - record: green_agent:policy_edge_weight:p90
+        # Global p90 across all edges (sum by (le) collapses source/target).
+        # Requires green_agent_policy_edge_weight to be a *histogram*.
+        # If your exporter emits it as a gauge, remove this rule — it will
+        # silently produce no data.
+        expr: |
+          histogram_quantile(
+            0.9,
+            sum by (le) (rate(green_agent_policy_edge_weight_bucket[5m]))
+          )
+
+      - record: green_agent:policy_edge_weight:avg
+        # Gauge-based alternative — use when the exporter emits a gauge.
+        expr: |
+          avg(green_agent_policy_edge_weight)
+
+  # ===========================================================================
+  # Group 4 — Enhanced module alerts
+  # ===========================================================================
+  - name: green_agent_enhanced
+    interval: 30s
+    rules:
+
+      - alert: GreenAgentLowMODPScore
+        # Aggregated by job — prevents per-series alert storms.
+        expr: |
+          avg by (job) (green_agent_modp_score) < 0.4
+        for: 10m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: modp
+        annotations:
+          summary: "Low MODP composite score"
+          description: |
+            Average MODP score across the job is
+            {{ printf "%.3f" $value }} (target > 0.6).
+            Check objective weights and system performance.
+          runbook_url: https://wiki.example.com/runbooks/modp-low-score
+          dashboard_url: https://grafana.example.com/d/green_agent_modp
+
+      - alert: GreenAgentLowRLHFFeedback
+        expr: |
+          avg by (job) (green_agent_rlhf_feedback) < 0.3
+        for: 15m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: rlhf
+        annotations:
+          summary: "Low RLHF feedback score"
+          description: |
+            Average human feedback score across the job is
+            {{ printf "%.3f" $value }}.
+            Consider adjusting agent behavior or collecting more feedback.
+          runbook_url: https://wiki.example.com/runbooks/rlhf-low-feedback
+          dashboard_url: https://grafana.example.com/d/green_agent_rlhf
+
+      - alert: GreenAgentGraphCentralityLow
+        expr: |
+          avg by (job) (green_agent_graph_centrality) < 0.3
+        for: 10m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: limit-graph
+        annotations:
+          summary: "Low LIMIT Graph centrality"
+          description: |
+            Average graph centrality across the job is
+            {{ printf "%.3f" $value }}. Topology may be suboptimal.
+          runbook_url: https://wiki.example.com/runbooks/graph-centrality-low
+          dashboard_url: https://grafana.example.com/d/green_agent_graphs
+
+      - alert: GreenAgentDistillationStalled
+        expr: |
+          # Threshold: 1 update per 30 min = 1/1800 per second.
+          rate(green_agent_distillation_update_count[30m]) < 1/1800
+        for: 30m
+        labels:
+          severity: info
+          team: ai-platform
+          component: distillation
+        annotations:
+          summary: "Distillation updates stalled"
+          description: |
+            Fewer than 1 distillation update per 30 minutes
+            (current: {{ printf "%.4f" $value }}/s).
+            Check if the training loop is active.
+          runbook_url: https://wiki.example.com/runbooks/distillation-stalled
+
+      - alert: GreenAgentMoEUnstable
+        expr: |
+          stddev_over_time(green_agent_moe_gate_weight[15m]) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: moe
+        annotations:
+          summary: "MoE gating unstable"
+          description: |
+            Gate weight standard deviation over 15 minutes is
+            {{ printf "%.3f" $value }}. Investigate expert routing stability.
+          runbook_url: https://wiki.example.com/runbooks/moe-unstable
+          dashboard_url: https://grafana.example.com/d/green_agent_moe
+
+      - alert: GreenAgentEvolutionStalled
+        # Stagnation: not regressing, but not meaningfully improving either.
+        expr: |
+          delta(green_agent_evolutionary_best_fitness[1h]) >= 0
+          and
+          delta(green_agent_evolutionary_best_fitness[1h]) < 0.01
+        for: 1h
+        labels:
+          severity: info
+          team: ai-platform
+          component: evolutionary
+        annotations:
+          summary: "Evolutionary optimisation stagnant"
+          description: |
+            Best fitness has not improved by 0.01 in the last hour
+            (delta: {{ printf "%.4f" $value }}).
+            Check population size, mutation rate, and selection pressure.
+          runbook_url: https://wiki.example.com/runbooks/evolution-stalled
+
+      - alert: GreenAgentEvolutionRegressed
+        # Regression: best fitness actually decreased. Distinct from
+        # stagnation — higher severity because it implies a bug or a
+        # policy rollback.
+        expr: |
+          delta(green_agent_evolutionary_best_fitness[1h]) < 0
+        for: 30m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: evolutionary
+        annotations:
+          summary: "Evolutionary fitness regressed"
+          description: |
+            Best fitness decreased by {{ printf "%.4f" $value }} in the
+            last hour. This is a regression — investigate whether the
+            evolution loop is reverting, or if a bug is mutating the
+            population in the wrong direction.
+          runbook_url: https://wiki.example.com/runbooks/evolution-regressed
+
+      - alert: GreenAgentFlexGenHighEnergy
+        expr: |
+          # rate() of a counter — result is J/s = Watts.
+          rate(green_agent_flexgen_energy_joules_total[5m]) > 1000
+        for: 10m
+        labels:
+          severity: warning
+          team: ai-platform
+          component: flexgen
+        annotations:
+          summary: "High FlexGen energy consumption"
+          description: |
+            FlexGen energy rate is {{ printf "%.1f" $value }} J/s
+            (threshold: 1000 J/s).
+            Consider switching precision or delegation policy.
+          runbook_url: https://wiki.example.com/runbooks/flexgen-high-energy
+          dashboard_url: https://grafana.example.com/d/green_agent_flexgen
+
+  # ===========================================================================
+  # Group 5 — Enhanced recording rules
+  # ===========================================================================
+  - name: green_agent_enhanced_recording_rules
+    interval: 1m
+    rules:
+
+      - record: green_agent:modp_score:avg5m
+        expr: avg_over_time(green_agent_modp_score[5m])
+
+      - record: green_agent:rlhf_feedback:avg1h
+        expr: avg_over_time(green_agent_rlhf_feedback[1h])
+
+      - record: green_agent:graph_centrality:avg1h
+        expr: avg_over_time(green_agent_graph_centrality[1h])
+
+      - record: green_agent:distillation_update_rate:rate5m
+        expr: sum(rate(green_agent_distillation_update_count[5m]))
