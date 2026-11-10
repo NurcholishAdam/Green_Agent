@@ -11,16 +11,31 @@ PREFER lean-ctx MCP tools over native equivalents for token savings:
 | `ctx_tree(path, depth)` | `ls` / `find` | Directory maps |
 | `ctx_edit(path, old_string, new_string)` | `Edit` (when Read unavailable) | Search-and-replace without native Read |
 
-Edit files: use native Edit/StrReplace if available. If Edit requires Read and Read is unavailable, use ctx_edit.
-Write, Delete, Glob — use normally. NEVER loop on Edit failures — switch to ctx_edit immediately.
+### Edit Fallback Rule (single source of truth)
+
+1. Prefer **native `Edit` / `StrReplace`** when available.
+2. If native `Edit` requires a prior `Read` **and** `Read` is unavailable → use **`ctx_edit`**.
+3. **NEVER** loop on `Edit` failures. On the **first** failure, switch to `ctx_edit` immediately.
+4. **Write, Delete, Glob** — use normally (no lean-ctx override needed).
 
 ---
 
 ## 🧠 Advanced Enhancement Integration
 
-When working with files under `src/enhancements/` or interacting with Green Agent's advanced modules, use the **enhanced read modes** available in lean-ctx to fetch only the most relevant state without reading entire files. This saves tokens and keeps context focused.
+When working with files under `src/enhancements/` or interacting with the Green Agent's advanced modules, use the **enhanced read modes** available in lean-ctx to fetch only the most relevant state without reading entire files. This saves tokens and keeps context focused.
 
-### Enhanced Read Modes (in addition to standard modes)
+### Mode Taxonomy
+
+```
+Standard modes  ──►  full | compressed | outline | ...
+Enhanced modes  ──►  graph | modp | rlhf | distillation | evolutionary |
+                     moe | flexgen | cache | cost | workload | zero_trust |
+                     routing | anomaly | safety | privacy | checkpoint |
+                     training | experiment | digest
+Composite modes ──►  mode="modp+moe" | mode="graph+routing" | mode="cost+energy"
+```
+
+### Enhanced Read Modes (standard set)
 
 | Mode | Purpose | Example Module |
 |------|---------|----------------|
@@ -32,45 +47,178 @@ When working with files under `src/enhancements/` or interacting with Green Agen
 | `moe` | MoE gating network weights and expert routing stats | `schemas/node_descriptor.py`, `schemas/workload_descriptor.py` |
 | `flexgen` | FlexGen configuration, precision, energy metrics | `config/green_agent_config.yaml`, runtime logs |
 
+### Enhanced Read Modes (extended set — new)
+
+| Mode | Purpose | Example Module | Token class |
+|------|---------|----------------|-------------|
+| `cache` | Cache hit/miss stats, compression-mode histogram, eviction counts | `core/cache_manager.py` | tiny |
+| `cost` | Composite cost: accuracy / energy / latency / carbon trade-off vector | `schemas/node_descriptor.py` | small |
+| `energy` | Energy-only slice of `flexgen` (kWh, avg watts, p95) | runtime telemetry logs | tiny |
+| `workload` | WorkloadDescriptor: SLO class, batch size, priority, tenant | `schemas/workload_descriptor.py` | small |
+| `zero_trust` | Trust score, attestation state, policy decisions | `zero_trust_architecture.py` | small |
+| `routing` | LIMIT graph routing decisions + next-hop probabilities | `core/graph_registry.py` | small |
+| `anomaly` | Anomaly flags, drift scores, alert severity | `core/anomaly_detector.py` | tiny |
+| `safety` | Guardrail state, blocked-policy counts, redaction stats | `core/safety.py` | tiny |
+| `privacy` | DP ε/δ budget consumption, clipping norms | `core/privacy.py` | tiny |
+| `checkpoint` | Last checkpoint id, step, loss, age | `training/checkpoints.py` | tiny |
+| `training` | Combined `distillation` + `evolutionary` snapshot (composite) | `schemas/node_descriptor.py` | small |
+| `experiment` | A/B test arm assignment, p-value, lift | `experiments/registry.py` | tiny |
+| `digest` | One-shot human-readable digest of *all* enabled enhanced modes | (composite) | medium |
+
+### Composite Modes (new)
+
+`mode` accepts `+`-joined unions. Composite reads issue a **single** MCP round-trip and merge the result object.
+
+| Composite | Equivalent | When to use |
+|-----------|------------|-------------|
+| `modp+moe` | MODP score **and** MoE gate weights | Trade-off **and** routing decisions together |
+| `graph+routing` | Topology **and** next-hop probabilities | Explain *why* a route was chosen |
+| `cost+energy` | Cost vector **and** raw energy | Carbon/latency debugging |
+| `modp+rlhf` | MODP **and** feedback score | Policy adjustment review |
+| `training` | `distillation+evolutionary` | Convergence monitoring |
+| `digest` | All enabled modes | Onboarding, incident triage, "state of the world" |
+
 ### Usage Examples
 
 ```python
-# Get LIMIT Graph metrics without reading entire registry implementation
+# --- core enhanced modes ---
 ctx_read("src/enhancements/core/graph_registry.py", mode="graph")
-
-# Get current MODP weights and score from NodeDescriptor
 ctx_read("src/enhancements/schemas/node_descriptor.py", mode="modp")
-
-# Get RLHF feedback score from FeedbackEvent
 ctx_read("src/enhancements/schemas/feedback_event.py", mode="rlhf")
-
-# Get distillation student stats and MoE gate weights
 ctx_read("src/enhancements/schemas/node_descriptor.py", mode="distillation")
-
-# Get evolutionary optimizer best fitness
 ctx_read("src/enhancements/schemas/node_descriptor.py", mode="evolutionary")
-
-# Get MoE gate weights
 ctx_read("src/enhancements/schemas/workload_descriptor.py", mode="moe")
-
-# Get FlexGen configuration and energy usage
 ctx_read("config/green_agent_config.yaml", mode="flexgen")
+
+# --- extended modes ---
+ctx_read("src/enhancements/core/cache_manager.py", mode="cache")
+ctx_read("src/enhancements/schemas/node_descriptor.py", mode="cost")
+ctx_read("src/enhancements/schemas/workload_descriptor.py", mode="workload")
+ctx_read("src/enhancements/zero_trust_architecture.py", mode="zero_trust")
+ctx_read("src/enhancements/core/graph_registry.py", mode="routing")
+ctx_read("src/enhancements/core/anomaly_detector.py", mode="anomaly")
+ctx_read("src/enhancements/core/safety.py", mode="safety")
+ctx_read("src/enhancements/core/privacy.py", mode="privacy")
+ctx_read("src/enhancements/training/checkpoints.py", mode="checkpoint")
+ctx_read("src/enhancements/experiments/registry.py", mode="experiment")
+
+# --- composite modes (single round-trip) ---
+ctx_read("src/enhancements/schemas/node_descriptor.py", mode="modp+moe")
+ctx_read("src/enhancements/core/graph_registry.py", mode="graph+routing")
+ctx_read("src/enhancements/schemas/node_descriptor.py", mode="cost+energy")
+
+# --- one-shot state digest ---
+ctx_read("src/enhancements/", mode="digest")
+```
+
+### Mode Selection Decision Tree
+
+```
+Need to EDIT a file?
+├── yes → use full (or standard) mode  ── do not use enhanced modes
+└── no  → need a single fact?
+         ├── routing / topology      → graph | routing | graph+routing
+         ├── trade-off / score       → modp | modp+moe | modp+rlhf
+         ├── cost / carbon / energy  → cost | energy | cost+energy
+         ├── model training state    → distillation | evolutionary | training
+         ├── routing weights         → moe
+         ├── inference delegation    → flexgen
+         ├── security / trust        → zero_trust | safety
+         ├── privacy budget          → privacy
+         ├── cache health            → cache
+         ├── anomaly / drift         → anomaly
+         ├── workload / SLO          → workload
+         ├── experiment state        → experiment
+         └── "everything at once"    → digest
 ```
 
 ### When to Use Enhanced Modes
 
-- **LIMIT Graph**: When you need topology context for routing or anomaly analysis.
-- **MODP**: When evaluating trade‑offs between accuracy, energy, latency, and carbon.
-- **RLHF**: When human feedback influences policy adjustments or routing priorities.
-- **Distillation**: When checking if the student policy is learning or the replay buffer is filling.
-- **Evolutionary**: When monitoring whether evolutionary optimisation is converging or stalled.
-- **MoE**: When diagnosing expert routing stability or gate weight changes.
-- **FlexGen**: When deciding to delegate LLM inference and checking energy consumption.
+- **LIMIT Graph / Routing** — topology context for routing or anomaly analysis; use `routing` for next-hop probabilities.
+- **MODP** — trade-offs between accuracy, energy, latency, and carbon.
+- **RLHF** — when human feedback influences policy adjustments or routing priorities.
+- **Distillation** — when checking if the student policy is learning or the replay buffer is filling.
+- **Evolutionary** — when monitoring whether evolutionary optimisation is converging or stalled.
+- **MoE** — when diagnosing expert routing stability or gate weight changes.
+- **FlexGen / Energy** — when deciding to delegate LLM inference and checking energy consumption.
+- **Cache** — when verifying that lean-ctx itself is delivering token savings.
+- **Zero-Trust / Safety / Privacy** — when auditing security posture, guardrail blocks, or DP budget.
+- **Checkpoint / Training / Experiment** — when tracking model lifecycle and A/B outcomes.
+- **Digest** — for onboarding, incident triage, or a full state snapshot in one call.
 
-These modes are designed to work with the advanced enhancement modules under `src/enhancements/` and require that the corresponding modules are enabled via `ENHANCEMENTS_ENABLED=true` or the appropriate configuration flags.
+### Token Budget Guidance (approximate)
 
-If the enhancements are not enabled or the modules are missing, these modes will gracefully fall back to standard file reading or return an empty result.
+| Mode | Tokens | Use when |
+|------|--------|----------|
+| `cache`, `anomaly`, `safety`, `privacy`, `checkpoint`, `experiment` | < 100 | quick health checks |
+| `energy`, `routing`, `workload` | ~100–250 | targeted diagnosis |
+| `modp`, `rlhf`, `zero_trust`, `moe` | ~250–500 | decision input |
+| `graph`, `distillation`, `evolutionary` | ~500–1 000 | analysis |
+| `flexgen`, `cost` | ~500–1 500 | configuration review |
+| `digest`, `training` | ~1 000–3 000 | snapshot / triage |
+| `full` | file-size dependent | **only when editing** |
+
+### Configuration Matrix
+
+Enhanced modes require the corresponding module to be enabled. If a flag is missing, the mode **silently falls back** to standard read (or empty result) and increments `lean_ctx.fallback.count{mode=...}`.
+
+| Mode(s) | Enable flag |
+|---------|-------------|
+| all enhanced | `ENHANCEMENTS_ENABLED=true` |
+| `graph`, `routing`, `anomaly` | `LIMIT_GRAPH_ENABLED=true` |
+| `modp`, `cost` | `MODP_ENABLED=true` |
+| `rlhf` | `RLHF_ENABLED=true` |
+| `distillation`, `training` | `DISTILLATION_ENABLED=true` |
+| `evolutionary`, `training` | `EVOLUTIONARY_ENABLED=true` |
+| `moe` | `MOE_ENABLED=true` |
+| `flexgen`, `energy` | `FLEXGEN_ENABLED=true` |
+| `zero_trust`, `safety` | `ZERO_TRUST_ENABLED=true` |
+| `privacy` | `DIFFERENTIAL_PRIVACY_ENABLED=true` |
+| `checkpoint`, `experiment` | `TRAINING_ENABLED=true` |
+| `cache` | always on (lean-ctx core) |
+| `digest` | union of all enabled modes |
+
+### Fallback & Error Taxonomy
+
+| Condition | Behavior | Signal |
+|-----------|----------|--------|
+| Module disabled | Return `{}` (empty result) | `fallback.count` +1 |
+| Module file missing | Return `{}` | `fallback.count` +1 |
+| Schema version mismatch | Best-effort parse + warning in result | `fallback.schema_warn` |
+| Mode unknown to lean-ctx build | Fall through to `full` | `fallback.unknown_mode` |
+| Composite sub-mode fails | Return only successful sub-results | `fallback.partial` |
+| File unreadable | Standard `ctx_read` error | propagate |
+
+All fallbacks are **non-fatal**. Log line format:
+
+```
+[lean-ctx] fallback mode=<mode> reason=<reason> path=<path>
+```
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `ctx_read(..., mode="graph")` returns `{}` | `LIMIT_GRAPH_ENABLED` off | enable flag or use `full` |
+| Mode returns full file | mode not supported by build | upgrade lean-ctx; check `version` |
+| `digest` missing sections | sub-module disabled | enable the missing flag |
+| `ctx_edit` repeatedly failing | file has no match / race | re-read via `ctx_read`, then retry once; never loop |
+| High token spend | using `full` on large files | switch to enhanced mode |
+
+### Mode Contract & Versioning
+
+- **Contract**: every enhanced mode returns a JSON-serialisable object whose top level matches `schemas/<mode>_vN.json`. Backwards-incompatible changes bump `N`.
+- **Version check**: `ctx_read(..., mode="meta")` reports the lean-ctx build and supported modes.
+- **Deprecation**: modes are deprecated for **one minor release** before removal; a warning is emitted with the replacement mode name.
+
+### Remember
+
+> Always prefer the **most context-efficient read mode**.
+> Use `full` **only** for files you intend to edit.
+> Use **enhanced modes** for quick state inspection.
+> Use **composite modes** to avoid multiple round-trips.
+> Use **`digest`** for a one-shot snapshot of the whole enhancement state.
 
 ---
 
-**Remember**: Always prefer the most context‑efficient read mode; use `full` only for files you intend to edit, and use the enhanced modes for quick state inspection.
+*End of lean-ctx — Context Engineering Layer (enhanced).*
