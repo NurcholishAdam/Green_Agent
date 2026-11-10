@@ -1,109 +1,279 @@
+// =============================================================================
+// === SAVE AS: agentbeats_manifest.json ===
+// =============================================================================
+// AgentBeats agent manifest — GreenAgent v2.0.0
+//
+// This file describes a benchmarkable Green Agent submission. It is
+// validated by schemas/agentbeats_manifest.v1.json and the companion
+// scripts/validate_manifest.py (both below).
+//
+// WHAT CHANGED FROM v1.0
+// ----------------------
+//  - **Image pinned by digest** (`@sha256:<hex>`), not `:latest`. Prior
+//    version's `:latest` made every benchmark run non-reproducible.
+//  - **`--once --iterations 1`** added to every query command — the
+//    prior version's `python run_agent.py` blocked forever on
+//    `await shutdown_event.wait()`.
+//  - **Per-query `--config` YAML** replaces the 18 "environment" vars
+//    that `run_agent.py` never read. The differences between the three
+//    queries now live in config files, not stringly-typed env vars.
+//  - **`task_input` and `expected_output`** added per query — the
+//    prior manifest had no task payload.
+//  - **`timeout_seconds`** added per query.
+//  - **`carbon_context`** block added — required for carbon math.
+//  - **`resources`, `secrets`, `license`, `maintainer`** added.
+//  - **Complete enhancement blocks** — the empty `bio_inspired`,
+//    `moe_expert`, `modp`, `rlhf`, `distillation` blocks now declare
+//    all fields the code actually reads.
+//  - **Shared defaults** hoisted to `defaults.environment` — the three
+//    queries now declare only their differences.
+//  - **`_meta`, `version`, `benchmark_name`, `benchmark_version`** added.
+//  - **Query descriptions** added so the benchmark's hypothesis is
+//    documented per query.
+//
+// PRECEDENCE
+// ----------
+//   Query-level `environment` > `defaults.environment` > image defaults.
+//   Query-level `config_overrides` are deep-merged on top of the base
+//   YAML referenced by `command[--config]`.
+//
+// SECRETS
+// -------
+//   No secrets in this file. Everything secret loads from
+//   `$GREEN_AGENT_SECRETS_DIR` inside the container. See SECURITY.md.
+//
+// PLACEHOLDERS TO FILL BEFORE SUBMITTING
+// --------------------------------------
+//   - image            → replace `@sha256:REPLACE_ME` with a real digest
+//   - _meta.owner      → your GitHub handle or org
+//   - _meta.contact    → a real email or URL
+//   - maintainer.name  → your name or team
+//
+// VALIDATE BEFORE SUBMITTING
+// --------------------------
+//   python scripts/validate_manifest.py agentbeats_manifest.json
 {
+  "_meta": {
+    "owner": "AI Research Agent",
+    "schema_version": "2.0",
+    "updated_at": "2024-01-01T00:00:00Z",
+    "contact": "platform@example.com",
+    "changelog_url": "https://wiki.example.com/green-agent/manifest-changelog"
+  },
+  "version": "2.0.0",
+
+  "benchmark_name": "green-agent-benchmark",
+  "benchmark_version": "2.0.0",
+
   "agent_name": "GreenAgent",
-  "description": "Minimal green benchmarking agent with advanced enhancements (LIMIT Graph, MODP, RLHF, distillation, MoE, evolutionary, FlexGen)",
-  "image": "ghcr.io/nurcholishadam/green-agent:latest",
+  "description": "Green benchmarking agent with optional advanced enhancements: LIMIT Graph, MODP, RLHF, distillation + MoE, evolutionary optimisation, and FlexGen (disabled by default). See README.md for the feature matrix.",
+  "maintainer": {
+    "name": "Green Agent Platform Team",
+    "contact": "platform@example.com",
+    "url": "https://github.com/<your-org>/Green_Agent"
+  },
+  "license": "Apache-2.0",
+  "tags": ["sustainability", "agent-benchmark", "carbon-aware"],
+
+  "image": "ghcr.io/<your-org>/green-agent@sha256:REPLACE_ME",
+  "image_platform": "linux/amd64",
+  "image_digest_expected": "sha256:REPLACE_ME",
+
+  "resources": {
+    "cpu_request": "500m",
+    "cpu_limit": "2",
+    "memory_request": "512Mi",
+    "memory_limit": "4Gi",
+    "gpu_limit": 0,
+    "network_policy": "egress-allowlist",
+    "filesystem": "read-only",
+    "capabilities_drop": ["ALL"],
+    "allow_privilege_escalation": false,
+    "run_as_user": 1000
+  },
+
+  "secrets": {
+    "mount_path": "/run/secrets",
+    "env_var": "GREEN_AGENT_SECRETS_DIR",
+    "required": ["helium_api_key"],
+    "optional": ["postgres_password", "redis_password", "rlhf_feedback_token"]
+  },
+
+  "hardware_profile": "nvidia_a100",
+  "data_dir": "/var/lib/green-agent",
+
+  "carbon_context": {
+    "region": "US-CA",
+    "grid_intensity_g_kwh": 220.0,
+    "pue_factor": 1.2,
+    "use_offset_logic": false
+  },
+
+  "defaults": {
+    "environment": {
+      "GREEN_AGENT_ENV": "production",
+      "GREEN_AGENT_CONFIG": "/etc/green-agent/agent_config.yaml",
+      "ENHANCEMENTS_ENABLED": "false",
+      "LOG_LEVEL": "INFO"
+    }
+  },
+
   "enhancements": {
-    "enabled": true,
+    "enabled": false,
+
     "limit_graph": {
       "enabled": true,
       "graph_metrics": {
         "centrality": 0.7,
         "connectivity": 0.6,
         "density": 0.5
-      }
+      },
+      "update_interval_seconds": 60,
+      "influence_weight": 0.3
     },
+
     "modp": {
       "enabled": true,
-      "objective_weights": [0.4, 0.3, 0.2, 0.1]
+      "objective_weights": [0.4, 0.3, 0.2, 0.1],
+      "normalize_weights": true,
+      "score_threshold_low": 0.4,
+      "score_threshold_high": 0.7
     },
+
     "rlhf": {
       "enabled": true,
-      "human_feedback_score": 0.6
+      "human_feedback_score": 0.6,
+      "collect_feedback": true,
+      "feedback_source": "dashboard",
+      "feedback_url": "http://127.0.0.1:8001/feedback"
     },
+
     "distillation": {
       "enabled": true,
-      "use_moe_gating": true
+      "use_moe_gating": true,
+      "distillation_lr": 0.01,
+      "gating_lr": 0.005,
+      "replay_size": 2000,
+      "train_every": 10,
+      "epsilon": 0.1,
+      "teachers": ["rule_based", "historical_ml", "q_learning", "rlhf"]
     },
+
     "bio_inspired": {
       "enabled": true,
-      "use_evolutionary": true
+      "use_evolutionary": true,
+      "population_size": 20,
+      "mutation_rate": 0.1,
+      "crossover_rate": 0.7,
+      "elitism": 2
     },
+
     "moe_expert": {
       "enabled": true,
-      "n_experts": 4
+      "n_experts": 4,
+      "gating_lr": 0.005
     },
+
     "flexgen": {
       "enabled": false,
       "model_name": "facebook/opt-6.7b",
+      "batch_size": 16,
+      "memory_limit_mb": 4096,
+      "precision_options": ["fp32", "fp16", "int8"],
       "default_precision": "fp16",
       "delegation_policy": "adaptive"
     }
   },
+
   "queries": [
     {
-      "id": "low-energy",
-      "command": ["python", "run_agent.py"],
+      "query_id": "low-energy",
+      "description": "Minimise energy consumption under a tight budget (0.5 Wh/task). Exercises MODP with an energy-biased weight vector and defers non-critical tasks to low-carbon windows.",
+      "command": [
+        "python", "run_agent.py",
+        "--once", "--iterations", "1",
+        "--config", "/etc/green-agent/queries/low-energy.yaml"
+      ],
+      "workdir": "/app",
+      "timeout_seconds": 60,
+      "expected_duration_seconds": 20,
+      "task_input": {
+        "task_id": "low_energy_001",
+        "task_type": "inference",
+        "model": "llama-7b",
+        "tokens": 1000,
+        "input_data": {"query": "Summarize the key points of sustainable AI"}
+      },
+      "expected_output": {
+        "must_contain": ["summary"],
+        "max_energy_wh": 0.5,
+        "max_latency_ms": 5000,
+        "min_accuracy": 0.5
+      },
       "environment": {
         "QUERY_MODE": "low_energy",
-        "MAX_ENERGY_WH": "0.03",
         "ENHANCEMENTS_ENABLED": "true",
-        "LIMIT_GRAPH_ENABLED": "true",
-        "LIMIT_GRAPH_CENTRALITY": "0.7",
-        "LIMIT_GRAPH_CONNECTIVITY": "0.6",
-        "MODP_ENABLED": "true",
-        "MODP_WEIGHTS": "[0.4,0.3,0.2,0.1]",
-        "RLHF_ENABLED": "true",
-        "HUMAN_FEEDBACK_SCORE": "0.6",
-        "DISTILLATION_ENABLED": "true",
-        "MOE_GATING_ENABLED": "true",
-        "EVOLUTIONARY_ENABLED": "true",
-        "FLEXGEN_ENABLED": "false",
-        "FLEXGEN_MODEL_NAME": "facebook/opt-6.7b",
-        "FLEXGEN_DEFAULT_PRECISION": "fp16"
+        "MODP_WEIGHTS": "[0.2,0.5,0.2,0.1]"
       }
     },
     {
-      "id": "balanced",
-      "command": ["python", "run_agent.py"],
+      "query_id": "balanced",
+      "description": "Balance accuracy, energy, latency, and carbon with the default MODP weight vector (0.4, 0.3, 0.2, 0.1). Baseline for the other two queries.",
+      "command": [
+        "python", "run_agent.py",
+        "--once", "--iterations", "1",
+        "--config", "/etc/green-agent/queries/balanced.yaml"
+      ],
+      "workdir": "/app",
+      "timeout_seconds": 60,
+      "expected_duration_seconds": 25,
+      "task_input": {
+        "task_id": "balanced_001",
+        "task_type": "inference",
+        "model": "llama-7b",
+        "tokens": 1000,
+        "input_data": {"query": "Explain the trade-off between accuracy and energy"}
+      },
+      "expected_output": {
+        "must_contain": ["trade-off"],
+        "max_energy_wh": 0.8,
+        "max_latency_ms": 10000,
+        "min_accuracy": 0.75
+      },
       "environment": {
         "QUERY_MODE": "balanced",
-        "MAX_ENERGY_WH": "0.05",
         "ENHANCEMENTS_ENABLED": "true",
-        "LIMIT_GRAPH_ENABLED": "true",
-        "LIMIT_GRAPH_CENTRALITY": "0.7",
-        "LIMIT_GRAPH_CONNECTIVITY": "0.6",
-        "MODP_ENABLED": "true",
-        "MODP_WEIGHTS": "[0.4,0.3,0.2,0.1]",
-        "RLHF_ENABLED": "true",
-        "HUMAN_FEEDBACK_SCORE": "0.6",
-        "DISTILLATION_ENABLED": "true",
-        "MOE_GATING_ENABLED": "true",
-        "EVOLUTIONARY_ENABLED": "true",
-        "FLEXGEN_ENABLED": "false",
-        "FLEXGEN_MODEL_NAME": "facebook/opt-6.7b",
-        "FLEXGEN_DEFAULT_PRECISION": "fp16"
+        "MODP_WEIGHTS": "[0.4,0.3,0.2,0.1]"
       }
     },
     {
-      "id": "high-accuracy",
-      "command": ["python", "run_agent.py"],
+      "query_id": "high-accuracy",
+      "description": "Maximise accuracy with an accuracy-biased MODP weight vector (0.7, 0.1, 0.1, 0.1). Relaxes the energy budget to 2 Wh/task and lets latency grow to 20 s.",
+      "command": [
+        "python", "run_agent.py",
+        "--once", "--iterations", "1",
+        "--config", "/etc/green-agent/queries/high-accuracy.yaml"
+      ],
+      "workdir": "/app",
+      "timeout_seconds": 120,
+      "expected_duration_seconds": 45,
+      "task_input": {
+        "task_id": "high_accuracy_001",
+        "task_type": "inference",
+        "model": "llama-7b",
+        "tokens": 2000,
+        "input_data": {"query": "Give a rigorous analysis of carbon-aware scheduling algorithms"}
+      },
+      "expected_output": {
+        "must_contain": ["analysis"],
+        "max_energy_wh": 2.0,
+        "max_latency_ms": 20000,
+        "min_accuracy": 0.9
+      },
       "environment": {
         "QUERY_MODE": "high_accuracy",
-        "MAX_ENERGY_WH": "0.08",
         "ENHANCEMENTS_ENABLED": "true",
-        "LIMIT_GRAPH_ENABLED": "true",
-        "LIMIT_GRAPH_CENTRALITY": "0.7",
-        "LIMIT_GRAPH_CONNECTIVITY": "0.6",
-        "MODP_ENABLED": "true",
-        "MODP_WEIGHTS": "[0.4,0.3,0.2,0.1]",
-        "RLHF_ENABLED": "true",
-        "HUMAN_FEEDBACK_SCORE": "0.6",
-        "DISTILLATION_ENABLED": "true",
-        "MOE_GATING_ENABLED": "true",
-        "EVOLUTIONARY_ENABLED": "true",
-        "FLEXGEN_ENABLED": "false",
-        "FLEXGEN_MODEL_NAME": "facebook/opt-6.7b",
-        "FLEXGEN_DEFAULT_PRECISION": "fp16"
+        "MODP_WEIGHTS": "[0.7,0.1,0.1,0.1]"
       }
     }
   ]
