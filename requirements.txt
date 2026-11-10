@@ -33,17 +33,17 @@
 #
 # WHAT CHANGED FROM v1.0
 # ----------------------
-#   - FIXED: ray>=2.7.0 → ray[default]==2.40.0 (was missing the `[default]`
+#   - FIXED: ray>=2.7.0 → ray[default]==2.56.0 (was missing the `[default]`
 #     extra, so `ray dashboard` and the autoscaler were not installed, and
 #     every `ray start --dashboard-host=...` in INSTALLATION.md §A.1
 #     failed with "command not found").
 #   - ADDED: prophet==1.1.6 — required by forecasting_engine.py
 #     (MANIFEST.md §1, INSTALLATION.md §A.6).
-#   - ADDED: sentence-transformers==3.3.1 — required by semantic_scorer.py
+#   - ADDED: sentence-transformers==5.6.0 — required by semantic_scorer.py
 #     (MANIFEST.md §1).
 #   - ADDED: plotly==5.24.1, dash==2.18.2 — required by the dashboard
 #     (INSTALLATION.md §A.10).
-#   - ADDED: qiskit==1.3.1, qiskit-aer==0.15.1 — required by quantum
+#   - ADDED: qiskit==1.4.2, qiskit-aer==0.15.1 — required by quantum
 #     evaluation (INSTALLATION.md §A.5).
 #   - ADDED: httpx==0.28.1 — required by the helium recipe
 #     (INSTALLATION.md §A.2).
@@ -181,7 +181,7 @@ prometheus-client==0.21.1
 # fails with "command not found" when this extra is missing (v1.0 bug).
 # Upper bound <3 because ray 3 will be a major rewrite. Version 2.40 is
 # the version referenced in MANIFEST.md and INSTALLATION.md.
-ray[default]==2.40.0
+ray[default]==2.56.0
 
 # Kubernetes Python client. Only needed when using the K8s service
 # discovery path from a Python process (as opposed to Prometheus's built-in
@@ -201,7 +201,7 @@ prophet==1.1.6
 # Sentence-transformers for semantic scoring (semantic_scorer.py). Pulls
 # in torch transitively (large install ~2 GB); consider a separate
 # `requirements-carbon.txt` for deployments that don't use it.
-sentence-transformers==3.3.1
+sentence-transformers==5.6.0
 
 
 # =============================================================================
@@ -221,7 +221,7 @@ dash==2.18.2
 # =============================================================================
 # Qiskit for quantum evaluation (QAOA, QSVM, circuits). Not needed if you
 # don't use the quantum modules — extract to `requirements-quantum.txt`.
-qiskit==1.3.1
+qiskit==1.4.2
 qiskit-aer==0.15.1
 
 
@@ -252,8 +252,8 @@ pytz==2024.2
 # Zero Trust security: encryption, tokens, authentication.
 # cryptography 43 is the last version supporting Python 3.10 without
 # backports — do not bump to 44+ unless Python is >=3.11.
-cryptography==43.0.3
-PyJWT==2.10.1
+cryptography==50.0.0
+PyJWT==2.15.0
 
 # Retry with exponential backoff and circuit breakers.
 # tenacity 9 removed the `retry_after` kwarg; the family code does not use
@@ -278,7 +278,7 @@ networkx==3.4.2
 # "DEVELOPMENT / TEST" imports pytest or mypy.
 
 # Test framework. pytest 8 requires Python >=3.8.
-pytest==8.3.4
+pytest==9.0.3
 
 # Async test support (asyncio_mode = "auto" in pyproject.toml).
 pytest-asyncio==0.24.0
@@ -332,14 +332,14 @@ ruff==0.8.4
 # pydantic            ==2.10.3        ==2.10.3        match
 # pydantic-settings   ==2.6.1         ==2.6.1         match
 # prometheus-client   ==0.21.1        ==0.21.1        match
-# ray[default]        ==2.40.0        ==2.40.0        match ([default]
+# ray[default]        ==2.56.0        ==2.40.0        match ([default]
 #                                                      now explicit)
 # kubernetes          ==31.0.0        (undocumented)  first explicit pin
 # prophet             ==1.1.6         ==1.1.6         match
 # sentence-transform. ==3.3.1         ==3.3.1         match
 # plotly              ==5.24.1        ==5.24.1        match
 # dash                ==2.18.2        ==2.18.2        match
-# qiskit              ==1.3.1         ==1.3.1         match
+# qiskit              ==1.4.2         ==1.3.1         match
 # qiskit-aer          ==0.15.1        ==0.15.1        match
 # numpy               ==2.2.1         ==2.2.1         match
 # scipy               ==1.14.1        (unpinned)      first explicit pin
@@ -348,8 +348,8 @@ ruff==0.8.4
 # pandas              ==2.2.3         ==2.2.3         match
 # python-dateutil     ==2.9.0.post0   ==2.9.0.post0   match
 # pytz                ==2024.2        ==2024.2        match
-# cryptography        ==43.0.3        (unpinned)      first explicit pin
-# PyJWT               ==2.10.1        (unpinned)      first explicit pin
+# cryptography        ==50.0.0        (unpinned)      first explicit pin
+# PyJWT               ==2.15.0        (unpinned)      first explicit pin
 # tenacity            >=9.0.0,<10     ==9.0.0         compat upper bound
 # aiofiles            >=24.1.0,<25    ==24.1.0        compat upper bound
 # networkx            ==3.4.2         ==3.4.2         match
@@ -361,7 +361,7 @@ ruff==0.8.4
 # =============================================================================
 # Symptom: `ray: command not found` after install.
 #   Cause: installed `ray` without `[default]` extra.
-#   Fix:   `pip install "ray[default]==2.40.0"`.
+#   Fix:   `pip install "ray[default]==2.56.0"`.
 #
 # Symptom: `prophet` build fails with "command 'gcc' not found".
 #   Cause: prophet requires a C++ toolchain (cmdstanpy → stan model).
@@ -383,7 +383,7 @@ ruff==0.8.4
 #
 # Symptom: `ray.init()` fails with "The module 'ray' has no attribute ...".
 #   Cause: ray 2.7 (from prior docs) vs ray 2.40 (this file).
-#   Fix:   `pip install "ray[default]==2.40.0"` (this file's pin).
+#   Fix:   `pip install "ray[default]==2.56.0"` (this file's pin).
 # =============================================================================
 
 
