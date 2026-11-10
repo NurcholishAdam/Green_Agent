@@ -1,4 +1,4 @@
-```markdown
+
 # lean-ctx — Context Engineering Layer
 
 PREFER lean-ctx MCP tools over native equivalents for token savings:
@@ -222,4 +222,4 @@ All fallbacks are **non-fatal**. Log line format:
 ---
 
 *End of lean-ctx — Context Engineering Layer (enhanced).*
-```
+
