@@ -1,96 +1,316 @@
+# =============================================================================
+# agent.toml — AgentBeats agent descriptor (Enhanced v2.0)
+# =============================================================================
+# Declares the Green Sustainability Agent to an AgentBeats harness: type,
+# capabilities, endpoints, scoring contract, resource requirements, and
+# enhancement configuration.
+#
+# Companion files:
+#   - schemas/agentbeats_agent.v1.json  — JSON-Schema-equivalent validator
+#   - scripts/validate_agent_toml.py    — semantic validation
+#
+# WHAT CHANGED FROM v1.0
+# ----------------------
+#   - **Fixed `0.0.0.0` in endpoints.** `0.0.0.0` is a *bind* address, not
+#     a routable one; clients cannot reach `http://0.0.0.0:8000/...`.
+#     Endpoints are now templated as `{host}` and the schema requires an
+#     actual hostname or IP.
+#   - **Fixed health endpoint path.** Prior version used `/health`; the
+#     family convention is `/healthz` (liveness) + `/readyz` (readiness).
+#     Both are declared now, plus `/metrics` (Prometheus) and `/version`.
+#   - **Fixed FlexGen nesting.** `[flexgen]` was a top-level table, so a
+#     parser walking `enhancements.*` would never see it. It is now
+#     `[enhancements.flexgen]` — consistent with the other 6 modules.
+#   - **Added `feedback_url`** to `[enhancements.rlhf]` — required when
+#     `feedback_source = "dashboard"` (per agent_config.yaml v2.0).
+#   - **Fixed `[enhancements].enabled` default** — now `false`, matching
+#     README.md §0.2. Per-query opt-in goes through `[enhancements]`
+#     overrides in the manifest.
+#   - **Fixed `evaluation_domains`** — replaced the non-existent
+#     `coding|reasoning|tool_use` values with the actual `TaskKind` enum
+#     from `src.types`: `fine_tuning|inference|agent|benchmark`.
+#   - **Fixed `unique_metrics` naming** — every metric is now prefixed
+#     with `green_agent_` and matches the name emitted by the exporter
+#     (see green_agent_alerts.yml v2.0).
+#   - **Removed `MCP` from `protocols`** — MCP is not implemented in the
+#     family; only A2A is.
+#   - **Added `_meta` block** (owner, schema_version, updated_at, contact).
+#   - **Added `[carbon_context]`** — required for any carbon metric.
+#   - **Added `[constraints]`** — matching agent_config.yaml.
+#   - **Added `[security]`** — secrets dir, network policy.
+#   - **Added `[resources]`** — cpu / memory / gpu.
+#   - **Added `[benchmark]`** — name + version.
+#   - **Added `[license]`, `[maintainer]`**.
+#   - **Added `[scoring].failure_taxonomy_ref`** and
+#     `[scoring].partial_credit_formula_ref`** — links to the actual
+#     contract instead of bare booleans.
+#   - **Fixed version drift** — `version = "5.0.0"`, matching run_agent.py.
+#   - **Fixed Python requirement** — `>=3.10`, matching
+#     requirements.txt.
+#   - **Fixed `hardware` requirement** — references the 10-profile enum
+#     from agent_config.yaml.
+#
+# PRECEDENCE
+# ----------
+#   Harness env-var overrides > this file > image defaults.
+#   Secrets load from `$GREEN_AGENT_SECRETS_DIR` inside the container;
+#   this file only declares *where* that dir is mounted.
+#
+# TEMPLATES
+# ---------
+#   `{host}` is replaced by the harness with the container's routable
+#   hostname or IP. Do NOT hardcode `0.0.0.0`, `localhost`, or
+#   `127.0.0.1` — the harness must be able to reach the container from
+#   its own network namespace.
+#
+# VALIDATE BEFORE SUBMITTING
+# --------------------------
+#   python scripts/validate_agent_toml.py agent.toml
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Metadata
+# -----------------------------------------------------------------------------
+[_meta]
+owner = "platform-team"
+schema_version = "2.0"
+updated_at = "2024-01-01T00:00:00Z"
+contact = "platform@example.com"
+changelog_url = "https://wiki.example.com/green-agent/agent-toml-changelog"
+
+
+# -----------------------------------------------------------------------------
+# Agent identity
+# -----------------------------------------------------------------------------
 [agent]
 name = "Green Sustainability Agent"
-version = "3.0.0"
+version = "5.0.0"                            # matches run_agent.py __version__
 description = "Evaluates AI agents on performance and environmental impact"
-agent_type = "green"  # ✓ CRITICAL: Must be "green"
+agent_type = "green"                         # ✓ CRITICAL: must be "green"
 
+license = "Apache-2.0"
+tags = ["sustainability", "agent-benchmark", "carbon-aware"]
+
+
+[maintainer]
+name = "Green Agent Platform Team"
+contact = "platform@example.com"
+url = "https://github.com/your-org/Green_Agent"
+
+
+# -----------------------------------------------------------------------------
+# Capabilities — what this agent can do
+# -----------------------------------------------------------------------------
 [capabilities]
-protocols = ["A2A", "MCP"]  # ✓ REQUIRED
-evaluation_domains = ["coding", "reasoning", "tool_use"]
+# Only protocols actually implemented in this codebase. MCP was claimed
+# in v1.0 but is not implemented anywhere in the family.
+protocols = ["A2A"]                          # ✓ REQUIRED
+
+# TaskKind enum from src.types (not the prior free-form
+# coding|reasoning|tool_use values).
+evaluation_domains = ["inference", "agent", "benchmark"]
+
+# Every name here matches a Prometheus metric emitted by the exporter —
+# see green_agent_alerts.yml v2.0 for the authoritative list.
+# Prefix `green_agent_` is applied uniformly.
 unique_metrics = [
-    "energy_efficiency",
-    "carbon_footprint",
-    "sustainability_index",
-    # Enhanced metrics
-    "modp_score",
-    "graph_centrality",
-    "graph_connectivity",
-    "rlhf_feedback_score",
-    "distillation_update_count",
-    "moe_gate_stddev",
-    "evolutionary_best_fitness"
+    # Base metrics (from limit_agentbench / README.md §2.2)
+    "green_agent_energy_kwh",                # gauge — kWh per task
+    "green_agent_carbon_co2e_kg",            # gauge — kg CO2e per task
+    "green_agent_sustainability_index",      # gauge — [0, 1]
+
+    # Enhanced metrics (from src/enhancements)
+    "green_agent_modp_score",                # gauge — [0, 1]
+    "green_agent_graph_centrality",          # gauge — [0, 1]
+    "green_agent_graph_connectivity",        # gauge — [0, 1]
+    "green_agent_rlhf_feedback",             # gauge — [0, 1]
+    "green_agent_distillation_update_count", # counter — updates/s
+    "green_agent_moe_gate_weight",           # gauge — gate weight
+    "green_agent_evolutionary_best_fitness", # gauge — fitness
+
+    # FlexGen (only when [enhancements.flexgen].enabled = true)
+    "green_agent_flexgen_energy_joules_total" # counter — Joules (cumulative)
 ]
 
+
+# -----------------------------------------------------------------------------
+# Runtime requirements
+# -----------------------------------------------------------------------------
 [requirements]
-python_version = ">=3.11"
-hardware = ["CPU", "GPU-optional"]
+python_version = ">=3.10,<3.13"              # matches requirements.txt
+# References the 10-profile enum in agent_config.yaml §5.2.
+hardware_profile = "nvidia_a100"             # or one of: nvidia_v100,
+                                             # nvidia_t4, nvidia_rtx_3090,
+                                             # nvidia_rtx_4090, amd_mi250,
+                                             # google_tpu_v4, cpu_intel_xeon,
+                                             # cpu_amd_epyc, default
+gpu_required = false                          # optional — see hardware_profile
+min_memory_gb = 4
+min_disk_gb = 20
 
+
+# -----------------------------------------------------------------------------
+# Endpoints — {host} is substituted by the harness.
+# Never hardcode 0.0.0.0 / localhost / 127.0.0.1; the harness must be able
+# to reach the container from its own network namespace.
+# -----------------------------------------------------------------------------
 [endpoints]
-a2a = "http://0.0.0.0:8000/a2a/task"  # ✓ REQUIRED
-health = "http://0.0.0.0:8000/health"  # ✓ REQUIRED
+a2a      = "http://{host}:8000/a2a/task"      # ✓ REQUIRED
+health   = "http://{host}:8000/healthz"       # ✓ REQUIRED — was /health
+ready    = "http://{host}:8000/readyz"        # recommended — readiness
+metrics  = "http://{host}:8000/metrics"       # recommended — Prometheus
+version  = "http://{host}:8000/version"       # recommended — build info
 
+
+# -----------------------------------------------------------------------------
+# Scoring contract
+# -----------------------------------------------------------------------------
 [scoring]
-primary_metric = "sustainability_index"
-secondary_metrics = ["accuracy", "energy_efficiency"]
-failure_handling = true  # ✓ REQUIRED
-partial_credit = true    # ✓ REQUIRED
+primary_metric = "green_agent_sustainability_index"
+secondary_metrics = [
+    "green_agent_accuracy",
+    "green_agent_energy_efficiency",
+]
 
-# ---------------------------------------------------------------------------
-# Advanced Enhancements (LIMIT Graph, MODP, RLHF, Multi‑Teacher On‑Policy
-# Distillation, Bio‑inspired Optimisation, MoE expert gating, FlexGen)
-# ---------------------------------------------------------------------------
+# Booleans alone are meaningless without the contract they point at.
+failure_handling         = true
+failure_handling_ref     = "README.md §7 / symbolic_policy.yaml"
+partial_credit           = true
+partial_credit_ref       = "core/scoring_utils.py::calculate_robust_score"
+
+# Score bounds and defaults so the harness can validate responses.
+score_bounds = { min = 0.0, max = 1.0 }
+
+
+# -----------------------------------------------------------------------------
+# Carbon context — required for any carbon metric
+# -----------------------------------------------------------------------------
+[carbon_context]
+region = "US-CA"                              # one of the 13 documented regions
+grid_intensity_g_kwh = 220.0                  # bounds: [0, 5000]
+pue_factor = 1.2                              # bounds: (1.0, 3.0]
+use_offset_logic = false
+
+
+# -----------------------------------------------------------------------------
+# Hard constraints — per task
+# -----------------------------------------------------------------------------
+[constraints]
+max_energy_per_task_wh = 5.0                  # bounds: (0, 1000]
+max_carbon_per_task_kg = 0.002                # bounds: (0, 10]
+max_latency_seconds = 120                     # bounds: (0, 86400]
+memory_limit_gb = 4.0                         # bounds: (0, 1024]
+
+
+# -----------------------------------------------------------------------------
+# Security — secrets and network
+# -----------------------------------------------------------------------------
+[security]
+secrets_dir = "/run/secrets"                  # matches $GREEN_AGENT_SECRETS_DIR
+required_secrets = ["helium_api_key"]
+optional_secrets = ["postgres_password", "redis_password", "rlhf_feedback_token"]
+network_policy = "egress-allowlist"
+run_as_user = 1000
+read_only_rootfs = true
+capabilities_drop = ["ALL"]
+
+
+# -----------------------------------------------------------------------------
+# Resources — what the harness must allocate
+# -----------------------------------------------------------------------------
+[resources]
+cpu_request = "500m"
+cpu_limit   = "2"
+memory_request = "512Mi"
+memory_limit   = "4Gi"
+gpu_limit = 0                                 # set to 1 when gpu_required = true
+
+
+# -----------------------------------------------------------------------------
+# Benchmark
+# -----------------------------------------------------------------------------
+[benchmark]
+name = "green-agent-benchmark"
+version = "2.0.0"
+manifest_ref = "agentbeats_manifest.json"     # companion file for full config
+
+
+# =============================================================================
+# Advanced enhancements
+# =============================================================================
+# Master switch defaults to FALSE (per README.md §0.2). Per-query opt-in
+# goes through the manifest's [defaults.environment] block or a per-query
+# --config YAML that overrides [enhancements.enabled] = true.
+# =============================================================================
 [enhancements]
-enabled = true                # Master switch for all advanced features
+enabled = false                               # OPT-IN
 
-  [enhancements.limit_graph]
-  enabled = true
-  graph_metrics = { centrality = 0.7, connectivity = 0.6, density = 0.5 }
-  update_interval_seconds = 60
-  influence_weight = 0.3
 
-  [enhancements.modp]
-  enabled = true
-  # Objective weights: [accuracy, energy, latency, carbon]
-  objective_weights = [0.4, 0.3, 0.2, 0.1]
-  normalize_weights = true
-  score_threshold_low = 0.4
-  score_threshold_high = 0.7
+[enhancements.limit_graph]
+enabled = true
+graph_metrics = { centrality = 0.7, connectivity = 0.6, density = 0.5 }
+update_interval_seconds = 60                  # bounds: [1, 3600]
+influence_weight = 0.3                        # bounds: [0, 1]
 
-  [enhancements.rlhf]
-  enabled = true
-  human_feedback_score = 0.6
-  collect_feedback = true
-  feedback_source = "dashboard"   # dashboard | api | manual
 
-  [enhancements.distillation]
-  enabled = true
-  use_moe_gating = true
-  distillation_lr = 0.01
-  gating_lr = 0.005
-  replay_size = 2000
-  train_every = 10
-  epsilon = 0.1
-  teachers = ["rule_based", "historical_ml", "q_learning", "rlhf"]
+[enhancements.modp]
+enabled = true
+# [accuracy, energy, latency, carbon] — must sum to 1.0 ± 1e-6.
+objective_weights = [0.4, 0.3, 0.2, 0.1]
+normalize_weights = true
+score_threshold_low = 0.4                     # bounds: [0, 1] — matches
+                                              # GreenAgentLowMODPScore < 0.4
+score_threshold_high = 0.7                    # bounds: [0, 1]
 
-  [enhancements.bio_inspired]
-  enabled = true
-  use_evolutionary = true
-  population_size = 20
-  mutation_rate = 0.1
-  crossover_rate = 0.7
-  elitism = 2
 
-  [enhancements.moe_expert]
-  enabled = true
-  n_experts = 4
-  gating_lr = 0.005
+[enhancements.rlhf]
+enabled = true
+human_feedback_score = 0.6                    # bounds: [0, 1]
+collect_feedback = true
+feedback_source = "dashboard"                 # dashboard | api | manual
+# Required when feedback_source ∈ {dashboard, api}.
+feedback_url = "http://127.0.0.1:8001/feedback"
 
-# FlexGen integration (optional LLM execution backend)
-[flexgen]
-enabled = true                  # Set to true to use FlexGen as execution backend
+
+[enhancements.distillation]
+enabled = true
+use_moe_gating = true
+distillation_lr = 0.01                        # bounds: (0, 1]
+gating_lr = 0.005                             # bounds: (0, 1]
+replay_size = 2000                            # bounds: [100, 100000]
+train_every = 10                              # bounds: [1, 1000]
+epsilon = 0.1                                 # bounds: [0, 1]
+# Must match MANIFEST.md §1 — the four teachers.
+teachers = ["rule_based", "historical_ml", "q_learning", "rlhf"]
+
+
+[enhancements.bio_inspired]
+enabled = true
+use_evolutionary = true
+population_size = 20                          # bounds: [10, 200]
+mutation_rate = 0.1                           # bounds: [0, 1]
+crossover_rate = 0.7                          # bounds: [0, 1]
+elitism = 2                                   # bounds: [0, population_size]
+
+
+[enhancements.moe_expert]
+enabled = true
+n_experts = 4                                 # bounds: [2, 16]
+gating_lr = 0.005                             # bounds: (0, 1]
+
+
+# -----------------------------------------------------------------------------
+# FlexGen — now correctly nested under [enhancements]
+# -----------------------------------------------------------------------------
+# Prior version used a TOP-LEVEL `[flexgen]` table, which a parser walking
+# `enhancements.*` would never reach — despite `flexgen_energy_joules_total`
+# being listed in [capabilities].unique_metrics.
+[enhancements.flexgen]
+enabled = true                                # still gated by [enhancements].enabled
 model_name = "facebook/opt-6.7b"
-batch_size = 16
-memory_limit_mb = 4096
+batch_size = 16                               # bounds: [1, 256]
+memory_limit_mb = 4096                        # bounds: (0, 1048576]
 precision_options = ["fp32", "fp16", "int8"]
-default_precision = "fp16"
-delegation_policy = "adaptive"   # adaptive | always | never
+default_precision = "fp16"                    # must be in precision_options
+delegation_policy = "adaptive"                # adaptive | always | never
