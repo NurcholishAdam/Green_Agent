@@ -2,13 +2,13 @@
 # =============================================================================
 # Dockerfile — Green Agent (Enhanced v2.0)
 # =============================================================================
-# Multi-stage build with a pinned base image, hardened non-root runtime, tini
+# Multi-stage build with a version-tagged base image, hardened non-root runtime, tini
 # as PID 1, and health checks on /metrics (the only HTTP endpoint
 # run_agent.py exposes).
 #
 # WHAT CHANGED FROM v1.0
 # ----------------------
-#   - Pinned base image by digest (was :slim, mutable).
+#   - Uses a version-tagged base image (rather than an invalid placeholder digest).
 #   - Multi-stage build — build tools (gcc, g++) live in the builder stage
 #     and are NOT copied to the runtime image (~200 MB saved, CVE surface
 #     reduced).
@@ -38,7 +38,7 @@
 #     --build-arg VERSION=5.0.0 \
 #     --build-arg VCS_REF=$(git rev-parse HEAD) \
 #     --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
-#     --build-arg PYTHON_IMAGE=python:3.12.3-slim@sha256:<digest> \
+#     --build-arg PYTHON_IMAGE=python:3.12.3-slim \
 #     --sbom=true --provenance=true \
 #     -t ghcr.io/<org>/green-agent:5.0.0 .
 #
@@ -60,7 +60,7 @@
 # -----------------------------------------------------------------------------
 # Build metadata
 # -----------------------------------------------------------------------------
-ARG PYTHON_IMAGE=python:3.12.3-slim@sha256:REPLACE_ME
+ARG PYTHON_IMAGE=python:3.12.3-slim
 ARG BUILD_DATE=unknown
 ARG VCS_REF=unknown
 ARG VERSION=5.0.0
@@ -127,7 +127,7 @@ LABEL org.opencontainers.image.title="Green Agent" \
       org.green-agent.enhancements.default-enabled="false"
 
 # --- Baseline env -----------------------------------------------------------
-# No PYTHONPATH=/app (that masks missing pip installs; `pip install -e .`
+# No PYTHONPATH=/app (that masks missing installs; `pip install -e .`
 # is authoritative). No MODE (CMD carries --mode unified).
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
