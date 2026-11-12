@@ -32,7 +32,7 @@
 # ecosystem packages cap at <3 and require >=2.x. Aer 0.17.2 supports
 # Qiskit 2.5+ (current release 0.17.2 per Aer docs).
 
-qiskit>=2.5,<3
+qiskit>=2.6.2,<3
 qiskit-aer>=0.17,<1
 
 # numpy>=2.0 and scipy>=1.14 come from base.txt (raised to Qiskit 2.x floors)

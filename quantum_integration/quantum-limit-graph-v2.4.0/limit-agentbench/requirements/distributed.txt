@@ -33,10 +33,10 @@
 # ray[serve] does NOT include Data/Train/Tune — declare them explicitly
 # because multi-teacher distillation needs distributed training + HPO.
 
-ray[serve,train,tune]>=2.52,<3
-# ray[serve-grpc]>=2.52,<3        # uncomment if Serve uses gRPC ingress
-# ray[client]>=2.52,<3            # uncomment if connecting to a remote cluster
-# ray[data]>=2.52,<3              # uncomment if using Ray Data for logs
+ray[serve,train,tune]>=2.60.0,<3
+# ray[serve-grpc]>=2.60.0,<3        # uncomment if Serve uses gRPC ingress
+# ray[client]>=2.60.0,<3            # uncomment if connecting to a remote cluster
+# ray[data]>=2.60.0,<3              # uncomment if using Ray Data for logs
 
 
 # =============================================================================
@@ -83,8 +83,8 @@ py-spy>=0.3,<1                    # attach to workers without restart
 
 orjson>=3.10,<4                   # fast JSON for logs / dashboard traffic
 msgspec>=0.18,<1                  # fast cross-process record serialization
-filelock>=3.13,<4                 # safe shared-filesystem checkpoint writes
-fsspec>=2024.2,<2026              # cloud filesystem abstraction
+filelock>=4.2.10,<5                 # safe shared-filesystem checkpoint writes
+fsspec>=2026.9.0,<2027              # cloud filesystem abstraction
 
 # Pick the cloud backend(s) you actually deploy to:
 # s3fs>=2024.2,<2026
@@ -111,7 +111,7 @@ uvloop>=0.19,<1; sys_platform != "win32"
 # SECTION 7 — TESTING DISTRIBUTED CODE
 # =============================================================================
 
-pytest>=8.0,<9
+pytest>=9.2.0,<10
 pytest-asyncio>=0.23,<1
 hypothesis>=6.98,<7               # property-based tests for reward/state invariants
 locust>=2.29,<3                   # load-test Serve deployments
