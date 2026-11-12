@@ -42,19 +42,17 @@
 //   No secrets in this file. Everything secret loads from
 //   `$GREEN_AGENT_SECRETS_DIR` inside the container. See SECURITY.md.
 //
-// PLACEHOLDERS TO FILL BEFORE SUBMITTING
-// --------------------------------------
-//   - image            → replace `@sha256:REPLACE_ME` with a real digest
-//   - _meta.owner      → your GitHub handle or org
-//   - _meta.contact    → a real email or URL
-//   - maintainer.name  → your name or team
+// RELEASE NOTE
+// ------------
+//   Publish the image and replace the digest placeholder before submitting
+//   this manifest. The build workflow currently exports an artifact only.
 //
 // VALIDATE BEFORE SUBMITTING
 // --------------------------
 //   python scripts/validate_manifest.py agentbeats_manifest.json
 {
   "_meta": {
-    "owner": "AI Research Agent",
+    "owner": "NurcholishAdam",
     "schema_version": "2.0",
     "updated_at": "2024-01-01T00:00:00Z",
     "contact": "platform@example.com",
@@ -70,12 +68,12 @@
   "maintainer": {
     "name": "Green Agent Platform Team",
     "contact": "platform@example.com",
-    "url": "https://github.com/<your-org>/Green_Agent"
+    "url": "https://github.com/NurcholishAdam/Green_Agent"
   },
   "license": "Apache-2.0",
   "tags": ["sustainability", "agent-benchmark", "carbon-aware"],
 
-  "image": "ghcr.io/<your-org>/green-agent@sha256:REPLACE_ME",
+  "image": "ghcr.io/nurcholishadam/green-agent@sha256:REPLACE_ME",
   "image_platform": "linux/amd64",
   "image_digest_expected": "sha256:REPLACE_ME",
 
