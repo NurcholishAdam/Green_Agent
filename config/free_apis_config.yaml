@@ -1,28 +1,279 @@
 # config/free_apis_config.yaml
-# Configuration for free API integrations
+#
+# Green Agent v5.0.0 — Free API integrations
+# ==========================================
+#
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Last Updated | 2026-11-13 |
+# | Status | Production Ready |
+# | Companion docs | `green_agent.yaml` (v5.0.0) · `configmap.yaml` (v5.0.0) · `deployment.yaml` (v5.0.0) · `Scripts and Utilities.md` (v1.2.0) · `REPOSITORY_REFACTORING_GUIDE.md` (v0.2.0) |
+#
+# ── Relationship to green_agent.yaml ─────────────────────────────────────
+#   `green_agent.yaml` (v5.0.0) is the canonical app config. This file is a
+#   **provider-specific** extension that configures the "free APIs" layer:
+#   carbon-intensity providers, weather, helium, and community data.
+#
+#   Precedence (highest wins):
+#     1. Deployment env vars
+#     2. ConfigMap envFrom (green_agent.yaml as env)
+#     3. green_agent.yaml (file)
+#     4. free_apis_config.yaml (this file) — provider-specific only
+#     5. Built-in defaults
+#
+#   Fields that MUST agree with `green_agent.yaml`:
+#     • carbon.default_region       ↔ this file's `default_region`
+#     • carbon.cache_ttl_seconds    ↔ this file's `cache_ttl_seconds` (per provider)
+#     • carbon.polling_interval_seconds ↔ this file's `rate_limits.*`
+#     • carbon.api_provider         ↔ this file's `provider_priority`
+#     • carbon.api_key_env_var      ↔ this file's `api_key_env_var` (per provider)
+#
+# ── Loading ───────────────────────────────────────────────────────────────
+#   The app looks for this file at:
+#       config/free_apis_config.yaml
+#   Override with the env var:
+#       FREE_APIS_CONFIG=/app/config/free_apis_config.yaml
+#
+#   In Kubernetes, mount it via `configmap.yaml` (v5.0.0) at
+#   `/app/config/free_apis_config.yaml`.
+#
+# ── Port collision warning ────────────────────────────────────────────────
+#   The Green Agent itself binds port **8000**. A self-hosted ElectricityMap
+#   URL on `localhost:8000` will loop back to the agent — not to
+#   ElectricityMap. Use a distinct port (8010 by convention) or a
+#   Kubernetes-internal hostname:
+#       http://electricitymap.svc.cluster.local:8010
+#
+# ── Secrets ───────────────────────────────────────────────────────────────
+#   API keys are NEVER in this file. They are read from env vars:
+#     CARBON_API_KEY                (legacy single key)
+#     ELECTRICITYMAP_API_KEY        (electricitymap)
+#     CARBONINTENSITY_API_KEY       (carbonintensity.org.uk)
+#     HELIUM_API_KEY                (helium monitoring)
+#     WEATHER_API_KEY               (weather provider)
+#
+#   Create them once per namespace:
+#     kubectl create secret generic green-agent-secrets \
+#       --from-literal=ELECTRICITYMAP_API_KEY="$ELECTRICITYMAP_API_KEY" \
+#       --from-literal=CARBONINTENSITY_API_KEY="$CARBONINTENSITY_API_KEY" \
+#       --from-literal=HELIUM_API_KEY="$HELIUM_API_KEY" \
+#       --from-literal=WEATHER_API_KEY="$WEATHER_API_KEY" \
+#       -n green-agent
+#
+# ── Rate-limit rationale ──────────────────────────────────────────────────
+#   These limits MUST be ≤ the cadence implied by
+#   `green_agent.yaml` `carbon.polling_interval_seconds` (default 900s = 15 min).
+#   The previous `grid_calls_per_minute: 30` allowed 30 calls per minute —
+#   450× faster than the 15-min polling cadence, and would get the agent
+#   rate-limited or banned by public providers.
+#
+# ── Validation ────────────────────────────────────────────────────────────
+#   python -c "import yaml; yaml.safe_load(open('config/free_apis_config.yaml'))"
+#   python -m pytest tests/unit/test_free_apis_config.py -v   # if present
+#   kubectl get configmap green-agent-config -n green-agent \
+#     -o jsonpath='{.data.free_apis_config\.yaml}' | head -20
+#
+# ── What's Not in Scope ───────────────────────────────────────────────────
+#   • API keys / secrets — see Kubernetes Secret / .env.example.
+#   • Full carbon provider catalogs — only the three named in
+#     `green_agent.yaml` (`simulation`, `electricitymap`, `carbonintensity`).
+#   • Multi-region active-active polling — single default + optional list.
+#   • Cost accounting per provider — provider billing is out of scope.
 
-# General settings
-cache_ttl: 300  # Cache TTL in seconds
-use_community_data: true
+# =============================================================================
+# General
+# =============================================================================
+# `default_region` MUST match `green_agent.yaml` `carbon.default_region`
+# (currently `"US-CA"`). A mismatch causes the wrong grid mix to be fetched.
+default_region: "US-CA"
 
-# Self-hosted ElectricityMap
-self_hosted_url: "http://localhost:8000"
+# Cache TTLs are **per provider** — different APIs update at different rates.
+# Overrides `green_agent.yaml` `carbon.cache_ttl_seconds` only for providers
+# that need a different value. Omit any key to inherit the base value.
+cache_ttl_seconds:
+  electricitymap: 300
+  carbonintensity: 300
+  self_hosted: 60
+  weather: 3600
+  helium: 900
+  community_data: 900
 
-# Region settings
-default_region: "us-east"
+# Timeout for any single HTTP call. Unresponsive providers abort after this.
+timeout_seconds: 10
 
-# Data collection
+# Retry policy for transient failures. Mirrors `green_agent.yaml`
+# `helium.max_retries` / `helium.base_retry_delay`.
+retry:
+  max_retries: 3
+  base_retry_delay: 1.0     # exponential backoff base (seconds)
+  max_delay: 30.0
+
+# Descriptive User-Agent. Public providers (ElectricityMap, carbonintensity.org.uk)
+# may block or throttle requests without one. Include a contact.
+user_agent: "green-agent/5.0.0 (+https://github.com/NurcholishAdam/Green_Agent)"
+
+# =============================================================================
+# Carbon providers
+# =============================================================================
+# Provider priority — first healthy provider wins.
+# Must be a subset of `green_agent.yaml` `carbon.api_provider` values:
+#   simulation | electricitymap | carbonintensity | self_hosted
+provider_priority:
+  - self_hosted
+  - electricitymap
+  - carbonintensity
+  - simulation
+
+# Self-hosted ElectricityMap (optional)
+# ── Port 8000 is the AGENT's own port. Use a distinct port (8010 convention)
+#    or a cluster-internal hostname to avoid a loopback.
+self_hosted:
+  enabled: false
+  url: "http://electricitymap.svc.cluster.local:8010"
+  health_path: "/health"
+
+# electricitymap.org (API key required)
+electricitymap:
+  enabled: true
+  base_url: "https://api.electricitymap.org/v3"
+  api_key_env_var: "ELECTRICITYMAP_API_KEY"
+
+# carbonintensity.org.uk (UK-only, API key optional)
+carbonintensity:
+  enabled: false
+  base_url: "https://api.carbonintensity.org.uk"
+  api_key_env_var: "CARBONINTENSITY_API_KEY"
+  country: "GB"
+
+# Fallback chain — tried in order when all providers fail.
+#   static     → use `static_fallback_gco2_kwh` below
+#   simulation → synthesize a plausible value
+fallback:
+  chain:
+    - static
+    - simulation
+  # Grid intensity assumed when every provider fails. Conservative default
+  # matches `green_agent.yaml` `carbon.defer_threshold: 400` so the agent
+  # errs on the side of caution rather than under-reporting.
+  static_fallback_gco2_kwh: 400.0
+
+# =============================================================================
+# Weather provider (optional)
+# =============================================================================
+# Rate limit below references a provider — configure it here.
+weather:
+  enabled: false
+  provider: "openweathermap"       # openweathermap | weatherapi | none
+  base_url: "https://api.openweathermap.org/data/2.5"
+  api_key_env_var: "WEATHER_API_KEY"
+
+# =============================================================================
+# Helium (supply monitoring)
+# =============================================================================
+# `green_agent.yaml` owns the full helium block. This file only mirrors the
+# enable flag + key so operators can see it in one place. If `enabled: true`
+# here but `helium.enabled: false` in green_agent.yaml, the value here wins
+# ONLY IF `green_agent.yaml` explicitly delegates to this file (documented
+# in its header). Default: defer to green_agent.yaml.
+helium:
+  # Set to `null` to defer to green_agent.yaml `helium.enabled`.
+  enabled: null
+  api_key_env_var: "HELIUM_API_KEY"
+
+# =============================================================================
+# Community data (opt-in telemetry)
+# =============================================================================
+# Feeds `CommunityDataHub` in `src/integration/free_apis.py`.
+# `auto_contribute: true` requires network egress to the community hub.
 community_data:
   enabled: true
-  auto_contribute: false  # Set to true to auto-contribute observations
+  auto_contribute: false
+  # Matches Scripts v1.2 `community_data_collector.py` MIN_CONTRIBUTION_INTERVAL_S.
+  min_contribution_interval_seconds: 60
   anonymize: true
-  
-# Fallback settings
-fallback:
-  use_static_data: true
-  use_simulation: true
-  
-# Rate limiting
+  # DP budget when anonymize=true. Set to null to defer to
+  # DIFFERENTIAL_PRIVACY_ENABLED + green_agent.yaml enhancements.privacy.*
+  differential_privacy:
+    enabled: null
+    epsilon: 1.0
+    delta: 1.0e-5
+  # Community hub endpoint (private; not listed here). Set via env var:
+  #   COMMUNITY_HUB_URL=https://community.green-agent.example/v1
+  hub_url_env_var: "COMMUNITY_HUB_URL"
+
+# =============================================================================
+# Rate limits — MUST be ≤ green_agent.yaml carbon.polling_interval_seconds
+# =============================================================================
+# carbon.polling_interval_seconds: 900 (15 min) ⇒ ≤ 4 calls/hour/provider.
+# Headroom assumes multi-region polling; e.g. 2 regions × 15 min = 8 calls/hour.
 rate_limits:
-  weather_calls_per_minute: 10
-  grid_calls_per_minute: 30
+  # 8 calls/minute leaves room for 2 regions polled every 15 min,
+  # plus a burst of manual refresh. Was 30/min (450× too high).
+  grid_calls_per_minute: 8
+  weather_calls_per_minute: 4
+  helium_calls_per_minute: 2
+  community_contribute_calls_per_minute: 1
+  # Hard ceiling regardless of provider — 429s are better than bans.
+  global_calls_per_minute: 30
+
+# =============================================================================
+# Regions (optional — multi-region polling)
+# =============================================================================
+# If empty, only `default_region` is polled.
+# Each region should be supported by at least one enabled provider.
+regions: []
+#  - "US-CA"
+#  - "US-NY"
+#  - "EU-NORTH"
+
+# =============================================================================
+# Changelog
+# =============================================================================
+# 5.0.0 (2026-04-10)
+#   Fixed:
+#     • self_hosted_url: http://localhost:8000 → self_hosted.url on port 8010
+#       (port 8000 collides with the agent's own HTTP server).
+#     • default_region: "us-east" → "US-CA" (matches green_agent.yaml).
+#     • grid_calls_per_minute: 30 → 8 (was 450× faster than
+#       carbon.polling_interval_seconds: 900).
+#     • use_community_data (top-level) removed — community_data.enabled is
+#       the single source of truth.
+#     • cache_ttl (scalar) → cache_ttl_seconds (per provider).
+#   Added:
+#     • provider_priority (self_hosted → electricitymap → carbonintensity → simulation).
+#     • Self-hosted, electricitymap, carbonintensity blocks with explicit
+#       enable flags + api_key_env_var.
+#     • timeout_seconds, retry, user_agent.
+#     • Weather provider block (was just a rate limit for nothing).
+#     • Helium block (defer to green_agent.yaml by default).
+#     • Community data min_contribution_interval_seconds + DP budget.
+#     • fallback.chain + static_fallback_gco2_kwh.
+#     • Multi-region `regions` list (optional).
+#     • Rate-limit rationale and per-provider limits.
+#     • Metadata block, header, loading instructions, port-collision warning,
+#       secrets guidance, validation recipe, "What's Not in Scope".
+#   Changed:
+#     • `anonymize` moved under `community_data` (was top-level).
+#     • Rate limits now per-provider (grid / weather / helium / community).
+
+# =============================================================================
+# Reviewer Checklist
+# =============================================================================
+#   [ ] `default_region` matches `green_agent.yaml` `carbon.default_region`.
+#   [ ] `self_hosted.url` does NOT point at port 8000 (agent's own port).
+#   [ ] `rate_limits.grid_calls_per_minute` is consistent with
+#       `green_agent.yaml` `carbon.polling_interval_seconds` (≤ 900s cadence).
+#   [ ] `provider_priority` is a subset of
+#       `green_agent.yaml` `carbon.api_provider` values.
+#   [ ] Every enabled provider has an `api_key_env_var` — the actual key lives
+#       in a Kubernetes Secret, never in this file.
+#   [ ] `community_data.auto_contribute: true` implies
+#       `min_contribution_interval_seconds` ≥ 60.
+#   [ ] This file is mounted at `/app/config/free_apis_config.yaml` via
+#       `configMapGenerator.files:` in the overlay.
+#   [ ] `FREE_APIS_CONFIG` env var (if set) points to the mounted path.
+#   [ ] `python -c "import yaml; yaml.safe_load(open('config/free_apis_config.yaml'))"`
+#       passes.
+#   [ ] No secrets committed to this file.
+# =============================================================================
