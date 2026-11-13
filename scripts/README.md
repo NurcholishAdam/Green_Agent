@@ -1,4 +1,4 @@
-```markdown
+
 # Scripts and Utilities
 
 | Field | Value |
@@ -690,4 +690,4 @@ pip install -r requirements-enhancements.txt
 **Version**: 1.2.0  
 **Companion docs**: see header table  
 **Breaking Changes**: `cleanup.sh` now defaults to dry-run (v1.2.0); add `--force` to restore v1.0 behavior
-```
+
