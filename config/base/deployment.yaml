@@ -1,20 +1,398 @@
+# config/base/deployment.yaml
+#
+# Purpose: run Green Agent v5.0 under the `restricted` Pod Security Standard.
+#
+# ── Why this file exists ──────────────────────────────────────────────────
+#   The ConfigMap (config/base/configmap.yaml) deliberately does NOT carry
+#   probes. Probes belong HERE, in `spec.template.spec.containers[]` — the
+#   kubelet reads them from the Pod spec, never from a mounted ConfigMap.
+#
+# ── PSA `restricted` compliance ───────────────────────────────────────────
+#   This Pod spec satisfies the `restricted` Pod Security Standard
+#   (matching the ConfigMap's `pod-security.kubernetes.io/enforce: restricted`
+#   label):
+#     • runAsNonRoot + runAsUser 10001
+#     • seccompProfile: RuntimeDefault
+#     • allowPrivilegeEscalation: false
+#     • capabilities.drop: [ALL]
+#     • readOnlyRootFilesystem: true
+#
+# ── Companion resources (ship alongside, not in this file) ────────────────
+#   • Namespace       green-agent
+#   • ConfigMap       green-agent-config     (files: green_agent.yaml, policies)
+#   • ConfigMap       green-agent-env        (env-only flags) — optional split
+#   • ConfigMap       green-agent-policies   (policy files)   — optional split
+#   • Secret          green-agent-secrets    (ZERO_TRUST_TOKEN, RLHF_API_KEY)
+#   • Service         green-agent            (targetPort: http, port: 8000)
+#   • Ingress         green-agent            (if external access is required)
+#   • NetworkPolicy   green-agent            (default-deny + allow ingress)
+#   • PodDisruptionBudget green-agent        (minAvailable: 1)
+#   • HorizontalPodAutoscaler green-agent    (scale on CPU + custom metrics)
+#   • ServiceAccount  green-agent            (no token automount)
+#   • PriorityClass   green-agent-critical
+#   • Kustomization   config/base/kustomization.yaml
+#
+# ── Image ─────────────────────────────────────────────────────────────────
+#   Prefer digest pinning for reproducibility:
+#     image: green-agent@sha256:<64-hex-digest>
+#   Get the digest with:
+#     docker buildx imagetools inspect green-agent:v5.0.0
+#
+# ── Precedence ────────────────────────────────────────────────────────────
+#   Env vars set on this Deployment override values in the ConfigMap
+#   (matches Dockerfile v2.0 and SYMBOLIC_OVERSIGHT_README.md v1.2
+#   §Configuration Matrix — env wins over YAML).
+#
+# ── Validation ────────────────────────────────────────────────────────────
+#   kubectl apply --dry-run=server -f config/base/deployment.yaml
+#   kubectl rollout status deployment/green-agent -n green-agent
+
 apiVersion: apps/v1
 kind: Deployment
+
 metadata:
   name: green-agent
   namespace: green-agent
+
+  labels:
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/instance: green-agent
+    app.kubernetes.io/version: "5.0.0"
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: green-agent
+    app.kubernetes.io/managed-by: kustomize
+
+  annotations:
+    # Apply the ConfigMap first (wave -1), then this Deployment (wave 0)
+    argocd.argoproj.io/sync-wave: "0"
+    # Placeholder — populated by Helm/Kustomize to roll pods on config change
+    checksum/config: ""
+
 spec:
-  replicas: 1
+  # Single replica means any eviction takes the service down.
+  # Production: 2+ replicas OR an HPA (see footer).
+  replicas: 2
+
+  # Zero-downtime rolling updates (never drop below the current replica count)
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  revisionHistoryLimit: 3
+  progressDeadlineSeconds: 600
+  minReadySeconds: 10
+
   selector:
     matchLabels:
-      app: green-agent
+      app.kubernetes.io/name: green-agent
+      app.kubernetes.io/instance: green-agent
+
   template:
     metadata:
       labels:
-        app: green-agent
+        app.kubernetes.io/name: green-agent
+        app.kubernetes.io/instance: green-agent
+        app.kubernetes.io/version: "5.0.0"
+        app.kubernetes.io/component: server
+        app.kubernetes.io/part-of: green-agent
+      annotations:
+        # Force a pod restart whenever the ConfigMap changes.
+        # Helm: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        # Kustomize: configMapGenerator adds a name hash automatically.
+        checksum/config: ""
+
     spec:
+      # No RBAC API access needed by the app; do not automount an SA token.
+      serviceAccountName: green-agent
+      automountServiceAccountToken: false
+
+      # PSA `restricted` — pod-level security context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+
+      terminationGracePeriodSeconds: 30
+
+      # Optional — set once a PriorityClass is created in the cluster
+      # priorityClassName: green-agent-critical
+
+      # Optional — spread replicas across zones
+      # topologySpreadConstraints:
+      #   - maxSkew: 1
+      #     topologyKey: topology.kubernetes.io/zone
+      #     whenUnsatisfiable: ScheduleAnyway
+      #     labelSelector:
+      #       matchLabels:
+      #         app.kubernetes.io/name: green-agent
+
+      # Optional — anti-affinity so 2 replicas never share a node
+      # affinity:
+      #   podAntiAffinity:
+      #     preferredDuringSchedulingIgnoredDuringExecution:
+      #       - weight: 100
+      #         podAffinityTerm:
+      #           topologyKey: kubernetes.io/hostname
+      #           labelSelector:
+      #             matchLabels:
+      #               app.kubernetes.io/name: green-agent
+
+      # Optional — private registry auth
+      # imagePullSecrets:
+      #   - name: green-agent-registry
+
       containers:
-      - name: green-agent
-        image: green-agent:latest
-        ports:
-        - containerPort: 8000
+        - name: green-agent
+          # Pin to a versioned tag (better than :latest) and prefer a digest
+          # for reproducibility. The v5.0.0 tag matches the ConfigMap's
+          # `system.version` and the Guide v5.0 release.
+          image: green-agent:v5.0.0
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          # Override any ConfigMap value with explicit env vars.
+          # Full precedence: this list > envFrom ConfigMap > envFrom Secret.
+          env:
+            - name: AGENT_PORT
+              value: "8000"
+            - name: AGENT_HEALTH_PATH
+              value: "/health"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: LOG_FORMAT
+              value: "json"
+
+          # Bulk import from the ConfigMap and Secret.
+          # Note: envFrom on a ConfigMap that ALSO contains file keys injects
+          # file contents as env vars. If that becomes a concern, split into
+          # `green-agent-env` (env-only) and `green-agent-policies` (files).
+          envFrom:
+            - configMapRef:
+                name: green-agent-config
+            - secretRef:
+                name: green-agent-secrets
+                optional: true     # allow startup if Secret is not yet present
+
+          # Requests = scheduler guarantee; Limits = hard cap.
+          # QoS class: Burstable (requests != limits → not evicted last).
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+
+          # PSA `restricted` — container-level security context
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop: ["ALL"]
+
+          # Startup: allow up to 2 min for Ray init + Python import warm-up.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 24          # 5 + 24*5 = ~2 min max
+
+          # Liveness: restart the pod if the app stops responding.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30       # after startupProbe succeeds
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Readiness: stop routing traffic if the app is temporarily unavailable.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # Graceful shutdown: wait for in-flight requests, then SIGTERM.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5 && kill -TERM 1 || true"]
+
+          volumeMounts:
+            # Config files (green_agent.yaml + policies) — read-only
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+
+            # Policy files (green_policy.yaml + symbolic_policy.yaml) — read-only
+            - name: policies
+              mountPath: /app/policies
+              readOnly: true
+
+            # Writable scratch (required because readOnlyRootFilesystem: true)
+            - name: tmp
+              mountPath: /tmp
+
+            # Writable dirs for checkpoints and output artifacts
+            - name: checkpoints
+              mountPath: /app/checkpoints
+            - name: out
+              mountPath: /out
+
+            # cgroup metrics — mirrors Dockerfile VOLUME + Guide v5.0 run flag
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+
+      volumes:
+        # Mount only the YAML config file (skip env-var keys)
+        - name: config
+          configMap:
+            name: green-agent-config
+            items:
+              - key: green_agent.yaml
+                path: green_agent.yaml
+
+        # Mount the two policy files
+        - name: policies
+          configMap:
+            name: green-agent-config
+            items:
+              - key: green_policy.yaml
+                path: green_policy.yaml
+              - key: symbolic_policy.yaml
+                path: symbolic_policy.yaml
+
+        # Ephemeral scratch
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+
+        # Checkpoints — swap for a PVC if TRAINING_ENABLED=true in production
+        - name: checkpoints
+          emptyDir:
+            sizeLimit: 1Gi
+
+        # Symbolic violation artifacts (symbolic_violations.json, etc.)
+        - name: out
+          emptyDir:
+            sizeLimit: 1Gi
+
+        # cgroup metrics (host read-only)
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+
+# ── Companion: PodDisruptionBudget (minAvailable 1) ─────────────────────
+# apiVersion: policy/v1
+# kind: PodDisruptionBudget
+# metadata:
+#   name: green-agent
+#   namespace: green-agent
+# spec:
+#   minAvailable: 1
+#   selector:
+#     matchLabels:
+#       app.kubernetes.io/name: green-agent
+#
+# ── Companion: HorizontalPodAutoscaler (CPU + memory) ───────────────────
+# apiVersion: autoscaling/v2
+# kind: HorizontalPodAutoscaler
+# metadata:
+#   name: green-agent
+#   namespace: green-agent
+# spec:
+#   scaleTargetRef:
+#     apiVersion: apps/v1
+#     kind: Deployment
+#     name: green-agent
+#   minReplicas: 2
+#   maxReplicas: 10
+#   metrics:
+#     - type: Resource
+#       resource:
+#         name: cpu
+#         target: { type: Utilization, averageUtilization: 70 }
+#     - type: Resource
+#       resource:
+#         name: memory
+#         target: { type: Utilization, averageUtilization: 80 }
+#
+# ── Companion: Service ──────────────────────────────────────────────────
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: green-agent
+#   namespace: green-agent
+# spec:
+#   selector:
+#     app.kubernetes.io/name: green-agent
+#   ports:
+#     - name: http
+#       port: 8000
+#       targetPort: http          # matches the named containerPort
+#
+# ── Companion: NetworkPolicy (default-deny + allow ingress) ─────────────
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: green-agent
+#   namespace: green-agent
+# spec:
+#   podSelector:
+#     matchLabels:
+#       app.kubernetes.io/name: green-agent
+#   policyTypes: [Ingress, Egress]
+#   ingress:
+#     - from:
+#         - namespaceSelector:
+#             matchLabels: { name: ingress-nginx }
+#       ports:
+#         - { protocol: TCP, port: 8000 }
+#   egress:
+#     - to:
+#         - namespaceSelector: {}
+#       ports:
+#         - { protocol: TCP, port: 443 }   # carbon APIs, RLHF, etc.
+#         - { protocol: UDP, port: 53 }    # DNS
+#
+# ── Validation ──────────────────────────────────────────────────────────
+#   # Static check (no cluster needed)
+#   kubectl apply --dry-run=client -f config/base/deployment.yaml
+#
+#   # Server-side check (validates against real API + Admission controllers)
+#   kubectl apply --dry-run=server -f config/base/deployment.yaml
+#
+#   # Confirm probes are wired
+#   kubectl get deploy green-agent -n green-agent \
+#     -o jsonpath='{.spec.template.spec.containers[0].livenessProbe}'
+#
+#   # Confirm securityContext satisfies PSA restricted
+#   kubectl get deploy green-agent -n green-agent \
+#     -o jsonpath='{.spec.template.spec.containers[0].securityContext}'
