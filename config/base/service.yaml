@@ -1,17 +1,279 @@
+# config/base/service.yaml
+#
+# Green Agent v5.0.0 — Service (ClusterIP for the HTTP API)
+# ==========================================================
+#
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Last Updated | 2026-11-13 |
+# | Status | Production Ready |
+# | Companion docs | `config/base/{namespace,configmap,deployment,ray-cluster,networkpolicy,hpa}.yaml` (v5.0.0), `green_agent.yaml` (v5.0.0), `Scripts and Utilities.md` (v1.2.0) |
+#
+# ── Why this Service targets the Deployment only ──────────────────────────
+#   Two different pod sets serve two different things:
+#     • HTTP API (port 8000)          → Deployment pods (app.kubernetes.io/name)
+#     • Ray dashboard (port 8265)     → RayCluster head pod only (component: head)
+#
+#   Exposing both on one Service creates two problems:
+#     1. The dashboard gets load-balanced across ALL green-agent pods, but
+#        only the head serves 8265 → ~66% of dashboard requests fail with
+#        `replicas: 3`.
+#     2. The dashboard becomes routable from any namespace that can reach
+#        this Service — including ingress-nginx and Prometheus, which
+#        should only reach the HTTP API.
+#
+#   KubeRay already creates `green-agent-cluster-head-svc` with the dashboard
+#   port. Use that for admin access:
+#       kubectl port-forward -n green-agent \
+#         svc/green-agent-cluster-head-svc 8265
+#
+#   If you need a cluster-internal Service for the dashboard (e.g. for a
+#   Ray client in another namespace), add a *separate* Service below that
+#   selects `component: head` — never reuse the HTTP Service.
+#
+# ── Selector ──────────────────────────────────────────────────────────────
+#   Must match the Deployment pod template labels exactly. Deployment v5.0
+#   sets:
+#       app.kubernetes.io/name: green-agent
+#       app.kubernetes.io/instance: green-agent
+#   There is NO `app: green-agent` on the pods. Selecting on `app:` returns
+#   zero endpoints and every request 503s.
+#
+# ── Port name parity ──────────────────────────────────────────────────────
+#   Deployment v5.0 names the container port `http`. Using `targetPort: http`
+#   here means renumbering the container port later requires no Service
+#   change. The Service-side `port` is renamed `http` (was `dashboard`) to
+#   match reality — this is the agent API, not a dashboard.
+#
+# ── Session affinity ──────────────────────────────────────────────────────
+#   LLM inference reuses a KV cache per pod. `sessionAffinity: ClientIP`
+#   with a 3-hour timeout keeps repeat callers on the same pod, improving
+#   cache hit rate. Set to `None` if the workload is stateless.
+#
+# ── Validation ────────────────────────────────────────────────────────────
+#   kubectl apply --dry-run=server -f config/base/service.yaml
+#   kubectl get svc green-agent -n green-agent
+#   kubectl get endpoints green-agent -n green-agent    # must list pods
+#   kubectl run -n green-agent curl --image=curlimages/curl --rm -it -- \
+#     curl -sS http://green-agent:8000/health           # must return 200
+#   kubectl port-forward -n green-agent svc/green-agent 8000:8000
+#     # then: curl http://127.0.0.1:8000/health
+
 apiVersion: v1
 kind: Service
+
 metadata:
   name: green-agent
+  namespace: green-agent
+
   labels:
-    app: green-agent
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/instance: green-agent
+    app.kubernetes.io/version: "5.0.0"
+    app.kubernetes.io/component: http-service
+    app.kubernetes.io/part-of: green-agent
+    app.kubernetes.io/managed-by: kustomize
+    # Uncomment if using Prometheus Operator with namespace selectors
+    # (kube-prometheus-stack default is `release: prometheus`).
+    # release: prometheus
+
+  annotations:
+    # Apply after the Deployment (wave 0) so pods exist before the Service.
+    argocd.argoproj.io/sync-wave: "1"
+    green-agent.io/base-version: "5.0.0"
+    # Annotation-based Prometheus scrape discovery. Only used when the
+    # Prometheus server uses `kubernetes_sd_configs` with annotations
+    # (not the Operator's ServiceMonitor). Harmless if unused.
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8000"
+    prometheus.io/path: "/metrics"
+
 spec:
   type: ClusterIP
-  ports:
-  - name: dashboard
-    port: 8000
-    targetPort: 8000
-  - name: ray-dashboard
-    port: 8265
-    targetPort: 8265
+
+  # Route to pods on the same node when possible (lower latency).
+  # `Cluster` = any pod; `Local` = same-node only (requires replicas on each node).
+  internalTrafficPolicy: Cluster
+
+  # Prefer same-zone endpoints (Kubernetes ≥1.31). Falls back to any zone.
+  # trafficDistribution: PreferClose
+
+  # Dual-stack clusters: serve both IPv4 and IPv6.
+  ipFamilyPolicy: PreferDualStack
+  # ipFamilies:
+  #   - IPv4
+  #   - IPv6
+
+  # Sticky sessions for LLM KV-cache reuse. Set to `None` for stateless.
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800          # 3 hours
+
   selector:
-    app: green-agent
+    # MUST match Deployment v5.0 pod template labels.
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/instance: green-agent
+
+  ports:
+    # Agent HTTP API — matches Deployment `containerPort: 8000 name: http`
+    - name: http
+      port: 8000
+      targetPort: http               # named port; resilient to renumbering
+      protocol: TCP
+
+    # Prometheus metrics — same port as HTTP (the app serves /metrics on 8000)
+    # Named separately so a ServiceMonitor or scrape config can target `metrics`.
+    - name: metrics
+      port: 8001                     # Service-only alias — same target pod port
+      targetPort: http
+      protocol: TCP
+
+# =============================================================================
+# Companion: Ray dashboard Service (OPTIONAL — prefer KubeRay's auto-service)
+# =============================================================================
+# KubeRay automatically creates `green-agent-cluster-head-svc` which exposes
+# the dashboard (8265), GCS (6379), client (10001), and API (10002). Use it:
+#
+#   kubectl port-forward -n green-agent \
+#     svc/green-agent-cluster-head-svc 8265
+#
+# Create this only if you need a *differently named* cluster-internal Service
+# for the dashboard (e.g. a Ray client in another namespace that cannot
+# resolve `green-agent-cluster-head-svc`). NEVER add it to the HTTP Service
+# above — the dashboard must not share a Service with the public API.
+#
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: green-agent-ray-dashboard
+#   namespace: green-agent
+#   labels:
+#     app.kubernetes.io/name: green-agent
+#     app.kubernetes.io/instance: green-agent
+#     app.kubernetes.io/component: ray-dashboard
+#     app.kubernetes.io/part-of: green-agent
+# spec:
+#   type: ClusterIP
+#   selector:
+#     app.kubernetes.io/name: green-agent
+#     app.kubernetes.io/component: head    # head-only — workers do not serve 8265
+#   ports:
+#     - name: ray-dashboard
+#       port: 8265
+#       targetPort: ray-dashboard
+#       protocol: TCP
+
+# =============================================================================
+# Companion: Headless Service for Ray worker joins (OPTIONAL)
+# =============================================================================
+# Ray workers need to resolve the head by stable DNS *before* the head's
+# readiness probe passes (the readiness probe requires the cluster to be up,
+# which requires workers — chicken-and-egg). A headless Service with
+# `publishNotReadyAddresses: true` breaks the deadlock.
+#
+# KubeRay's `green-agent-cluster-head-svc` already does this. Add this only
+# if you need a custom name.
+#
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: green-agent-headless
+#   namespace: green-agent
+# spec:
+#   clusterIP: None                     # headless — per-pod DNS
+#   publishNotReadyAddresses: true      # reachable before Ready
+#   selector:
+#     app.kubernetes.io/name: green-agent
+#     app.kubernetes.io/component: head
+#   ports:
+#     - name: ray-gcs
+#       port: 6379
+#       targetPort: ray-gcs
+#     - name: ray-client
+#       port: 10001
+#       targetPort: ray-client
+#     - name: ray-api
+#       port: 10002
+#       targetPort: ray-api
+
+# =============================================================================
+# Companion: ServiceMonitor (if Prometheus Operator is in use)
+# =============================================================================
+# The `release: prometheus` label on this Service + the namespace makes the
+# Operator discover it. Pair with a ServiceMonitor:
+#
+# apiVersion: monitoring.coreos.com/v1
+# kind: ServiceMonitor
+# metadata:
+#   name: green-agent
+#   namespace: green-agent
+# spec:
+#   selector:
+#     matchLabels:
+#       app.kubernetes.io/name: green-agent
+#   endpoints:
+#     - port: http
+#       path: /metrics
+#       interval: 15s
+
+# =============================================================================
+# What's Not in Scope
+# =============================================================================
+# • Ingress / Gateway API — external exposure is a separate overlay.
+# • LoadBalancer — ClusterIP only; use Ingress for external.
+# • ExternalName — not applicable; this is a workload Service.
+# • NodePort — prefer Ingress over NodePort for production.
+# • Global DNS (external-dns) — cluster add-on.
+
+# =============================================================================
+# Changelog
+# =============================================================================
+# 5.0.0 (2026-04-10)
+#   Fixed:
+#     • selector now matches Deployment v5.0 pod labels
+#       (app.kubernetes.io/name + instance). Previous `app: green-agent`
+#       selected zero pods — the Service had no endpoints.
+#     • Added metadata.namespace: green-agent (was defaulting to "default").
+#     • Split Ray dashboard out of the HTTP Service. The dashboard is
+#       served only by the RayCluster head; load-balancing 8265 across all
+#       green-agent pods fails ~66% of connections.
+#     • Renamed Service port `dashboard` → `http` (this is the agent API,
+#       not a dashboard).
+#     • targetPort 8000 (numeric) → `http` (named; resilient to renumber).
+#   Added:
+#     • app.kubernetes.io/* labels (matches companion manifests).
+#     • argocd.argoproj.io/sync-wave: "1".
+#     • prometheus.io/* annotations for annotation-based scrape discovery.
+#     • sessionAffinity: ClientIP with 3h timeout (KV-cache reuse).
+#     • internalTrafficPolicy: Cluster (explicit).
+#     • ipFamilyPolicy: PreferDualStack.
+#     • A `metrics` port alias (8001 → http) for ServiceMonitor clarity.
+#     • Companion Ray dashboard Service + headless Service examples
+#       (commented) — use KubeRay's auto-generated service by default.
+#     • ServiceMonitor example.
+#     • Validation recipe, "What's Not in Scope", Reviewer Checklist.
+#   Removed:
+#     • `ray-dashboard: 8265` from the HTTP Service (belongs to RayCluster
+#       head; KubeRay creates the head service automatically).
+# =============================================================================
+
+# =============================================================================
+# Reviewer Checklist
+# =============================================================================
+#   [ ] metadata.namespace is green-agent.
+#   [ ] selector matches Deployment v5.0 pod template labels EXACTLY
+#       (app.kubernetes.io/name + instance).
+#   [ ] `kubectl get endpoints green-agent -n green-agent` lists pods
+#       (never `<none>`).
+#   [ ] Service has ONLY the `http` (and optional `metrics`) ports — no
+#       8265 dashboard port.
+#   [ ] targetPort is `http` (named) — not 8000 (numeric).
+#   [ ] Ray dashboard access is via KubeRay's
+#       `green-agent-cluster-head-svc` or a separate `component: head`
+#       Service — never the HTTP Service.
+#   [ ] sessionAffinity is intentional (LLM cache) or `None` (stateless).
+#   [ ] `kubectl run -n green-agent curl --image=curlimages/curl --rm -it
+#       -- curl -sS http://green-agent:8000/health` returns 200.
+# =============================================================================
