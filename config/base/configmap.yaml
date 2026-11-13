@@ -1,13 +1,250 @@
-# config/base/configmap.yaml - CORRECT
+# config/base/configmap.yaml
+#
+# Purpose: application configuration for Green Agent v5.0.
+#
+# ── What goes here ────────────────────────────────────────────────────────
+#   • Non-sensitive application config (YAML / text)
+#   • Policy files the app reads at startup
+#   • Feature flags that map to env vars when consumed via `envFrom`
+#
+# ── What does NOT go here ─────────────────────────────────────────────────
+#   • PROBES (liveness / readiness / startup)
+#       → belong in `Deployment.spec.containers[].livenessProbe` / `readinessProbe` / `startupProbe`
+#   • SECRETS (ZERO_TRUST_TOKEN, RLHF_API_KEY, K8s service tokens)
+#       → belong in a `Secret` (encrypted at rest via etcd encryption or external KMS)
+#   • ENV-ONLY FLAGS that differ per environment
+#       → belong in `Deployment.spec.containers[].env` or a separate `green-agent-env` ConfigMap
+#   • BINARY payloads > 1 MB
+#       → ConfigMap hard limit is 1 MB; use a PVC or an external config store
+#
+# ── Anti-pattern (do NOT do this) ─────────────────────────────────────────
+#   `livenessProbe:` or `readinessProbe:` under `data:` in a ConfigMap is a
+#   silent no-op — the kubelet only reads probes from the Pod spec, never
+#   from a mounted ConfigMap. Put them in the Deployment instead:
+#
+#       # deployment.yaml (CORRECT)
+#       spec:
+#         containers:
+#           - name: green-agent
+#             livenessProbe:
+#               httpGet: { path: /health, port: 8000 }
+#               periodSeconds: 30
+#             readinessProbe:
+#               httpGet: { path: /health, port: 8000 }
+#               periodSeconds: 10
+#
+# ── Precedence ────────────────────────────────────────────────────────────
+#   Env vars from the Deployment override values in this ConfigMap (matches
+#   Dockerfile v2.0 and SYMBOLIC_OVERSIGHT_README.md v1.2 §Configuration Matrix).
+#
+# ── Companion K8s resources ───────────────────────────────────────────────
+#   • Secret         green-agent-secrets    (ZERO_TRUST_TOKEN, RLHF_API_KEY)
+#   • ConfigMap      green-agent-env        (env-only flags: LOG_LEVEL, LOG_FORMAT)
+#   • ConfigMap      green-agent-policies   (green_policy.yaml, symbolic_policy.yaml)
+#   • Deployment     green-agent            (probes, containers, env)
+#   • Service        green-agent            (port 8000)
+#   • Kustomization  config/base/kustomization.yaml
+#
+# ── RBAC note ─────────────────────────────────────────────────────────────
+#   Restrict `edit` on this ConfigMap to the deploy pipeline ServiceAccount.
+#   ConfigMap contents are readable by any pod that mounts them; treat them
+#   as public to the namespace.
+#
+# ── Size limit ────────────────────────────────────────────────────────────
+#   Total ConfigMap size ≤ 1 MB (API server limit). Keep policy files small
+#   or split into `green-agent-policies`.
+#
+# ── GitOps annotations ────────────────────────────────────────────────────
+#   `checksum/config` is populated by Helm (`{{ include … | sha256sum }}`) or
+#   Kustomize's `configMapGenerator` + name-hash suffix. It triggers a pod
+#   rollout when the ConfigMap changes. `argocd.argoproj.io/sync-wave: "-1"`
+#   ensures this ConfigMap is applied before the Deployment.
+
 apiVersion: v1
 kind: ConfigMap
+
 metadata:
   name: green-agent-config
+  namespace: green-agent
+
   labels:
-    app: green-agent
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/instance: green-agent
+    app.kubernetes.io/version: "5.0.0"
+    app.kubernetes.io/component: config
+    app.kubernetes.io/part-of: green-agent
+    app.kubernetes.io/managed-by: kustomize
+    # Pod Security Admission — ConfigMap consumers run under `restricted`
+    pod-security.kubernetes.io/enforce: restricted
+
+  annotations:
+    # Apply this ConfigMap before the Deployment (GitOps ordering)
+    argocd.argoproj.io/sync-wave: "-1"
+    # Placeholder — set by Helm/Kustomize to trigger rollout on change
+    checksum/config: ""
+
+  # `immutable: true` would prevent updates without delete+recreate.
+  # Leave `false` so the deploy pipeline can roll forward.
+  # Set to `true` only for fully frozen release artifacts.
+  # immutable: false
+
 data:
-  green_agent_config.yaml: |
+  # ── Application config ────────────────────────────────────────────────
+  # Filename matches `config/green_agent.yaml` per Architecture v1.2,
+  # Quick Start v1.2, and Integration Guide v5.0. The previous key
+  # `green_agent_config.yaml` was a filename drift.
+  green_agent.yaml: |
     system:
       version: "5.0.0"
+      layers:
+        meta_cognitive: "1.2.0"
+        symbolic_oversight: "1.2.0"
+        enhancements: "1.2.0"
       mode: "unified"
-    # ... config data only, NO probe fields
+
+    ray:
+      num_workers: 8
+      dashboard_port: 8265
+
+    carbon:
+      default_region: "US-CA"
+
+    policy:
+      mode: "moderate"
+      symbolic_path: "symbolic_policy.yaml"
+      green_path: "green_policy.yaml"
+
+    logging:
+      level: "INFO"
+      format: "json"
+
+    training:
+      checkpoint_dir: "checkpoints"
+
+    enhancements:
+      enabled: true                    # ↔ ENHANCEMENTS_ENABLED
+      limit_graph:
+        enabled: true                  # ↔ LIMIT_GRAPH_ENABLED
+        graph_metrics:
+          centrality: 0.7
+          connectivity: 0.6
+      modp:
+        enabled: true                  # ↔ MODP_ENABLED
+        objective_weights: [0.4, 0.3, 0.2, 0.1]  # [accuracy, energy, latency, carbon]
+      rlhf:
+        enabled: true                  # ↔ RLHF_ENABLED
+        human_feedback_score: 0.6      # 0–1, higher better
+      distillation:
+        enabled: true                  # ↔ DISTILLATION_ENABLED
+        use_moe_gating: true
+      evolutionary:                    # renamed from `bio_inspired` in v1.2
+        enabled: true                  # ↔ EVOLUTIONARY_ENABLED
+        population_size: 20
+        mutation_rate: 0.1
+      moe:                             # renamed from `moe_expert` in v1.2
+        enabled: true                  # ↔ MOE_ENABLED (alias MOE_GATING_ENABLED)
+        n_experts: 4
+      flexgen:
+        enabled: false                 # ↔ FLEXGEN_ENABLED (opt-in)
+        model_name: "facebook/opt-6.7b"
+        default_precision: "fp16"
+        delegation_policy: "adaptive"
+      zero_trust:
+        enabled: false                 # ↔ ZERO_TRUST_ENABLED
+      privacy:
+        enabled: false                 # ↔ DIFFERENTIAL_PRIVACY_ENABLED
+      training:
+        enabled: false                 # ↔ TRAINING_ENABLED
+        checkpoint_dir: "checkpoints"
+
+  # ── Meta-cognitive policy ─────────────────────────────────────────────
+  # Small enough to inline. If it grows, split into `green-agent-policies`.
+  green_policy.yaml: |
+    meta_cognitive:
+      reflection_frequency: 5
+      self_adjustment_thresholds:
+        energy_threshold_pct: 80
+        carbon_threshold_pct: 80
+        latency_threshold_pct: 80
+        memory_threshold_pct: 80
+      adaptive_policy_enabled: true
+      long_context:
+        enabled: true
+        history_window: 10
+
+  # ── Symbolic rules (4th layer) ────────────────────────────────────────
+  # Symbolic oversight is always-on when this file exists at the app's
+  # `SYMBOLIC_POLICY` path (default `symbolic_policy.yaml`).
+  symbolic_policy.yaml: |
+    symbolic_rules:
+      - id: "SUST-001"
+        name: "Carbon Threshold Violation"
+        category: "sustainability"
+        priority: "high"
+        condition: "carbon > 60 AND latency > 2000"
+        action: "flag_inefficiency"
+        explanation: "High carbon combined with high latency"
+
+      - id: "ENH-MODP-001"
+        name: "Low MODP Score Alert"
+        category: "enhanced"
+        priority: "medium"           # NOT "warning"
+        condition: "modp_score < 0.4"
+        action: "trigger_policy_review"
+        explanation: "Overall multi-objective performance is poor"
+
+      - id: "ENH-FLEX-001"
+        name: "FlexGen Energy Spike"
+        category: "enhanced"
+        priority: "medium"
+        condition: "flexgen_energy_kwh > 1.0"
+        action: "switch_precision"
+        explanation: "FlexGen energy above 1 kWh — drop precision"
+
+  # ── Env-only flags (optional — prefer `green-agent-env` ConfigMap) ────
+  # These are read by the Deployment's `envFrom` if you use `envFrom`.
+  # Env vars still win over YAML per the Configuration Matrix.
+  LOG_LEVEL: "INFO"
+  LOG_FORMAT: "json"
+  ENHANCEMENTS_ENABLED: "true"
+  MODP_ENABLED: "true"
+  RLHF_ENABLED: "true"
+  FLEXGEN_ENABLED: "false"
+  ZERO_TRUST_ENABLED: "false"
+  DIFFERENTIAL_PRIVACY_ENABLED: "false"
+  TRAINING_ENABLED: "false"
+  SYMBOLIC_POLICY: "symbolic_policy.yaml"
+
+# ── Companion Secret (NOT in this file) ─────────────────────────────────
+# Create separately so it is never committed to Git in plaintext:
+#
+#   kubectl create secret generic green-agent-secrets \
+#     --from-literal=ZERO_TRUST_TOKEN="$ZERO_TRUST_TOKEN" \
+#     --from-literal=RLHF_API_KEY="$RLHF_API_KEY" \
+#     -n green-agent
+#
+# Or, if using Kustomize `secretGenerator`:
+#
+#   secretGenerator:
+#     - name: green-agent-secrets
+#       envs:
+#         - secrets.env   # gitignored
+#
+# ── binaryData (only if you need binary content) ────────────────────────
+# ConfigMap supports a `binaryData` field for binary-safe values:
+#
+#   binaryData:
+#     favicon.ico: <base64-encoded bytes>
+#
+# Total size (data + binaryData) must remain ≤ 1 MB.
+#
+# ── Validation ──────────────────────────────────────────────────────────
+# Dry-run against the API server before applying:
+#
+#   kubectl apply --dry-run=server -f config/base/configmap.yaml
+#
+# Validate the embedded YAML with:
+#
+#   kubectl get configmap green-agent-config -n green-agent \
+#     -o jsonpath='{.data.green_agent\.yaml}' | python -c \
+#     'import sys,yaml; yaml.safe_load(sys.stdin); print("ok")'
