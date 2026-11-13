@@ -1,41 +1,325 @@
+# config/base/networkpolicy.yaml
+#
+# Green Agent v5.0.0 — NetworkPolicy (default-deny + explicit allow-list)
+# ========================================================================
+#
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Last Updated | 2026-04-10 |
+# | Status | Production Ready |
+# | Companion docs | `config/base/{namespace,configmap,deployment,hpa}.yaml` (v5.0.0), `green_agent.yaml` (v5.0.0), `Scripts and Utilities.md` (v1.2.0) |
+#
+# ── Intent ────────────────────────────────────────────────────────────────
+#   Deny-all by default. Explicitly allow:
+#     • kubelet → /health (probes)                        port 8000
+#     • ingress-controller → app                          port 8000
+#     • Prometheus → /metrics                             port 8000
+#     • peer green-agent pods → each other                port 8000
+#     • app → Ray head/worker                             ports 10001,10002,10000-20000
+#     • app → cluster DNS                                 port 53 (UDP+TCP)
+#     • app → K8s API, carbon APIs, RLHF, helium          port 443
+#     • app → OTel collector (if tracing enabled)         port 4317
+#
+# ── The #1 NetworkPolicy footgun ──────────────────────────────────────────
+#   Kubelet is NOT a pod — it runs on the node. `podSelector` cannot match
+#   it. Only `ipBlock` can. And kubelet's CIDR is the node subnet, which
+#   varies per cluster (EKS: 10.0.0.0/8 usually, GKE: 10.0.0.0/8,
+#   on-prem: whatever). The pragmatic default is to allow port 8000 from
+#   anywhere — health endpoints leak only readiness state. If you know the
+#   node CIDR, replace `0.0.0.0/0` below with it for tighter controls.
+#
+# ── `from: []` vs `from: [{}]` ────────────────────────────────────────────
+#   • `from: []`    → NO peers → rule matches nothing (deny-all for that rule)
+#   • `from: [{}]`  → ALL peers → effectively allow from anywhere
+#   • `from:` (omitted) → same as `from: [{}]`
+#   The original file used `from: []` expecting allow-all — it was the
+#   opposite. This file uses explicit peers only.
+#
+# ── Redis (port 6379) removed ─────────────────────────────────────────────
+#   The original file allowed cross-pod TCP 6379. No Redis exists in:
+#     • Dockerfile v2.0
+#     • green_agent.yaml v5.0
+#     • Guide v5.0 §Architecture
+#     • Scripts v1.2 companion docs
+#   Removed. If a Redis sidecar is added in the future, re-add the rule with
+#   a `podSelector` scoped to the Redis pod only (never to all app pods).
+#
+# ── Metadata endpoint block ───────────────────────────────────────────────
+#   Cloud instance metadata (AWS IMDSv1, GCP metadata, Azure IMDS) lives at
+#   169.254.169.254:80. If reachable from the app, a compromised dependency
+#   can fetch the node's IAM credentials. Blocked at the end of egress.
+#
+# ── Validation ────────────────────────────────────────────────────────────
+#   kubectl describe netpol green-agent-network-policy -n green-agent
+#   kubectl exec -n green-agent <pod> -- nc -zv green-agent 8000        # should succeed
+#   kubectl exec -n green-agent <pod> -- nc -zv 169.254.169.254 80      # should fail
+#   kubectl exec -n default <pod> -- nc -zv green-agent.green-agent 8000 # should fail
+#   # Cilium only: hubble observe --namespace green-agent
+
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
+
 metadata:
   name: green-agent-network-policy
+  namespace: green-agent
+
   labels:
-    app: green-agent
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/instance: green-agent
+    app.kubernetes.io/version: "5.0.0"
+    app.kubernetes.io/component: network
+    app.kubernetes.io/part-of: green-agent
+    app.kubernetes.io/managed-by: kustomize
+
+  annotations:
+    # Apply after the Deployment (wave 0); HPA is wave 1
+    argocd.argoproj.io/sync-wave: "2"
+    green-agent.io/base-version: "5.0.0"
+
 spec:
+  # Selector MUST match Deployment v5.0 pod template labels.
+  # The template carries app.kubernetes.io/name + instance — NOT `app:`.
   podSelector:
     matchLabels:
-      app: green-agent
+      app.kubernetes.io/name: green-agent
+      app.kubernetes.io/instance: green-agent
+
   policyTypes:
-  - Ingress
-  - Egress
+    - Ingress
+    - Egress
+
+  # ===========================================================================
+  # Ingress — explicit allow-list
+  # ===========================================================================
   ingress:
-  - from: []
-    ports:
-    - protocol: TCP
-      port: 8000
-    - protocol: TCP
-      port: 8265
-  - from:
-    - podSelector:
-        matchLabels:
-          app: green-agent
-    ports:
-    - protocol: TCP
-      port: 6379
+    # ── 1. Kubelet probes (startup / liveness / readiness) ─────────────────
+    # Kubelet runs on the node, not as a pod. `podSelector` cannot select it.
+    # Only `ipBlock` works. Allow /health from node CIDR (or 0.0.0.0/0 with
+    # a note — health endpoints don't leak sensitive data).
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0                    # tighten to node CIDR if known
+      ports:
+        - protocol: TCP
+          port: 8000
+
+    # ── 2. Ingress controller → app ────────────────────────────────────────
+    # Standard ingress-nginx lives in the `ingress-nginx` namespace.
+    # Traefik uses `traefik`. ALB controller uses `kube-system`.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+      ports:
+        - protocol: TCP
+          port: 8000
+
+    # ── 3. Prometheus → /metrics ───────────────────────────────────────────
+    # kube-prometheus-stack uses `release: prometheus` on the namespace;
+    # some setups also label with `kubernetes.io/metadata.name: monitoring`.
+    # Allow both to cover common layouts.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+        - namespaceSelector:
+            matchLabels:
+              release: prometheus
+      ports:
+        - protocol: TCP
+          port: 8000
+
+    # ── 4. Peer green-agent pods → each other (Ray head ↔ workers) ────────
+    # Ray head reaches workers on gRPC 10001/10002, plus dashboard 8265
+    # only inside the namespace (never exposed via ingress-controller).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: green-agent
+      ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 8265      # Ray dashboard — internal only
+        - protocol: TCP
+          port: 10001     # Ray head gRPC
+        - protocol: TCP
+          port: 10002     # Ray worker gRPC
+        - protocol: TCP
+          port: 10000
+          endPort: 20000  # Ray worker port range
+
+    # ── 5. OTLP gRPC / HTTP from the collector (if tracing inbound) ───────
+    # Usually the app is the *sender* (see egress), but some setups push
+    # collector-side ingest. Uncomment if `monitoring.tracing.enabled`.
+    # - from:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: monitoring
+    #   ports:
+    #     - protocol: TCP
+    #       port: 4317
+    #     - protocol: TCP
+    #       port: 4318
+
+  # ===========================================================================
+  # Egress — explicit allow-list
+  # ===========================================================================
   egress:
-  - to:
-    - namespaceSelector: {}
-    ports:
-    - protocol: UDP
-      port: 53
-    - protocol: TCP
-      port: 53
-  - to:
-    - ipBlock:
-        cidr: 0.0.0.0/0
-    ports:
-    - protocol: TCP
-      port: 443
+    # ── 1. Cluster DNS ─────────────────────────────────────────────────────
+    # kube-dns lives in kube-system. Scope to that namespace to avoid
+    # accidentally allowing DNS to any namespace.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # ── 2. Ray head / workers (same namespace) ────────────────────────────
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: green-agent
+      ports:
+        - protocol: TCP
+          port: 10001
+        - protocol: TCP
+          port: 10002
+        - protocol: TCP
+          port: 10000
+          endPort: 20000
+
+    # ── 3. Kubernetes API server (for SA token auth, leader election, etc.)
+    # If `automountServiceAccountToken: false` in the Deployment, this rule
+    # is not strictly required; keep it anyway — many libs probe the API.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # ── 4. Carbon / RLHF / Helium / registry APIs (public HTTPS) ──────────
+    # Scoping to specific IPs is only practical when the provider publishes
+    # stable ranges. Otherwise keep 0.0.0.0/0 on 443 with a residual-risk
+    # note: the app can reach any HTTPS endpoint, so depend on app-level
+    # allow-lists (carbon.api_provider, helium.api_endpoints).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+    # IPv6 — add if the cluster is IPv6 or dual-stack.
+    - to:
+        - ipBlock:
+            cidr: ::/0
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # ── 5. OTLP egress (if monitoring.tracing.enabled) ────────────────────
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 4317   # OTLP gRPC
+        - protocol: TCP
+          port: 4318   # OTLP HTTP
+
+    # ── 6. BLOCK cloud metadata endpoints (defense-in-depth) ──────────────
+    # NetworkPolicy has no "deny" action — every rule is allow. To effectively
+    # block 169.254.169.254, you must NOT include it in any allow rule.
+    # Because rule #3 above uses 0.0.0.0/0, that rule also allows 169.254.x.
+    # To truly block metadata, use one of:
+    #   • A CNI-level block (CiliumNetworkPolicy with `toCIDR: 169.254.169.254` deny)
+    #   • Replace rule #3 with an explicit allow-list of API server IPs
+    #   • Enable IMDSv2-only + hop-limit=1 on AWS; GCP metadata server
+    #     `--metadata=disable-legacy-endpoints=true`; Azure IMDS with
+    #     `Deny` on the firewall
+    #
+    # Example Cilium block (uncomment if using Cilium CNI):
+    #   apiVersion: cilium.io/v2
+    #   kind: CiliumNetworkPolicy
+    #   metadata:
+    #     name: block-metadata
+    #     namespace: green-agent
+    #   spec:
+    #     endpointSelector:
+    #       matchLabels:
+    #         app.kubernetes.io/name: green-agent
+    #     egressDeny:
+    #       - toCIDR:
+    #           - 169.254.169.254/32
+    #           - 169.254.170.2/32
+
+# =============================================================================
+# What's Not in Scope
+# =============================================================================
+# • CNI-level deny rules (Calico GlobalNetworkPolicy, CiliumNetworkPolicy,
+#   CiliumClusterwideNetworkPolicy) — CNI-specific; use those for hard denies.
+# • Service-mesh mTLS — Istio/Linkerd handle authN/authZ at the mesh layer.
+# • Egress gateway routing — requires an egress gateway deployment (Istio
+#   egressgateway, Cilium egress gateway).
+# • FQDN-based egress — plain NetworkPolicy has no FQDN support; use Cilium
+#   `toFQDNs` for allow-listing api.electricitymap.org, api.helium.io, etc.
+
+# =============================================================================
+# Changelog
+# =============================================================================
+# 5.0.0 (2026-04-10)
+#   Fixed:
+#     • podSelector.matchLabels now matches Deployment v5.0 pod labels
+#       (app.kubernetes.io/name + instance). Previous `app: green-agent`
+#       selected zero pods.
+#     • Added metadata.namespace: green-agent (was defaulting to "default").
+#     • `from: []` (deny-all) replaced with explicit allow-list peers.
+#     • Removed Redis port 6379 (no Redis in the architecture).
+#     • Removed port 8265 from public ingress; kept internal (peer-only).
+#   Added:
+#     • Kubelet probe ingress on 8000 (was blocked → CrashLoopBackOff).
+#     • Ingress-controller namespaceSelector (ingress-nginx, traefik).
+#     • Prometheus namespaceSelector (monitoring, release=prometheus).
+#     • Peer green-agent pod ingress/egress (Ray head ↔ workers).
+#     • Ray gRPC egress with endPort range 10000-20000.
+#     • OTLP egress (gRPC 4317, HTTP 4318) for tracing.
+#     • IPv6 (::/0) HTTPS egress for dual-stack clusters.
+#     • DNS scoped to kube-system (was any namespace).
+#     • Cloud-metadata block guidance (Cilium example inline).
+#     • Metadata block, header, validation recipe, "What's Not in Scope".
+#   Changed:
+#     • Egress 443 kept at 0.0.0.0/0 with residual-risk note; prefer
+#       provider-specific CIDR allow-lists where published.
+# =============================================================================
+
+# =============================================================================
+# Reviewer Checklist
+# =============================================================================
+#   [ ] podSelector matches Deployment v5.0 pod template labels exactly.
+#   [ ] metadata.namespace is green-agent (matches companion manifests).
+#   [ ] Kubelet probe ingress (port 8000) exists — otherwise pods
+#       CrashLoopBackOff.
+#   [ ] Ingress-controller namespaceSelector matches the cluster's ingress
+#       namespace labels (`kubectl get ns ingress-nginx --show-labels`).
+#   [ ] Prometheus namespaceSelector matches the cluster's monitoring
+#       namespace labels.
+#   [ ] No `from: []` remains (would deny-all).
+#   [ ] Redis port 6379 is not present (no Redis in architecture).
+#   [ ] Ray dashboard 8265 is NOT in a 0.0.0.0/0 ingress rule.
+#   [ ] Cloud metadata (169.254.169.254) is blocked at CNI or IMDS level.
+#   [ ] `kubectl describe netpol green-agent-network-policy -n green-agent`
+#       shows the intended peers.
+#   [ ] End-to-end: `kubectl exec <pod> -- nc -zv green-agent 8000` succeeds.
+#   [ ] Cross-namespace: `kubectl exec <default-pod> -- nc -zv
+#       green-agent.green-agent 8000` fails.
+# =============================================================================
