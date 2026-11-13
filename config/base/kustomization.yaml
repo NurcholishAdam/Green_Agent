@@ -1,11 +1,303 @@
+# config/base/kustomization.yaml
+#
+# Green Agent v5.0.0 — Kustomize base
+# ===================================
+#
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Last Updated | 2026-11-13 |
+# | Status | Production Ready |
+# | Companion docs | `config/base/{configmap,deployment,hpa}.yaml` (v5.0.0), `green_agent.yaml` (v5.0.0), `Scripts and Utilities.md` (v1.2.0), `REPOSITORY_REFACTORING_GUIDE.md` (v0.2.0) |
+#
+# ── Overlay pattern ───────────────────────────────────────────────────────
+#   config/
+#   ├── base/                          ← this file
+#   │   ├── kustomization.yaml
+#   │   ├── configmap.yaml
+#   │   ├── deployment.yaml
+#   │   ├── service.yaml
+#   │   ├── hpa.yaml
+#   │   ├── serviceaccount.yaml
+#   │   ├── poddisruptionbudget.yaml
+#   │   ├── networkpolicy.yaml
+#   │   └── ray-cluster.yaml
+#   └── overlays/
+#       ├── development/
+#       │   ├── kustomization.yaml
+#       │   └── deployment-patch.yaml
+#       ├── staging/
+#       └── production/
+#           ├── kustomization.yaml
+#           ├── deployment-patch.yaml
+#           └── secret.env             # gitignored
+#
+#   Apply an overlay:
+#       kubectl apply -k config/overlays/production
+#
+# ── Why `labels:` instead of `commonLabels:` ─────────────────────────────
+#   `commonLabels` is DEPRECATED in Kustomize v4+. Worse, it adds labels to
+#   `Deployment.spec.selector.matchLabels` — an IMMUTABLE field. Adding a
+#   label there on the second apply fails with:
+#       The Deployment "green-agent" is invalid:
+#       spec.selector: Invalid value: ...: field is immutable
+#
+#   Modern equivalent that does NOT touch selectors:
+#       labels:
+#         - pairs: { app: green-agent }
+#           includeSelectors: false
+#
+#   The Deployment already selects on `app.kubernetes.io/name` +
+#   `app.kubernetes.io/instance`, so we don't need `app: green-agent` in
+#   the selector. `includeSelectors: false` keeps the immutable field safe.
+#
+# ── Resource ordering ─────────────────────────────────────────────────────
+#   `sortOptions.order: fifo` applies resources in the order below.
+#   Correct order matters — ServiceAccount must exist before the pod is
+#   created; ConfigMap must exist before the Deployment mounts it.
+#
+#       1. Namespace             (cluster prerequisite — usually pre-existing)
+#       2. ServiceAccount        (pod identity)
+#       3. ConfigMap             (files + env)
+#       4. Secret                (via secretGenerator, gitignored values)
+#       5. Deployment            (the HTTP head)
+#       6. Service               (route traffic to the Deployment)
+#       7. RayCluster            (worker pool — autoscaled by Ray)
+#       8. HorizontalPodAutoscaler (targets the Deployment, not RayCluster)
+#       9. PodDisruptionBudget   (protects replicas during drains)
+#      10. NetworkPolicy         (locks down egress last)
+#
+# ── Validation ────────────────────────────────────────────────────────────
+#   kustomize build config/base              # prints rendered YAML
+#   kubectl apply -k config/base --dry-run=server
+#   kubectl kustomize config/overlays/production   # server-side dry-run
+#
+# ── What's Not in Scope ───────────────────────────────────────────────────
+#   • Cluster autoscaling (Karpenter / GKE NAP / EKS MNG) — infra layer.
+#   • Ingress / Gateway API — ship separately; base assumes ClusterIP Service.
+#   • Cert-manager / ExternalDNS — cluster-level add-ons.
+#   • Secrets management (Vault / External Secrets) — use externalRefs.
+#   • Multi-cluster federation — use Argo CD ApplicationSets.
+#
+# ── Changelog ─────────────────────────────────────────────────────────────
+#   5.0.0 (2026-04-10)
+#     Fixed:
+#       • commonLabels → labels with includeSelectors: false
+#         (prevents immutable-selector breakage on re-apply)
+#       • Added missing resources: deployment.yaml, configmap.yaml, hpa.yaml,
+#         serviceaccount.yaml, poddisruptionbudget.yaml, networkpolicy.yaml
+#       • Added sortOptions so ServiceAccount/ConfigMap apply before Deployment
+#     Added:
+#       • images: block so overlays can override the tag
+#       • commonAnnotations (base version marker)
+#       • generatorOptions (name-suffix hash for ConfigMap/Secret)
+#       • buildMetadata (managedByLabel + originAnnotations)
+#       • replicas: block (Ray head, non-HPA resource)
+#       • patches: extension point (commented; overlays use this)
+#       • Overlay directory tree + validation recipe
+#     Changed:
+#       • namespace: kept (harmless; child resources also declare it)
+#       • resource list reordered to match sortOptions
+#     Removed:
+#       • commonLabels (deprecated)
+
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+# ── Namespace ─────────────────────────────────────────────────────────────
+# Applied to all resources that don't already declare one. Child manifests
+# also declare `namespace: green-agent` — harmless and explicit.
 namespace: green-agent
 
-commonLabels:
-  app: green-agent
+# ── Labels (replaces deprecated `commonLabels`) ───────────────────────────
+# includeSelectors: false → do NOT touch Deployment.spec.selector.matchLabels
+# (that field is immutable; adding to it breaks the next apply).
+labels:
+  - pairs:
+      app: green-agent
+      app.kubernetes.io/name: green-agent
+      app.kubernetes.io/instance: green-agent
+      app.kubernetes.io/version: "5.0.0"
+      app.kubernetes.io/part-of: green-agent
+      app.kubernetes.io/managed-by: kustomize
+    includeSelectors: false
 
+# ── Annotations ───────────────────────────────────────────────────────────
+commonAnnotations:
+  green-agent.io/base-version: "5.0.0"
+  green-agent.io/managed-by: kustomize
+
+# ── Resources (applied in this order — see header) ────────────────────────
 resources:
-- ray-cluster.yaml
-- service.yaml
+  # 1. Namespace (create only if not pre-provisioned)
+  - namespace.yaml
+
+  # 2. ServiceAccount — must exist before the Deployment's pod is scheduled
+  - serviceaccount.yaml
+
+  # 3. ConfigMap — Deployment mounts green_agent.yaml + policies from it
+  - configmap.yaml
+
+  # 4. Deployment — the HTTP head pod (probes, securityContext, volumes)
+  - deployment.yaml
+
+  # 5. Service — targetPort: http → matches containerPort: 8000
+  - service.yaml
+
+  # 6. RayCluster — worker pool; autoscaled by Ray (NOT HPA)
+  - ray-cluster.yaml
+
+  # 7. HPA — targets Deployment (apps/v1), not RayCluster
+  - hpa.yaml
+
+  # 8. PodDisruptionBudget — minAvailable: 1
+  - poddisruptionbudget.yaml
+
+  # 9. NetworkPolicy — default-deny + explicit allow-list
+  - networkpolicy.yaml
+
+# ── Secret generation ─────────────────────────────────────────────────────
+# DO NOT commit real values. Create the Secret imperatively in the cluster:
+#
+#   kubectl create secret generic green-agent-secrets \
+#     --from-literal=ZERO_TRUST_TOKEN="$ZERO_TRUST_TOKEN" \
+#     --from-literal=RLHF_API_KEY="$RLHF_API_KEY" \
+#     --from-literal=CARBON_API_KEY="$CARBON_API_KEY" \
+#     --from-literal=HELIUM_API_KEY="$HELIUM_API_KEY" \
+#     -n green-agent
+#
+# Or, for local dev overlays only (secret.env is gitignored):
+#
+# secretGenerator:
+#   - name: green-agent-secrets
+#     envs:
+#       - secret.env
+#     options:
+#       disableNameSuffixHash: true
+
+# ── Image tag override ────────────────────────────────────────────────────
+# Overlays override `newTag` / `newName` to pin per environment. The base
+# uses the release tag matching the ConfigMap's system.version.
+images:
+  - name: green-agent
+    newTag: v5.0.0
+    # newName: ghcr.io/nurcholishadam/green-agent   # for registry override
+
+# ── Replicas (only for non-HPA resources) ─────────────────────────────────
+# The Deployment is managed by the HPA in production, so it is intentionally
+# omitted here. RayCluster worker count is managed by Ray's autoscaler.
+replicas:
+  - name: green-agent-cluster    # RayCluster head group
+    count: 1
+
+# ── Generator options ─────────────────────────────────────────────────────
+# name-suffix hash forces pod rollout when a ConfigMap/Secret changes
+# (mounted as a volume). Deployment also carries a `checksum/config`
+# annotation for envFrom-based reloads.
+generatorOptions:
+  disableNameSuffixHash: false
+  labels:
+    app.kubernetes.io/component: config
+
+# ── Apply ordering ────────────────────────────────────────────────────────
+# fifo = apply resources in the order they appear above (matches the header).
+sortOptions:
+  order: fifo
+
+# ── Build metadata ────────────────────────────────────────────────────────
+# managedByLabel adds `app.kubernetes.io/managed-by: kustomize`.
+# originAnnotations records the source file for each rendered object.
+buildMetadata:
+  - managedByLabel
+  - originAnnotations
+
+# ── Patches (extension point — overlays add their own) ────────────────────
+# Overlays patch base resources here. Example (config/overlays/production/):
+#
+# patches:
+#   - target:
+#       kind: Deployment
+#       name: green-agent
+#     patch: |-
+#       - op: replace
+#         path: /spec/template/spec/containers/0/resources/requests/cpu
+#         value: "1"
+#       - op: add
+#         path: /spec/template/spec/containers/0/env/-
+#         value:
+#           name: ENVIRONMENT
+#           value: production
+#
+#   - path: deployment-patch.yaml    # strategic merge patch alternative
+
+# ── OpenAPI schema validation (optional) ──────────────────────────────────
+# Uncomment to validate rendered objects against a Kubernetes OpenAPI schema.
+# openapi:
+#   path: kustomize-openapi.json
+
+# ── Helm chart coexistence (optional) ─────────────────────────────────────
+# If the project later consumes a Helm chart, uncomment and build with
+# `kustomize build --enable-helm`.
+# helmCharts:
+#   - name: green-agent
+#     repo: https://charts.example.com
+#     version: 5.0.0
+#     releaseName: green-agent
+#     namespace: green-agent
+#     valuesInline:
+#       enhancements:
+#         enabled: true
+
+# ── Overlay example (illustrative — lives in overlays/, not here) ─────────
+#
+#   # config/overlays/production/kustomization.yaml
+#   apiVersion: kustomize.config.k8s.io/v1beta1
+#   kind: Kustomization
+#   namespace: green-agent
+#   resources:
+#     - ../../base
+#   images:
+#     - name: green-agent
+#       newName: ghcr.io/nurcholishadam/green-agent
+#       newTag: v5.0.0
+#   labels:
+#     - pairs:
+#         environment: production
+#       includeSelectors: false
+#   configMapGenerator:
+#     - name: green-agent-config
+#       behavior: merge
+#       files:
+#         - green_agent.yaml=config/production/green_agent.yaml
+#   patches:
+#     - path: deployment-patch.yaml
+#
+#   # config/overlays/production/deployment-patch.yaml
+#   apiVersion: apps/v1
+#   kind: Deployment
+#   metadata:
+#     name: green-agent
+#   spec:
+#     template:
+#       spec:
+#         containers:
+#           - name: green-agent
+#             resources:
+#               requests:
+#                 cpu: "1"
+#                 memory: "2Gi"
+#               limits:
+#                 cpu: "4"
+#                 memory: "8Gi"
+
+# ── Reviewer Checklist ────────────────────────────────────────────────────
+#   [ ] `commonLabels` is not present anywhere (use `labels:`).
+#   [ ] `labels[].includeSelectors` is `false` unless every target resource
+#       already has that label in its selector from creation.
+#   [ ] resources: contains configmap.yaml, deployment.yaml, hpa.yaml,
+#       serviceaccount.yaml, poddisruptionbudget.yaml, networkpolicy.yaml.
+#   [ ] images.newTag matches the ConfigMap's system.version.
+#   [ ] Secret is NOT in secretGenerator for production (create imperatively).
+#   [ ] `kustomize build config/base` renders without warnings.
+#   [ ] `kubectl apply -k config/base --dry-run=server` passes.
+#   [ ] Overlay directory tree matches config/overlays/<env>/.
