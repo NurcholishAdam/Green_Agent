@@ -619,7 +619,7 @@ pip install -r requirements-enhancements.txt
 
 ## Changelog
 
-### 1.2.0 (2026-04-10)
+### 1.2.0 (2026-11-13)
 
 **Added**
 
