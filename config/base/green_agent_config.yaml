@@ -1,71 +1,363 @@
-# Green Agent v5.0.0 Base Configuration
+# config/base/green_agent.yaml
+#
+# Green Agent v5.0.0 — Base Configuration
 # =======================================
-# Copy to config/overlays/{development,staging,production}/ and modify as needed
+#
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Companion layer versions | 1.2.0 (meta-cognitive, symbolic, enhancements) |
+# | Last Updated | 2026-04-10 |
+# | Status | Base — copy and modify per overlay |
+#
+# ── How to use ────────────────────────────────────────────────────────────
+#   1. Copy this file to config/overlays/{development,staging,production}/.
+#   2. Override only the keys that differ from base.
+#   3. Overlays are rendered with Kustomize (config/overlays/<env>/kustomization.yaml)
+#      or Helm values files — never edited in place.
+#
+# ── Precedence (highest wins) ─────────────────────────────────────────────
+#   Deployment env vars  >  ConfigMap envFrom  >  YAML in this file
+#   This matches Dockerfile v2.0 and SYMBOLIC_OVERSIGHT_README.md v1.2
+#   §Configuration Matrix. Env vars are canonical.
+#
+# ── Env-var ↔ YAML mapping (subset) ───────────────────────────────────────
+#   ENHANCEMENTS_ENABLED             ↔ enhancements.enabled
+#   LIMIT_GRAPH_ENABLED              ↔ enhancements.limit_graph.enabled
+#   MODP_ENABLED                     ↔ enhancements.modp.enabled
+#   RLHF_ENABLED                     ↔ enhancements.rlhf.enabled
+#   DISTILLATION_ENABLED             ↔ enhancements.distillation.enabled
+#   EVOLUTIONARY_ENABLED             ↔ enhancements.evolutionary.enabled
+#   MOE_ENABLED (alias MOE_GATING_ENABLED) ↔ enhancements.moe.enabled
+#   FLEXGEN_ENABLED                  ↔ enhancements.flexgen.enabled
+#   ZERO_TRUST_ENABLED               ↔ enhancements.zero_trust.enabled
+#   DIFFERENTIAL_PRIVACY_ENABLED     ↔ enhancements.privacy.enabled
+#   TRAINING_ENABLED                 ↔ enhancements.training.enabled
+#   LOG_LEVEL                        ↔ system.log_level (and monitoring.logging.level)
+#   LOG_FORMAT                       ↔ monitoring.logging.format
+#   SYMBOLIC_POLICY                  ↔ symbolic.policy_path
+#   ZERO_TRUST_TOKEN                 ↔ (secret only — no YAML key)
+#   RLHF_API_KEY                     ↔ (secret only — no YAML key)
+#   CARBON_API_KEY                   ↔ carbon.api_key_env_var (indirect)
+#   HELIUM_API_KEY                   ↔ helium.api_key_env_var (indirect)
+#   LEAN_CTX_VERSION                 ↔ (informational — no YAML key)
+#
+# ── Secrets ───────────────────────────────────────────────────────────────
+#   Never commit ZERO_TRUST_TOKEN, RLHF_API_KEY, CARBON_API_KEY, or
+#   HELIUM_API_KEY. Use .env.example as the template (checked in) and inject
+#   the real values via Kubernetes Secret or a local .env (gitignored).
+#
+# ── Migration notes (from v4 / v1.1) ──────────────────────────────────────
+#   bio_inspired.enabled       → enhancements.evolutionary.enabled
+#   moe_expert.enabled         → enhancements.moe.enabled
+#   flexgen_energy_joules      → flexgen_energy_kwh
+#   priority: "warning"        → priority: "medium"
+#
+# ── Validation ────────────────────────────────────────────────────────────
+#   python -c "import yaml; yaml.safe_load(open('config/base/green_agent.yaml'))"
+#   kubectl apply --dry-run=server -f config/base/configmap.yaml
+#
+# ── Companion resources ───────────────────────────────────────────────────
+#   • config/base/configmap.yaml      (mounts this file + policies)
+#   • config/base/deployment.yaml     (probes, securityContext, volumes)
+#   • config/base/kustomization.yaml  (bundles all)
+#   • config/overlays/<env>/          (per-environment overrides)
+#   • MANIFEST.sha256                 (file-preservation inventory)
+#   • .env.example                    (secrets template)
 
+# =============================================================================
+# System
+# =============================================================================
 system:
   version: "5.0.0"
-  mode: "unified"          # legacy | unified | compare
-  debug: false
-  log_level: "INFO"        # DEBUG | INFO | WARNING | ERROR
+  # Layer versions are independent of the guide version — see companion docs.
+  layers:
+    meta_cognitive: "1.2.0"
+    symbolic_oversight: "1.2.0"
+    enhancements: "1.2.0"
 
+  mode: "unified"                # legacy | unified | compare
+  debug: false                   # forces log_level=DEBUG when true
+  log_level: "INFO"              # canonical: env LOG_LEVEL wins
+  timezone: "UTC"                # ISO 8601 timestamps throughout
+
+  # Writable data root — checkpoints, run_memory.json, symbolic_violations.json
+  data_dir: "/app/data"
+  max_concurrent_tasks: 32
+
+# =============================================================================
+# Ray (distributed execution)
+# =============================================================================
 ray:
   enabled: true
-  num_workers: 4
+  num_workers: 8                 # aligned with Guide v5.0 + ConfigMap v5.0
   min_workers: 2
   max_workers: 20
   dashboard_port: 8265
+  namespace: "ray"               # Ray's own namespace on shared clusters
+  # address: "ray://green-agent-ray-head:10001"   # connect to existing cluster
+  # If Ray is not installed, the app falls back to in-process execution.
 
+# =============================================================================
+# Carbon
+# =============================================================================
 carbon:
-  api_provider: "simulation"    # simulation | electricitymap | carbonintensity
+  # Provider chain — tries each in order until one succeeds.
+  # `simulation` requires no API key and is the safest default.
+  api_provider: "simulation"     # simulation | electricitymap | carbonintensity
+  fallback_provider: "simulation"
   default_region: "US-CA"
-  eco_mode_threshold: 200       # gCO2/kWh for yellow zone
-  defer_threshold: 400          # gCO2/kWh for red zone
-  api_key_env_var: "CARBON_API_KEY"
 
+  # Zone thresholds (gCO2/kWh) — match Guide v5.0 §Carbon defaults
+  eco_mode_threshold: 200        # yellow zone
+  defer_threshold: 400           # red zone
+
+  # Polling / caching
+  polling_interval_seconds: 900  # 15 min — matches helium default
+  cache_ttl_seconds: 300         # 5 min
+
+  # Per-provider API keys (resolved from env vars)
+  api_key_env_var: "CARBON_API_KEY"          # legacy single-key var
+  electricitymap_api_key_env_var: "ELECTRICITYMAP_API_KEY"
+  carbonintensity_api_key_env_var: "CARBONINTENSITY_API_KEY"
+
+# =============================================================================
+# Helium (supply monitoring)
+# =============================================================================
 helium:
-  enabled: false                # Set to true to enable helium supply monitoring
+  enabled: false                 # set true to activate HELIUM_API_KEY
+  # URL placeholders — replace with real endpoints before enabling.
   api_endpoints:
-    primary: "https://api.helium-monitor.example.com/v1/supply"
-    backup: "https://backup.helium-api.example.com/v1/status"
-  api_key_env_var: "HELIUM_API_KEY"  # Loads from environment if set
-  update_interval_seconds: 900       # 15 minutes between API fetches
-  history_buffer_size: 100           # Keep last N signals in memory
-  max_retries: 3                     # API retry attempts
-  base_retry_delay: 1.0              # Base delay for exponential backoff (seconds)
-  simulation_enabled: true           # Fallback to simulation on API failure
-  simulation_seed: null              # Set integer for deterministic testing (e.g., 42)
+    primary: "https://api.helium-monitor.example.com/v1/supply"     # PLACEHOLDER
+    backup:  "https://backup.helium-api.example.com/v1/status"      # PLACEHOLDER
 
+  api_key_env_var: "HELIUM_API_KEY"
+  update_interval_seconds: 900   # 15 min between fetches
+  history_buffer_size: 100       # ~1 MB RAM for 100 signal snapshots
+  max_retries: 3
+  base_retry_delay: 1.0          # seconds — exponential backoff base
+  simulation_enabled: true       # fall back to synthetic data on API failure
+  simulation_seed: null          # set an int (e.g. 42) for deterministic tests
+
+# =============================================================================
+# Monitoring
+# =============================================================================
 monitoring:
   prometheus:
     enabled: true
-    port: 8000
+    port: 9090                   # separate from agent port 8000 (avoids collision)
     metrics_path: "/metrics"
-    max_edges_export: 100      # Limit edge metrics to prevent cardinality explosion
+    scrape_interval: "15s"
+    max_edges_export: 100        # requires LIMIT_GRAPH_ENABLED=true for full graph
   logging:
-    level: "INFO"
-    format: "json"
-    file: "logs/green_agent.log"
+    level: "INFO"                # canonical: env LOG_LEVEL wins
+    format: "json"               # canonical: env LOG_FORMAT wins
+    # Files are NOT written — the Deployment uses readOnlyRootFilesystem: true.
+    # Logs go to stdout and are captured by the container runtime.
+    # file: "/dev/stdout"
+  tracing:
+    enabled: false               # OpenTelemetry export
+    # endpoint: "http://otel-collector:4317"
+  alertmanager:
+    enabled: false
+    # endpoint: "http://alertmanager:9093"
 
+# =============================================================================
+# Security
+# =============================================================================
 security:
+  # DEV-ONLY default. In production:
+  #   • enable_auth: true
+  #   • tls.enabled: true
+  #   • enhancements.zero_trust.enabled: true
   enable_auth: false
   tls:
     enabled: false
-    cert_file: ""
-    key_file: ""
+    cert_file: null              # set to a real path; null disables
+    key_file: null
   rbac:
     enabled: true
-    default_policy: "deny"
+    default_policy: "deny"       # allow-list must exist separately
+  cors:
+    enabled: false
+    # allowed_origins: ["https://app.example.com"]
+  rate_limit:
+    enabled: false
+    requests_per_second: 10
+  # Zero Trust is wired via enhancements.zero_trust.enabled below.
+  # ZERO_TRUST_TOKEN is injected from a Kubernetes Secret.
 
+# =============================================================================
+# Quantum (optional)
+# =============================================================================
 quantum:
-  enabled: false
-  backend: "simulator"         # simulator | ibm | rigetti | ionq
+  enabled: false                 # disabled by default
+  backend: "simulator"           # simulator | ibm | rigetti | ionq | none
+  # NOTE: qubit_count and error_mitigation are IGNORED when enabled=false.
   qubit_count: 12
   error_mitigation: ["ZNE", "PEC"]
 
+# =============================================================================
+# Policy (meta-cognitive)
+# =============================================================================
 policy:
-  mode: "moderate"             # conservative | moderate | aggressive
+  mode: "moderate"               # conservative | moderate | aggressive
+  # Paths resolved relative to config/data root.
+  green_path: "green_policy.yaml"
+  symbolic_path: "symbolic_policy.yaml"
+
+  # Legacy weight set — retained for compatibility with pre-v1.2 code paths.
+  # NOTE: distinct from enhancements.modp.objective_weights
+  # (see the enhancements block below). If both are set, the app uses
+  # enhancements.modp.objective_weights for scoring and policy.weights
+  # only for the legacy ranking heuristic.
   weights:
     carbon_importance: 0.4
     performance_importance: 0.3
     cost_importance: 0.2
     deadline_importance: 0.1
+
+# =============================================================================
+# Meta-cognitive (2nd feedback layer — v1.2.0)
+# =============================================================================
+meta_cognitive:
+  reflection_frequency: 5        # reflect every N steps
+  self_adjustment_thresholds:
+    energy_threshold_pct: 80
+    carbon_threshold_pct: 80
+    latency_threshold_pct: 80
+    memory_threshold_pct: 80
+  adaptive_policy_enabled: true
+  long_context:
+    enabled: true
+    history_window: 10
+    min_confidence_threshold: 0.7
+  sustained_reflection:
+    enabled: true
+    memory_persistence: true
+    meta_policy_generation: true
+
+# =============================================================================
+# Symbolic oversight (3rd feedback layer — v1.2.0)
+# =============================================================================
+# Always-on when symbolic_path exists; the app loads rules at startup.
+symbolic:
+  enabled: true
+  policy_path: "symbolic_policy.yaml"
+  # Actions vocabulary is fixed — see SYMBOLIC_OVERSIGHT_README.md v1.2
+  # §Rule Action Vocabulary. Unknown actions are logged and ignored.
+  # block_request requires enhancements.zero_trust.enabled=true.
+  allow_whitelist_parser: true   # always true — evaluator refuses eval/exec
+
+# =============================================================================
+# Advanced enhancements (4th feedback layer — v1.2.0)
+# =============================================================================
+# Env vars are canonical; YAML maps onto them (env wins on conflict).
+# See SYMBOLIC_OVERSIGHT_README.md v1.2 §Configuration Matrix.
+enhancements:
+  enabled: true                  # ↔ ENHANCEMENTS_ENABLED
+
+  limit_graph:
+    enabled: true                # ↔ LIMIT_GRAPH_ENABLED
+    graph_metrics:
+      centrality: 0.7
+      connectivity: 0.6
+
+  modp:
+    enabled: true                # ↔ MODP_ENABLED
+    # Four weights, in this exact order:
+    objective_weights: [0.4, 0.3, 0.2, 0.1]  # [accuracy, energy, latency, carbon]
+
+  rlhf:
+    enabled: true                # ↔ RLHF_ENABLED
+    human_feedback_score: 0.6    # 0–1, higher better
+
+  distillation:
+    enabled: true                # ↔ DISTILLATION_ENABLED
+    use_moe_gating: true
+
+  evolutionary:                  # renamed from `bio_inspired` in v1.2
+    enabled: true                # ↔ EVOLUTIONARY_ENABLED
+    population_size: 20
+    mutation_rate: 0.1
+
+  moe:                           # renamed from `moe_expert` in v1.2
+    enabled: true                # ↔ MOE_ENABLED (alias MOE_GATING_ENABLED)
+    n_experts: 4
+
+  flexgen:
+    enabled: false               # ↔ FLEXGEN_ENABLED (opt-in)
+    model_name: "facebook/opt-6.7b"
+    default_precision: "fp16"
+    delegation_policy: "adaptive"
+
+  zero_trust:
+    enabled: false               # ↔ ZERO_TRUST_ENABLED
+    # ZERO_TRUST_TOKEN is injected from a Kubernetes Secret
+
+  privacy:
+    enabled: false               # ↔ DIFFERENTIAL_PRIVACY_ENABLED
+    epsilon: 1.0                 # DP ε
+    delta: 1.0e-5                # DP δ
+
+  training:
+    enabled: false               # ↔ TRAINING_ENABLED
+    checkpoint_dir: "checkpoints"  # under system.data_dir
+
+# =============================================================================
+# Overlay example (do NOT edit this block — it is illustrative)
+# =============================================================================
+# config/overlays/production/green_agent.yaml
+# =============================================
+# system:
+#   log_level: "WARNING"
+# security:
+#   enable_auth: true
+#   tls:
+#     enabled: true
+#     cert_file: "/etc/tls/tls.crt"
+#     key_file:  "/etc/tls/tls.key"
+# enhancements:
+#   flexgen:
+#     enabled: true
+#   zero_trust:
+#     enabled: true
+#   privacy:
+#     enabled: true
+# carbon:
+#   api_provider: "electricitymap"
+
+# =============================================================================
+# What's Not in Scope
+# =============================================================================
+# • Non-YAML config formats (JSON, TOML) — the app reads YAML only.
+# • Secret storage — see Kubernetes Secret / .env.example.
+# • Overlay generation — use Kustomize or Helm, not manual copies.
+# • Scheduler policy — Ray handles it; only worker counts are here.
+
+# =============================================================================
+# Changelog
+# =============================================================================
+# 5.0.0 (2026-04-10)
+#   Added:
+#     • enhancements, meta_cognitive, symbolic, privacy, training blocks
+#     • system.layers version reconciliation
+#     • policy.symbolic_path / policy.green_path
+#     • objective_weights labels [accuracy, energy, latency, carbon]
+#     • metadata block + TOC-style header + env-var mapping
+#     • carbon fallback_provider / polling_interval / cache_ttl
+#     • ray.namespace + optional address
+#     • monitoring.prometheus.scrape_interval, tracing, alertmanager
+#     • security.cors / rate_limit
+#     • migration notes and validation recipes
+#   Changed:
+#     • monitoring.prometheus.port 8000 → 9090 (avoids agent port collision)
+#     • ray.num_workers 4 → 8 (aligns with Guide v5.0 + ConfigMap v5.0)
+#     • monitoring.logging.file removed (respects readOnlyRootFilesystem)
+#     • security.tls.cert_file "" → null
+#     • helium.api_endpoints marked as PLACEHOLDER
+#   Fixed:
+#     • security.enable_auth=false documented as dev-only
+#     • quantum.* marked dead-config when enabled=false
+#     • policy.weights vs enhancements.modp.objective_weights clarified
+# =============================================================================
