@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | **Version** | 1.2.0 |
-| **Last Updated** | 2026-04-10 |
+| **Last Updated** | 2026-11-13 |
 | **Status** | Production Ready |
 | **Audience** | Operators, integrators, maintainers |
 | **Companion docs** | `REPOSITORY_REFACTORING_GUIDE.md` (v0.2.0) · `SYMBOLIC_OVERSIGHT_README.md` (v1.2.0) · `Meta-Cognitive Architecture for Green Agent.md` (v1.2.0) · `META_COGNITIVE_ENHANCEMENT_COMPLETE.md` (v1.2.0) · `NEURO_SYMBOLIC_INTEGRATION_COMPLETE.md` (v1.2.0) · `QUICK_START.md` (v1.2.0) · `.cursorrules` |
