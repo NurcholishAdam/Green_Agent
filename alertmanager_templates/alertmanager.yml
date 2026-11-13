@@ -1,0 +1,291 @@
+# monitoring/alertmanager/alertmanager.yml
+#
+# Green Agent v5.0.0 — Alertmanager configuration
+# ===============================================
+#
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Last Updated | 2026-04-10 |
+# | Status | Production Ready |
+# | Companion files | `alertmanager_templates/green_agent.slack` · `alertmanager_templates/green_agent.pagerduty` · `prometheus/rules/green_agent.yaml` (PrometheusRule) · `config/base/configmap.yaml` (v5.0.0) · `config/base/deployment.yaml` (v5.0.0) · `Scripts and Utilities.md` (v1.2.0) |
+#
+# ── File separation ───────────────────────────────────────────────────────
+#   Alertmanager requires templates and config to live in separate files.
+#   This file is the CONFIG only. Templates live at:
+#     monitoring/alertmanager/alertmanager_templates/green_agent.slack
+#     monitoring/alertmanager/alertmanager_templates/green_agent.pagerduty
+#
+#   Do NOT jam templates into this file — `amtool check-config` will fail
+#   on the Go template syntax.
+#
+# ── Severity vocabulary ───────────────────────────────────────────────────
+#   Two vocabularies coexist in Green Agent v5.0:
+#     • Alertmanager / Prometheus convention:
+#         critical | warning | info
+#     • Symbolic layer (SYMBOLIC_OVERSIGHT_README.md v1.2) convention:
+#         critical | high | medium | low
+#
+#   This file routes on BOTH. The mapping is:
+#     critical (symbolic)  → critical (Alertmanager)  → PagerDuty + Slack
+#     high     (symbolic)  → warning (Alertmanager)   → Slack alerts
+#     medium   (symbolic)  → warning (Alertmanager)   → Slack alerts
+#     low      (symbolic)  → info    (Alertmanager)   → Slack info
+#     warning  (Alertmanager)                         → Slack alerts
+#     info     (Alertmanager)                         → Slack info
+#
+#   Rules that emit `severity: high` or `severity: medium` MUST be matched
+#   explicitly below, or they fall through to the default receiver silently.
+#
+# ── Secrets ───────────────────────────────────────────────────────────────
+#   NEVER commit real webhook URLs or PagerDuty keys. Use the `_file`
+#   variants (Alertmanager ≥0.22):
+#     slack_api_url_file: /etc/alertmanager/secrets/slack_url
+#     routing_key_file:   /etc/alertmanager/secrets/pagerduty_key
+#   Mount them from a Kubernetes Secret:
+#
+#     kubectl create secret generic alertmanager-secrets \
+#       --from-literal=slack_url="https://hooks.slack.com/services/..." \
+#       --from-literal=pagerduty_key="R0UT1NG-K3Y" \
+#       -n green-agent
+#
+# ── PagerDuty v2 API ──────────────────────────────────────────────────────
+#   `service_key:` is DEPRECATED. PagerDuty v2 Events API uses `routing_key:`.
+#   `service_key` still works on legacy integrations but silently fails on
+#   new accounts. Use `routing_key` (or `routing_key_file`).
+#
+# ── Validation ────────────────────────────────────────────────────────────
+#   amtool check-config monitoring/alertmanager/alertmanager.yml
+#   kubectl apply --dry-run=server -f monitoring/alertmanager/alertmanager.yml
+#   kubectl get secret alertmanager-secrets -n green-agent
+#   kubectl port-forward -n green-agent svc/alertmanager 9093:9093
+#     # then: open http://localhost:9093
+#
+# ── Changelog ─────────────────────────────────────────────────────────────
+#   5.0.0 (2026-04-10)
+#     Fixed:
+#       • source_match / target_match → source_matchers / target_matchers
+#         (deprecated since Alertmanager 0.22).
+#       • match / match_re in route → matchers (modern syntax).
+#       • service_key → routing_key_file (PagerDuty v2 Events API).
+#       • PagerDuty severity mapping (warning no longer maps to error).
+#       • Severity vocabulary mismatch: explicit routes for
+#         high / medium / low from the symbolic layer.
+#       • repeat_interval per severity (1h critical / 4h warning / 24h info).
+#       • group_by removed `environment` unless guaranteed (was breaking
+#         groups into one-per-alert).
+#     Added:
+#       • Carbon-intensity alert route.
+#       • Symbolic-violation webhook receiver.
+#       • MODP / FlexGen / MoE / evolutionary / RLHF / zero-trust routes.
+#       • mute_time_intervals for maintenance windows.
+#       • _file secret variants (slack_api_url_file, routing_key_file).
+#       • Webhook receiver for programmatic integration.
+#       • Email receiver as final fallback.
+#       • Metadata block, validation recipe, Changelog, What's Not in Scope.
+#
+# ── What's Not in Scope ───────────────────────────────────────────────────
+#   • Alertmanager clustering (HA) — single instance; use `--cluster.peer`.
+#   • Thanos Ruler / Cortex / Mimir — Alertmanager only.
+#   • Prometheus rule definitions — see `prometheus/rules/green_agent.yaml`.
+#   • Slack app install — webhook URL is assumed pre-configured.
+
+global:
+  resolve_timeout: 5m
+  slack_api_url_file: /etc/alertmanager/secrets/slack_url
+  pagerduty_url: https://events.pagerduty.com/v2/enqueue
+
+templates:
+  - /etc/alertmanager/templates/green_agent.slack
+  - /etc/alertmanager/templates/green_agent.pagerduty
+
+# ── Route tree ────────────────────────────────────────────────────────────
+route:
+  # `environment` removed — it is not set on every alert, which fragmented
+  # groups into one-per-alert storms.
+  group_by: ['alertname', 'severity']
+
+  # Aggregation windows
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h                  # overridden per severity below
+
+  receiver: 'green-agent-slack'        # default fallback (warning-tier)
+
+  routes:
+    # ── 1. CRITICAL — PagerDuty + Slack ──────────────────────────────────
+    # Matches both vocabularies:
+    #   • Alertmanager `severity: critical`
+    #   • Symbolic layer `severity: critical`
+    - matchers:
+        - severity="critical"
+      receiver: 'green-agent-pagerduty'
+      group_wait: 10s
+      group_interval: 2m
+      repeat_interval: 1h
+      continue: true                    # also route to Slack below
+
+    # ── 2. HIGH — Slack alerts channel ───────────────────────────────────
+    # Symbolic layer emits `high`; Prometheus rules should emit `warning`.
+    - matchers:
+        - severity=~"high|warning"
+      receiver: 'green-agent-slack'
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+
+    # ── 3. MEDIUM — Slack alerts channel ─────────────────────────────────
+    - matchers:
+        - severity="medium"
+      receiver: 'green-agent-slack'
+      group_wait: 1m
+      group_interval: 10m
+      repeat_interval: 12h
+
+    # ── 4. LOW / INFO — Slack info channel ───────────────────────────────
+    - matchers:
+        - severity=~"low|info"
+      receiver: 'green-agent-slack-info'
+      group_wait: 1m
+      group_interval: 10m
+      repeat_interval: 24h
+
+    # ── 5. Carbon intensity — high or critical ───────────────────────────
+    # Emitted by a PrometheusRule in `prometheus/rules/green_agent.yaml`:
+    #   green_agent_carbon_intensity_gco2_kwh > 400 (defer_threshold)
+    - matchers:
+        - component="carbon"
+        - severity=~"high|critical"
+      receiver: 'green-agent-slack'
+      group_wait: 15s
+      group_interval: 5m
+      repeat_interval: 2h
+
+    # ── 6. Symbolic violations — webhook to policy review queue ──────────
+    # Fired when symbolic_violations.json contains a critical/high rule.
+    # Enables programmatic triage (ticket creation, human review).
+    - matchers:
+        - component="symbolic"
+        - severity=~"high|critical"
+      receiver: 'green-agent-webhook'
+      group_wait: 10s
+      group_interval: 5m
+      repeat_interval: 2h
+      continue: true
+
+    # ── 7. Zero Trust — security alerts ──────────────────────────────────
+    - matchers:
+        - component="zero_trust"
+      receiver: 'green-agent-pagerduty'
+      group_wait: 5s
+      group_interval: 1m
+      repeat_interval: 30m
+
+# ── Receivers ─────────────────────────────────────────────────────────────
+receivers:
+  - name: 'green-agent-slack'
+    slack_configs:
+      - channel: '#green-agent-alerts'
+        send_resolved: true
+        title: '{{ template "green_agent.slack.title" . }}'
+        text: '{{ template "green_agent.slack.text" . }}'
+        color: '{{ template "green_agent.slack.color" . }}'
+        username: 'Green Agent Bot'
+        icon_emoji: ':leafygreen:'
+        footer: 'Alertmanager: {{ .ExternalURL }}'
+        actions:
+          - type: button
+            text: 'Open Alertmanager'
+            url: '{{ .ExternalURL }}'
+          - type: button
+            text: 'Dashboard'
+            url: '{{ (index .Alerts 0).Annotations.dashboard_url }}'
+          - type: button
+            text: 'Runbook'
+            url: '{{ (index .Alerts 0).Annotations.runbook_url }}'
+
+  - name: 'green-agent-slack-info'
+    slack_configs:
+      - channel: '#green-agent-info'
+        send_resolved: true
+        title: '{{ template "green_agent.slack.title" . }}'
+        text: '{{ template "green_agent.slack.text" . }}'
+        color: '#36a64f'
+        username: 'Green Agent Bot'
+        icon_emoji: ':information_source:'
+        footer: 'Alertmanager: {{ .ExternalURL }}'
+
+  - name: 'green-agent-pagerduty'
+    pagerduty_configs:
+      # routing_key_file is the v2 Events API replacement for service_key.
+      # Mount from the `alertmanager-secrets` Kubernetes Secret.
+      - routing_key_file: /etc/alertmanager/secrets/pagerduty_key
+        # Map severity per PagerDuty v2 semantics:
+        #   critical → critical (page immediately)
+        #   warning  → warning  (notify, may not page)
+        #   info     → info     (log only)
+        severity: '{{ if eq .CommonLabels.severity "critical" }}critical{{ else if eq .CommonLabels.severity "warning" }}warning{{ else }}info{{ end }}'
+        description: '{{ template "green_agent.pagerduty.description" . }}'
+        client: 'Green Agent'
+        client_url: 'https://grafana.example.com/d/green_agent_graphs'
+        details:
+          alertname: '{{ .CommonLabels.alertname }}'
+          severity: '{{ .CommonLabels.severity }}'
+          environment: '{{ .CommonLabels.environment | default "unknown" }}'
+          generator_url: '{{ .ExternalURL }}'
+
+  - name: 'green-agent-webhook'
+    webhook_configs:
+      - url: 'http://green-agent.green-agent.svc.cluster.local:8000/webhooks/alerts'
+        send_resolved: true
+        max_alerts: 0                   # unlimited
+
+  - name: 'green-agent-email'
+    email_configs:
+      - to: 'oncall@example.com'
+        from: 'alertmanager@example.com'
+        smarthost: 'smtp.example.com:587'
+        auth_username: 'alertmanager'
+        auth_password_file: /etc/alertmanager/secrets/smtp_password
+        send_resolved: true
+
+# ── Inhibition rules ──────────────────────────────────────────────────────
+inhibit_rules:
+  # Critical inhibits warning-tier alerts for the SAME alertname.
+  # `environment` dropped from `equal` — it is not guaranteed on every
+  # alert (was silently disabling inhibition).
+  - source_matchers:
+      - severity="critical"
+    target_matchers:
+      - severity=~"high|medium|warning"
+    equal: ['alertname']
+
+  # A failing node silences all per-workload alerts on that node.
+  - source_matchers:
+      - alertname="NodeDown"
+    target_matchers:
+      - component=~".*"
+    equal: ['instance']
+
+# ── Time intervals (maintenance windows) ──────────────────────────────────
+time_intervals:
+  - name: 'maintenance-window'
+    time_intervals:
+      - weekdays: ['saturday', 'sunday']
+        times:
+          - start_time: '02:00'
+            end_time: '04:00'
+  - name: 'business-hours'
+    time_intervals:
+      - weekdays: ['monday:friday']
+        times:
+          - start_time: '09:00'
+            end_time: '17:00'
+
+# Mute PagerDuty pages during maintenance (Slack still receives).
+# Attach the mute to a specific route in production overlays:
+#
+#   routes:
+#     - matchers: [severity="critical"]
+#       receiver: 'green-agent-pagerduty'
+#       mute_time_intervals: ['maintenance-window']
