@@ -1,4 +1,4 @@
-```markdown
+
 # Module Guide
 
 | Field | Value |
