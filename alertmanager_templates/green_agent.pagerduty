@@ -1,0 +1,52 @@
+# monitoring/alertmanager/alertmanager_templates/green_agent.pagerduty
+#
+# Green Agent v5.0.0 — PagerDuty templates
+# ========================================
+#
+# Companion: `alertmanager.yml` (v5.0.0). Rendered via `routing_key`
+# (PagerDuty v2 Events API).
+#
+# ── Differences vs the Slack template ────────────────────────────────────
+#   • PagerDuty has no emoji / color — plain text only.
+#   • Resolved events carry a shorter body — PagerDuty collapses them.
+#   • Each firing alert is separated by `---` so PagerDuty renders them as
+#     separate lines in the incident details.
+
+{{ define "green_agent.pagerduty.title" -}}
+[{{ .Status | toUpper }}] Green Agent: {{ .CommonLabels.alertname }}
+{{- end }}
+
+{{ define "green_agent.pagerduty.description" -}}
+{{ if gt (len .Alerts.Firing) 0 -}}
+{{ range .Alerts.Firing -}}
+Alert: {{ .Annotations.summary }}
+Rule: {{ .Labels.alertname }}
+Severity: {{ .Labels.severity }}
+{{- if .Labels.component }}
+Component: {{ .Labels.component }}
+{{- end }}
+Started: {{ .StartsAt.Format "2006-01-02 15:04:05 MST" }}
+
+{{ .Annotations.description }}
+
+{{- if .Annotations.symbolic_rule_id }}
+Symbolic Rule: {{ .Annotations.symbolic_rule_id }}
+{{- end }}
+
+{{- if .Annotations.runbook_url }}
+Runbook: {{ .Annotations.runbook_url }}
+{{- end }}
+{{- if .Annotations.dashboard_url }}
+Dashboard: {{ .Annotations.dashboard_url }}
+{{- end }}
+Source: {{ .GeneratorURL }}
+---
+{{ end -}}
+{{- else -}}
+All Green Agent alerts resolved.
+{{ range .Alerts.Resolved -}}
+Resolved: {{ .Annotations.summary }} ({{ .EndsAt.Format "2006-01-02 15:04:05 MST" }})
+---
+{{ end -}}
+{{- end -}}
+{{- end }}
