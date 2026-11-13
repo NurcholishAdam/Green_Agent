@@ -1,4 +1,253 @@
+# config/base/namespace.yaml
+#
+# Green Agent v5.0.0 — Namespace
+# ==============================
+#
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Last Updated | 2026-11-13 |
+# | Status | Production Ready |
+# | Companion docs | `config/base/{kustomization,configmap,deployment,hpa}.yaml` (v5.0.0), `green_agent.yaml` (v5.0.0), `Scripts and Utilities.md` (v1.2.0), `REPOSITORY_REFACTORING_GUIDE.md` (v0.2.0) |
+#
+# ── What this file is for ─────────────────────────────────────────────────
+#   • Creates the `green-agent` Namespace (if not pre-provisioned).
+#   • Enforces Pod Security Admission (PSA) `restricted` at the namespace
+#     level. PSA labels MUST live on the Namespace — labels on ConfigMaps,
+#     Deployments, or Pods are ignored.
+#   • Carries the `environment` label so overlays can select the namespace
+#     for policy, quotas, and NetworkPolicy scoping.
+#
+# ── Pre-provisioned namespaces ────────────────────────────────────────────
+#   In many clusters (GKE Autopilot, EKS managed, OpenShift) the namespace is
+#   created by infra before Argo/Kustomize runs. Applying this file in that
+#   case is idempotent — but it will set the labels, which can conflict with
+#   platform defaults. To skip creation in fully-managed clusters, either:
+#     • Delete `namespace.yaml` from `resources:` in `kustomization.yaml`, or
+#     • Apply with `kubectl apply -f` (labels merge) rather than
+#       `kubectl replace` (labels reset).
+#
+# ── Why PSA labels live here and not on the ConfigMap ────────────────────
+#   The ConfigMap v5.0 (`configmap.yaml`) previously carried
+#   `pod-security.kubernetes.io/enforce: restricted` — that is a NO-OP.
+#   PSA reads labels from the NAMESPACE only. This file is the correct
+#   location. (The ConfigMap label has been removed in its v5.0 revision.)
+#
+# ── Companion resources (ship alongside, not in this file) ────────────────
+#   • ServiceAccount   green-agent        (serviceaccount.yaml)
+#   • ResourceQuota    green-agent-quota  (resourcequota.yaml)
+#   • LimitRange       green-agent-limits (limitrange.yaml)
+#   • NetworkPolicy    default-deny       (networkpolicy.yaml)
+#   • Role/RoleBinding (if RBAC is needed — rbac.yaml)
+#
+# ── Multi-tenant safety ───────────────────────────────────────────────────
+#   This namespace is NOT pre-emptively quota-limited in this file. Without
+#   a ResourceQuota, a runaway HPA (`maxReplicas: 20` × `limits` of 4 CPU /
+#   8 Gi) can reserve 80 CPU / 160 Gi cluster-wide. See the commented
+#   ResourceQuota at the bottom of this file.
+#
+# ── Validation ────────────────────────────────────────────────────────────
+#   kubectl apply --dry-run=server -f config/base/namespace.yaml
+#   kubectl get ns green-agent -o jsonpath='{.metadata.labels}'
+#   kubectl auth can-i create pods -n green-agent --as=system:serviceaccount:green-agent:green-agent
+
 apiVersion: v1
 kind: Namespace
+
 metadata:
   name: green-agent
+
+  labels:
+    # ── Standard identity ──────────────────────────────────────────────
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/instance: green-agent
+    app.kubernetes.io/version: "5.0.0"
+    app.kubernetes.io/component: namespace
+    app.kubernetes.io/part-of: green-agent
+    app.kubernetes.io/managed-by: kustomize
+
+    # ── Environment (overlays override this value) ─────────────────────
+    environment: base
+
+    # ── Pod Security Admission (PSA) ───────────────────────────────────
+    # `enforce` blocks non-compliant pods at admission time.
+    # `audit` logs violations to the audit log without blocking.
+    # `warn` shows warnings to kubectl users.
+    # `enforce-version: latest` avoids silent drift on cluster upgrades;
+    # pin (e.g. v1.29) if you need reproducibility across upgrades.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+
+    # ── Service mesh ───────────────────────────────────────────────────
+    # Green Agent does not require a service mesh. Set to "enabled" only
+    # if the cluster installs Istio (or set linkerd.io/inject: enabled).
+    istio-injection: disabled
+
+    # ── Prometheus Operator discovery (optional) ───────────────────────
+    # Uncomment if your Prometheus Operator uses namespace selectors
+    # matching `release: prometheus` (kube-prometheus-stack default).
+    # release: prometheus
+
+  annotations:
+    # Apply this Namespace BEFORE the ConfigMap (-1) and Deployment (0).
+    # Wave -2 ensures the namespace exists before any namespaced resource.
+    argocd.argoproj.io/sync-wave: "-2"
+
+    # Base version marker — overlays may override with their own tag.
+    green-agent.io/base-version: "5.0.0"
+
+    # If the namespace is provisioned by infra (GKE Autopilot, EKS managed,
+    # OpenShift), uncomment the annotation below. Kustomize will skip
+    # applying this file via `kubectl apply -k` when the annotation is set
+    # and `--load-restrictor` honors it.
+    # config.kubernetes.io/local-config: "true"
+
+# ── Namespace immutability note ───────────────────────────────────────────
+# `metadata.name` is IMMUTABLE. Renaming `green-agent` requires:
+#   1. Creating the new namespace.
+#   2. Migrating every resource that hardcodes `namespace: green-agent`
+#      (configmap.yaml, deployment.yaml, hpa.yaml, service.yaml, …).
+#   3. Deleting the old namespace (irreversible — wait for cascading GC).
+# Every companion manifest in this repo hardcodes `namespace: green-agent`;
+# renaming requires touching all of them.
+
+# =============================================================================
+# Companion: ResourceQuota (multi-tenant safety — recommended in shared clusters)
+# =============================================================================
+# Save as config/base/resourcequota.yaml and add to kustomization resources.
+# Ceilings below are the recommended defaults for a shared cluster:
+#   • HPA can scale to 20 replicas × (4 CPU / 8 Gi limits) = 80 CPU / 160 Gi
+#   • Quota caps this at 40 CPU / 80 Gi to leave headroom for other tenants
+#
+# apiVersion: v1
+# kind: ResourceQuota
+# metadata:
+#   name: green-agent-quota
+#   namespace: green-agent
+# spec:
+#   hard:
+#     requests.cpu: "16"
+#     requests.memory: "32Gi"
+#     limits.cpu: "40"
+#     limits.memory: "80Gi"
+#     pods: "30"
+#     services: "10"
+#     configmaps: "20"
+#     secrets: "20"
+#     persistentvolumeclaims: "10"
+#     requests.storage: "200Gi"
+
+# =============================================================================
+# Companion: LimitRange (default resources for pods without explicit limits)
+# =============================================================================
+# Save as config/base/limitrange.yaml and add to kustomization resources.
+# Prevents pods without `resources` from becoming BestEffort QoS.
+#
+# apiVersion: v1
+# kind: LimitRange
+# metadata:
+#   name: green-agent-limits
+#   namespace: green-agent
+# spec:
+#   limits:
+#     - type: Container
+#       default:
+#         cpu: "2"
+#         memory: "4Gi"
+#       defaultRequest:
+#         cpu: "100m"
+#         memory: "128Mi"
+#       max:
+#         cpu: "8"
+#         memory: "16Gi"
+#       min:
+#         cpu: "10m"
+#         memory: "64Mi"
+
+# =============================================================================
+# Companion: NetworkPolicy default-deny (deny all traffic until explicit allow)
+# =============================================================================
+# Save as config/base/networkpolicy.yaml and add to kustomization resources.
+# Pairs with the allow-list NetworkPolicy in deployment.yaml v5.0 header.
+#
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: default-deny
+#   namespace: green-agent
+# spec:
+#   podSelector: {}
+#   policyTypes: [Ingress, Egress]
+
+# =============================================================================
+# Companion: ServiceAccount (referenced by deployment.yaml v5.0)
+# =============================================================================
+# Save as config/base/serviceaccount.yaml and add to kustomization resources.
+# deployment.yaml v5.0 sets `serviceAccountName: green-agent` — without this
+# SA, pods fail to start with "serviceaccount not found".
+#
+# apiVersion: v1
+# kind: ServiceAccount
+# metadata:
+#   name: green-agent
+#   namespace: green-agent
+#   labels:
+#     app.kubernetes.io/name: green-agent
+#     app.kubernetes.io/part-of: green-agent
+#   annotations:
+#     # Prevent token automount on this SA (already set in Deployment,
+#     # but defense-in-depth is worth it).
+#     kubernetes.io/enforce-mountable-secrets: "true"
+# automountServiceAccountToken: false
+
+# =============================================================================
+# What's Not in Scope
+# =============================================================================
+# • Cluster-level RBAC (ClusterRole, ClusterRoleBinding) — per-cluster setup.
+# • Ingress / Gateway API — ship as a separate overlay.
+# • cert-manager / ExternalDNS / External Secrets — cluster add-ons.
+# • PodSecurityPolicy — removed in Kubernetes 1.25; PSA replaces it.
+# • PriorityClass (green-agent-critical) — cluster-scoped, separate file.
+
+# =============================================================================
+# Changelog
+# =============================================================================
+# 5.0.0 (2026-04-10)
+#   Fixed:
+#     • Moved PSA labels (pod-security.kubernetes.io/*) from the ConfigMap to
+#       this Namespace — PSA reads labels from the Namespace only. The
+#       ConfigMap label was a no-op and has been removed.
+#   Added:
+#     • app.kubernetes.io/* labels (matches companion manifests).
+#     • environment: base label (overlays override).
+#     • PSA enforce + enforce-version + audit + warn (restricted tier).
+#     • argocd.argoproj.io/sync-wave: "-2" (before ConfigMap -1, Deployment 0).
+#     • green-agent.io/base-version annotation.
+#     • istio-injection: disabled label.
+#     • Companion ResourceQuota / LimitRange / NetworkPolicy /
+#       ServiceAccount examples (commented).
+#     • Namespace-immutability warning.
+#     • Pre-provisioned-namespace guidance.
+#     • Validation recipe + "What's Not in Scope".
+# =============================================================================
+
+# =============================================================================
+# Reviewer Checklist
+# =============================================================================
+#   [ ] PSA labels (enforce/audit/warn + versions) are on THIS Namespace.
+#   [ ] No `pod-security.kubernetes.io/*` label remains on the ConfigMap.
+#   [ ] app.kubernetes.io/* labels match configmap.yaml / deployment.yaml.
+#   [ ] argocd.argoproj.io/sync-wave is "-2" (before ConfigMap -1).
+#   [ ] `kubectl apply --dry-run=server -f config/base/namespace.yaml` passes.
+#   [ ] `kubectl get ns green-agent -o jsonpath='{.metadata.labels}'` shows
+#       the enforce/audit/warn tiers.
+#   [ ] If infra pre-provisions the namespace, `config.kubernetes.io/local-config`
+#       annotation is uncommented or `namespace.yaml` is removed from
+#       `resources:` in `kustomization.yaml`.
+#   [ ] Companion ServiceAccount (green-agent) exists before Deployment is
+#       applied.
+# =============================================================================
