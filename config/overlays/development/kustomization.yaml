@@ -1,13 +1,302 @@
+# config/overlays/development/kustomization.yaml
+#
+# Green Agent v5.0.0 — Development overlay
+# ========================================
+#
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Last Updated | 2026-11-13 |
+# | Status | Production Ready |
+# | Environment | development |
+# | Base | ../../base (v5.0.0) |
+# | Companion docs | `config/base/*` (v5.0.0), `green_agent.yaml` (v5.0.0), `Scripts and Utilities.md` (v1.2.0), `REPOSITORY_REFACTORING_GUIDE.md` (v0.2.0) |
+#
+# ── Overlay strategy (one of two — pick one, not both) ────────────────────
+#
+#   OPTION A — namespace-per-env (recommended for this repo)
+#     namespace: dev-green-agent
+#     namePrefix: dev-                 # optional, only if you run multiple
+#                                      # instances in the SAME namespace
+#
+#   OPTION B — shared namespace + per-instance prefix
+#     namespace: green-agent           # base namespace
+#     namePrefix: dev-                 # pods become dev-green-agent
+#
+#   The original file mixed the two:
+#     namespace: green-agent-test      # env-suffixed (Option A)
+#     namePrefix: dev-                 # instance-suffixed (Option B)
+#
+#   Result: base Namespace → dev-green-agent (unused), resources → green-agent-test
+#   (never created). Every namespaced resource failed to apply.
+#
+#   This overlay uses **Option A**: `namespace: dev-green-agent` + `namePrefix: dev-`
+#   so both stay consistent. `dev-green-agent` is the resulting namespace name.
+#   If you don't want a `dev-` prefix on every resource name, delete the
+#   `namePrefix:` line and set `namespace: green-agent-dev`.
+#
+# ── Image tag policy ──────────────────────────────────────────────────────
+#   `newTag` here MUST correspond to a tag that exists in the registry.
+#   Acceptable values:
+#     • v5.0.0-dev                    (release-prep tag)
+#     • v5.0.0-dev.2026-04-10         (date-stamped)
+#     • sha-<40-hex>                  (git SHA, best for traceability)
+#   Do NOT use `:latest` or `:test`:
+#     • :latest is a floating tag — different pods may pull different
+#       images on restart, breaking reproducibility.
+#     • :test implies an unspecified build — nothing guarantees it exists.
+#
+#   This overlay also overrides the **RayCluster** head and worker tags
+#   (base uses `green-agent:v5.0.0`). Both must match or Ray's cluster
+#   join fails with a version-check error.
+#
+# ── Namespace creation ────────────────────────────────────────────────────
+#   The base creates `Namespace green-agent`. With `namePrefix: dev-` and
+#   `namespace: dev-green-agent`, the resulting Namespace is `dev-green-agent`.
+#   Because `Namespace` is cluster-scoped, `namespace:` does NOT rename it —
+#   the `namePrefix:` does. This is why Option A is chosen here: both
+#   transformations agree.
+#
+# ── Secrets ───────────────────────────────────────────────────────────────
+#   The base Deployment mounts `secretRef: green-agent-secrets` (optional).
+#   In dev, create it once before the first deploy:
+#
+#       kubectl create namespace dev-green-agent    # if not via this overlay
+#       kubectl create secret generic green-agent-secrets \
+#         --from-literal=ZERO_TRUST_TOKEN=dev-not-required \
+#         --from-literal=RLHF_API_KEY=dev-not-required \
+#         -n dev-green-agent
+#
+#   Alternatively, use `secretGenerator` in this overlay (see commented block
+#   below) for local-only development. NEVER commit real secrets.
+#
+# ── Validation ────────────────────────────────────────────────────────────
+#   kubectl kustomize config/overlays/development/ | head -50
+#   kubectl apply -k config/overlays/development --dry-run=server
+#   kubectl get all -n dev-green-agent
+#   kubectl get raycluster -n dev-green-agent
+#
+# ── Changelog ─────────────────────────────────────────────────────────────
+#   5.0.0 (2026-04-10)
+#     Fixed:
+#       • namespace: green-agent-test → dev-green-agent (matches namePrefix)
+#         — previous combination produced an unused dev-green-agent Namespace
+#         and failed to create the resources' actual namespace.
+#       • images.newTag: test → v5.0.0-dev (verifiable tag).
+#     Added:
+#       • labels block (environment: development, instance override).
+#       • commonAnnotations (base version, environment marker).
+#       • replicas override (Deployment → 1).
+#       • HPA patch (min: 1, max: 2).
+#       • RayCluster patch (min: 0, max: 2, idle: 30s).
+#       • Deployment patches (LOG_LEVEL=DEBUG, imagePullPolicy=Always,
+#         remove /sys/fs/cgroup hostPath for macOS dev).
+#       • PSA relaxation to `baseline` for dev clusters.
+#       • Header explaining Option A vs Option B.
+#       • Secret creation guidance + commented secretGenerator.
+#       • Validation recipe.
+#     Removed:
+#       • "✅ This sets the image …" inline comment (folded into header).
+#
+# ── What's Not in Scope ───────────────────────────────────────────────────
+#   • Ingress / Gateway API — dev typically uses `kubectl port-forward`.
+#   • ExternalDNS — dev uses in-cluster DNS only.
+#   • Secret rotation — a dev Secret is set once and forgotten.
+#   • Production-grade HA — dev runs 1 replica by design.
+
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: green-agent-test
+# ── Namespace ─────────────────────────────────────────────────────────────
+# Matches `namePrefix: dev-` below so the base Namespace (renamed to
+# dev-green-agent) and the resources' target namespace agree.
+namespace: dev-green-agent
+
+# ── Name prefix ───────────────────────────────────────────────────────────
+# Renames every resource: green-agent → dev-green-agent,
+# green-agent-config → dev-green-agent-config, etc.
+# Kustomize propagates the prefix to references (Service → Deployment,
+# HPA.scaleTargetRef.name, etc.). Pod template labels are NOT renamed —
+# they remain `app.kubernetes.io/instance: green-agent` unless overridden
+# by the `labels:` block below.
 namePrefix: dev-
 
+# ── Base ──────────────────────────────────────────────────────────────────
 resources:
-- ../../base
+  - ../../base
 
-# ✅ This sets the image for all containers in the base resources
+# ── Labels (overlay-wide) ─────────────────────────────────────────────────
+# `includeSelectors: false` so we don't touch Deployment.spec.selector.matchLabels
+# (immutable) or NetworkPolicy selectors (which would break cross-namespace rules).
+labels:
+  - pairs:
+      environment: development
+      # Override the base's `instance: green-agent` so dev and prod pods
+      # cannot be cross-selected if they ever share a namespace.
+      app.kubernetes.io/instance: green-agent-dev
+      app.kubernetes.io/version: "5.0.0-dev"
+    includeSelectors: false
+
+# ── Annotations (overlay-wide) ────────────────────────────────────────────
+commonAnnotations:
+  green-agent.io/base-version: "5.0.0"
+  green-agent.io/environment: development
+
+# ── Image override ────────────────────────────────────────────────────────
+# Base uses `green-agent:v5.0.0`. Dev uses a `-dev` tag that MUST exist
+# in the registry. Kustomize updates both the Deployment and the RayCluster
+# head/worker images because both reference `green-agent` by name.
 images:
-- name: green-agent
-  newTag: test
+  - name: green-agent
+    newTag: v5.0.0-dev
+    # newName: ghcr.io/nurcholishadam/green-agent   # uncomment for registry override
+
+# ── Replicas (Deployment only — Ray workers are autoscaled by Ray) ────────
+# Base: replicas: 2. Dev: 1 replica is enough and cheaper.
+replicas:
+  - name: green-agent
+    count: 1
+
+# ── Patches (dev-specific tuning) ─────────────────────────────────────────
+patches:
+  # 1. HPA — scale down bounds for dev (base: min 3 / max 20)
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: green-agent
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+      - op: replace
+        path: /spec/maxReplicas
+        value: 2
+
+  # 2. RayCluster — allow scale to zero when idle (base: min 2)
+  - target:
+      kind: RayCluster
+      name: green-agent-cluster
+    patch: |-
+      - op: replace
+        path: /spec/workerGroupSpecs/0/replicas
+        value: 1
+      - op: replace
+        path: /spec/workerGroupSpecs/0/minReplicas
+        value: 0
+      - op: replace
+        path: /spec/workerGroupSpecs/0/maxReplicas
+        value: 2
+      - op: replace
+        path: /spec/workerGroupSpecs/0/idleTimeoutSeconds
+        value: 30
+
+  # 3. Deployment — verbose logging, always-pull, strip macOS-incompatible mount
+  - target:
+      kind: Deployment
+      name: green-agent
+    patch: |-
+      # Pick up freshly pushed dev tags
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+      # Verbose logs in dev (base LOG_LEVEL=INFO at env index 4)
+      - op: replace
+        path: /spec/template/spec/containers/0/env/4/value
+        value: DEBUG
+      # Human-readable logs in dev (base LOG_FORMAT=json at env index 5)
+      - op: replace
+        path: /spec/template/spec/containers/0/env/5/value
+        value: text
+      # /sys/fs/cgroup hostPath does not work on macOS (kind/minikube/Docker Desktop)
+      # Base mount index: 5 (config, policies, tmp, checkpoints, out, cgroup)
+      - op: remove
+        path: /spec/template/spec/containers/0/volumeMounts/5
+      - op: remove
+        path: /spec/template/spec/volumes/5
+
+  # 4. Namespace — relax PSA from `restricted` to `baseline` for dev clusters
+  #    kind/minikube often rejects `restricted` on older kernels.
+  - target:
+      kind: Namespace
+    patch: |-
+      - op: replace
+        path: /metadata/labels/pod-security.kubernetes.io~1enforce
+        value: baseline
+      - op: replace
+        path: /metadata/labels/pod-security.kubernetes.io~1audit
+        value: baseline
+      - op: replace
+        path: /metadata/labels/pod-security.kubernetes.io~1warn
+        value: baseline
+
+# ── Sort options ──────────────────────────────────────────────────────────
+# fifo matches the base's ordering (Namespace → SA → ConfigMap → Deployment →
+# Service → RayCluster → HPA → PDB → NetworkPolicy). Overlay patches do not
+# change the ordering.
+sortOptions:
+  order: fifo
+
+# ── Build metadata ────────────────────────────────────────────────────────
+buildMetadata:
+  - managedByLabel
+  - originAnnotations
+
+# =============================================================================
+# Companion: Secret (dev-only — use `kubectl create secret` for real values)
+# =============================================================================
+# For LOCAL-ONLY dev where a placeholder Secret is acceptable, uncomment the
+# block below and create `secret.env` (gitignored):
+#
+#   # secret.env (add to .gitignore)
+#   ZERO_TRUST_TOKEN=dev-not-required
+#   RLHF_API_KEY=dev-not-required
+#
+# secretGenerator:
+#   - name: green-agent-secrets
+#     envs:
+#       - secret.env
+#     options:
+#       disableNameSuffixHash: true   # stable name so Deployment can reference it
+#
+# NEVER commit real secrets. For cluster-managed secrets use ExternalSecrets
+# or SealedSecrets.
+
+# =============================================================================
+# Companion: .env.development (referenced by Scripts v1.2 deploy.sh)
+# =============================================================================
+# Save as config/environments/.env.development (gitignored):
+#
+#   ENVIRONMENT=development
+#   NAMESPACE=dev-green-agent
+#   LOG_LEVEL=DEBUG
+#   ENHANCEMENTS_ENABLED=true
+#   MODP_ENABLED=true
+#   RLHF_ENABLED=true
+#   FLEXGEN_ENABLED=false
+#   ZERO_TRUST_ENABLED=false
+#   DIFFERENTIAL_PRIVACY_ENABLED=false
+#   TRAINING_ENABLED=false
+#   SYMBOLIC_POLICY=symbolic_policy.yaml
+
+# =============================================================================
+# Reviewer Checklist
+# =============================================================================
+#   [ ] `namespace:` and `namePrefix:` produce a consistent final namespace.
+#       `kubectl kustomize . | grep 'namespace:'` should show ONLY
+#       `dev-green-agent` (never `green-agent` or `green-agent-test`).
+#   [ ] `images.newTag` corresponds to a tag that exists in the registry
+#       (`docker buildx imagetools inspect green-agent:v5.0.0-dev`).
+#   [ ] RayCluster head and worker tags match the Deployment tag
+#       (all become `v5.0.0-dev` via the single `images:` entry).
+#   [ ] `labels[].includeSelectors` is `false` — never touches immutable
+#       Deployment selectors.
+#   [ ] `replicas` override is present (`count: 1`).
+#   [ ] HPA patch lowers `minReplicas` and `maxReplicas`.
+#   [ ] RayCluster patch lowers worker bounds.
+#   [ ] `/sys/fs/cgroup` hostPath is removed (dev on macOS cannot mount it).
+#   [ ] PSA relaxed to `baseline` (or the dev cluster enforces `restricted`).
+#   [ ] Secret `green-agent-secrets` exists in `dev-green-agent` before first
+#       deploy, OR `secretGenerator` is uncommented with a placeholder.
+#   [ ] `kubectl apply -k config/overlays/development --dry-run=server` passes.
+#   [ ] `kubectl get all -n dev-green-agent` shows the expected pods/Services.
+#   [ ] Companion `.env.development` exists and matches the overlay's env vars.
+# =============================================================================
