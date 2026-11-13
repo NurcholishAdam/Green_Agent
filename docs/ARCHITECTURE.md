@@ -641,7 +641,7 @@ ctx_read("src/reflection/reflection_engine.py", mode="signatures")
 **Last Updated**: 2026-11-13 · **Version**: 5.0.0 · **Layer versions**: 1.2.0
 ```
 
----
+
 
 ## Summary of changes vs. original
 
