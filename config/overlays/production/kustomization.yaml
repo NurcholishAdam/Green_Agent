@@ -1,41 +1,388 @@
+# config/overlays/production/kustomization.yaml
+#
+# Green Agent v5.0.0 — Production overlay
+# =======================================
+#
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Last Updated | 2026-11-13 |
+# | Status | Production Ready |
+# | Environment | production |
+# | Base | ../../base (v5.0.0) |
+# | Companion docs | `config/base/*` (v5.0.0), `green_agent.yaml` (v5.0.0), `Scripts and Utilities.md` (v1.2.0), `REPOSITORY_REFACTORING_GUIDE.md` (v0.2.0) |
+#
+# ── Overlay strategy ──────────────────────────────────────────────────────
+#   Production uses **namespace-per-env** (Option A) consistent with the dev
+#   overlay:
+#     namespace: prod-green-agent
+#     namePrefix: prod-            # consistent with dev- pattern
+#
+#   The base creates `Namespace green-agent`. With `namePrefix: prod-` it
+#   becomes `prod-green-agent`, which matches `namespace:` above. All
+#   namespaced resources go to `prod-green-agent`.
+#
+#   The original file mixed two strategies:
+#     namespace: green-agent-production   # env-suffixed
+#     namePrefix: prod-                   # instance-suffixed
+#   This produced an unused `prod-green-agent` Namespace (from base) and
+#   failed to create `green-agent-production` — every apply failed with
+#   `namespaces "green-agent-production" not found`.
+#
+# ── Image override ────────────────────────────────────────────────────────
+#   Kustomize's `images:` matches the base image by its **`name` field**
+#   (`green-agent`), not the full registry path. Use `newName:` for the
+#   registry override:
+#     images:
+#       - name: green-agent                       # base name
+#         newName: ghcr.io/nurcholishadam/green-agent
+#         newTag: v5.0.0
+#   Do NOT put the full path in `name:` — it won't match anything.
+#   Also: `green_agent` (underscore) vs `green-agent` (hyphen) are DIFFERENT
+#   image names. The Dockerfile builds `green-agent`; GHCR path is
+#   `ghcr.io/nurcholishadam/green-agent`.
+#
+# ── Replicas — which resource, which field ────────────────────────────────
+#   The `replicas:` transformer targets `spec.replicas`. That works for
+#   Deployment / StatefulSet / ReplicaSet. It does NOT work for RayCluster
+#   (no top-level `spec.replicas`; use `spec.workerGroupSpecs[].replicas`).
+#
+#   Production scaling for RayCluster:
+#     • Head  stays at 1 (single GCS/API server; multiple heads break Ray)
+#     • Workers scale via `workerGroupSpecs[0].replicas` — use a patch
+#     • HTTP Deployment scales via HPA
+#
+#   The original `replicas: - name: green-agent-cluster, count: 8` targeted
+#   the head group. RayCluster has no `spec.replicas` — this either failed
+#   silently or (worse) set the head to 8, breaking the cluster. Replaced
+#   with a worker-group patch below.
+#
+# ── Security context — patch individual fields ────────────────────────────
+#   Never `op: replace` the whole `securityContext` — that drops
+#   `seccompProfile: RuntimeDefault`, `runAsGroup`, `fsGroup`, and
+#   `fsGroupChangePolicy`, which PSA `restricted` requires. Patch individual
+#   fields (`op: replace` on a sub-path), or omit the patch entirely — the
+#   base already satisfies PSA `restricted` with `runAsUser: 10001` (the
+#   Dockerfile's `appuser`). Changing UID to 1000 breaks file permissions
+#   because `/app` is owned by 10001 in the image.
+#
+# ── Env-var overrides ─────────────────────────────────────────────────────
+#   ConfigMap data keys become env vars via `envFrom: configMapRef`. BUT:
+#   Deployment `env:` entries WIN over `envFrom`. Base Deployment v5.0 sets
+#   `LOG_LEVEL: INFO` at `env[4]` — a ConfigMap key `LOG_LEVEL=WARNING` is
+#   masked. Patch the Deployment `env[4]` instead.
+#
+#   `RAY_ENABLED`, `QUANTUM_ENABLED`, `CARBON_API_PROVIDER` are NOT
+#   documented env vars. The app reads `ray.enabled` / `quantum.enabled` /
+#   `carbon.api_provider` from the YAML file (mounted at
+#   `/app/config/green_agent.yaml`). To change those, override the YAML
+#   file via `configMapGenerator.files:` — not via env vars.
+#
+# ── Secrets ───────────────────────────────────────────────────────────────
+#   Production tokens are NOT in this overlay. Create them once per cluster:
+#
+#       kubectl create namespace prod-green-agent    # if not via this overlay
+#       kubectl create secret generic green-agent-secrets \
+#         --from-literal=ZERO_TRUST_TOKEN="$ZERO_TRUST_TOKEN" \
+#         --from-literal=RLHF_API_KEY="$RLHF_API_KEY" \
+#         --from-literal=CARBON_API_KEY="$CARBON_API_KEY" \
+#         --from-literal=HELIUM_API_KEY="$HELIUM_API_KEY" \
+#         -n prod-green-agent
+#
+#   Or use ExternalSecrets / SealedSecrets for GitOps-safe rotation.
+#   NEVER commit real secrets to Git.
+#
+# ── Image pull secret ─────────────────────────────────────────────────────
+#   GHCR requires authentication. Create the pull secret:
+#
+#       kubectl create secret docker-registry ghcr-credentials \
+#         --docker-server=ghcr.io \
+#         --docker-username=<user> \
+#         --docker-password=<token> \
+#         -n prod-green-agent
+#
+#   Then the `imagePullSecrets` patch below references it.
+#
+# ── Validation ────────────────────────────────────────────────────────────
+#   kubectl kustomize config/overlays/production/ | head -80
+#   kubectl apply -k config/overlays/production --dry-run=server
+#   kubectl get all -n prod-green-agent
+#   kubectl get raycluster -n prod-green-agent
+#   kubectl get pod -n prod-green-agent -o jsonpath='{.items[0].spec.containers[0].image}'
+#     # → ghcr.io/nurcholishadam/green-agent:v5.0.0
+#
+# ── What's Not in Scope ───────────────────────────────────────────────────
+#   • Ingress / Gateway API — ship as a separate overlay (config/overlays/production/ingress.yaml).
+#   • cert-manager / ExternalDNS — cluster add-ons.
+#   • Blue/green or canary — requires Argo Rollouts / Flagger (separate CRDs).
+#   • Multi-region active-active — needs external coordination (Global LB).
+#   • Secret rotation — use ExternalSecrets / SealedSecrets.
+#
+# ── Changelog ─────────────────────────────────────────────────────────────
+#   5.0.0 (2026-04-10)
+#     Fixed:
+#       • commonLabels → labels with includeSelectors: false
+#         (prevents immutable-selector breakage).
+#       • namespace: green-agent-production → prod-green-agent
+#         (matches namePrefix: prod- and the base's namespace creation).
+#       • images.name: ghcr.io/nurcholishadam/green_agent →
+#         name: green-agent / newName: ghcr.io/nurcholishadam/green-agent
+#         (previous name matched nothing).
+#       • replicas: green-agent-cluster count: 8 → worker-group patch
+#         (RayCluster has no spec.replicas).
+#       • securityContext patch replaced whole object → patches individual
+#         fields (preserves seccompProfile, runAsGroup, fsGroup,
+#         fsGroupChangePolicy; keeps UID 10001 not 1000).
+#       • LOG_LEVEL=WARNING in ConfigMap (masked by env) → Deployment env
+#         patch (env wins over envFrom).
+#       • Removed invented env vars RAY_ENABLED / QUANTUM_ENABLED /
+#         CARBON_API_PROVIDER (no app support; use file override for
+#         carbon.api_provider).
+#     Added:
+#       • labels block (environment: production, instance: green-agent-prod,
+#         criticality: high).
+#       • commonAnnotations (base version, environment).
+#       • HPA production patch (min: 3, max: 50).
+#       • Deployment resource limits patch (1 CPU / 2 Gi → 4 CPU / 8 Gi).
+#       • PDB minAvailable: 2.
+#       • imagePullSecrets patch for GHCR.
+#       • priorityClassName: green-agent-critical (requires PriorityClass).
+#       • Secret creation guidance.
+#       • File override example for green_agent.yaml.
+#       • sortOptions: fifo.
+#       • buildMetadata.
+#       • Validation recipe, "What's Not in Scope", Reviewer Checklist.
+#     Removed:
+#       • Stray `criticality: high` as commonLabels (kept as label but
+#         documented as consumed by PriorityClass patch).
+
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: green-agent-production
+# ── Namespace (matches namePrefix so base Namespace aligns) ───────────────
+namespace: prod-green-agent
+
+# ── Name prefix (produces prod-green-agent from base green-agent) ─────────
 namePrefix: prod-
 
+# ── Base ──────────────────────────────────────────────────────────────────
 resources:
-- ../../base
+  - ../../base
 
-commonLabels:
-  environment: production
-  criticality: high
+# ── Labels (replaces deprecated commonLabels) ─────────────────────────────
+# includeSelectors: false → does NOT touch Deployment.spec.selector.matchLabels
+# (immutable). Critical for the second-and-later apply.
+labels:
+  - pairs:
+      environment: production
+      criticality: high
+      app.kubernetes.io/instance: green-agent-prod
+      app.kubernetes.io/version: "5.0.0"
+    includeSelectors: false
 
+# ── Annotations (overlay-wide) ────────────────────────────────────────────
+commonAnnotations:
+  green-agent.io/base-version: "5.0.0"
+  green-agent.io/environment: production
+  green-agent.io/criticality: high
+
+# ── ConfigMap merge (env-var-style keys only) ─────────────────────────────
+# These become env vars via `envFrom: configMapRef` on the Deployment.
+# NOTE: Deployment `env:` entries WIN over `envFrom` — LOG_LEVEL is also
+# set at env[4] in the base Deployment, so the WARNING value below is
+# masked unless the Deployment env is patched (see the patch below).
 configMapGenerator:
-- name: green-agent-config
-  behavior: merge
-  literals:
-  - LOG_LEVEL=WARNING
-  - RAY_ENABLED=true
-  - QUANTUM_ENABLED=true
-  - CARBON_API_PROVIDER=electricitymap
+  - name: green-agent-config
+    behavior: merge
+    literals:
+      - LOG_LEVEL=WARNING
+      # Do NOT set RAY_ENABLED / QUANTUM_ENABLED / CARBON_API_PROVIDER here —
+      # they are not documented env vars. To change ray.enabled,
+      # quantum.enabled, or carbon.api_provider, override the
+      # green_agent.yaml file content instead (see commented block below).
 
+  # ── File override (commented — uncomment to override green_agent.yaml) ──
+  # - name: green-agent-config
+  #   behavior: merge
+  #   files:
+  #     - green_agent.yaml=production/green_agent.yaml
+  #
+  #   # config/overlays/production/production/green_agent.yaml:
+  #   #
+  #   #   system:
+  #   #     log_level: "WARNING"
+  #   #   ray:
+  #   #     enabled: true
+  #   #   carbon:
+  #   #     api_provider: "electricitymap"
+  #   #   quantum:
+  #   #     enabled: true
+
+# ── Image override ────────────────────────────────────────────────────────
+# Kustomize matches by the base image `name` field (`green-agent`), not the
+# full registry path. `newName:` moves it to GHCR.
 images:
-- name: ghcr.io/nurcholishadam/green_agent
-  newTag: v5.0.0
+  - name: green-agent
+    newName: ghcr.io/nurcholishadam/green-agent
+    newTag: v5.0.0
 
-replicas:
-- name: green-agent-cluster
-  count: 8
-
+# ── Patches ───────────────────────────────────────────────────────────────
 patches:
-- target:
-    kind: RayCluster
-    name: green-agent-cluster
-  patch: |-
-    - op: replace
-      path: /spec/headGroupSpec/template/spec/securityContext
-      value:
-        runAsNonRoot: true
-        runAsUser: 1000
-        fsGroup: 1000
+  # 1. HPA — production bounds (base: min 3 / max 20)
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: green-agent
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+      - op: replace
+        path: /spec/maxReplicas
+        value: 50
+
+  # 2. Deployment — env, resources, pull secret, priority class
+  - target:
+      kind: Deployment
+      name: green-agent
+    patch: |-
+      # LOG_LEVEL env wins over envFrom — set it here (base index 4)
+      - op: replace
+        path: /spec/template/spec/containers/0/env/4/value
+        value: WARNING
+      # Production resource profile
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: "1"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: "2Gi"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/cpu
+        value: "4"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: "8Gi"
+      # GHCR pull secret
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value:
+          - name: ghcr-credentials
+      # PriorityClass — makes `criticality: high` functional
+      - op: add
+        path: /spec/template/spec/priorityClassName
+        value: green-agent-critical
+
+  # 3. RayCluster — worker bounds (base: worker group min 2 / max 20 / idle 60)
+  #    Do NOT target head (spec.headGroupSpec.replicas — keep 1).
+  - target:
+      kind: RayCluster
+      name: green-agent-cluster
+    patch: |-
+      - op: replace
+        path: /spec/workerGroupSpecs/0/replicas
+        value: 8
+      - op: replace
+        path: /spec/workerGroupSpecs/0/minReplicas
+        value: 4
+      - op: replace
+        path: /spec/workerGroupSpecs/0/maxReplicas
+        value: 20
+      - op: replace
+        path: /spec/workerGroupSpecs/0/idleTimeoutSeconds
+        value: 120
+
+  # 4. PodDisruptionBudget — production minAvailable (base: 1)
+  - target:
+      kind: PodDisruptionBudget
+      name: green-agent
+    patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 2
+
+# ── Sort options ──────────────────────────────────────────────────────────
+# Matches base ordering (Namespace → SA → ConfigMap → Deployment → Service
+# → RayCluster → HPA → PDB → NetworkPolicy). Overlay patches do not change
+# the ordering.
+sortOptions:
+  order: fifo
+
+# ── Build metadata ────────────────────────────────────────────────────────
+buildMetadata:
+  - managedByLabel
+  - originAnnotations
+
+# =============================================================================
+# Companion: PriorityClass (cluster-scoped — apply once per cluster)
+# =============================================================================
+# The `priorityClassName: green-agent-critical` patch above requires this
+# PriorityClass to exist. Create it separately:
+#
+# apiVersion: scheduling.k8s.io/v1
+# kind: PriorityClass
+# metadata:
+#   name: green-agent-critical
+# value: 1000000
+# globalDefault: false
+# description: "Green Agent production workloads — evicted last under pressure"
+#
+# Add to a separate `cluster-resources/` overlay (cluster-scoped resources
+# do not belong in namespace overlays).
+
+# =============================================================================
+# Companion: Secret (create imperatively — never commit)
+# =============================================================================
+#   kubectl create secret generic green-agent-secrets \
+#     --from-literal=ZERO_TRUST_TOKEN="$ZERO_TRUST_TOKEN" \
+#     --from-literal=RLHF_API_KEY="$RLHF_API_KEY" \
+#     --from-literal=CARBON_API_KEY="$CARBON_API_KEY" \
+#     --from-literal=HELIUM_API_KEY="$HELIUM_API_KEY" \
+#     -n prod-green-agent
+#
+#   kubectl create secret docker-registry ghcr-credentials \
+#     --docker-server=ghcr.io \
+#     --docker-username="$GHCR_USER" \
+#     --docker-password="$GHCR_TOKEN" \
+#     -n prod-green-agent
+
+# =============================================================================
+# Companion: .env.production (referenced by Scripts v1.2 deploy.sh)
+# =============================================================================
+# Save as config/environments/.env.production (gitignored):
+#
+#   ENVIRONMENT=production
+#   NAMESPACE=prod-green-agent
+#   LOG_LEVEL=WARNING
+#   ENHANCEMENTS_ENABLED=true
+#   MODP_ENABLED=true
+#   RLHF_ENABLED=true
+#   FLEXGEN_ENABLED=true
+#   ZERO_TRUST_ENABLED=true
+#   DIFFERENTIAL_PRIVACY_ENABLED=true
+#   TRAINING_ENABLED=true
+#   SYMBOLIC_POLICY=symbolic_policy.yaml
+
+# =============================================================================
+# Reviewer Checklist
+# =============================================================================
+#   [ ] `commonLabels` is NOT present — use `labels:` with includeSelectors: false.
+#   [ ] `namespace:` and `namePrefix:` produce a consistent final namespace.
+#       `kubectl kustomize . | grep 'namespace:'` shows only prod-green-agent.
+#   [ ] `images.name` matches the base image name (`green-agent`), not the
+#       registry path. `newName` / `newTag` set the registry + version.
+#   [ ] No `replicas:` override targets `green-agent-cluster` (RayCluster
+#       head). Worker scaling is via the RayCluster patch.
+#   [ ] `securityContext` patch (if any) touches individual fields, not the
+#       whole object. `seccompProfile: RuntimeDefault` is preserved.
+#   [ ] `LOG_LEVEL` is set via Deployment env patch (not just ConfigMap).
+#   [ ] No invented env vars (RAY_ENABLED, QUANTUM_ENABLED,
+#       CARBON_API_PROVIDER) remain.
+#   [ ] Secret `green-agent-secrets` + pull secret `ghcr-credentials` exist
+#       in `prod-green-agent` before first deploy.
+#   [ ] PriorityClass `green-agent-critical` exists (cluster-scoped).
+#   [ ] `kubectl apply -k config/overlays/production --dry-run=server` passes.
+#   [ ] `kubectl get pod -n prod-green-agent -o jsonpath='{.items[0].spec.containers[0].image}'`
+#       shows `ghcr.io/nurcholishadam/green-agent:v5.0.0`.
+#   [ ] `kubectl get raycluster -n prod-green-agent` shows worker replicas = 8.
+#   [ ] Companion `.env.production` exists and matches overlay env vars.
+# =============================================================================
