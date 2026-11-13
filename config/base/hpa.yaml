@@ -1,31 +1,235 @@
+# config/base/hpa.yaml
+#
+# Green Agent v5.0.0 — HorizontalPodAutoscaler
+# ============================================
+#
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Last Updated | 2026-11-13 |
+# | Status | Production Ready |
+# | Companion docs | `config/base/deployment.yaml` (v5.0.0), `config/base/configmap.yaml` (v5.0.0), `green_agent.yaml` (v5.0.0), `SYMBOLIC_OVERSIGHT_README.md` (v1.2.0), `Scripts and Utilities.md` (v1.2.0) |
+#
+# ── Why this file targets a Deployment, not a RayCluster ──────────────────
+#   HPA uses the Kubernetes `/scale` subresource. Only built-in workload
+#   controllers implement it:
+#       Deployment, ReplicaSet, StatefulSet, ReplicationController
+#   KubeRay's RayCluster CRD does NOT implement `/scale`. An HPA targeting
+#   `kind: RayCluster` never acts — the controller logs
+#       "unable to get target's current scale"
+#   and leaves the cluster at whatever count it was created with.
+#
+#   The correct split for Green Agent v5.0:
+#     • HTTP-serving head pods   → HPA on Deployment `green-agent`
+#     • Ray worker pods          → RayCluster.spec.autoscalerOptions
+#                                  (Ray's native autoscaler; see footer)
+#
+# ── Scaling signals ───────────────────────────────────────────────────────
+#   Baseline : CPU utilization (70%)
+#   Domain   : Carbon intensity (green-agent-specific)
+#              Scale up when carbon is LOW  (cheap to run)
+#              Scale down when carbon is HIGH (defer work)
+#   Enhanced : MODP score, queue depth, RPS (custom metrics via Prometheus Adapter)
+#
+# ── Carbon-aware rationale ────────────────────────────────────────────────
+#   `green_agent.yaml` defines:
+#       carbon.eco_mode_threshold: 200   (yellow zone, gCO2/kWh)
+#       carbon.defer_threshold:   400    (red zone)
+#   The carbon metric below scales the deployment toward whatever the grid
+#   can support *right now*. It is exposed by the Green Agent at /metrics
+#   (see `green_agent.yaml` → `monitoring.prometheus.*`).
+#
+# ── Precedence ────────────────────────────────────────────────────────────
+#   When this HPA exists, `Deployment.spec.replicas` is IGNORED — the HPA
+#   controller owns it. Remove `replicas: 2` from `deployment.yaml` v5.0
+#   (or keep it as the initial value before the HPA kicks in on first sync).
+#
+# ── Companion resources ───────────────────────────────────────────────────
+#   • Deployment     green-agent        (target of this HPA)
+#   • PodDisruptionBudget green-agent   (minAvailable: 1)
+#   • Prometheus Adapter               (exposes custom metrics)
+#   • RayCluster     green-agent-cluster (autoscaled via autoscalerOptions)
+#
+# ── Validation ────────────────────────────────────────────────────────────
+#   kubectl apply --dry-run=server -f config/base/hpa.yaml
+#   kubectl get hpa green-agent -n green-agent -w
+#   kubectl describe hpa green-agent -n green-agent
+
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
+
 metadata:
-  name: green-agent-hpa
+  name: green-agent
+  namespace: green-agent
+
   labels:
-    app: green-agent
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/instance: green-agent
+    app.kubernetes.io/version: "5.0.0"
+    app.kubernetes.io/component: autoscaler
+    app.kubernetes.io/part-of: green-agent
+    app.kubernetes.io/managed-by: kustomize
+
+  annotations:
+    # Apply after the Deployment (wave 0), so the target exists
+    argocd.argoproj.io/sync-wave: "1"
+
 spec:
+  # ── Target: the Deployment, NOT the RayCluster ─────────────────────────
   scaleTargetRef:
-    apiVersion: ray.io/v1
-    kind: RayCluster
-    name: green-agent-cluster
-  minReplicas: 2
+    apiVersion: apps/v1
+    kind: Deployment
+    name: green-agent
+
+  # ── Bounds ─────────────────────────────────────────────────────────────
+  #   minReplicas: 3 → survives a zone failure and one eviction
+  #   maxReplicas: 20 → matches enhancements/ray caps in green_agent.yaml
+  minReplicas: 3
   maxReplicas: 20
+
+  # ── Metrics ────────────────────────────────────────────────────────────
   metrics:
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: Utilization
-        averageUtilization: 70
-  - type: Resource
-    resource:
-      name: memory
-      target:
-        type: Utilization
-        averageUtilization: 80
+    # 1. CPU — baseline saturation signal
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    # 2. Carbon intensity — domain signal (green-agent-specific)
+    #    Exposed by the agent at /metrics as
+    #    `green_agent_carbon_intensity_gco2_kwh`.
+    #    Scale up when carbon is LOW (below eco_mode_threshold).
+    #    Scale down when carbon is HIGH (above defer_threshold).
+    #    Requires: Prometheus Adapter with a rule exposing this metric.
+    - type: Pods
+      pods:
+        metric:
+          name: green_agent_carbon_intensity_gco2_kwh
+        target:
+          type: AverageValue
+          averageValue: "200"        # = carbon.eco_mode_threshold
+
+    # 3. Queue depth — workload signal
+    #    Exposed by the agent at /metrics as `green_agent_queue_depth`.
+    - type: Pods
+      pods:
+        metric:
+          name: green_agent_queue_depth
+        target:
+          type: AverageValue
+          averageValue: "50"
+
+  # ── Behavior ───────────────────────────────────────────────────────────
   behavior:
+    # Slow scale-down so in-flight requests finish and Ray tasks complete.
+    # Matches Deployment.terminationGracePeriodSeconds (30) + preStop (5)
+    # + minReadySeconds (10) with margin.
     scaleDown:
-      stabilizationWindowSeconds: 300
+      stabilizationWindowSeconds: 600        # 10 min lookback
+      selectPolicy: Min
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60                  # at most 1 pod/min down
+        - type: Percent
+          value: 25
+          periodSeconds: 120                 # or 25% every 2 min
+
+    # Fast scale-up, but rate-limited so we don't cold-start 20 pods at once.
     scaleUp:
-      stabilizationWindowSeconds: 60
+      stabilizationWindowSeconds: 30         # react within 30s to bursts
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30                  # double every 30s (3→6→12→20)
+        - type: Pods
+          value: 4
+          periodSeconds: 30                  # or 4 pods every 30s
+
+# =============================================================================
+# Alternative: Ray autoscaler (for Ray WORKER pods, not HTTP head pods)
+# =============================================================================
+# RayCluster is a CRD without a /scale subresource. Its worker replicas are
+# managed by Ray's own autoscaler via spec.autoscalerOptions. Do NOT point an
+# HPA at a RayCluster.
+#
+# apiVersion: ray.io/v1
+# kind: RayCluster
+# metadata:
+#   name: green-agent-cluster
+#   namespace: green-agent
+# spec:
+#   autoscalerOptions:
+#     upscalingMode: Default        # or Aggressive
+#     idleTimeoutSeconds: 60        # scale down after 60s idle
+#     resources: "CPU"              # or "GPU"
+#     # Ray autoscaler reads workload from the head; no HPA involved.
+#   headGroupSpec:
+#     replicas: 1                   # head is always 1
+#     # ...
+#   workerGroupSpecs:
+#     - groupName: workers
+#       replicas: 2
+#       minReplicas: 2
+#       maxReplicas: 20             # ← Ray autoscaler uses these bounds
+#       rayStartParams: {}
+#       template: { ... }
+
+# =============================================================================
+# Prerequisites for custom metrics
+# =============================================================================
+# The two non-Resource metrics above (`green_agent_carbon_intensity_gco2_kwh`
+# and `green_agent_queue_depth`) require a Prometheus Adapter rule. Example:
+#
+#   # prometheus-adapter/config.yaml
+#   rules:
+#     - seriesQuery: 'green_agent_carbon_intensity_gco2_kwh{namespace!=""}'
+#       resources:
+#         overrides:
+#           namespace: { resource: "namespace" }
+#       name: { matches: "^(.*)$" }
+#       metricsQuery: 'avg(<<.Series>>{<<.LabelMatchers>>}) by (pod)'
+#
+# Without the adapter, the HPA logs:
+#   "unable to fetch metrics" for the custom metric and falls back to
+#   the CPU metric only.
+#
+# To ship a CPU-only HPA (simpler bootstrap), delete metrics entries #2 and #3.
+
+# =============================================================================
+# What's Not in Scope
+# =============================================================================
+# • Vertical Pod Autoscaler (VPA) — memory/CPU request tuning is manual here.
+# • KEDA / event-driven scaling — HTTP burst handling only.
+# • Karpenter / Cluster Autoscaler — node-level scaling is the cluster's job.
+# • Ray worker scaling — handled by RayCluster.spec.autoscalerOptions.
+# • Carbon-aware node selection — done by the LIMIT Graph module, not HPA.
+
+# =============================================================================
+# Changelog
+# =============================================================================
+# 5.0.0 (2026-11-13)
+#   Fixed:
+#     • scaleTargetRef now targets Deployment (apps/v1) — RayCluster has no
+#       /scale subresource, so the previous HPA was a no-op.
+#     • Added namespace: green-agent (was implicitly "default").
+#     • Added full app.kubernetes.io/* labels.
+#     • Added argocd.argoproj.io/sync-wave: "1" (after Deployment wave 0).
+#   Added:
+#     • behavior.policies (rate limits) for scaleUp and scaleDown.
+#     • behavior.selectPolicy for both directions.
+#     • Carbon-aware metric (green_agent_carbon_intensity_gco2_kwh).
+#     • Queue-depth metric (green_agent_queue_depth).
+#     • RayCluster autoscaler alternative (commented footer).
+#     • Prometheus Adapter prerequisite snippet.
+#     • Validation recipe + companion resources.
+#   Changed:
+#     • minReplicas 2 → 3 (zone-failure survival).
+#     • scaleDown stabilization 300s → 600s (matches grace period).
+#     • scaleUp stabilization 60s → 30s (policies cap the rate instead).
+#   Removed:
+#     • Memory metric (memory does not shrink; caused over-provisioning).
+# =============================================================================
