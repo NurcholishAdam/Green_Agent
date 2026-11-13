@@ -1,27 +1,329 @@
+# config/overlays/staging/kustomization.yaml
+#
+# Green Agent v5.0.0 — Staging overlay
+# ====================================
+#
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Last Updated | 2026-11-13 |
+# | Status | Production Ready |
+# | Environment | staging |
+# | Base | ../../base (v5.0.0) |
+# | Companion docs | `config/base/*` (v5.0.0), `green_agent.yaml` (v5.0.0), `Scripts and Utilities.md` (v1.2.0), `REPOSITORY_REFACTORING_GUIDE.md` (v0.2.0) |
+#
+# ── Environment role ──────────────────────────────────────────────────────
+#   Staging is a **pre-production gate**. It mirrors production's shape
+#   (same namespace pattern, same PSA tier, same image registry) but with
+#   smaller bounds:
+#
+#                    dev            staging        production
+#     HPA min/max    1/2            2/10           3/50
+#     Ray workers    0-2            2-8            4-20
+#     CPU/mem        base (500m/1)  base (500m/1)  1/2 → 4/8
+#     LOG_LEVEL      DEBUG          INFO           WARNING
+#     PSA            baseline       restricted     restricted
+#     PriorityClass  none           none           critical
+#
+# ── Overlay strategy ──────────────────────────────────────────────────────
+#   Namespace-per-env (consistent with dev and prod):
+#     namespace: staging-green-agent
+#     namePrefix: staging-            # matches dev- / prod- pattern
+#
+#   The base creates `Namespace green-agent`. With `namePrefix: staging-`
+#   it becomes `staging-green-agent`, matching `namespace:` above. All
+#   namespaced resources land in `staging-green-agent`.
+#
+#   The original file mixed two strategies:
+#     namespace: green-agent-staging   # env-suffixed
+#     namePrefix: staging-             # instance-suffixed
+#   This produced an unused `staging-green-agent` Namespace (from base) and
+#   failed to create `green-agent-staging` — every apply failed with
+#   `namespaces "green-agent-staging" not found`.
+#
+# ── Image override ────────────────────────────────────────────────────────
+#   Kustomize's `images:` matches the base image by its **`name` field**
+#   (`green-agent`), not the full registry path. Use `newName:` for the
+#   registry override:
+#     images:
+#       - name: green-agent                       # base name
+#         newName: ghcr.io/nurcholishadam/green-agent
+#         newTag: v5.0.0-rc1
+#   Do NOT put the full path in `name:` — it won't match anything. Also:
+#   `green_agent` (underscore) vs `green-agent` (hyphen) are DIFFERENT
+#   image names. The Dockerfile builds `green-agent`; GHCR path is
+#   `ghcr.io/nurcholishadam/green-agent`.
+#
+#   Verify the tag exists before deploying:
+#       docker buildx imagetools inspect ghcr.io/nurcholishadam/green-agent:v5.0.0-rc1
+#
+# ── Replicas — which resource, which field ────────────────────────────────
+#   The `replicas:` transformer targets `spec.replicas`. That works for
+#   Deployment / StatefulSet / ReplicaSet. It does NOT work for RayCluster
+#   (no top-level `spec.replicas`; use `spec.workerGroupSpecs[].replicas`).
+#
+#   Staging scaling:
+#     • HTTP Deployment  → HPA patch (min: 2, max: 10)
+#     • Ray workers      → RayCluster worker-group patch (2–8)
+#     • Ray head         → stays at 1 (never scale — multiple heads break Ray)
+#
+# ── Env-var overrides ─────────────────────────────────────────────────────
+#   ConfigMap data keys become env vars via `envFrom: configMapRef`. BUT:
+#   Deployment `env:` entries WIN over `envFrom`. Base Deployment v5.0 sets
+#   `LOG_LEVEL: INFO` at `env[4]` — a ConfigMap key `LOG_LEVEL=INFO` is
+#   redundant (same value) and any other value would be masked.
+#
+#   `RAY_ENABLED` and `CARBON_API_PROVIDER` are NOT documented env vars. The
+#   app reads `ray.enabled` / `carbon.api_provider` from the YAML file
+#   (mounted at `/app/config/green_agent.yaml`). To change those, override
+#   the YAML file via `configMapGenerator.files:` — not via env vars.
+#
+# ── Secrets ───────────────────────────────────────────────────────────────
+#   Staging tokens come from a K8s Secret, created once per cluster:
+#
+#       kubectl create namespace staging-green-agent    # if not via this overlay
+#       kubectl create secret generic green-agent-secrets \
+#         --from-literal=ZERO_TRUST_TOKEN="$STAGING_ZERO_TRUST_TOKEN" \
+#         --from-literal=RLHF_API_KEY="$STAGING_RLHF_API_KEY" \
+#         --from-literal=CARBON_API_KEY="$STAGING_CARBON_API_KEY" \
+#         -n staging-green-agent
+#
+#   NEVER commit real secrets to Git. For GitOps-safe rotation use
+#   ExternalSecrets or SealedSecrets.
+#
+# ── Image pull secret ─────────────────────────────────────────────────────
+#   GHCR requires authentication for private images:
+#
+#       kubectl create secret docker-registry ghcr-credentials \
+#         --docker-server=ghcr.io \
+#         --docker-username=<user> \
+#         --docker-password=<token> \
+#         -n staging-green-agent
+#
+# ── Validation ────────────────────────────────────────────────────────────
+#   kubectl kustomize config/overlays/staging/ | head -80
+#   kubectl apply -k config/overlays/staging --dry-run=server
+#   kubectl get all -n staging-green-agent
+#   kubectl get raycluster -n staging-green-agent
+#   kubectl get pod -n staging-green-agent -o jsonpath='{.items[0].spec.containers[0].image}'
+#     # → ghcr.io/nurcholishadam/green-agent:v5.0.0-rc1
+#
+# ── What's Not in Scope ───────────────────────────────────────────────────
+#   • Ingress / Gateway API — ship as a separate overlay.
+#   • cert-manager / ExternalDNS — cluster add-ons.
+#   • Blue/green staging — use `nameSuffix` + a second overlay.
+#   • PriorityClass — staging does not preempt; use default priority.
+#   • Secret rotation — use ExternalSecrets / SealedSecrets.
+#
+# ── Changelog ─────────────────────────────────────────────────────────────
+#   5.0.0 (2026-04-10)
+#     Fixed:
+#       • commonLabels → labels with includeSelectors: false
+#         (prevents immutable-selector breakage).
+#       • namespace: green-agent-staging → staging-green-agent
+#         (matches namePrefix: staging- and the base's namespace creation).
+#       • images.name: ghcr.io/nurcholishadam/green_agent →
+#         name: green-agent / newName: ghcr.io/nurcholishadam/green-agent
+#         (previous name matched nothing — rc1 tag was never applied).
+#       • replicas: green-agent-cluster count: 4 → worker-group patch
+#         (RayCluster has no spec.replicas; head must stay 1).
+#       • Removed invented env vars RAY_ENABLED / CARBON_API_PROVIDER
+#         (no app support; use file override for carbon.api_provider).
+#       • LOG_LEVEL=INFO kept in ConfigMap for symmetry but documented as
+#         redundant with Deployment env (matches base value).
+#     Added:
+#       • labels block (environment: staging, instance: green-agent-staging,
+#         criticality: medium).
+#       • commonAnnotations (base version, environment).
+#       • HPA staging patch (min: 2, max: 10).
+#       • RayCluster worker-group patch (replicas: 4, min: 2, max: 8,
+#         idle: 60s).
+#       • imagePullSecrets patch for GHCR.
+#       • Secret creation guidance.
+#       • File override example for green_agent.yaml.
+#       • sortOptions: fifo.
+#       • buildMetadata.
+#       • Validation recipe, "What's Not in Scope", Reviewer Checklist.
+#     Removed:
+#       • `replicas:` block targeting green-agent-cluster (RayCluster).
+
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: green-agent-staging
+# ── Namespace (matches namePrefix so base Namespace aligns) ───────────────
+namespace: staging-green-agent
+
+# ── Name prefix (produces staging-green-agent from base green-agent) ──────
 namePrefix: staging-
 
+# ── Base ──────────────────────────────────────────────────────────────────
 resources:
-- ../../base
+  - ../../base
 
-commonLabels:
-  environment: staging
+# ── Labels (replaces deprecated commonLabels) ─────────────────────────────
+# includeSelectors: false → does NOT touch Deployment.spec.selector.matchLabels
+# (immutable). Critical for the second-and-later apply.
+labels:
+  - pairs:
+      environment: staging
+      criticality: medium
+      app.kubernetes.io/instance: green-agent-staging
+      app.kubernetes.io/version: "5.0.0-rc1"
+    includeSelectors: false
 
+# ── Annotations (overlay-wide) ────────────────────────────────────────────
+commonAnnotations:
+  green-agent.io/base-version: "5.0.0"
+  green-agent.io/environment: staging
+
+# ── ConfigMap merge (env-var-style keys only) ─────────────────────────────
+# These become env vars via `envFrom: configMapRef` on the Deployment.
+# NOTE: Deployment `env:` entries WIN over `envFrom` — LOG_LEVEL is already
+# set at env[4] in the base Deployment to `INFO`, so this key is redundant
+# (matches base value). It is kept for symmetry with prod, where the value
+# differs (WARNING) and is patched on the Deployment.
 configMapGenerator:
-- name: green-agent-config
-  behavior: merge
-  literals:
-  - LOG_LEVEL=INFO
-  - RAY_ENABLED=true
-  - CARBON_API_PROVIDER=electricitymap
+  - name: green-agent-config
+    behavior: merge
+    literals:
+      - LOG_LEVEL=INFO
+      # Do NOT set RAY_ENABLED / CARBON_API_PROVIDER here — they are not
+      # documented env vars. To change ray.enabled or carbon.api_provider,
+      # override the green_agent.yaml file content instead (see below).
 
+  # ── File override (commented — uncomment to override green_agent.yaml) ──
+  # - name: green-agent-config
+  #   behavior: merge
+  #   files:
+  #     - green_agent.yaml=staging/green_agent.yaml
+  #
+  #   # config/overlays/staging/staging/green_agent.yaml:
+  #   #
+  #   #   carbon:
+  #   #     api_provider: "electricitymap"
+  #   #   ray:
+  #   #     enabled: true
+  #   #     num_workers: 4
+
+# ── Image override ────────────────────────────────────────────────────────
+# Kustomize matches by the base image `name` field (`green-agent`), not the
+# full registry path. `newName:` moves it to GHCR.
+# Verify the tag exists before deploying:
+#   docker buildx imagetools inspect ghcr.io/nurcholishadam/green-agent:v5.0.0-rc1
 images:
-- name: ghcr.io/nurcholishadam/green_agent
-  newTag: v5.0.0-rc1
+  - name: green-agent
+    newName: ghcr.io/nurcholishadam/green-agent
+    newTag: v5.0.0-rc1
 
-replicas:
-- name: green-agent-cluster
-  count: 4
+# ── Patches ───────────────────────────────────────────────────────────────
+patches:
+  # 1. HPA — staging bounds (base: min 3 / max 20)
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: green-agent
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 10
+
+  # 2. Deployment — GHCR pull secret (base has it commented out)
+  - target:
+      kind: Deployment
+      name: green-agent
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value:
+          - name: ghcr-credentials
+
+  # 3. RayCluster — worker bounds (base: worker group min 2 / max 20 / idle 60)
+  #    Do NOT target head (spec.headGroupSpec.replicas — keep 1).
+  - target:
+      kind: RayCluster
+      name: green-agent-cluster
+    patch: |-
+      - op: replace
+        path: /spec/workerGroupSpecs/0/replicas
+        value: 4
+      - op: replace
+        path: /spec/workerGroupSpecs/0/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/workerGroupSpecs/0/maxReplicas
+        value: 8
+      - op: replace
+        path: /spec/workerGroupSpecs/0/idleTimeoutSeconds
+        value: 60
+
+# ── Sort options ──────────────────────────────────────────────────────────
+# Matches base ordering (Namespace → SA → ConfigMap → Deployment → Service
+# → RayCluster → HPA → PDB → NetworkPolicy).
+sortOptions:
+  order: fifo
+
+# ── Build metadata ────────────────────────────────────────────────────────
+buildMetadata:
+  - managedByLabel
+  - originAnnotations
+
+# =============================================================================
+# Companion: Secret (create imperatively — never commit)
+# =============================================================================
+#   kubectl create secret generic green-agent-secrets \
+#     --from-literal=ZERO_TRUST_TOKEN="$STAGING_ZERO_TRUST_TOKEN" \
+#     --from-literal=RLHF_API_KEY="$STAGING_RLHF_API_KEY" \
+#     --from-literal=CARBON_API_KEY="$STAGING_CARBON_API_KEY" \
+#     -n staging-green-agent
+#
+#   kubectl create secret docker-registry ghcr-credentials \
+#     --docker-server=ghcr.io \
+#     --docker-username="$GHCR_USER" \
+#     --docker-password="$GHCR_TOKEN" \
+#     -n staging-green-agent
+
+# =============================================================================
+# Companion: .env.staging (referenced by Scripts v1.2 deploy.sh)
+# =============================================================================
+# Save as config/environments/.env.staging (gitignored):
+#
+#   ENVIRONMENT=staging
+#   NAMESPACE=staging-green-agent
+#   LOG_LEVEL=INFO
+#   ENHANCEMENTS_ENABLED=true
+#   MODP_ENABLED=true
+#   RLHF_ENABLED=true
+#   FLEXGEN_ENABLED=true
+#   ZERO_TRUST_ENABLED=true
+#   DIFFERENTIAL_PRIVACY_ENABLED=false
+#   TRAINING_ENABLED=false
+#   SYMBOLIC_POLICY=symbolic_policy.yaml
+
+# =============================================================================
+# Reviewer Checklist
+# =============================================================================
+#   [ ] `commonLabels` is NOT present — use `labels:` with includeSelectors: false.
+#   [ ] `namespace:` and `namePrefix:` produce a consistent final namespace
+#       (`staging-green-agent`). Verify:
+#       `kubectl kustomize . | grep 'namespace:'`
+#   [ ] `images.name` matches the base image name (`green-agent`), not the
+#       registry path. `newName` / `newTag` set the registry + version.
+#   [ ] `v5.0.0-rc1` tag exists in GHCR (verify with
+#       `docker buildx imagetools inspect`).
+#   [ ] No `replicas:` override targets `green-agent-cluster` (RayCluster
+#       head). Worker scaling is via the RayCluster patch.
+#   [ ] `LOG_LEVEL=INFO` matches the base Deployment env value (redundant but
+#       consistent with prod pattern).
+#   [ ] No invented env vars (RAY_ENABLED, CARBON_API_PROVIDER) remain.
+#   [ ] Secret `green-agent-secrets` + pull secret `ghcr-credentials` exist
+#       in `staging-green-agent` before first deploy.
+#   [ ] `kubectl apply -k config/overlays/staging --dry-run=server` passes.
+#   [ ] `kubectl get pod -n staging-green-agent -o jsonpath='{.items[0].spec.containers[0].image}'`
+#       shows `ghcr.io/nurcholishadam/green-agent:v5.0.0-rc1`.
+#   [ ] `kubectl get raycluster -n staging-green-agent` shows worker
+#       replicas = 4.
+#   [ ] `kubectl get hpa -n staging-green-agent` shows min 2 / max 10.
+#   [ ] Companion `.env.staging` exists and matches overlay env vars.
+# =============================================================================
