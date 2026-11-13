@@ -1,0 +1,336 @@
+# monitoring/prometheus/rules/green_agent.yaml
+#
+# Green Agent v5.0.0 — PrometheusRule
+# ===================================
+#
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Last Updated | 2026-04-10 |
+# | Status | Production Ready |
+# | Companion files | `alertmanager.yml` (v5.0.0) · `alertmanager_templates/green_agent.slack` · `alertmanager_templates/green_agent.pagerduty` |
+#
+# ── Why this file exists ──────────────────────────────────────────────────
+#   Alertmanager has no `expr` field — the alerts it groups/routes must be
+#   defined as PrometheusRules (or equivalent) upstream. Without this file,
+#   the config has no alerts to route.
+#
+#   Every alert below routes via a `severity` + `component` label. Component
+#   values match the routing tree in `alertmanager.yml`:
+#     carbon | symbolic | zero_trust | modp | flexgen | moe | evolutionary
+#     | rlhf | graph | checkpoint | health
+#
+# ── Severity values ───────────────────────────────────────────────────────
+#   These rules emit BOTH vocabularies where applicable:
+#     • `critical` — pages PagerDuty immediately
+#     • `warning`  — Slack alerts channel
+#     • `info`     — Slack info channel
+#   Symbolic-derived alerts (via exporter) emit `high` / `medium` / `low`
+#   to preserve the symbolic layer's vocabulary. Alertmanager's routing tree
+#   matches both `warning` and `high` on the same route.
+#
+# ── Metric sources ────────────────────────────────────────────────────────
+#   All `green_agent_*` metrics are exported at `:8000/metrics` by the agent
+#   (see `MODULE_GUIDE.md` §Metric Reference) or derived from
+#   `symbolic_violations.json` by the symbolic exporter.
+#
+# ── Validation ────────────────────────────────────────────────────────────
+#   promtool check rules monitoring/prometheus/rules/green_agent.yaml
+#   kubectl apply --dry-run=server -f monitoring/prometheus/rules/green_agent.yaml
+#   kubectl get prometheusrule green-agent -n green-agent
+#
+# ── What's Not in Scope ───────────────────────────────────────────────────
+#   • Cross-cluster alerting — Thanos Ruler / Mimir required.
+#   • Anomaly detection rules — separate ML-based detector.
+#   • Synthetic probes (Blackbox exporter) — separate manifest.
+#   • Recording rules — add in `monitoring/prometheus/rules/recording.yaml`.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+
+metadata:
+  name: green-agent
+  namespace: green-agent
+  labels:
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/instance: green-agent
+    app.kubernetes.io/version: "5.0.0"
+    app.kubernetes.io/component: alerts
+    app.kubernetes.io/part-of: green-agent
+    app.kubernetes.io/managed-by: kustomize
+    release: prometheus                # discovered by kube-prometheus-stack
+
+spec:
+  groups:
+    # ═════════════════════════════════════════════════════════════════════
+    # CARBON — the Green Agent's core purpose
+    # ═════════════════════════════════════════════════════════════════════
+    - name: green-agent.carbon
+      interval: 60s
+      rules:
+        - alert: CarbonIntensityHigh
+          expr: green_agent_carbon_intensity_gco2_kwh > 400
+          for: 15m
+          labels:
+            severity: warning           # mapped from symbolic `high`
+            component: carbon
+          annotations:
+            summary: "Grid carbon intensity above defer threshold ({{ $value | printf \"%.0f\" }} gCO2/kWh)"
+            description: "Current grid carbon intensity exceeds carbon.defer_threshold (400 gCO2/kWh). Workloads should defer or shift regions."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/docs/runbooks/carbon-intensity.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_carbon"
+
+        - alert: CarbonIntensityCritical
+          expr: green_agent_carbon_intensity_gco2_kwh > 600
+          for: 5m
+          labels:
+            severity: critical
+            component: carbon
+          annotations:
+            summary: "Grid carbon intensity critically high ({{ $value | printf \"%.0f\" }} gCO2/kWh)"
+            description: "Sustained carbon intensity above 600 gCO2/kWh. Defer non-urgent work and enable eco_mode."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/docs/runbooks/carbon-critical.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_carbon"
+
+        - alert: CarbonDataStale
+          expr: time() - green_agent_carbon_last_update_timestamp_seconds > 1800
+          for: 15m
+          labels:
+            severity: warning
+            component: carbon
+          annotations:
+            summary: "Carbon intensity data stale (>30 min)"
+            description: "No fresh carbon-intensity reading in the last 30 minutes. The provider may be down — the fallback chain is active."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/config/free_apis_config.yaml"
+            dashboard_url: "https://grafana.example.com/d/green_agent_carbon"
+
+    # ═════════════════════════════════════════════════════════════════════
+    # MODP — composite score regression
+    # ═════════════════════════════════════════════════════════════════════
+    - name: green-agent.modp
+      interval: 60s
+      rules:
+        - alert: MODPScoreLow
+          expr: green_agent_modp_score < 0.4
+          for: 10m
+          labels:
+            severity: medium            # → Slack alerts channel
+            component: modp
+          annotations:
+            summary: "MODP composite score below 0.4 ({{ $value | printf \"%.2f\" }})"
+            description: "Multi-objective performance regression. Review the [accuracy, energy, latency, carbon] trade-off vector in `modp_score`."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/docs/runbooks/modp-regression.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_modp"
+
+    # ═════════════════════════════════════════════════════════════════════
+    # FLEXGEN — energy spike
+    # ═════════════════════════════════════════════════════════════════════
+    - name: green-agent.flexgen
+      interval: 60s
+      rules:
+        - alert: FlexGenEnergySpike
+          expr: rate(green_agent_flexgen_energy_kwh_total[5m]) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+            component: flexgen
+          annotations:
+            summary: "FlexGen energy consumption spiking ({{ $value | printf \"%.3f\" }} kWh/min)"
+            description: "FlexGen delegated inference is consuming unusually high energy. Consider switching precision (fp16 → int8)."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/docs/runbooks/flexgen-energy.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_flexgen"
+
+    # ═════════════════════════════════════════════════════════════════════
+    # MoE — routing stability
+    # ═════════════════════════════════════════════════════════════════════
+    - name: green-agent.moe
+      interval: 60s
+      rules:
+        - alert: MoEGateUnstable
+          expr: green_agent_moe_gate_stddev > 0.2
+          for: 15m
+          labels:
+            severity: warning
+            component: moe
+          annotations:
+            summary: "MoE routing unstable (stddev {{ $value | printf \"%.2f\" }})"
+            description: "Expert gating weights are oscillating. Distillation may be failing or experts are unbalanced."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/docs/runbooks/moe-instability.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_moe"
+
+    # ═════════════════════════════════════════════════════════════════════
+    # EVOLUTIONARY — convergence stagnation
+    # ═════════════════════════════════════════════════════════════════════
+    - name: green-agent.evolutionary
+      interval: 5m
+      rules:
+        - alert: EvolutionaryStagnation
+          expr: green_agent_evolutionary_fitness_delta_1h < 0.01
+          for: 1h
+          labels:
+            severity: medium
+            component: evolutionary
+          annotations:
+            summary: "Evolutionary optimisation stalled (Δfitness/1h {{ $value | printf \"%.3f\" }})"
+            description: "Best fitness has not improved in 1 hour. Consider `restart_evolution` action or larger population_size."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/docs/runbooks/evolutionary-stagnation.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_evolutionary"
+
+    # ═════════════════════════════════════════════════════════════════════
+    # RLHF — feedback degradation
+    # ═════════════════════════════════════════════════════════════════════
+    - name: green-agent.rlhf
+      interval: 60s
+      rules:
+        - alert: HumanFeedbackLow
+          expr: green_agent_human_feedback_score < 0.3
+          for: 30m
+          labels:
+            severity: medium
+            component: rlhf
+          annotations:
+            summary: "Human feedback score below 0.3 ({{ $value | printf \"%.2f\" }})"
+            description: "RLHF feedback is weak — collect more feedback or retrain the preference model."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/docs/runbooks/rlhf-low-feedback.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_rlhf"
+
+    # ═════════════════════════════════════════════════════════════════════
+    # LIMIT Graph — topology drift
+    # ═════════════════════════════════════════════════════════════════════
+    - name: green-agent.graph
+      interval: 60s
+      rules:
+        - alert: GraphCentralityLow
+          expr: green_agent_graph_centrality < 0.3
+          for: 15m
+          labels:
+            severity: low               # → Slack info channel
+            component: graph
+          annotations:
+            summary: "LIMIT Graph centrality below 0.3 ({{ $value | printf \"%.2f\" }})"
+            description: "Node is topologically peripheral — may receive stale state or miss routing decisions."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/docs/runbooks/graph-centrality.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_graph"
+
+    # ═════════════════════════════════════════════════════════════════════
+    # SYMBOLIC — 4th-layer violation alerts (via exporter)
+    # ═════════════════════════════════════════════════════════════════════
+    - name: green-agent.symbolic
+      interval: 30s
+      rules:
+        - alert: SymbolicViolationCritical
+          expr: green_agent_symbolic_violations_total{severity="critical"} > 0
+          for: 1m
+          labels:
+            severity: critical
+            component: symbolic
+          annotations:
+            summary: "{{ $labels.rule_id }} critical symbolic violation"
+            description: "A critical symbolic rule fired. Check `symbolic_violations.json` for the full trace."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/SYMBOLIC_OVERSIGHT_README.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_symbolic"
+            symbolic_rule_id: "{{ $labels.rule_id }}"
+
+        - alert: SymbolicViolationHigh
+          expr: green_agent_symbolic_violations_total{severity="high"} > 0
+          for: 5m
+          labels:
+            severity: high              # symbolic vocabulary preserved
+            component: symbolic
+          annotations:
+            summary: "{{ $labels.rule_id }} high symbolic violation"
+            description: "A high-severity symbolic rule fired. Review `symbolic_violations.json`."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/SYMBOLIC_OVERSIGHT_README.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_symbolic"
+            symbolic_rule_id: "{{ $labels.rule_id }}"
+
+        - alert: SymbolicViolationMedium
+          expr: green_agent_symbolic_violations_total{severity="medium"} > 0
+          for: 15m
+          labels:
+            severity: medium
+            component: symbolic
+          annotations:
+            summary: "{{ $labels.rule_id }} medium symbolic violation"
+            description: "A medium-severity symbolic rule fired. Review on the next check-in."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/SYMBOLIC_OVERSIGHT_README.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_symbolic"
+            symbolic_rule_id: "{{ $labels.rule_id }}"
+
+    # ═════════════════════════════════════════════════════════════════════
+    # ZERO TRUST — security alerts
+    # ═════════════════════════════════════════════════════════════════════
+    - name: green-agent.zero_trust
+      interval: 60s
+      rules:
+        - alert: ZeroTrustAuthFailure
+          expr: rate(green_agent_zero_trust_auth_failures_total[5m]) > 0.1
+          for: 5m
+          labels:
+            severity: critical
+            component: zero_trust
+          annotations:
+            summary: "Zero Trust authentication failures spiking"
+            description: "Elevated authentication failures — possible credential compromise or misconfiguration."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/docs/runbooks/zero-trust.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_zero_trust"
+
+        - alert: BlockRequestTriggered
+          expr: increase(green_agent_block_request_total[5m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+            component: zero_trust
+          annotations:
+            summary: "block_request action triggered"
+            description: "A symbolic rule fired `block_request` (requires ZERO_TRUST_ENABLED=true). A request was halted."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/SYMBOLIC_OVERSIGHT_README.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_zero_trust"
+
+    # ═════════════════════════════════════════════════════════════════════
+    # TRAINING / CHECKPOINT — staleness
+    # ═════════════════════════════════════════════════════════════════════
+    - name: green-agent.checkpoint
+      interval: 5m
+      rules:
+        - alert: CheckpointStale
+          expr: time() - green_agent_last_checkpoint_timestamp_seconds > 3600
+          for: 15m
+          labels:
+            severity: medium
+            component: checkpoint
+          annotations:
+            summary: "Last checkpoint older than 1 hour"
+            description: "Training has not produced a checkpoint in 1 hour — check TRAINING_ENABLED and the training loop."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/docs/runbooks/checkpoint.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_training"
+
+    # ═════════════════════════════════════════════════════════════════════
+    # HEALTH — exporter up/down
+    # ═════════════════════════════════════════════════════════════════════
+    - name: green-agent.health
+      interval: 60s
+      rules:
+        - alert: SymbolicExporterDown
+          expr: up{job="green-agent-symbolic-exporter"} == 0
+          for: 5m
+          labels:
+            severity: high
+            component: symbolic
+          annotations:
+            summary: "Symbolic violations exporter down"
+            description: "The exporter that reads symbolic_violations.json is unreachable — critical violations will not fire alerts."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/SYMBOLIC_OVERSIGHT_README.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_symbolic"
+
+        - alert: GreenAgentMetricsDown
+          expr: up{job="green-agent"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            component: health
+          annotations:
+            summary: "Green Agent metrics endpoint down"
+            description: "The agent's `/metrics` endpoint is unreachable. Check the Deployment and Service."
+            runbook_url: "https://github.com/NurcholishAdam/Green_Agent/blob/main/Scripts%20and%20Utilities.md"
+            dashboard_url: "https://grafana.example.com/d/green_agent_overview"
