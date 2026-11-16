@@ -1,234 +1,279 @@
 # syntax=docker/dockerfile:1.7
-# =============================================================================
-# Dockerfile — Green Agent (Enhanced v2.0)
-# =============================================================================
-# Multi-stage build with a version-tagged base image, hardened non-root runtime, tini
-# as PID 1, and health checks on /metrics (the only HTTP endpoint
-# run_agent.py exposes).
 #
-# WHAT CHANGED FROM v1.0
-# ----------------------
-#   - Uses a version-tagged base image (rather than an invalid placeholder digest).
-#   - Multi-stage build — build tools (gcc, g++) live in the builder stage
-#     and are NOT copied to the runtime image (~200 MB saved, CVE surface
-#     reduced).
-#   - Non-root runtime user (uid=1000) — v1.0 ran as root.
-#   - tini as PID 1 — v1.0's SIGTERM reached Python but not Ray workers.
-#   - HEALTHCHECK on /metrics — v1.0's /health endpoint does not exist in
-#     run_agent.py. Using Python (not curl) so the runtime image stays lean.
-#   - EXPOSE 8000 only — v1.0 exposed 8265 (Ray dashboard, UNAUTHENTICATED
-#     by default) and 9090 (Prometheus UI, not in this container).
-#   - ENHANCEMENTS_ENABLED=false and all sibling flags=false — v1.0 set them
-#     to true, contradicting README.md §0.2 and the file's own comment.
-#   - MODP_WEIGHTS quoted — the raw [0.4,0.3,0.2,0.1] is valid but opaque.
-#   - COPY --chown=app:app — v1.0 left files root-owned.
-#   - ARG for build metadata + full OCI labels.
-#   - STOPSIGNAL SIGTERM.
-#   - ENTRYPOINT + CMD split — v1.0 used CMD only, so `docker run <image>
-#     --once` was impossible.
-#   - Removed `MODE=unified` env (duplicated with CMD `--mode unified`).
-#   - Removed `PYTHONPATH=/app` (masks missing installs; `pip install -e .`
-#     is authoritative).
-#   - Added VOLUME /run/secrets for the secrets mount.
-#   - Secrets are never baked into the image; see SECURITY.md.
+# Green Agent v5.0.0 — Dockerfile
+# ================================
 #
-# BUILD METADATA
-# --------------
-#   docker buildx build \
-#     --build-arg VERSION=5.0.0 \
-#     --build-arg VCS_REF=$(git rev-parse HEAD) \
-#     --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
-#     --build-arg PYTHON_IMAGE=python:3.12.3-slim \
-#     --sbom=true --provenance=true \
-#     -t ghcr.io/<org>/green-agent:5.0.0 .
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Last Updated | 2026-11-16 |
+# | Status | Production Ready |
+# | Base image | python:3.12.3-slim (digest-pinned) |
+# | Runtime user | appuser:10001 (non-root) |
+# | PID 1 | tini |
+# | Healthcheck | GET /health :8000 |
+# | Signals | SIGTERM (graceful shutdown) |
 #
-# RUN
-# ---
-#   # Continuous (metrics + a2a endpoint stay up for scraping)
-#   docker run --rm -p 8000:8000 -v /run/secrets:/run/secrets:ro \
-#     ghcr.io/<org>/green-agent@sha256:<digest>
+# ── Build variants ────────────────────────────────────────────────────────
+#   Full (all enhancements) :
+#     docker build --build-arg ENHANCEMENTS_ENABLED=true -t green-agent:full .
+#   Lean (no enhancements) :
+#     docker build --build-arg ENHANCEMENTS_ENABLED=false -t green-agent:lean .
+#   Custom (per-module flags) :
+#     docker build \
+#       --build-arg ENHANCEMENTS_ENABLED=true \
+#       --build-arg FLEXGEN_ENABLED=true \
+#       --build-arg ZERO_TRUST_ENABLED=true \
+#       -t green-agent:custom .
 #
-#   # Batch — one task and exit
-#   docker run --rm -v /run/secrets:/run/secrets:ro \
-#     ghcr.io/<org>/green-agent@sha256:<digest> --once --iterations 1
+# ── To update the base digest ─────────────────────────────────────────────
+#   docker buildx imagetools inspect python:3.12.3-slim
+#   → copy the `Digest: sha256:…` line into ARG PYTHON_IMAGE below.
 #
-#   # Enable enhancements at runtime (they are OFF by default)
-#   docker run --rm -p 8000:8000 -e ENHANCEMENTS_ENABLED=true \
-#     ghcr.io/<org>/green-agent@sha256:<digest>
+# ── Verification after build ──────────────────────────────────────────────
+#   docker run --rm green-agent:full python test_symbolic_oversight.py
+#   docker inspect --format='{{.State.Health.Status}}' <container-id>
+#
+# ── Reproducibility ───────────────────────────────────────────────────────
+#   All versioned flags are ARG-overridable; the defaults below produce a
+#   full-enhancements image. Never commit a `REPLACE_ME` digest — the build
+#   fails at the `FROM` line before any layer runs.
 # =============================================================================
 
-# -----------------------------------------------------------------------------
-# Build metadata
-# -----------------------------------------------------------------------------
-ARG PYTHON_IMAGE=python:3.12.3-slim
-ARG BUILD_DATE=unknown
-ARG VCS_REF=unknown
-ARG VERSION=5.0.0
+# ── Base image (pinned by digest for reproducibility) ────────────────────
+# Last verified: 2026-11-16
+# To update:     docker buildx imagetools inspect python:3.12.3-slim
+ARG PYTHON_IMAGE=python:3.12.3-slim@sha256:afc139a0a640942491ec481ad8dda10f2c5b753f5c969393b12480155fe15a63
+
 
 # =============================================================================
 # Stage 1 — builder
+#   Installs Python dependencies into /install (a self-contained prefix).
+#   Leaves gcc/g++ behind — they do NOT ship in the runtime stage.
 # =============================================================================
 FROM ${PYTHON_IMAGE} AS builder
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Build-time system deps only. These stay in the builder stage.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
-# Build-time system dependencies. gcc/g++ are required by prophet
-# (cmdstanpy → C++), qiskit-aer (rust/cargo wheel build fallback), and
-# sentence-transformers (torch on some platforms). They are NOT copied to
-# the runtime stage.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        cmake \
-        git \
-    && rm -rf /var/lib/apt/lists/*
+# Copy requirements first (layer cache: deps only re-install when they change)
+COPY requirements.txt .
+COPY requirements.lock.txt* ./
+COPY pyproject.toml ./
+COPY README.md* ./
 
-# Copy pinned dependency manifests. The lock file is preferred when present
-# (--require-hashes for supply-chain integrity). requirements.txt is the
-# fallback for environments without a lock file.
-COPY requirements.txt requirements.lock.txt* ./
-
-# Prefer hashed lock install. Fall back to plain pinned install.
+# Install into /install (isolated prefix — copied verbatim in runtime)
 RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir --upgrade pip && \
     if [ -f requirements.lock.txt ]; then \
-        pip install --no-cache-dir --require-hashes \
-            -r requirements.lock.txt; \
+        pip install --no-cache-dir --prefix=/install \
+            --require-hashes -r requirements.lock.txt; \
     else \
-        pip install --no-cache-dir -r requirements.txt; \
-    fi
+        pip install --no-cache-dir --prefix=/install \
+            -r requirements.txt; \
+    fi && \
+    pip check
 
-# Pre-download the sentence-transformers model so the runtime image does
-# not need network access on first request. Best-effort — skip if the
-# module is not present in requirements.txt.
-RUN python -c "from sentence_transformers import SentenceTransformer; \
-    SentenceTransformer('all-MiniLM-L6-v2')" || true
+# Install the src/ package in editable-equivalent mode so `from src.*` works.
+# We copy the source tree now, then `pip install --prefix=/install .`.
+COPY src/ ./src/
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir --prefix=/install --no-deps . && \
+    pip check
+
 
 # =============================================================================
 # Stage 2 — runtime
+#   Minimal footprint: no compilers, no caches, non-root user, tini PID 1.
 # =============================================================================
 FROM ${PYTHON_IMAGE} AS runtime
 
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# ── Build metadata (baked into image labels) ──────────────────────────────
 ARG BUILD_DATE
 ARG VCS_REF
-ARG VERSION
+ARG BUILD_VERSION=5.0.0
 
-# --- OCI image labels -------------------------------------------------------
-LABEL org.opencontainers.image.title="Green Agent" \
-      org.opencontainers.image.description="Green benchmarking agent with optional advanced enhancements" \
-      org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.created="${BUILD_DATE}" \
-      org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.source="https://github.com/your-org/Green_Agent" \
-      org.green-agent.enhancements.available="true" \
-      org.green-agent.enhancements.default-enabled="false"
-
-# --- Baseline env -----------------------------------------------------------
-# No PYTHONPATH=/app (that masks missing installs; `pip install -e .`
-# is authoritative). No MODE (CMD carries --mode unified).
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
-    RAY_DISABLE_DOCKER_CPU_WARNING=1 \
-    LOG_LEVEL=INFO \
-    PORT=8000 \
-    BIND=0.0.0.0 \
-    GREEN_AGENT_DATA_DIR=/var/lib/green-agent \
-    GREEN_AGENT_SECRETS_DIR=/run/secrets
-
-# --- tini: PID 1 for signal forwarding -------------------------------------
-# Without tini, SIGTERM reaches python but not Ray workers. tini forwards
-# the signal to all children so the container drains cleanly.
+# ── Runtime system deps: tini only ────────────────────────────────────────
+# tini = minimal init: forwards SIGTERM, reaps zombie processes.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tini \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 10001 -g 10001 -m -s /bin/bash appuser
 
-# --- Non-root user ---------------------------------------------------------
-# UID 1000 matches run_agent.py's `run_as_user` in agent_config.yaml and
-# the k8s deployment's `securityContext.runAsUser`.
-RUN groupadd -g 1000 app \
-    && useradd -u 1000 -g app -m -s /usr/sbin/nologin app \
-    && mkdir -p /app /var/lib/green-agent /var/log/green-agent /app/results \
-    && chown -R app:app /app /var/lib/green-agent /var/log/green-agent
+# ── Python dependencies from builder ──────────────────────────────────────
+COPY --from=builder /install /usr/local
 
-# --- Installed Python environment from the builder stage -------------------
-# Both stages use the same base image, so the site-packages and console
-# scripts are safe to copy. This is the standard multi-stage Python pattern.
-COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
-
+# ── Application source + assets ───────────────────────────────────────────
 WORKDIR /app
 
-# --- Application code ------------------------------------------------------
-# Copied as `app:app` — v1.0 left files root-owned, which broke the
-# non-root runtime.
-COPY --chown=app:app . .
+COPY --chown=appuser:appuser src/ ./src/
+COPY --chown=appuser:appuser run_agent.py ./run_agent.py
+COPY --chown=appuser:appuser docker_metrics_collector.py ./docker_metrics_collector.py
+COPY --chown=appuser:appuser agentbeats.json ./agentbeats.json
 
-# Editable install so `from src...` works without PYTHONPATH hacks. The
-# `|| true` handles cases where the repo root has no pyproject.toml (e.g.,
-# legacy deployments) — in that case `run_agent.py` must be invoked with
-# an explicit PYTHONPATH via env.
-RUN pip install --no-deps -e . || true
+# Config + policies (mounted or baked-in)
+COPY --chown=appuser:appuser green_policy.yaml* ./green_policy.yaml
+COPY --chown=appuser:appuser symbolic_policy.yaml* ./symbolic_policy.yaml
 
-# --- Enhancement toggles — default FALSE per README.md §0.2 ----------------
-# Enable at runtime:  -e ENHANCEMENTS_ENABLED=true
-# Or via docker-compose env_file.
-ENV ENHANCEMENTS_ENABLED=false \
-    LIMIT_GRAPH_ENABLED=false \
+# Optional: free_apis config (mounted from ConfigMap in K8s)
+COPY --chown=appuser:appuser free_apis_config.yaml* ./free_apis_config.yaml
+
+# Test suite (kept so `python test_symbolic_oversight.py` works in-container)
+COPY --chown=appuser:appuser test_symbolic_oversight.py* ./
+COPY --chown=appuser:appuser test_meta_cognitive.py* ./
+
+# Make sure appuser owns everything
+RUN chown -R appuser:appuser /app && \
+    mkdir -p /app/checkpoints /out && \
+    chown -R appuser:appuser /app/checkpoints /out
+
+# ── Base environment (always set) ─────────────────────────────────────────
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONHASHSEED=0 \
+    PYTHONPATH=/app:/app/src \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TZ=UTC \
+    LOG_LEVEL=INFO \
+    LOG_FORMAT=json \
+    LEAN_CTX_VERSION=0.1.0 \
+    AGENT_PORT=8000 \
+    AGENT_HEALTH_PATH=/health \
+    SYMBOLIC_POLICY=symbolic_policy.yaml \
+    FREE_APIS_CONFIG=free_apis_config.yaml
+
+# ── Build-time toggles (ARG → ENV) ────────────────────────────────────────
+# Every ARG is overridable per build; defaults enable the full suite.
+ARG ENHANCEMENTS_ENABLED=true
+ARG LIMIT_GRAPH_ENABLED=true
+ARG MODP_ENABLED=true
+ARG RLHF_ENABLED=true
+ARG DISTILLATION_ENABLED=true
+ARG MOE_ENABLED=true
+ARG EVOLUTIONARY_ENABLED=true
+ARG FLEXGEN_ENABLED=false
+ARG ZERO_TRUST_ENABLED=false
+ARG DIFFERENTIAL_PRIVACY_ENABLED=false
+ARG TRAINING_ENABLED=false
+
+# ── Advanced enhancements (runtime ENV) ───────────────────────────────────
+# NOTE: MODP_WEIGHTS is CSV, NOT JSON — Docker ENV does not parse JSON.
+# The entrypoint below validates format and sum() ≈ 1.0 before starting.
+ENV ENHANCEMENTS_ENABLED=${ENHANCEMENTS_ENABLED} \
+    LIMIT_GRAPH_ENABLED=${LIMIT_GRAPH_ENABLED} \
     LIMIT_GRAPH_CENTRALITY=0.7 \
     LIMIT_GRAPH_CONNECTIVITY=0.6 \
-    MODP_ENABLED=false \
-    MODP_WEIGHTS="[0.4,0.3,0.2,0.1]" \
-    RLHF_ENABLED=false \
+    MODP_ENABLED=${MODP_ENABLED} \
+    MODP_WEIGHTS="0.4,0.3,0.2,0.1" \
+    RLHF_ENABLED=${RLHF_ENABLED} \
     HUMAN_FEEDBACK_SCORE=0.6 \
-    DISTILLATION_ENABLED=false \
-    MOE_GATING_ENABLED=false \
-    EVOLUTIONARY_ENABLED=false \
+    DISTILLATION_ENABLED=${DISTILLATION_ENABLED} \
+    MOE_ENABLED=${MOE_ENABLED} \
+    MOE_GATING_ENABLED=${MOE_ENABLED} \
+    EVOLUTIONARY_ENABLED=${EVOLUTIONARY_ENABLED} \
     POPULATION_SIZE=20 \
     MUTATION_RATE=0.1 \
-    FLEXGEN_ENABLED=false \
+    ZERO_TRUST_ENABLED=${ZERO_TRUST_ENABLED} \
+    DIFFERENTIAL_PRIVACY_ENABLED=${DIFFERENTIAL_PRIVACY_ENABLED} \
+    TRAINING_ENABLED=${TRAINING_ENABLED} \
+    CHECKPOINT_DIR=/app/checkpoints \
+    FLEXGEN_ENABLED=${FLEXGEN_ENABLED} \
     FLEXGEN_MODEL_NAME=facebook/opt-6.7b \
     FLEXGEN_DEFAULT_PRECISION=fp16 \
     FLEXGEN_DELEGATION_POLICY=adaptive
 
-# --- Secrets mount ---------------------------------------------------------
-# Never bake secrets into the image. The orchestrator mounts a tmpfs or
-# Kubernetes Secret at /run/secrets.
-VOLUME ["/run/secrets"]
+# ── Entrypoint with validation ────────────────────────────────────────────
+# Runs BEFORE CMD. Fails fast on bad config instead of silently degrading.
+RUN cat > /usr/local/bin/docker-entrypoint.sh <<'ENTRYPOINT_EOF'
+#!/bin/bash
+set -euo pipefail
 
-# --- Ports -----------------------------------------------------------------
-# Only 8000 is exposed. The container serves:
-#   - /metrics      Prometheus scrape endpoint (run_agent.py)
-# Ray dashboard (8265) is UNAUTHENTICATED by default and must NOT be
-# exposed from this container. Prometheus UI (9090) is a separate service
-# that runs outside the container.
+# 1. Validate MODP_WEIGHTS: list of floats summing to ~1.0
+if [[ -n "${MODP_WEIGHTS:-}" ]]; then
+    if ! python - <<'PY'
+import os, sys
+raw = os.environ["MODP_WEIGHTS"]
+try:
+    parts = [p.strip() for p in raw.strip("[]").split(",") if p.strip()]
+    vals  = [float(p) for p in parts]
+    assert vals, "empty weight vector"
+    total = sum(vals)
+    assert abs(total - 1.0) < 1e-6, f"weights sum to {total}, expected ~1.0"
+except Exception as exc:
+    print(f"[entrypoint] MODP_WEIGHTS invalid ({raw!r}): {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+    then
+        echo "[entrypoint] fatal: MODP_WEIGHTS is not a valid weight vector" >&2
+        exit 1
+    fi
+fi
+
+# 2. Warn on dead configuration
+if [[ "${FLEXGEN_ENABLED:-false}" == "false" && -n "${FLEXGEN_MODEL_NAME:-}" ]]; then
+    echo "[entrypoint] warn: FLEXGEN_ENABLED=false but FLEXGEN_* vars set (ignored)" >&2
+fi
+
+# 3. Fail fast if Zero Trust is enabled without a token
+if [[ "${ZERO_TRUST_ENABLED:-false}" == "true" && -z "${ZERO_TRUST_TOKEN:-}" ]]; then
+    echo "[entrypoint] fatal: ZERO_TRUST_ENABLED=true but ZERO_TRUST_TOKEN is unset" >&2
+    exit 1
+fi
+
+# 4. Emit the resolved toggle matrix for operability
+echo "[entrypoint] enhancement toggles:" >&2
+for flag in ENHANCEMENTS_ENABLED LIMIT_GRAPH_ENABLED MODP_ENABLED RLHF_ENABLED \
+            DISTILLATION_ENABLED MOE_ENABLED EVOLUTIONARY_ENABLED ZERO_TRUST_ENABLED \
+            DIFFERENTIAL_PRIVACY_ENABLED TRAINING_ENABLED FLEXGEN_ENABLED; do
+    printf '  %-30s = %s\n' "$flag" "${!flag:-unset}" >&2
+done
+
+exec "$@"
+ENTRYPOINT_EOF
+
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
+
+# ── Metadata labels (OCI) ─────────────────────────────────────────────────
+LABEL org.opencontainers.image.title="green-agent" \
+      org.opencontainers.image.description="Green Agent with 4-layer feedback + advanced enhancements" \
+      org.opencontainers.image.version="${BUILD_VERSION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.source="https://github.com/NurcholishAdam/Green_Agent" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.green-agent.enhancements="true" \
+      org.green-agent.layer-versions="meta-cognitive=1.2.0,symbolic=1.2.0,enhancements=1.2.0"
+
+# ── Volume for cgroup metrics ─────────────────────────────────────────────
+# Mount read-only at run time:
+#   -v /sys/fs/cgroup:/sys/fs/cgroup:ro
+VOLUME ["/sys/fs/cgroup"]
+
+# ── Runtime ───────────────────────────────────────────────────────────────
 EXPOSE 8000
-
-# --- Runtime user ----------------------------------------------------------
-USER 1000:1000
-
-# --- Health check ----------------------------------------------------------
-# Uses Python (not curl) so the runtime image stays lean. /metrics is the
-# only HTTP endpoint run_agent.py exposes; it returns 200 while the
-# process is serving. For /healthz + /readyz semantics, add app.py as a
-# sidecar or process supervisor.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "\
-import sys, urllib.request; \
-sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/metrics', timeout=5).status == 200 else 1)"
-
-# --- Signal handling -------------------------------------------------------
-# Default is SIGTERM, but explicit is better — tini forwards it, python
-# handles it via atexit + signal.signal(), Ray workers drain gracefully.
 STOPSIGNAL SIGTERM
 
-# --- Entrypoint ------------------------------------------------------------
-# ENTRYPOINT + CMD pattern so batch mode is possible at runtime:
-#     docker run <image> --once --iterations 1
-# The CMD below is the default (continuous mode).
-ENTRYPOINT ["/usr/bin/tini", "--", "python", "runtime/run_agent.py"]
-CMD ["--mode", "unified"]
+USER appuser
+
+# Healthcheck against the agent's /health endpoint (matches Deployment v5.0).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import os,sys,urllib.request; \
+        port=os.environ.get('AGENT_PORT','8000'); \
+        path=os.environ.get('AGENT_HEALTH_PATH','/health'); \
+        sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}{path}', timeout=3).status==200 else 1)"
+
+# tini = PID 1 → signal forwarding + zombie reaping.
+# entrypoint = validation, then exec CMD.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
+CMD ["python", "run_agent.py", "--mode=unified"]
