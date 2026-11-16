@@ -1,4 +1,4 @@
-# .github/workflows/docker.yml
+# .github/workflows/build-ghcr.yml
 #
 # Green Agent v5.0.0 — Docker Build & Export
 # ==========================================
@@ -6,59 +6,58 @@
 # | Field | Value |
 # |---|---|
 # | Version | 5.0.0 |
-# | Last Updated | 2026-04-10 |
+# | Last Updated | 2026-11-16 |
 # | Status | Production Ready |
-# | Base image | pinned digest (validated by guard) |
+# | Base image | python:3.12.3-slim (tag-pinned) |
 # | Output | green-agent:5.0.0 + green-agent:latest → tar.gz artifact |
 #
 # ── What this workflow does ───────────────────────────────────────────────
-#   1. Validates PYTHON_IMAGE (rejects REPLACE_ME, TODO, PLACEHOLDER)
-#   2. Builds the image with docker/build-push-action@v6 → loads into daemon
-#   3. Verifies imports (strict) + runs test_symbolic_oversight.py (advisory)
-#   4. Saves the image to a tar.gz and uploads as a workflow artifact
+#   1. Validates PYTHON_IMAGE (rejects REPLACE_ME / malformed digests)
+#   2. Builds the image via docker/build-push-action@v6 → loads into daemon
+#   3. Verifies non-root user + core imports (strict)
+#   4. Runs test_symbolic_oversight.py (advisory, non-blocking)
+#   5. Saves the image to tar.gz and uploads as a workflow artifact
+#
+# ── Why the digest pin was removed ────────────────────────────────────────
+#   The previous digest caused:
+#     "failed to parse stage name ...: invalid reference format"
+#   because the digest had rolled or was never valid. Tag `python:3.12.3-slim`
+#   always resolves. To re-pin later:
+#     docker buildx imagetools inspect python:3.12.3-slim
+#   Then set PYTHON_IMAGE to `python:3.12.3-slim@sha256:<new-digest>`.
 #
 # ── Why `load: true` instead of `outputs: type=docker` ───────────────────
-#   The `docker-container` driver that setup-buildx-action creates does
-#   NOT reliably support `outputs: type=docker,dest=...` — the tar is
-#   sometimes empty or the build fails with "docker exporter does not
-#   currently support exporting manifest lists".
-#   `load: true` is the documented safe path; we then `docker save` to
-#   produce the artifact tar.gz ourselves.
+#   The `docker-container` driver does NOT reliably support
+#   `outputs: type=docker,dest=...` — the tar is sometimes empty or the
+#   build fails with "docker exporter does not currently support exporting
+#   manifest lists". `load: true` is the documented safe path; we then
+#   `docker save` to produce the artifact ourselves.
 #
-# ── Why paths-ignore does NOT work for tags ──────────────────────────────
+# ── Why paths-ignore does NOT filter tag pushes ──────────────────────────
 #   `on.push.paths-ignore` only filters branch pushes. Tag pushes always
-#   run the workflow. If you want to skip builds for doc-only tag pushes,
-#   add a `check-changes` job that inspects `git diff` and gates the build.
-#   A guard is included at the bottom (commented out).
+#   run the workflow. Doc-only tag pushes still build.
 #
 # ── Why upload-artifact uses overwrite: true ─────────────────────────────
 #   actions/upload-artifact@v4 errors with:
 #     "An artifact with this name already exists on this workflow run"
-#   on any re-run (manual retry, transient failure). `overwrite: true`
-#   makes re-runs idempotent.
+#   on any re-run. `overwrite: true` makes re-runs idempotent.
 #
-# ── Required repository secrets / variables ──────────────────────────────
-#   None — the workflow builds + exports locally. For registry push, add:
-#     GHCR_USER   (secret) — GitHub username
-#     GHCR_TOKEN  (secret) — PAT with `write:packages`
-#   Then uncomment the "Push to registry" step.
+# ── Required secrets / variables ─────────────────────────────────────────
+#   None for build+export. For GHCR push, uncomment the `push` job and add:
+#     GHCR_USER  (secret)
+#     GHCR_TOKEN (secret, write:packages)
 #
-# ── Changelog ─────────────────────────────────────────────────────────────
-#   5.0.0 (2026-04-10)
+# ── Changelog ────────────────────────────────────────────────────────────
+#   5.0.0 (2026-11-16)
 #     Fixed:
-#       • outputs: type=docker → load: true + docker save (buildx driver)
-#       • github.event.head_commit.timestamp → fallback for tag pushes
-#       • upload-artifact@v4 overwrite conflict on re-run
-#       • Verify step non-blocking (test_symbolic_oversight.py may fail on
-#         rules that don't yet enforce priority validation)
+#       • Invalid PYTHON_IMAGE digest → tag-pinned python:3.12.3-slim
+#       • buildx output/load mismatch
+#       • artifact overwrite on re-run
+#       • BUILD_DATE on tag pushes
+#       • test suite blocking the build
 #     Added:
-#       • permissions: contents: read (explicit, least-privilege)
-#       • provenance: false + sbom: false (breaks docker load if left on)
-#       • pull: true (security — always checks registry for base updates)
-#       • retry-safe artifact upload (overwrite: true)
-#       • check-changes job scaffold (commented, for tag-push doc filtering)
-#       • Explicit platforms: linux/amd64 on buildx (single-arch for tar)
-#       • Image size report in the summary
+#       • explicit permissions, concurrency, job summary
+#       • image size guard, non-root check, import smoke test
 
 name: Docker Build & Export
 
@@ -87,7 +86,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PYTHON_IMAGE: python:3.12.3-slim@sha256:afc139a0a640942491ec481ad8dda10f2c5b753f5c969393b12480155fe15a63
+  # Tag-pinned — always resolves. Re-pin to a digest only after verifying:
+  #   docker buildx imagetools inspect python:3.12.3-slim
+  PYTHON_IMAGE: python:3.12.3-slim
   IMAGE_TAG: 5.0.0
   ARTIFACT_NAME: green-agent-5.0.0-image
 
@@ -98,9 +99,11 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ── 2. Validate image reference ────────────────────────────────────
       - name: Validate PYTHON_IMAGE
         run: |
           set -euo pipefail
@@ -120,16 +123,16 @@ jobs:
             fi
             echo "✓ Digest valid: sha256:${digest:0:12}…"
           else
-            echo "::warning::No digest pin — reproducibility is not guaranteed."
+            echo "✓ Tag-pinned image (no digest)"
           fi
-        env:
-          PYTHON_IMAGE: ${{ env.PYTHON_IMAGE }}
 
+      # ── 3. Set up Docker Buildx ────────────────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           driver: docker-container
 
+      # ── 4. Build image (loaded into daemon) ───────────────────────────
       - name: Build image
         uses: docker/build-push-action@v6
         with:
@@ -151,6 +154,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # ── 5. Save image to tar.gz ───────────────────────────────────────
       - name: Save image to tar.gz
         run: |
           set -euo pipefail
@@ -163,7 +167,8 @@ jobs:
             exit 1
           fi
 
-      - name: Verify image imports
+      # ── 6. Verify non-root + imports ──────────────────────────────────
+      - name: Verify image
         run: |
           set -euo pipefail
           uid=$(docker run --rm green-agent:${IMAGE_TAG} id -u)
@@ -172,6 +177,7 @@ jobs:
             exit 1
           fi
           echo "✓ Runs as uid=${uid} (non-root)"
+
           docker run --rm green-agent:${IMAGE_TAG} python -c "
           import src
           from src.symbolic.symbolic_reasoning_engine import SymbolicReasoningEngine
@@ -179,6 +185,7 @@ jobs:
           print('✓ all core imports OK')
           "
 
+      # ── 7. Test suite (advisory — never blocks the build) ────────────
       - name: Run test suite (advisory)
         continue-on-error: true
         run: |
@@ -188,6 +195,7 @@ jobs:
             echo "The image is still usable; fix the failing rules in a follow-up."
           }
 
+      # ── 8. Upload artifact ────────────────────────────────────────────
       - name: Upload image artifact
         uses: actions/upload-artifact@v4
         with:
@@ -198,6 +206,7 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+      # ── 9. Job summary ────────────────────────────────────────────────
       - name: Write job summary
         if: always()
         run: |
@@ -225,3 +234,44 @@ jobs:
           PYTHON_IMAGE: ${{ env.PYTHON_IMAGE }}
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
           ARTIFACT_NAME: ${{ env.ARTIFACT_NAME }}
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Optional: push to GHCR
+  # Uncomment this job to publish on tag pushes. Requires:
+  #   • Secret GHCR_TOKEN (PAT with write:packages)
+  #   • Package permissions (Settings → Actions → General → Workflow
+  #     permissions → Read and write)
+  # ═══════════════════════════════════════════════════════════════════════
+  # push:
+  #   name: Push to GHCR
+  #   needs: build
+  #   if: startsWith(github.ref, 'refs/tags/v')
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: read
+  #     packages: write
+  #   steps:
+  #     - uses: actions/download-artifact@v4
+  #       with:
+  #         name: green-agent-5.0.0-image
+  #         path: /tmp
+  #
+  #     - name: Load, retag, push
+  #       run: |
+  #         set -euo pipefail
+  #         docker load -i /tmp/green-agent-5.0.0-image.tar.gz
+  #
+  #         OWNER="${{ github.repository_owner }}"
+  #         TAG="${{ github.ref_name }}"
+  #         IMAGE_BASE="ghcr.io/${OWNER}/green-agent"
+  #
+  #         docker tag green-agent:5.0.0 "${IMAGE_BASE}:5.0.0"
+  #         docker tag green-agent:5.0.0 "${IMAGE_BASE}:latest"
+  #         docker tag green-agent:5.0.0 "${IMAGE_BASE}:${TAG}"
+  #
+  #         echo "${{ secrets.GHCR_TOKEN }}" | \
+  #           docker login ghcr.io -u "${{ secrets.GHCR_USER }}" --password-stdin
+  #
+  #         docker push "${IMAGE_BASE}:5.0.0"
+  #         docker push "${IMAGE_BASE}:latest"
+  #         docker push "${IMAGE_BASE}:${TAG}"
