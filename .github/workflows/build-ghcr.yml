@@ -1,28 +1,63 @@
-name: Build and Export Docker Image (No Registry Push)
+# .github/workflows/docker.yml
+name: Docker Build & Export
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - '**.md'
+
+env:
+  PYTHON_IMAGE: python:3.12.3-slim@sha256:afc139a0a640942491ec481ad8dda10f2c5b753f5c969393b12480155fe15a63
 
 jobs:
-  build-and-export:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Build Docker image
+      - name: Validate PYTHON_IMAGE (guard against REPLACE_ME)
         run: |
-          docker build \
-            --build-arg PYTHON_IMAGE=python:3.12.3-slim \
-            -t green-agent:latest .
+          set -euo pipefail
+          if [[ "${PYTHON_IMAGE}" =~ (REPLACE_ME|TODO|PLACEHOLDER) ]]; then
+            echo "::error::PYTHON_IMAGE is a placeholder: ${PYTHON_IMAGE}"
+            exit 1
+          fi
+          digest="${PYTHON_IMAGE##*@sha256:}"
+          [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::Malformed digest"; exit 1; }
+          echo "✓ PYTHON_IMAGE valid"
 
-      - name: Save Docker image to tar file
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: |
+            PYTHON_IMAGE=${{ env.PYTHON_IMAGE }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            BUILD_VERSION=5.0.0
+            ENHANCEMENTS_ENABLED=true
+          tags: |
+            green-agent:5.0.0
+            green-agent:latest
+          outputs: type=docker,dest=/tmp/green-agent-5.0.0.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify image
         run: |
-          docker save green-agent:latest -o /tmp/green-agent.tar
+          docker load -i /tmp/green-agent-5.0.0.tar
+          docker run --rm green-agent:5.0.0 python test_symbolic_oversight.py
 
-      - name: Upload image as artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: green-agent-docker-image
-          path: /tmp/green-agent.tar
+          name: green-agent-5.0.0-image
+          path: /tmp/green-agent-5.0.0.tar
+          retention-days: 30
