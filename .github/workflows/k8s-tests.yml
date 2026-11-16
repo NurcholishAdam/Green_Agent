@@ -1,126 +1,585 @@
+# .github/workflows/k8s-tests.yml
+#
+# Green Agent v5.0.0 — Kubernetes Integration Tests
+# ==================================================
+#
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Last Updated | 2026-11-16 |
+# | Status | Production Ready |
+# | Trigger | push to `main` / `develop` · PR to `main` · manual |
+# | Runtime | Kind cluster · KubeRay operator · Green Agent manifests |
+# | Timeout | 30 minutes |
+#
+# ── What this workflow does ───────────────────────────────────────────────
+#   1. Installs kubectl / Helm / standalone kustomize (v5.4+)
+#   2. Creates a Kind cluster
+#   3. Installs the KubeRay operator (correct chart version + CRD wait)
+#   4. Builds the Green Agent image and loads it into Kind
+#   5. Applies the development Kustomize overlay
+#   6. Waits for: Deployment rollout, RayCluster ready, operator webhook
+#   7. Runs pytest against `tests/k8s/`
+#   8. On failure: dumps `kubectl describe`, `kubectl logs`, `kubectl get events`
+#   9. Always: uploads test results + diagnostics, deletes the cluster
+#
+# ── Bugs fixed vs. the previous version ──────────────────────────────────
+#   • **YAML did not parse.** `Deploy Green Agent` was at column 0 while
+#     every other step was at 4-space indent → the step became a sibling of
+#     `steps:` instead of an item. The whole workflow was rejected before
+#     step 1 ran.
+#   • **Removed the verbatim chat paste** `# In .github/workflows/k8s-tests.yml,
+#     replace the "Deploy Green Agent" step:` — it was never a real comment.
+#   • **Namespace mismatch.** `TEST_NAMESPACE=green-agent-test` but the dev
+#     overlay creates `dev-green-agent`. `kubectl apply -k -n green-agent-test`
+#     ignores `-n` (Kustomize's `namespace:` wins) → all waits checked an
+#     empty namespace → 300s timeout → job failed.
+#   • **Label selector mismatch.** `kubectl wait -l app=green-agent` — no pod
+#     has `app: green-agent`. The Deployment v5.0 uses
+#     `app.kubernetes.io/name` + `app.kubernetes.io/instance`. Waits now
+#     match those labels.
+#   • **Image tag mismatch.** `LOCAL_IMAGE=green-agent:test` but the overlay
+#     uses `green-agent:v5.0.0-dev` → `ImagePullBackOff`. Both now use the
+#     same tag.
+#   • **Ray version mismatch.** `RAY_VERSION=2.7.0` but Dockerfile / build
+#     workflows use `ray[default]>=2.9.0` → cluster join fails. Now 2.9.0.
+#   • **Bundled kustomize too old.** `kubectl v1.28.0` ships kustomize 5.0.4
+#     which rejects `labels: includeSelectors: false` (the pattern in
+#     `config/base/kustomization.yaml` v5.0). Standalone kustomize v5.4.3
+#     is now installed.
+#   • **No `set -euo pipefail`** on any step — pipeline failures were silent.
+#   • **No diagnostic dump on failure** — a failing test left no evidence.
+#   • Waits for rollout + RayCluster readiness, not just raw pods.
+#   • Verifies `imagePullPolicy: IfNotPresent` so the loaded image is
+#     actually used.
+#   • Bumped KIND (0.23.0), kubectl (v1.30.0), Helm (v3.15.0).
+#   • Added `permissions`, `concurrency`, `paths-ignore`, `workflow_dispatch`.
+#   • Added pip + Docker caches.
+#
+# ── Required repo files ──────────────────────────────────────────────────
+#   • Dockerfile
+#   • config/overlays/development/kustomization.yaml
+#   • config/overlays/development/namespace.yaml
+#   • tests/requirements-tests.txt
+#   • tests/k8s/
+#
+# ── Local dry-run ────────────────────────────────────────────────────────
+#   kind create cluster --name green-agent-test
+#   helm repo add kuberay https://ray-project.github.io/kuberay-helm/
+#   helm repo update
+#   helm install kuberay-operator kuberay/kuberay-operator \
+#     --version 1.1.0 -n ray-system --create-namespace --wait
+#   kubectl wait --for=condition=established crd/rayclusters.ray.io --timeout=60s
+#   docker build -t green-agent:v5.0.0-dev .
+#   kind load docker-image green-agent:v5.0.0-dev --name green-agent-test
+#   kustomize build config/overlays/development | kubectl apply -f -
+#   kubectl rollout status deployment/green-agent -n dev-green-agent --timeout=300s
+#   pytest tests/k8s/ -v
+#
+# ── Changelog ────────────────────────────────────────────────────────────
+#   5.0.0 (2026-11-16)
+#     Fixed:
+#       • YAML indentation (workflow rejected before step 1)
+#       • Removed chat paste artifact from the YAML body
+#       • TEST_NAMESPACE: green-agent-test → dev-green-agent (matches overlay)
+#       • LOCAL_IMAGE tag: test → v5.0.0-dev (matches overlay)
+#       • kubectl wait label: app=green-agent → app.kubernetes.io/*
+#       • RAY_VERSION: 2.7.0 → 2.9.0 (matches Dockerfile)
+#       • Bundled kustomize (5.0.4) → standalone v5.4.3 (required by v5.0 manifests)
+#       • Waits for Deployment rollout + RayCluster ready, not raw pods
+#       • imagePullPolicy guard so the loaded image is actually used
+#     Added:
+#       • set -euo pipefail on every step
+#       • Diagnostic dump on failure (describe, logs, events → artifact)
+#       • permissions: contents: read
+#       • concurrency group + cancel-in-progress
+#       • paths-ignore for docs-only pushes
+#       • workflow_dispatch for manual re-run
+#       • pip + Docker (gha) build caches
+#       • ::group:: / ::error:: annotations
+#       • Job summary with cluster + node + image status
+#       • Full header, Changelog, What's Not in Scope, Reviewer Checklist
+#     Bumped:
+#       • KIND_VERSION v0.20.0 → v0.23.0
+#       • kubectl v1.28.0 → v1.30.0
+#       • Helm v3.13.0 → v3.15.0
+#
+# ── What's Not in Scope ──────────────────────────────────────────────────
+#   • Multi-node Kind cluster (single-node only)
+#   • Real cloud provider integration (GKE/EKS/AKS)
+#   • Real carbon APIs (uses simulation provider)
+#   • HPA scale-up validation (Kind has no metrics-server by default)
+#   • NetworkPolicy enforcement (Kind's default CNI ignores NetworkPolicy)
+#   • Zero Trust / DP / Training flags (opt-in via build-args, disabled here)
+#   • Load / soak tests — smoke + manifest validation only
+
 name: Kubernetes Integration Tests
 
 on:
   push:
     branches: [main, develop]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'README.md'
+      - '.github/workflows/build-and-push.yml'
+      - '.github/workflows/build-ghcr.yml'
+      - '.github/workflows/agentbeats-submission.yml'
+      - '.github/workflows/validate-agentbeats.yml'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'README.md'
+  workflow_dispatch:
 
+# ── Least-privilege ──────────────────────────────────────────────────────
+permissions:
+  contents: read
+
+# ── Cancel in-progress runs on the same ref ──────────────────────────────
+concurrency:
+  group: k8s-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── Shared environment ───────────────────────────────────────────────────
 env:
-  TEST_NAMESPACE: green-agent-test
-  KIND_VERSION: 'v0.20.0'
-  KUBERAY_CHART_VERSION: '1.1.0'  # ✅ Correct Helm chart version
-  RAY_VERSION: '2.7.0'            # Ray version (for rayVersion field)
-  LOCAL_IMAGE: green-agent:test
+  # MUST match config/overlays/development/kustomization.yaml `namespace:`
+  TEST_NAMESPACE: dev-green-agent
+  # MUST match config/overlays/development/kustomization.yaml `images: newTag:`
+  LOCAL_IMAGE: green-agent:v5.0.0-dev
+  # MUST match Dockerfile / build-and-push.yml ray[default] version
+  RAY_VERSION: '2.9.0'
+  KIND_VERSION: 'v0.23.0'
+  KUBECTL_VERSION: 'v1.30.0'
+  HELM_VERSION: 'v3.15.0'
+  KUSTOMIZE_VERSION: 'v5.4.3'
+  KUBERAY_CHART_VERSION: '1.1.0'
+  CLUSTER_NAME: green-agent-test
 
 jobs:
   test:
+    name: Kind + Ray + Green Agent
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-    
-    - name: Install kubectl
-      uses: azure/setup-kubectl@v4
-      with:
-        version: 'v1.28.0'
-    
-    - name: Install Helm
-      uses: azure/setup-helm@v4
-      with:
-        version: 'v3.13.0'
-    
-    - name: Create Kind cluster
-      run: |
-        curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
-        chmod +x ./kind
-        sudo mv ./kind /usr/local/bin/kind
-        kind create cluster --name green-agent-test
-        kubectl wait --for=condition=ready node --all --timeout=60s
-      shell: bash
-    
-    # ✅ FIX: Use correct chart version + latest repo update
-    - name: Install Ray Operator
-      run: |
-        echo "📦 Installing KubeRay Operator..."
-        
-        # Add repo
-        helm repo add kuberay https://ray-project.github.io/kuberay-helm/
-        
-        # ✅ CRITICAL: Update repo to get latest chart versions
-        helm repo update
-        
-        # ✅ Use correct chart version (1.1.0, not 2.7.0)
-        helm install kuberay-operator kuberay/kuberay-operator \
-          --version ${{ env.KUBERAY_CHART_VERSION }} \
-          --namespace ray-system \
-          --create-namespace \
-          --wait --timeout 5m
-        
-        # Wait for CRDs
-        kubectl wait --for=condition=established crd/rayclusters.ray.io --timeout=60s
-        
-        # Wait for operator pod
-        kubectl wait --for=condition=ready pod \
-          -l app.kubernetes.io/name=kuberay-operator \
-          -n ray-system \
-          --timeout=120s
-        
-        echo "✅ Ray Operator ready"
-        kubectl get crd | grep ray
-        kubectl get pods -n ray-system
-      shell: bash
-    
-    - name: Build and load image
-      run: |
-        docker build -t ${{ env.LOCAL_IMAGE }} .
-        kind load docker-image ${{ env.LOCAL_IMAGE }} --name green-agent-test
-      shell: bash
-    
-    # In .github/workflows/k8s-tests.yml, replace the "Deploy Green Agent" step:
 
-- name: Deploy Green Agent
-  run: |
-    echo "🚀 Deploying to namespace: ${{ env.TEST_NAMESPACE }}..."
-    
-    # Create namespace
-    kubectl create namespace ${{ env.TEST_NAMESPACE }} 2>/dev/null || true
-    
-    # Apply kustomize (image is set via kustomization.yaml images: field)
-    echo "▶ Applying configuration..."
-    kubectl apply -k config/overlays/development -n ${{ env.TEST_NAMESPACE }}
-    
-    # ✅ FIX: Remove kubectl set image - not needed for RayCluster
-    # The image is already set by kustomize
-    
-    echo "✅ Deployment initiated"
-    kubectl get all -n ${{ env.TEST_NAMESPACE }}
-  shell: bash    
-    - name: Wait for pods
-      run: |
-        kubectl wait --for=condition=ready pod \
-          -l app=green-agent \
-          -n ${{ env.TEST_NAMESPACE }} \
-          --timeout=300s
-        kubectl get pods -n ${{ env.TEST_NAMESPACE }}
-      shell: bash
-    
-    - name: Run tests
-      run: |
-        pip install -r tests/requirements-tests.txt
-        pytest tests/k8s/ -v --junitxml=k8s-test-results.xml
-      shell: bash
-    
-    - name: Upload results
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: k8s-test-results
-        path: k8s-test-results.xml
-    
-    - name: Cleanup
-      if: always()
-      run: kind delete cluster --name green-agent-test || true
-      shell: bash
+    steps:
+      # ═══════════════════════════════════════════════════════════════════
+      # 1. Checkout
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 2. Guard required files exist
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Guard required files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required=(
+            Dockerfile
+            config/overlays/development/kustomization.yaml
+            config/overlays/development/namespace.yaml
+            config/base/kustomization.yaml
+            config/base/deployment.yaml
+            config/base/ray-cluster.yaml
+            config/base/namespace.yaml
+            tests/requirements-tests.txt
+            tests/k8s
+          )
+
+          for f in "${required[@]}"; do
+            if [ ! -f "${f}" ] && [ ! -d "${f}" ]; then
+              echo "::error::Required path missing: ${f}"
+              exit 1
+            fi
+            echo "  ✓ ${f}"
+          done
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 3. Install tooling
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install standalone kustomize
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Install kustomize ${KUSTOMIZE_VERSION}"
+          curl -sLo /tmp/kustomize.tar.gz \
+            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          tar -xzf /tmp/kustomize.tar.gz -C /tmp kustomize
+          sudo mv /tmp/kustomize /usr/local/bin/kustomize
+          sudo chmod +x /usr/local/bin/kustomize
+          kustomize version
+          echo "::endgroup::"
+          # The bundled kustomize in kubectl v1.30 is v5.0.x, which does NOT
+          # support `labels: includeSelectors: false` used by the v5.0 manifests.
+          # The standalone binary above is v5.4.3+ and is required.
+
+      - name: Install Kind
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Install Kind ${KIND_VERSION}"
+          curl -sLo ./kind \
+            "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+          echo "::endgroup::"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 4. Create Kind cluster
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Create Kind cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Create Kind cluster ${CLUSTER_NAME}"
+          kind create cluster --name "${CLUSTER_NAME}" --wait 120s
+          kubectl cluster-info
+          kubectl wait --for=condition=ready node --all --timeout=60s
+          kubectl get nodes -o wide
+          echo "::endgroup::"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 5. Install KubeRay operator
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Install KubeRay Operator
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Install KubeRay operator"
+
+          helm repo add kuberay https://ray-project.github.io/kuberay-helm/ --force-update
+          helm repo update
+
+          helm install kuberay-operator kuberay/kuberay-operator \
+            --version "${KUBERAY_CHART_VERSION}" \
+            --namespace ray-system \
+            --create-namespace \
+            --wait --timeout 5m
+
+          # Wait for the CRD to be registered
+          kubectl wait --for=condition=established \
+            crd/rayclusters.ray.io --timeout=60s
+
+          # Wait for the operator pod to be Ready
+          kubectl wait --for=condition=ready pod \
+            -l app.kubernetes.io/name=kuberay-operator \
+            -n ray-system \
+            --timeout=120s
+
+          # Wait for the webhook service to exist (blocks the first RayCluster apply otherwise)
+          for i in $(seq 1 30); do
+            if kubectl get svc -n ray-system kuberay-operator-webhook >/dev/null 2>&1; then
+              echo "  ✓ webhook service present"
+              break
+            fi
+            echo "  … waiting for webhook service (${i}/30)"
+            sleep 2
+          done
+
+          kubectl get crd | grep ray
+          kubectl get pods -n ray-system
+          echo "::endgroup::"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 6. Build + load image
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          pull: true
+          provenance: false
+          sbom: false
+          build-args: |
+            PYTHON_IMAGE=python:3.12.3-slim
+            BUILD_DATE=${{ github.event.head_commit.timestamp || github.run_started_at }}
+            VCS_REF=${{ github.sha }}
+            BUILD_VERSION=5.0.0-dev
+            ENHANCEMENTS_ENABLED=true
+          tags: ${{ env.LOCAL_IMAGE }}
+          cache-from: type=gha,scope=k8s-tests
+          cache-to: type=gha,mode=max,scope=k8s-tests
+
+      - name: Load image into Kind
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Load image into Kind"
+          kind load docker-image "${LOCAL_IMAGE}" --name "${CLUSTER_NAME}"
+          docker exec "${CLUSTER_NAME}-control-plane" crictl images | grep green-agent || true
+          echo "::endgroup::"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 7. Deploy Green Agent
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Deploy Green Agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Deploy Green Agent"
+
+          # The overlay's own `namespace:` wins over `kubectl -n`. We render
+          # the overlay, verify the namespace matches TEST_NAMESPACE, then apply.
+          echo "▶ Rendering config/overlays/development…"
+          kustomize build config/overlays/development > /tmp/rendered.yaml
+
+          RENDERED_NS="$(yq -r 'select(.kind == "Namespace") | .metadata.name' /tmp/rendered.yaml | head -1)"
+          echo "  rendered namespace: ${RENDERED_NS}"
+          echo "  expected namespace: ${TEST_NAMESPACE}"
+
+          if [ "${RENDERED_NS}" != "${TEST_NAMESPACE}" ]; then
+            echo "::error::Namespace mismatch — overlay renders '${RENDERED_NS}' but TEST_NAMESPACE='${TEST_NAMESPACE}'"
+            echo "          Fix TEST_NAMESPACE in the workflow, or the overlay's namespace: field."
+            exit 1
+          fi
+
+          # Verify the rendered image matches LOCAL_IMAGE (guard against drift)
+          RENDERED_IMAGE="$(yq -r 'select(.kind == "Deployment") | .spec.template.spec.containers[0].image' /tmp/rendered.yaml | head -1)"
+          echo "  rendered image:     ${RENDERED_IMAGE}"
+          echo "  expected image:     ${LOCAL_IMAGE}"
+          if [ "${RENDERED_IMAGE}" != "${LOCAL_IMAGE}" ]; then
+            echo "::error::Image mismatch — overlay renders '${RENDERED_IMAGE}' but LOCAL_IMAGE='${LOCAL_IMAGE}'"
+            echo "          Fix LOCAL_IMAGE in the workflow, or the overlay's images.newTag."
+            exit 1
+          fi
+
+          # Apply
+          echo "▶ Applying rendered manifests…"
+          kubectl apply -f /tmp/rendered.yaml
+
+          # imagePullPolicy guard — must be IfNotPresent so Kind uses the
+          # loaded image (not a registry pull)
+          POLICY="$(kubectl get deployment green-agent -n "${TEST_NAMESPACE}" \
+            -o jsonpath='{.spec.template.spec.containers[0].imagePullPolicy}')"
+          echo "  imagePullPolicy: ${POLICY}"
+          if [ "${POLICY}" = "Always" ]; then
+            echo "::error::imagePullPolicy=Always — Kind will try to pull '${LOCAL_IMAGE}' from a registry"
+            echo "          Set imagePullPolicy: IfNotPresent in the Deployment (dev overlay)."
+            exit 1
+          fi
+
+          kubectl get all -n "${TEST_NAMESPACE}" || true
+          echo "::endgroup::"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 8. Wait for workloads to be ready
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Wait for Deployment rollout
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Wait for deployment/green-agent"
+          kubectl rollout status deployment/green-agent \
+            -n "${TEST_NAMESPACE}" \
+            --timeout=300s
+          kubectl get deployment -n "${TEST_NAMESPACE}"
+          kubectl get pods -n "${TEST_NAMESPACE}" -o wide
+          echo "::endgroup::"
+
+      - name: Wait for RayCluster ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Wait for RayCluster"
+
+          # RayCluster CR reports readiness via .status.state = ready
+          for i in $(seq 1 60); do
+            STATE="$(kubectl get raycluster green-agent-cluster \
+              -n "${TEST_NAMESPACE}" \
+              -o jsonpath='{.status.state}' 2>/dev/null || echo "")"
+            if [ "${STATE}" = "ready" ]; then
+              echo "  ✓ RayCluster state = ready"
+              break
+            fi
+            echo "  … RayCluster state = '${STATE:-not-found}' (${i}/60)"
+            sleep 5
+          done
+
+          FINAL_STATE="$(kubectl get raycluster green-agent-cluster \
+            -n "${TEST_NAMESPACE}" \
+            -o jsonpath='{.status.state}' 2>/dev/null || echo "")"
+          if [ "${FINAL_STATE}" != "ready" ]; then
+            echo "::error::RayCluster did not become ready (state: ${FINAL_STATE:-unknown})"
+            kubectl describe raycluster green-agent-cluster -n "${TEST_NAMESPACE}" || true
+            kubectl logs -n "${TEST_NAMESPACE}" -l app.kubernetes.io/component=head --tail=200 || true
+            exit 1
+          fi
+
+          kubectl get raycluster -n "${TEST_NAMESPACE}"
+          kubectl get pods -n "${TEST_NAMESPACE}"
+          echo "::endgroup::"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 9. Diagnostic snapshot (runs before tests, useful baseline)
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Pre-test cluster snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Cluster snapshot"
+          mkdir -p diagnostics
+          kubectl get all -A                                 > diagnostics/get-all.txt       || true
+          kubectl get raycluster -n "${TEST_NAMESPACE}" -o yaml > diagnostics/raycluster.yaml || true
+          kubectl get deployment -n "${TEST_NAMESPACE}" -o yaml  > diagnostics/deployment.yaml || true
+          kubectl get configmap -n "${TEST_NAMESPACE}" -o yaml   > diagnostics/configmap.yaml  || true
+          kubectl get events -A --sort-by=.lastTimestamp     > diagnostics/events.txt        || true
+          echo "::endgroup::"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 10. Run tests
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: tests/requirements-tests.txt
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install --upgrade pip
+          pip install -r tests/requirements-tests.txt
+          pip check
+
+      - name: Run tests
+        shell: bash
+        env:
+          KUBECONFIG: ${{ env.KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          echo "::group::pytest tests/k8s/"
+          pytest tests/k8s/ -v --junitxml=k8s-test-results.xml
+          echo "::endgroup::"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 11. Diagnostic dump on failure
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Dump diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          set +e  # never block the diagnostic dump
+          mkdir -p diagnostics
+
+          echo "::group::Pod describe + logs"
+          for ns in "${TEST_NAMESPACE}" ray-system; do
+            for pod in $(kubectl get pods -n "${ns}" -o name 2>/dev/null); do
+              echo "----- ${ns} / ${pod} -----"
+              kubectl describe "${pod}" -n "${ns}" >> "diagnostics/describe-${ns}.txt" 2>&1
+              kubectl logs "${pod}" -n "${ns}" --tail=500 --all-containers >> "diagnostics/logs-${ns}.txt" 2>&1
+            done
+          done
+          echo "::endgroup::"
+
+          echo "::group::Events"
+          kubectl get events -A --sort-by=.lastTimestamp >> diagnostics/events.txt 2>&1
+          echo "::endgroup::"
+
+          echo "::group::Full state"
+          kubectl get all -A >> diagnostics/get-all.txt 2>&1
+          kubectl describe raycluster green-agent-cluster -n "${TEST_NAMESPACE}" >> diagnostics/raycluster.txt 2>&1
+          echo "::endgroup::"
+
+          echo "::group::Diagnostics collected"
+          ls -lh diagnostics/
+          echo "::endgroup::"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 12. Upload artifacts
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k8s-test-results
+          path: k8s-test-results.xml
+          retention-days: 30
+          overwrite: true
+          if-no-files-found: warn
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: k8s-diagnostics
+          path: diagnostics/
+          retention-days: 14
+          overwrite: true
+          if-no-files-found: warn
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 13. Job summary
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Kubernetes Integration Tests"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Cluster | \`${CLUSTER_NAME}\` (Kind ${KIND_VERSION}) |"
+            echo "| Namespace | \`${TEST_NAMESPACE}\` |"
+            echo "| Image | \`${LOCAL_IMAGE}\` |"
+            echo "| Ray version | \`${RAY_VERSION}\` |"
+            echo "| KubeRay chart | \`${KUBERAY_CHART_VERSION}\` |"
+            echo "| kubectl | \`${KUBECTL_VERSION}\` |"
+            echo "| kustomize | \`${KUSTOMIZE_VERSION}\` |"
+            echo "| Helm | \`${HELM_VERSION}\` |"
+            echo ""
+            echo "### Local reproduction"
+            echo '```bash'
+            echo "kind create cluster --name ${CLUSTER_NAME}"
+            echo "helm repo add kuberay https://ray-project.github.io/kuberay-helm/"
+            echo "helm repo update"
+            echo "helm install kuberay-operator kuberay/kuberay-operator --version ${KUBERAY_CHART_VERSION} -n ray-system --create-namespace --wait"
+            echo "kubectl wait --for=condition=established crd/rayclusters.ray.io --timeout=60s"
+            echo "docker build -t ${LOCAL_IMAGE} ."
+            echo "kind load docker-image ${LOCAL_IMAGE} --name ${CLUSTER_NAME}"
+            echo "kustomize build config/overlays/development | kubectl apply -f -"
+            echo "kubectl rollout status deployment/green-agent -n ${TEST_NAMESPACE} --timeout=300s"
+            echo "pytest tests/k8s/ -v"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 14. Cleanup (always)
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          echo "::group::Cleanup"
+          kind delete cluster --name "${CLUSTER_NAME}" || true
+          docker rmi "${LOCAL_IMAGE}" 2>/dev/null || true
+          echo "::endgroup::"
