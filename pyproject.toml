@@ -1,7 +1,13 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "green-agent"
 version = "5.0.0"
+description = "Green Agent — 4-layer feedback + advanced enhancements"
 requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
 dependencies = [
     "PyYAML>=6.0",
     "aiofiles>=23.0.0",
@@ -32,3 +38,13 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["core*", "enhancements*", "symbolic*", "dashboard*",
+           "policy*", "monitoring*", "reflection*", "memory*",
+           "analysis*", "utils*", "quantum*", "interpretation*",
+           "decision*", "optimization*", "benchmarking*", "carbon*",
+           "ml_governance*", "governance*", "distributed*",
+           "orchestration*", "integration*", "runtime*"]
+
+[tool.setuptools.package-data]
+enhancements = ["config.yaml"]
+"enhancements.core" = ["*.json"]
