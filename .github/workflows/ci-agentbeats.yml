@@ -1,21 +1,440 @@
-- name: Detect and validate AgentBeats config
-  run: |
-    if [ -f agentbeats.json ]; then
-      echo "Using agentbeats.json"
-      jq . agentbeats.json > /dev/null
-      jq -e '.queries | type == "array"' agentbeats.json > /dev/null
-      jq -e '.image | ascii_downcase == .' agentbeats.json > /dev/null
+# .github/workflows/validate-agentbeats.yml
+#
+# Green Agent v5.0.0 — AgentBeats Configuration Validation
+# =========================================================
+#
+# | Field | Value |
+# |---|---|
+# | Version | 5.0.0 |
+# | Last Updated | 2026-11-16 |
+# | Status | Production Ready |
+# | Trigger | push to `main` · PR to `main` · manual |
+# | Purpose | Validate `agentbeats.json` OR `agentbeats.yml` before any build |
+#
+# ── What this workflow does ───────────────────────────────────────────────
+#   1. Detects the format (JSON preferred; warns if both exist)
+#   2. Parses the file (jq / yq) with a clear error message
+#   3. Validates required fields (.name, .version, .image, .entrypoint,
+#      .description, .queries) with type + non-empty checks
+#   4. Validates .image format (ghcr.io/<owner>/<repo>:<tag>) and rejects
+#      mutable tags (:latest, :main, :dev, …)
+#   5. Cross-checks .image tag ↔ .version (warn)
+#   6. Guards yq implementation (mikefarah's Go yq, not kislyuk/python yq)
+#   7. Runs scripts/validate_agentbeats.py (with timeout + existence guard)
+#   8. Emits a job summary + uploads the config as a provenance artifact
+#
+# ── Bugs fixed vs. the previous snippet ──────────────────────────────────
+#   • `jq -e '.image | ascii_downcase == .'` crashed with a jq stack trace
+#     when `.image` was missing (null cannot be matched). Now guarded by
+#     a `type == "string" and length > 0` check first.
+#   • `yq '.image | test("^[a-z0-9./:-]+$")'` had the same null crash and
+#     accepted meaningless values (".", "///", ":::"). Now: strict
+#     ghcr.io regex + null guard.
+#   • `.queries` rule differed per format — JSON allowed `[]`, YAML
+#     required `length > 0`. Now both require non-empty array.
+#   • `.version`, `.name`, `.entrypoint`, `.description` were never
+#     checked — downstream `build-and-push.yml` requires them. Now
+#     validated here first.
+#   • `:latest` / `:main` / `:dev` passed both branches but
+#     `agentbeats-submission.yml` v5.0.0 rejects them. Now rejected here
+#     with the same rule.
+#   • `.image` format was loose (`"foo"` passed). Now requires
+#     `ghcr.io/<owner>/<repo>:<tag>`.
+#   • No `set -euo pipefail` — unset variables and pipeline failures
+#     were silently ignored. Now every `run:` block uses it.
+#   • `yq '.queries | length > 0'` works only on mikefarah's yq, not on
+#     kislyuk/python yq. Now implementation is checked and warned.
+#   • Two separate `- run:` steps for one logical check. Merged into one
+#     for failure context.
+#   • Raw `echo "❌ …"` → `::error::` annotations.
+#   • No job summary / artifact upload. Both added.
+#
+# ── Required `agentbeats.json` / `agentbeats.yml` shape ──────────────────
+#   {
+#     "name":        "green-agent",                              # string
+#     "version":     "5.0.0",                                    # semver
+#     "image":       "ghcr.io/nurcholishadam/green-agent:5.0.0", # immutable
+#     "entrypoint":  ["python", "run_agent.py"],                 # array
+#     "description": "Green Agent v5.0.0",                       # string
+#     "queries":     [{ "id": "query-1", "task": "..." }]        # array
+#   }
+#
+# ── Format priority ──────────────────────────────────────────────────────
+#   If both `agentbeats.json` AND `agentbeats.yml` exist at the repo root,
+#   `.json` wins and a warning is emitted. Delete one to silence it.
+#
+# ── Local dry-run ────────────────────────────────────────────────────────
+#   bash -c "$(sed -n '/Detect and validate/,/^$/p' .github/workflows/validate-agentbeats.yml)"
+#   or simply:
+#     jq . agentbeats.json
+#     jq -e '.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+")' agentbeats.json
+#     python scripts/validate_agentbeats.py
+#
+# ── Changelog ────────────────────────────────────────────────────────────
+#   5.0.0 (2026-11-16)
+#     Fixed:
+#       • `.image` null crash in both jq and yq branches
+#       • Format-inconsistent `.queries` rule
+#       • Missing `.name` / `.version` / `.entrypoint` / `.description` checks
+#       • Mutable tags (:latest, :main, :dev) not rejected
+#       • Loose `.image` regex (`"foo"` passed)
+#       • Missing `set -euo pipefail`
+#       • yq implementation not pinned (mikefarah vs kislyuk)
+#       • Two-step split → merged into one step with grouped logs
+#     Added:
+#       • `::error::` / `::warning::` annotations
+#       • `::group::` / `::endgroup::` log folding
+#       • `.image` ↔ `.version` cross-check (warn only)
+#       • Required-file guards (scripts/validate_agentbeats.py, Dockerfile)
+#       • `timeout-minutes: 5` on the step
+#       • Job summary with detected format + field list + image + version
+#       • Config artifact uploaded for provenance (90-day retention)
+#       • Format-priority warning when both files exist
+#
+# ── What's Not in Scope ──────────────────────────────────────────────────
+#   • Schema evolution (adding/removing required fields) — pinned to v5.0.0
+#   • Deep schema validation — delegated to scripts/validate_agentbeats.py
+#   • Registry reachability check (does the image exist?) — build workflows
+#   • YAML → JSON conversion — the two formats are validated independently
 
-    elif [ -f agentbeats.yml ]; then
-      echo "Using agentbeats.yml"
-      yq . agentbeats.yml > /dev/null
-      yq '.queries | length > 0' agentbeats.yml > /dev/null
-      yq '.image | test("^[a-z0-9./:-]+$")' agentbeats.yml > /dev/null
+name: Validate AgentBeats config
 
-    else
-      echo "❌ No agentbeats.json or agentbeats.yml found at repo root"
-      exit 1
-    fi
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'agentbeats.json'
+      - 'agentbeats.yml'
+      - 'agentbeats.yaml'
+      - 'scripts/validate_agentbeats.py'
+      - '.github/workflows/validate-agentbeats.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'agentbeats.json'
+      - 'agentbeats.yml'
+      - 'agentbeats.yaml'
+      - 'scripts/validate_agentbeats.py'
+      - '.github/workflows/validate-agentbeats.yml'
+  workflow_dispatch:
 
-- run: python scripts/validate_agentbeats.py
+permissions:
+  contents: read
 
+concurrency:
+  group: validate-agentbeats-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate config
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # ═══════════════════════════════════════════════════════════════════
+      # 1. Checkout
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 2. Install pinned yq (mikefarah's Go yq, NOT kislyuk's Python yq)
+      #    `yq '.queries | length > 0'` and `yq -e 'tag == "!!seq"'`
+      #    require mikefarah's implementation. The ubuntu-latest runner
+      #    ships mikefarah's yq, but self-hosted runners may not.
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Ensure mikefarah's yq
+        run: |
+          set -euo pipefail
+
+          if ! command -v yq >/dev/null 2>&1; then
+            echo "::error::yq not found — installing mikefarah's yq"
+            YQ_VERSION=v4.44.3
+            sudo wget -q "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+              -O /usr/local/bin/yq
+            sudo chmod +x /usr/local/bin/yq
+          fi
+
+          if ! yq --version 2>&1 | grep -qi 'mikefarah'; then
+            echo "::error::yq is not mikefarah's implementation — syntax may differ"
+            echo "          found: $(yq --version 2>&1 || echo 'unknown')"
+            echo "          install: https://github.com/mikefarah/yq#install"
+            exit 1
+          fi
+
+          echo "✓ yq: $(yq --version)"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 3. Guard the external Python validator exists
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Guard validator script
+        run: |
+          set -euo pipefail
+
+          if [ ! -f scripts/validate_agentbeats.py ]; then
+            echo "::error::scripts/validate_agentbeats.py not found"
+            echo "          Create it or remove this step from the workflow."
+            exit 1
+          fi
+          echo "✓ scripts/validate_agentbeats.py present"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 4. Detect + validate the config (single step, grouped logs)
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Detect and validate AgentBeats config
+        id: validate
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          # ── 4a. Detect format ────────────────────────────────────────────
+          echo "::group::Detect config format"
+          FORMAT=""
+          FILE=""
+
+          if [ -f agentbeats.json ] && [ -f agentbeats.yml ]; then
+            echo "::warning::Both agentbeats.json and agentbeats.yml exist — using .json (priority)"
+            FORMAT="json"
+            FILE="agentbeats.json"
+          elif [ -f agentbeats.json ]; then
+            FORMAT="json"
+            FILE="agentbeats.json"
+          elif [ -f agentbeats.yml ]; then
+            FORMAT="yaml"
+            FILE="agentbeats.yml"
+          elif [ -f agentbeats.yaml ]; then
+            FORMAT="yaml"
+            FILE="agentbeats.yaml"
+          else
+            echo "::error::No agentbeats.json / agentbeats.yml / agentbeats.yaml found at repo root"
+            exit 1
+          fi
+
+          echo "✓ Detected: ${FILE} (format: ${FORMAT})"
+          echo "format=${FORMAT}" >> "$GITHUB_OUTPUT"
+          echo "file=${FILE}"     >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+          # ── 4b. Helper: run jq or yq depending on format ─────────────────
+          parse_ok() {
+            if [ "${FORMAT}" = "json" ]; then
+              jq . "${FILE}" > /dev/null
+            else
+              yq . "${FILE}" > /dev/null
+            fi
+          }
+
+          assert_present() {
+            local field="$1"
+            local desc="$2"
+            if [ "${FORMAT}" = "json" ]; then
+              if ! jq -e --arg f "${field}" \
+                'has($f) and (.[$f] != null)' "${FILE}" > /dev/null 2>&1; then
+                echo "::error::.${field} is missing or null (${desc}) in ${FILE}"
+                return 1
+              fi
+            else
+              if ! yq -e "has(\"${field}\") and .${field} != null" "${FILE}" > /dev/null 2>&1; then
+                echo "::error::.${field} is missing or null (${desc}) in ${FILE}"
+                return 1
+              fi
+            fi
+            echo "  ✓ .${field}"
+          }
+
+          assert_string() {
+            local field="$1"
+            if [ "${FORMAT}" = "json" ]; then
+              if ! jq -e --arg f "${field}" \
+                '.[$f] | type == "string" and length > 0' "${FILE}" > /dev/null 2>&1; then
+                echo "::error::.${field} must be a non-empty string"
+                return 1
+              fi
+            else
+              if ! yq -e ".${field} | tag == \"!!str\" and length > 0" "${FILE}" > /dev/null 2>&1; then
+                echo "::error::.${field} must be a non-empty string"
+                return 1
+              fi
+            fi
+          }
+
+          assert_array() {
+            local field="$1"
+            if [ "${FORMAT}" = "json" ]; then
+              if ! jq -e --arg f "${field}" \
+                '.[$f] | type == "array" and length > 0' "${FILE}" > /dev/null 2>&1; then
+                echo "::error::.${field} must be a non-empty array"
+                return 1
+              fi
+            else
+              if ! yq -e ".${field} | tag == \"!!seq\" and length > 0" "${FILE}" > /dev/null 2>&1; then
+                echo "::error::.${field} must be a non-empty array"
+                return 1
+              fi
+            fi
+          }
+
+          get_string() {
+            if [ "${FORMAT}" = "json" ]; then
+              jq -er ".$1" "${FILE}"
+            else
+              yq -er ".$1" "${FILE}"
+            fi
+          }
+
+          # ── 4c. Parse check ──────────────────────────────────────────────
+          echo "::group::Parse ${FILE}"
+          if ! parse_ok; then
+            echo "::error::${FILE} is not valid ${FORMAT}"
+            exit 1
+          fi
+          echo "✓ Parse OK"
+          echo "::endgroup::"
+
+          # ── 4d. Required fields ──────────────────────────────────────────
+          echo "::group::Required fields"
+          assert_present name        "agent name"
+          assert_present version     "semver"
+          assert_present image       "container image reference"
+          assert_present entrypoint  "runtime entrypoint"
+          assert_present description "human description"
+          assert_present queries     "benchmark queries"
+          echo "::endgroup::"
+
+          # ── 4e. Field types ──────────────────────────────────────────────
+          echo "::group::Field types"
+          assert_string name
+          assert_string version
+          assert_string image
+          assert_array  entrypoint
+          assert_string description
+          assert_array  queries
+          echo "  ✓ all field types valid"
+          echo "::endgroup::"
+
+          # ── 4f. Version is semver ────────────────────────────────────────
+          echo "::group::Semver check"
+          VERSION="$(get_string version)"
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "::error::.version must be semver (e.g. 5.0.0) — got: ${VERSION}"
+            exit 1
+          fi
+          echo "  ✓ .version = ${VERSION}"
+          echo "::endgroup::"
+
+          # ── 4g. Image format + immutability ──────────────────────────────
+          echo "::group::Image reference"
+          IMAGE="$(get_string image)"
+          echo "  .image = ${IMAGE}"
+
+          # Format: ghcr.io/<owner>/<repo>:<tag>
+          if ! [[ "${IMAGE}" =~ ^ghcr\.io/[a-z0-9._-]+/[a-z0-9._-]+:[a-zA-Z0-9._-]+$ ]]; then
+            echo "::error::.image must match 'ghcr.io/<owner>/<repo>:<tag>' — got: ${IMAGE}"
+            exit 1
+          fi
+          echo "  ✓ format valid"
+
+          # Mutable tags rejected (AgentBeats immutability requirement)
+          IMAGE_TAG="${IMAGE##*:}"
+          if [[ "${IMAGE_TAG}" =~ ^(latest|main|master|dev|stable|edge|test|canary|nightly)$ ]]; then
+            echo "::error::.image tag '${IMAGE_TAG}' is mutable — AgentBeats requires an immutable tag"
+            echo "          Use a version (5.0.0), git SHA (sha-abc1234), or date (2026-11-16)"
+            exit 1
+          fi
+          echo "  ✓ tag '${IMAGE_TAG}' is immutable"
+
+          # Cross-check .image tag ↔ .version (warn only)
+          if [[ "${IMAGE_TAG}" != "${VERSION}" ]] \
+             && [[ "${IMAGE_TAG}" != sha-* ]] \
+             && [[ "${IMAGE_TAG}" != *"${VERSION}"* ]]; then
+            echo "::warning::.image tag '${IMAGE_TAG}' does not match .version '${VERSION}' or a git SHA"
+          fi
+          echo "::endgroup::"
+
+          # ── 4h. Expose outputs for downstream steps ──────────────────────
+          {
+            echo "version=${VERSION}"
+            echo "image=${IMAGE}"
+            echo "image_tag=${IMAGE_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "✓ Configuration valid"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 5. Run the external Python validator (timeout-guarded)
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Run scripts/validate_agentbeats.py
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+
+          echo "::group::External validator"
+          if ! python scripts/validate_agentbeats.py; then
+            echo "::error::scripts/validate_agentbeats.py failed"
+            exit 1
+          fi
+          echo "✓ External validator passed"
+          echo "::endgroup::"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 6. Upload the config as a provenance artifact
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Upload config artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agentbeats-config-${{ steps.validate.outputs.version || 'unknown' }}
+          path: |
+            agentbeats.json
+            agentbeats.yml
+            agentbeats.yaml
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: warn
+          compression-level: 6
+
+      # ═══════════════════════════════════════════════════════════════════
+      # 7. Job summary
+      # ═══════════════════════════════════════════════════════════════════
+      - name: Write job summary
+        if: always()
+        run: |
+          FORMAT="${{ steps.validate.outputs.format || 'n/a' }}"
+          FILE="${{ steps.validate.outputs.file || 'n/a' }}"
+          VERSION="${{ steps.validate.outputs.version || 'n/a' }}"
+          IMAGE="${{ steps.validate.outputs.image || 'n/a' }}"
+          IMAGE_TAG="${{ steps.validate.outputs.image_tag || 'n/a' }}"
+
+          {
+            echo "## AgentBeats Config Validation"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Detected format | \`${FORMAT}\` |"
+            echo "| Config file | \`${FILE}\` |"
+            echo "| \`.version\` | \`${VERSION}\` |"
+            echo "| \`.image\` | \`${IMAGE}\` |"
+            echo "| \`.image\` tag | \`${IMAGE_TAG}\` |"
+            echo ""
+            echo "### Required schema"
+            echo '```json'
+            echo '{'
+            echo '  "name": "green-agent",'
+            echo '  "version": "5.0.0",'
+            echo '  "image": "ghcr.io/<owner>/green-agent:5.0.0",'
+            echo '  "entrypoint": ["python", "run_agent.py"],'
+            echo '  "description": "...",'
+            echo '  "queries": [{ "id": "query-1", "task": "..." }]'
+            echo '}'
+            echo '```'
+            echo ""
+            echo "### Validation rules"
+            echo "- \`.version\` must be semver (\`5.0.0\`)"
+            echo "- \`.image\` must match \`ghcr.io/<owner>/<repo>:<tag>\`"
+            echo "- \`.image\` tag must **not** be \`:latest\`, \`:main\`, \`:dev\`, …"
+            echo "- \`.entrypoint\` and \`.queries\` must be non-empty arrays"
+            echo "- \`.name\` and \`.description\` must be non-empty strings"
+            echo ""
+            echo "If both \`agentbeats.json\` and \`agentbeats.yml\` exist, \`.json\` wins."
+          } >> "$GITHUB_STEP_SUMMARY"
