@@ -99,6 +99,23 @@ from typing import (
     Union,
 )
 
+try:
+    from ._common import (
+        _cfg_get,
+        _ensure_aware,
+        _json_safe,
+        _parse_timestamp,
+        _utcnow,
+    )
+except ImportError:
+    from _common import (  # type: ignore[no-redef]
+        _cfg_get,
+        _ensure_aware,
+        _json_safe,
+        _parse_timestamp,
+        _utcnow,
+    )
+
 # --------------------------------------------------------------------------- #
 # Optional dependencies
 # --------------------------------------------------------------------------- #
@@ -136,66 +153,6 @@ _VALID_FAIL_MODES = ("silent", "log", "raise")
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _ensure_aware(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def _parse_timestamp(raw: Any) -> datetime:
-    if isinstance(raw, datetime):
-        return _ensure_aware(raw)
-    if isinstance(raw, str):
-        s = raw.strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        try:
-            return _ensure_aware(datetime.fromisoformat(s))
-        except ValueError:
-            return _utcnow()
-    return _utcnow()
-
-
-def _json_safe(obj: Any) -> Any:
-    """Make *obj* JSON-serialisable (inf/nan → None, datetimes → ISO)."""
-    if isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return None
-        return obj
-    if isinstance(obj, datetime):
-        return _ensure_aware(obj).isoformat()
-    if isinstance(obj, Enum):
-        return obj.value
-    if isinstance(obj, dict):
-        return {str(k): _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [_json_safe(v) for v in obj]
-    return obj
-
-
-def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
-    """Read a key from a dict / pydantic-v1 / pydantic-v2 / object config."""
-    if config is None:
-        return default
-    if isinstance(config, Mapping):
-        return config.get(key, default)
-    if hasattr(config, "model_dump"):
-        try:
-            return config.model_dump().get(key, default)
-        except Exception:
-            pass
-    if hasattr(config, "dict") and callable(getattr(config, "dict")):
-        try:
-            return config.dict().get(key, default)
-        except Exception:
-            pass
-    return getattr(config, key, default)
-
-
 def _validate_config(config: Any) -> None:
     """Validate configuration; raise ``ValueError`` on obvious mistakes."""
     if config is None:
