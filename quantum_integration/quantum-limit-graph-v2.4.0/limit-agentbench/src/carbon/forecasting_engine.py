@@ -78,6 +78,25 @@ from typing import (
     Tuple,
 )
 
+try:
+    from ._common import (
+        _cfg_get,
+        _ensure_aware,
+        _json_safe,
+        _parse_timestamp,
+        _safe_mean,
+        _utcnow,
+    )
+except ImportError:
+    from _common import (  # type: ignore[no-redef]
+        _cfg_get,
+        _ensure_aware,
+        _json_safe,
+        _parse_timestamp,
+        _safe_mean,
+        _utcnow,
+    )
+
 # --------------------------------------------------------------------------- #
 # Import v18 (single implementation for fetching, caching, circuits, retry)
 # --------------------------------------------------------------------------- #
@@ -170,54 +189,6 @@ except ImportError as _e:  # pragma: no cover
     SimpleActiveUserPreferenceLearner = None  # type: ignore[assignment]
     InMemoryStorage = None  # type: ignore[assignment]
     StorageProtocol = None  # type: ignore[assignment]
-
-    def _utcnow() -> datetime:  # type: ignore[misc]
-        return datetime.now(timezone.utc)
-
-    def _ensure_aware(dt: datetime) -> datetime:  # type: ignore[misc]
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-    def _parse_timestamp(raw: Any) -> datetime:  # type: ignore[misc]
-        if isinstance(raw, datetime):
-            return _ensure_aware(raw)
-        if isinstance(raw, str):
-            s = raw.strip()
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            try:
-                return _ensure_aware(datetime.fromisoformat(s))
-            except ValueError:
-                return _utcnow()
-        return _utcnow()
-
-    def _json_safe(obj: Any) -> Any:  # type: ignore[misc]
-        if isinstance(obj, float):
-            return None if (math.isnan(obj) or math.isinf(obj)) else obj
-        if isinstance(obj, datetime):
-            return _ensure_aware(obj).isoformat()
-        if isinstance(obj, Enum):
-            return obj.value
-        if isinstance(obj, Mapping):
-            return {str(k): _json_safe(v) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple, set)):
-            return [_json_safe(v) for v in obj]
-        return obj
-
-    def _cfg_get(config: Any, key: str, default: Any = None) -> Any:  # type: ignore[misc]
-        if config is None:
-            return default
-        if isinstance(config, Mapping):
-            return config.get(key, default)
-        return getattr(config, key, default)
-
-    def _safe_mean(values: Any, default: float = 0.0) -> float:  # type: ignore[misc]
-        items = [
-            float(v)
-            for v in values
-            if v is not None and math.isfinite(float(v))
-        ]
-        return statistics.mean(items) if items else default
-
 
 logger = logging.getLogger(__name__)
 

@@ -88,35 +88,20 @@ from typing import (
     Tuple,
 )
 
+try:
+    from ._common import _ensure_aware, _parse_timestamp, _utcnow
+except ImportError:
+    from _common import (  # type: ignore[no-redef]
+        _ensure_aware,
+        _parse_timestamp,
+        _utcnow,
+    )
+
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
 # Time / value helpers
 # --------------------------------------------------------------------------- #
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _ensure_aware(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def _parse_timestamp(raw: Any) -> datetime:
-    if isinstance(raw, datetime):
-        return _ensure_aware(raw)
-    if isinstance(raw, str):
-        s = raw.strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        try:
-            return _ensure_aware(datetime.fromisoformat(s))
-        except ValueError:
-            return _utcnow()
-    return _utcnow()
-
-
 # --------------------------------------------------------------------------- #
 # Bounds
 # --------------------------------------------------------------------------- #
