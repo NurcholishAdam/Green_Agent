@@ -154,7 +154,7 @@ resources:
   - poddisruptionbudget.yaml
 
   # 9. NetworkPolicy — default-deny + explicit allow-list
-  - networkpolicy.yaml
+  - network-policy.yaml
 
 # ── Secret generation ─────────────────────────────────────────────────────
 # DO NOT commit real values. Create the Secret imperatively in the cluster:
@@ -182,13 +182,6 @@ images:
   - name: green-agent
     newTag: v5.0.0
     # newName: ghcr.io/nurcholishadam/green-agent   # for registry override
-
-# ── Replicas (only for non-HPA resources) ─────────────────────────────────
-# The Deployment is managed by the HPA in production, so it is intentionally
-# omitted here. RayCluster worker count is managed by Ray's autoscaler.
-replicas:
-  - name: green-agent-cluster    # RayCluster head group
-    count: 1
 
 # ── Generator options ─────────────────────────────────────────────────────
 # name-suffix hash forces pod rollout when a ConfigMap/Secret changes

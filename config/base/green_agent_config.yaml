@@ -145,7 +145,7 @@ helium:
 monitoring:
   prometheus:
     enabled: true
-    port: 9090                   # separate from agent port 8000 (avoids collision)
+    port: 8000                   # exposed by the agent Service and health probes
     metrics_path: "/metrics"
     scrape_interval: "15s"
     max_edges_export: 100        # requires LIMIT_GRAPH_ENABLED=true for full graph
@@ -351,7 +351,7 @@ enhancements:
 #     • security.cors / rate_limit
 #     • migration notes and validation recipes
 #   Changed:
-#     • monitoring.prometheus.port 8000 → 9090 (avoids agent port collision)
+#     • monitoring.prometheus.port 9090 → 8000 (matches the agent Service)
 #     • ray.num_workers 4 → 8 (aligns with Guide v5.0 + ConfigMap v5.0)
 #     • monitoring.logging.file removed (respects readOnlyRootFilesystem)
 #     • security.tls.cert_file "" → null

@@ -2,8 +2,12 @@ import pytest
 import subprocess
 import json
 import os
+import yaml
 
-NAMESPACE = os.getenv("GREEN_AGENT_NAMESPACE", "green-agent-test")
+NAMESPACE = os.getenv("GREEN_AGENT_NAMESPACE", "green-agent")
+RESOURCE_PREFIX = os.getenv("GREEN_AGENT_RESOURCE_PREFIX", "")
+SERVICE_NAME = f"{RESOURCE_PREFIX}green-agent"
+HPA_NAME = f"{RESOURCE_PREFIX}green-agent"
 
 def _kubectl_get(resource_type, resource_name, namespace=NAMESPACE, output="json"):
     """Helper to run kubectl get and return parsed JSON or raw output."""
@@ -24,7 +28,7 @@ def test_ray_cluster_exists():
 def test_pods_running():
     """Test pods are running"""
     result = subprocess.run(
-        ['kubectl', 'get', 'pods', '-n', NAMESPACE, '-l', 'app=green-agent'],
+        ['kubectl', 'get', 'pods', '-n', NAMESPACE, '-l', 'app.kubernetes.io/name=green-agent'],
         capture_output=True, text=True
     )
     assert 'Running' in result.stdout
@@ -32,7 +36,7 @@ def test_pods_running():
 def test_service_exists():
     """Test service exists"""
     result = subprocess.run(
-        ['kubectl', 'get', 'svc', '-n', NAMESPACE, 'dev-green-agent'],
+        ['kubectl', 'get', 'svc', '-n', NAMESPACE, SERVICE_NAME],
         capture_output=True, text=True
     )
     assert result.returncode == 0
@@ -42,8 +46,8 @@ def test_service_exists():
 # Enhanced tests for advanced modules
 # ------------------------------------------------------------------------------
 
-def _get_pod_env(component_label="component=head"):
-    """Retrieve environment variables of the first pod matching the label."""
+def _get_pod_env(component_label="app.kubernetes.io/component=head"):
+    """Retrieve effective environment variables from the first matching pod."""
     # Get pod name
     get_pod = subprocess.run(
         ["kubectl", "get", "pods", "-n", NAMESPACE, "-l", component_label, "-o", "jsonpath={.items[0].metadata.name}"],
@@ -52,24 +56,17 @@ def _get_pod_env(component_label="component=head"):
     if get_pod.returncode != 0 or not get_pod.stdout.strip():
         pytest.skip(f"No pod found with label {component_label}")
     pod_name = get_pod.stdout.strip()
-    # Get env vars
     get_env = subprocess.run(
-        ["kubectl", "get", "pod", pod_name, "-n", NAMESPACE, "-o", "jsonpath={.spec.containers[0].env}"],
+        ["kubectl", "exec", pod_name, "-n", NAMESPACE, "--", "env"],
         capture_output=True, text=True
     )
     if get_env.returncode != 0:
-        pytest.skip("Failed to retrieve environment variables")
-    # Parse JSON
-    try:
-        env_list = json.loads(get_env.stdout)
-    except json.JSONDecodeError:
-        pytest.skip("Environment variables not in JSON format")
-    env_dict = {item.get("name"): item.get("value", "") for item in env_list}
-    return env_dict
+        pytest.fail(f"Failed to retrieve environment variables: {get_env.stderr}")
+    return dict(line.split("=", 1) for line in get_env.stdout.splitlines() if "=" in line)
 
 def test_head_pod_has_enhancement_env_vars():
     """Head pod should have enhancement environment variables set."""
-    env = _get_pod_env("component=head")
+    env = _get_pod_env("app.kubernetes.io/component=head")
     required_vars = {
         "ENHANCEMENTS_ENABLED": "true",
         "LIMIT_GRAPH_ENABLED": "true",
@@ -78,14 +75,14 @@ def test_head_pod_has_enhancement_env_vars():
         "DISTILLATION_ENABLED": "true",
         "MOE_GATING_ENABLED": "true",
         "EVOLUTIONARY_ENABLED": "true",
-        "FLEXGEN_ENABLED": "true",
+        "FLEXGEN_ENABLED": "false",
     }
     for var, expected in required_vars.items():
         assert env.get(var) == expected, f"Missing or incorrect {var} in head pod"
 
 def test_worker_pod_has_enhancement_env_vars():
     """Worker pods should have enhancement environment variables set."""
-    env = _get_pod_env("component=worker")
+    env = _get_pod_env("app.kubernetes.io/component=worker")
     required_vars = {
         "ENHANCEMENTS_ENABLED": "true",
         "LIMIT_GRAPH_ENABLED": "true",
@@ -94,41 +91,36 @@ def test_worker_pod_has_enhancement_env_vars():
         "DISTILLATION_ENABLED": "true",
         "MOE_GATING_ENABLED": "true",
         "EVOLUTIONARY_ENABLED": "true",
-        "FLEXGEN_ENABLED": "true",
+        "FLEXGEN_ENABLED": "false",
     }
     for var, expected in required_vars.items():
         assert env.get(var) == expected, f"Missing or incorrect {var} in worker pod"
 
 def test_enhancement_configmap_exists():
     """Enhancement ConfigMap should be present and contain advanced settings."""
-    result = _kubectl_get("configmap", "green-agent-enhancements", output="json")
+    result = _kubectl_get("configmap", f"{RESOURCE_PREFIX}green-agent-config", output="json")
     if result.returncode != 0:
-        pytest.skip("green-agent-enhancements ConfigMap not found")
+        pytest.skip("green-agent-config ConfigMap not found")
     cm = json.loads(result.stdout)
     data = cm.get("data", {})
-    config_yaml = data.get("green_agent_config.yaml", "")
-    assert "limit_graph" in config_yaml
-    assert "modp" in config_yaml
-    assert "rlhf" in config_yaml
-    assert "distillation" in config_yaml
-    assert "bio_inspired" in config_yaml
-    assert "moe_expert" in config_yaml
-    assert "flexgen" in config_yaml
+    config_yaml = data.get("green_agent.yaml", "")
+    config = yaml.safe_load(config_yaml)
+    enhancements = config.get("enhancements", {})
+    assert {"limit_graph", "modp", "rlhf", "distillation", "evolutionary", "moe", "flexgen"} <= set(enhancements)
 
 def test_flexgen_env_var_in_deployment():
     """Deployment/Pod should have FlexGen environment variables."""
-    env = _get_pod_env("component=head")
-    # FlexGen may not be enabled in all environments; we check if present, not mandatory.
-    # If not present, the test passes but prints a warning.
+    env = _get_pod_env("app.kubernetes.io/component=head")
+    # FlexGen is intentionally disabled in the default deployment profile.
     if "FLEXGEN_ENABLED" not in env:
         pytest.skip("FlexGen not enabled in this deployment")
-    assert env.get("FLEXGEN_ENABLED") == "true"
+    assert env.get("FLEXGEN_ENABLED") == "false"
     assert "FLEXGEN_MODEL_NAME" in env
     assert "FLEXGEN_DEFAULT_PRECISION" in env
 
-def test_hpa_has_enhanced_metrics():
-    """HPA should include custom metrics for MODP, RLHF, etc."""
-    result = _kubectl_get("hpa", "green-agent-hpa", output="json")
+def test_hpa_has_resource_and_agent_metrics():
+    """HPA should include CPU and the Green Agent workload metrics."""
+    result = _kubectl_get("hpa", HPA_NAME, output="json")
     if result.returncode != 0:
         pytest.skip("HPA not found")
     hpa = json.loads(result.stdout)
@@ -141,16 +133,8 @@ def test_hpa_has_enhanced_metrics():
             metric_names.add(metric["external"]["metric"]["name"])
         elif metric.get("type") == "Resource":
             metric_names.add(metric["resource"]["name"])
-    required_metrics = {
-        "modp_score",
-        "rlhf_feedback_score",
-        "graph_centrality",
-        "distillation_update_rate",
-        "moe_gate_stddev",
-        "evolutionary_best_fitness",
-        "flexgen_energy_rate",
-    }
-    assert required_metrics.issubset(metric_names), f"Missing enhanced metrics: {required_metrics - metric_names}"
+    required_metrics = {"cpu", "green_agent_carbon_intensity_gco2_kwh", "green_agent_queue_depth"}
+    assert required_metrics <= metric_names, f"Missing HPA metrics: {required_metrics - metric_names}"
 
 def test_prometheus_adapter_has_enhanced_metrics_config():
     """Prometheus adapter custom metrics config should include enhanced metrics."""

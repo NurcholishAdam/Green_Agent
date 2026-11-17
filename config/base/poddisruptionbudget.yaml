@@ -1,0 +1,16 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: green-agent
+  namespace: green-agent
+  labels:
+    app.kubernetes.io/name: green-agent
+    app.kubernetes.io/instance: green-agent
+    app.kubernetes.io/part-of: green-agent
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: green-agent
+      app.kubernetes.io/instance: green-agent
+      app.kubernetes.io/component: server

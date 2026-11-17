@@ -116,9 +116,8 @@ namespace: dev-green-agent
 # Renames every resource: green-agent → dev-green-agent,
 # green-agent-config → dev-green-agent-config, etc.
 # Kustomize propagates the prefix to references (Service → Deployment,
-# HPA.scaleTargetRef.name, etc.). Pod template labels are NOT renamed —
-# they remain `app.kubernetes.io/instance: green-agent` unless overridden
-# by the `labels:` block below.
+# HPA.scaleTargetRef.name, etc.). Keep Pod selector labels unchanged so
+# the Deployment selector continues to match its Pod template.
 namePrefix: dev-
 
 # ── Base ──────────────────────────────────────────────────────────────────
@@ -131,9 +130,6 @@ resources:
 labels:
   - pairs:
       environment: development
-      # Override the base's `instance: green-agent` so dev and prod pods
-      # cannot be cross-selected if they ever share a namespace.
-      app.kubernetes.io/instance: green-agent-dev
       app.kubernetes.io/version: "5.0.0-dev"
     includeSelectors: false
 
@@ -189,15 +185,15 @@ patches:
         path: /spec/workerGroupSpecs/0/idleTimeoutSeconds
         value: 30
 
-  # 3. Deployment — verbose logging, always-pull, strip macOS-incompatible mount
+  # 3. Deployment — verbose logging and local image usage
   - target:
       kind: Deployment
       name: green-agent
     patch: |-
-      # Pick up freshly pushed dev tags
+      # Use the image loaded into Kind by the integration workflow.
       - op: replace
         path: /spec/template/spec/containers/0/imagePullPolicy
-        value: Always
+        value: IfNotPresent
       # Verbose logs in dev (base LOG_LEVEL=INFO at env index 4)
       - op: replace
         path: /spec/template/spec/containers/0/env/4/value
@@ -206,13 +202,6 @@ patches:
       - op: replace
         path: /spec/template/spec/containers/0/env/5/value
         value: text
-      # /sys/fs/cgroup hostPath does not work on macOS (kind/minikube/Docker Desktop)
-      # Base mount index: 5 (config, policies, tmp, checkpoints, out, cgroup)
-      - op: remove
-        path: /spec/template/spec/containers/0/volumeMounts/5
-      - op: remove
-        path: /spec/template/spec/volumes/5
-
   # 4. Namespace — relax PSA from `restricted` to `baseline` for dev clusters
   #    kind/minikube often rejects `restricted` on older kernels.
   - target:
