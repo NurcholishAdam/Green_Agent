@@ -78,28 +78,6 @@ jobs:
 
           echo "✓ Required Kubernetes test files present"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install Kind and kubectl
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "▶ Installing kubectl"
-          curl -fsSLo /usr/local/bin/kubectl \
-            https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl
-          chmod +x /usr/local/bin/kubectl
-          kubectl version --client
-
-          echo "▶ Installing Kind"
-          curl -fsSLo /usr/local/bin/kind \
-            https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64
-          chmod +x /usr/local/bin/kind
-          kind version
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
@@ -154,31 +132,32 @@ jobs:
           PY
 
       - name: Create Kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+          wait: 120s
+          kubectl_version: v1.31.3
+
+      - name: Verify Kubernetes access
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > kind-config.yaml <<'YAML'
-          kind: Cluster
-          apiVersion: kind.x-k8s.io/v1alpha4
-          nodes:
-            - role: control-plane
-          YAML
-
-          kind create cluster \
-            --name "${KIND_CLUSTER_NAME}" \
-            --config kind-config.yaml \
-            --wait 90s
-
           kubectl cluster-info
           kubectl get nodes
+          kind version
 
       - name: Load image into Kind
         shell: bash
         run: |
           set -euo pipefail
-          kind load docker-image "${IMAGE_NAME}:${IMAGE_TAG}" --name "${KIND_CLUSTER_NAME}"
-          docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" --format 'Loaded image: {{.RepoTags}}'
+
+          kind load docker-image \
+            "${IMAGE_NAME}:${IMAGE_TAG}" \
+            --name "${KIND_CLUSTER_NAME}"
+
+          docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" \
+            --format 'Loaded image: {{.RepoTags}}'
 
       - name: Create namespace
         shell: bash
