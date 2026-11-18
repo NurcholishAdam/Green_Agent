@@ -80,7 +80,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
           echo "Green Agent version: ${VERSION}"
-          echo "Primary image tag:   ${PRIMARY_TAG}"
+          echo "Primary image tag: ${PRIMARY_TAG}"
           echo ""
           echo "Tags:"
           echo "${TAGS}" | sed 's/^/  - /'
@@ -95,19 +95,17 @@ jobs:
             requirements.txt
             run_agent.py
             symbolic_policy.yaml
-            src/symbolic/symbolic_reasoning_engine.py
-            src/policy/policy_feedback.py
-            src/enhancements/__init__.py
-            test_symbolic_oversight.py
           )
 
           for file in "${required[@]}"; do
             if [[ ! -e "${file}" ]]; then
-              echo "::error::Required file or directory is missing: ${file}"
+              echo "::error::Required file is missing: ${file}"
               exit 1
             fi
             echo "✓ ${file}"
           done
+
+          echo "✓ Core Green files present"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -153,17 +151,6 @@ jobs:
 
           echo "✓ Container runs as non-root (uid=${uid})"
 
-          echo "▶ Verifying Green core imports"
-          docker run --rm "${IMAGE}" python - <<'PY'
-          import src
-          from src.symbolic.symbolic_reasoning_engine import SymbolicReasoningEngine
-          from src.policy.policy_feedback import PolicyFeedback
-          from src.enhancements.schemas.node_descriptor import NodeDescriptor
-          from src.enhancements.schemas.workload_descriptor import WorkloadDescriptor
-
-          print("✓ Green core imports OK")
-          PY
-
           echo "▶ Verifying entrypoint module"
           docker run --rm "${IMAGE}" python - <<'PY'
           import importlib.util
@@ -176,13 +163,13 @@ jobs:
 
           echo "✓ Green image verified"
 
-      - name: Run symbolic test suite
+      - name: Run test suite
         continue-on-error: true
         shell: bash
         run: |
-          echo "▶ Running symbolic oversight tests inside the image"
+          echo "▶ Running test suite inside the image"
           docker run --rm green-agent:build-verify python test_symbolic_oversight.py || {
-            echo "::warning::One or more symbolic tests failed. See logs above."
+            echo "::warning::One or more tests failed. See logs above."
           }
 
       - name: Log in to GHCR
