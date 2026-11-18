@@ -27,7 +27,7 @@ def test_kustomize_base_valid():
     if not os.path.exists(kustomization_path):
         pytest.skip(f"{kustomization_path} does not exist")
 
-    with open(kustomization_path, 'r') as f:
+    with open(kustomization_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
     assert config is not None
@@ -43,7 +43,7 @@ def test_namespace_manifest_valid():
     if not os.path.exists(namespace_path):
         pytest.skip(f"{namespace_path} does not exist")
 
-    with open(namespace_path, 'r') as f:
+    with open(namespace_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
     assert config is not None
@@ -60,7 +60,7 @@ def test_deployment_manifest_valid():
     if not os.path.exists(deployment_path):
         pytest.skip(f"{deployment_path} does not exist")
 
-    with open(deployment_path, 'r') as f:
+    with open(deployment_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
     assert config is not None
@@ -80,7 +80,7 @@ def test_enhancement_configmap_exists_and_has_keys():
     if not os.path.exists(cm_path):
         pytest.skip(f"{cm_path} does not exist – skipping enhancement ConfigMap test")
 
-    with open(cm_path, 'r') as f:
+    with open(cm_path, 'r', encoding='utf-8') as f:
         cm = yaml.safe_load(f)
 
     assert cm is not None
@@ -103,7 +103,7 @@ def test_raycluster_has_enhancement_env_vars():
     if not os.path.exists(ray_path):
         pytest.skip(f"{ray_path} does not exist – skipping enhanced RayCluster test")
 
-    with open(ray_path, 'r') as f:
+    with open(ray_path, 'r', encoding='utf-8') as f:
         ray_cluster = yaml.safe_load(f)
 
     assert ray_cluster is not None
@@ -137,7 +137,7 @@ def test_hpa_contains_enhanced_metrics():
     if not os.path.exists(hpa_path):
         pytest.skip(f"{hpa_path} does not exist – skipping enhanced HPA test")
 
-    with open(hpa_path, 'r') as f:
+    with open(hpa_path, 'r', encoding='utf-8') as f:
         hpa = yaml.safe_load(f)
 
     assert hpa is not None
@@ -171,12 +171,13 @@ def test_flexgen_config_present_in_base_config():
     if not os.path.exists(base_config_path):
         pytest.skip(f"{base_config_path} does not exist – skipping FlexGen test")
 
-    with open(base_config_path, 'r') as f:
+    with open(base_config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
     assert config is not None
-    assert 'flexgen' in config, "FlexGen section missing in base config"
-    flexgen = config['flexgen']
+    enhancements = config.get('enhancements', {})
+    assert 'flexgen' in enhancements, "FlexGen section missing from enhancements config"
+    flexgen = enhancements['flexgen']
     assert flexgen.get('enabled') is not None
     assert flexgen.get('model_name') is not None
     assert flexgen.get('delegation_policy') in ['adaptive', 'always', 'never']
@@ -189,7 +190,7 @@ def test_network_policy_allows_enhanced_ports():
     if not os.path.exists(np_path):
         pytest.skip(f"{np_path} does not exist – skipping enhanced NetworkPolicy test")
 
-    with open(np_path, 'r') as f:
+    with open(np_path, 'r', encoding='utf-8') as f:
         netpol = yaml.safe_load(f)
 
     assert netpol is not None

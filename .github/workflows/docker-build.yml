@@ -8,14 +8,13 @@
 # | Version | 5.0.0 |
 # | Last Updated | 2026-11-16 |
 # | Status | Production Ready |
-# | Trigger | push to `main` · `v*` tags · PR to `main` · manual |
-# | Output | immutable `ghcr.io/<owner>/green-agent:<tag>` |
+# | Trigger | manual dispatch only |
+# | Output | verified local image; no registry push |
 #
-# ── Consolidated workflow ─────────────────────────────────────────────────
-# This workflow **replaces** the previous `docker-build.yml` (broken — used
-# the non-existent `toLower()` expression function, so the workflow was
-# rejected at validation time). Do NOT recreate a separate "Build and Push
-# Docker Image" workflow; extend this file instead.
+# ── Manual compatibility workflow ────────────────────────────────────────
+# Automated image builds and GHCR publishing are handled by
+# `build-docker.yaml`. This older workflow is retained for manual build
+# verification only and must not publish a second image on every push.
 #
 # ── What this workflow does ───────────────────────────────────────────────
 #   1. Validates `agentbeats.json` (schema + `.image` tag immutability)
@@ -68,7 +67,7 @@
 #
 # ── Required repository permissions ──────────────────────────────────────
 #   Settings → Actions → General → Workflow permissions:
-#     ✅ Read and write permissions
+#   This verification-only workflow needs no package write permission.
 #
 # ── Required `agentbeats.json` fields ────────────────────────────────────
 #   {
@@ -127,29 +126,8 @@
 name: Build & Push Green Agent (GHCR)
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-    paths-ignore:
-      - 'README.md'
-      - 'docs/**'
-      - '**.md'
-      - '.github/workflows/k8s-tests.yml'
-      - '.github/workflows/validate-agentbeats.yml'
-  pull_request:
-    branches: [main]
-    paths-ignore:
-      - 'README.md'
-      - 'docs/**'
-      - '**.md'
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: 'Build + verify only — do NOT push to GHCR'
-        required: false
-        default: 'false'
-        type: choice
-        options: ['false', 'true']
       enhancements_enabled:
         description: 'Enable all enhancement modules'
         required: false
@@ -160,7 +138,6 @@ on:
 # ── Least-privilege permissions ──────────────────────────────────────────
 permissions:
   contents: read
-  packages: write
   # id-token: write         # uncomment when adding cosign signing
   # attestations: write     # uncomment when adding SLSA provenance
 
@@ -355,13 +332,14 @@ jobs:
 
           required=(
             Dockerfile
+            config/base/green_agent_config.yaml
             requirements.txt
             run_agent.py
             symbolic_policy.yaml
             agentbeats.json
-            src/symbolic/symbolic_reasoning_engine.py
-            src/policy/policy_feedback.py
-            src/enhancements/__init__.py
+            quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/symbolic/symbolic_reasoning_engine.py
+            quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/policy/policy_feedback.py
+            quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/__init__.py
             test_symbolic_oversight.py
           )
 
@@ -448,6 +426,7 @@ jobs:
           assert spec is not None, 'run_agent.py not importable'
           print('  ✓ run_agent module found')
           "
+          docker run --rm "${VERIFY_TAG}" python run_agent.py --help >/dev/null
           echo "::endgroup::"
 
           # 9d. agentbeats.json baked in
@@ -472,51 +451,7 @@ jobs:
           }
 
       # ═══════════════════════════════════════════════════════════════════
-      # 11. Login to GHCR (only after verification)
-      # ═══════════════════════════════════════════════════════════════════
-      - name: Login to GHCR
-        if: |
-          github.event_name == 'push'
-          && github.event.inputs.dry_run != 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # ═══════════════════════════════════════════════════════════════════
-      # 12. Push image (all computed tags)
-      # ═══════════════════════════════════════════════════════════════════
-      - name: Push image
-        id: push
-        if: |
-          github.event_name == 'push'
-          && github.event.inputs.dry_run != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PRIMARY="${{ steps.tags.outputs.primary }}"
-          echo "::group::Push tags"
-
-          while IFS= read -r tag; do
-            [ -z "${tag}" ] && continue
-            echo "  → docker push ${tag}"
-            docker push "${tag}"
-          done <<< "${{ steps.tags.outputs.list }}"
-
-          echo "::endgroup::"
-
-          # Capture the immutable digest of the primary tag
-          DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${PRIMARY}")"
-          echo "✓ Pushed: ${DIGEST}"
-
-          {
-            echo "digest=${DIGEST}"
-          } >> "$GITHUB_OUTPUT"
-
-      # ═══════════════════════════════════════════════════════════════════
-      # 13. Upload agentbeats.json as provenance artifact
+      # 11. Upload agentbeats.json as a verification artifact
       # ═══════════════════════════════════════════════════════════════════
       - name: Upload agentbeats.json
         uses: actions/upload-artifact@v4
@@ -531,7 +466,7 @@ jobs:
           compression-level: 6
 
       # ═══════════════════════════════════════════════════════════════════
-      # 14. Job summary
+      # 12. Job summary
       # ═══════════════════════════════════════════════════════════════════
       - name: Write job summary
         if: always()
@@ -541,13 +476,13 @@ jobs:
           SHA_TAG="${{ steps.tags.outputs.sha_tag || 'n/a' }}"
           AB_IMAGE="${{ steps.agentbeats.outputs.image || 'n/a' }}"
           AB_VERSION="${{ steps.agentbeats.outputs.version || 'n/a' }}"
-          DIGEST="${{ steps.push.outputs.digest || 'not-pushed' }}"
+          DIGEST="not-published (manual verification workflow)"
           TRIGGER="${{ github.event_name }}"
           REF="${{ github.ref_name }}"
           SHA="${GITHUB_SHA:0:7}"
 
           {
-            echo "## Green Agent — Build & Push Summary"
+            echo "## Green Agent — Manual Build Verification"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
@@ -558,17 +493,9 @@ jobs:
             echo "| SHA-pinned tag | \`${SHA_TAG}\` |"
             echo "| agentbeats.json .image | \`${AB_IMAGE}\` |"
             echo "| agentbeats.json .version | \`${AB_VERSION}\` |"
-            echo "| Digest | \`${DIGEST}\` |"
+            echo "| Registry status | \`${DIGEST}\` |"
             echo ""
-            if [ "${DIGEST}" = "not-pushed" ]; then
-              echo "> ⚠️ Image was **not pushed** (PR or dry-run). Build + verify only."
-            else
-              echo "### Pull commands"
-              echo '```bash'
-              echo "docker pull ${PRIMARY}"
-              echo "docker pull ${DIGEST}"
-              echo '```'
-            fi
+            echo "> This workflow verifies the image locally. Automated publishing is handled by \`build-docker.yaml\`."
             echo ""
             echo "### Required \`agentbeats.json\` shape"
             echo '```json'

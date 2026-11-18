@@ -184,6 +184,7 @@ jobs:
           from src.policy.policy_feedback import PolicyFeedback
           print('✓ all core imports OK')
           "
+          docker run --rm green-agent:${IMAGE_TAG} python run_agent.py --help > /dev/null
 
       # ── 7. Test suite (advisory — never blocks the build) ────────────
       - name: Run test suite (advisory)

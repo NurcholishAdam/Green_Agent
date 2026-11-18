@@ -11,7 +11,7 @@
 # | Base image | python:3.12.3-slim (digest-pinned) |
 # | Runtime user | appuser:10001 (non-root, group + user explicitly created) |
 # | PID 1 | tini |
-# | Healthcheck | GET /health :8000 |
+# | Healthcheck | GET /metrics :8000 |
 #
 # ── Fix vs. previous version ──────────────────────────────────────────────
 #   `useradd -u 10001 -g 10001 …` failed with:
@@ -57,7 +57,6 @@ WORKDIR /build
 # Glob-safe: matches requirements.txt (always) and requirements.lock.txt (if present)
 COPY requirements*.txt ./
 COPY pyproject.toml ./
-COPY src/ ./src/
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir --upgrade pip && \
@@ -99,9 +98,10 @@ COPY --from=builder /install /usr/local
 # ── Application source (required files — fail loudly if missing) ─────────
 WORKDIR /app
 
-COPY --chown=appuser:appuser src/ ./src/
+COPY --chown=appuser:appuser quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/ ./src/
 COPY --chown=appuser:appuser run_agent.py ./run_agent.py
 COPY --chown=appuser:appuser agentbeats.json ./agentbeats.json
+COPY --chown=appuser:appuser config/base/green_agent_config.yaml ./config/base/green_agent_config.yaml
 
 # Ensure `src` is a package (safe even if __init__.py is already present)
 RUN touch /app/src/__init__.py && chown appuser:appuser /app/src/__init__.py
@@ -145,7 +145,7 @@ ENV PYTHONUNBUFFERED=1 \
     LOG_FORMAT=json \
     LEAN_CTX_VERSION=0.1.0 \
     AGENT_PORT=8000 \
-    AGENT_HEALTH_PATH=/health \
+    AGENT_HEALTH_PATH=/metrics \
     SYMBOLIC_POLICY=symbolic_policy.yaml \
     FREE_APIS_CONFIG=free_apis_config.yaml
 
@@ -259,7 +259,7 @@ STOPSIGNAL SIGTERM
 USER appuser
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD python -c "import os,sys,urllib.request; port=os.environ.get('AGENT_PORT','8000'); path=os.environ.get('AGENT_HEALTH_PATH','/health'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}{path}', timeout=3).status==200 else 1)"
+    CMD python -c "import os,sys,urllib.request; port=os.environ.get('AGENT_PORT','8000'); path=os.environ.get('AGENT_HEALTH_PATH','/metrics'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}{path}', timeout=3).status==200 else 1)"
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
-CMD ["python", "run_agent.py", "--mode=unified"]
+CMD ["python", "run_agent.py", "--mode=unified", "--metrics-bind=0.0.0.0"]

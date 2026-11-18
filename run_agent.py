@@ -79,6 +79,7 @@ import logging
 import os
 import signal
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Optional
 
@@ -311,16 +312,19 @@ def _setup_signal_handlers(loop: asyncio.AbstractEventLoop,
                 logger.debug("Could not register %s: %s", sig, exc)
 
 
-def _print_result(result: Any) -> None:
-    """Print task result fields via safe ``getattr`` with ``n/a`` fallbacks."""
-    task_id = getattr(result, "task_id", "?")
-    success = getattr(result, "success", None)
-    energy = getattr(result, "energy_consumed", None)
-    carbon = getattr(result, "carbon_emitted", None)
-    accuracy = getattr(result, "accuracy", None)
-    reward = getattr(result, "negawatt_reward", None)
-    zone = getattr(result, "carbon_zone", None)
-    errors = getattr(result, "errors", None) or []
+def _print_result(result: Any, task_id: Optional[str] = None) -> None:
+    """Print result fields from either mapping- or attribute-based results."""
+    task_id = _result_value(result, "task_id", "id") or task_id or "?"
+    success = _result_value(result, "success")
+    status_value = _result_value(result, "status")
+    if success is None and isinstance(status_value, str):
+        success = status_value.lower() in {"success", "succeeded", "completed"}
+    energy = _result_value(result, "energy_consumed", "energy_kwh")
+    carbon = _result_value(result, "carbon_emitted", "carbon_kgco2e")
+    accuracy = _result_value(result, "accuracy")
+    reward = _result_value(result, "negawatt_reward")
+    zone = _result_value(result, "carbon_zone")
+    errors = _result_value(result, "errors") or []
 
     if success is True:
         status = "Success"
@@ -339,6 +343,17 @@ def _print_result(result: Any) -> None:
     if errors:
         print(f"   Errors:          {errors}")
     print(f"{'='*60}\n")
+
+
+def _result_value(result: Any, *names: str) -> Any:
+    for name in names:
+        if isinstance(result, Mapping):
+            value = result.get(name)
+        else:
+            value = getattr(result, name, None)
+        if value is not None:
+            return value
+    return None
 
 
 def _start_metrics(exporter: GraphMetricsExporter, port: int,
@@ -421,7 +436,14 @@ async def _run(args: argparse.Namespace) -> int:
         logger.info("Initializing UnifiedGreenAgent...")
         try:
             agent = UnifiedGreenAgent(config)
-            await _maybe_await(agent.initialize())
+            start = getattr(agent, "start", None)
+            if not callable(start):
+                start = getattr(agent, "initialize", None)
+            if not callable(start):
+                raise AttributeError(
+                    "UnifiedGreenAgent exposes neither start() nor initialize()"
+                )
+            await _maybe_await(start())
         except Exception as exc:
             logger.error("Agent initialization failed: %s", exc, exc_info=True)
             return 2
@@ -478,10 +500,12 @@ async def _run(args: argparse.Namespace) -> int:
         else:
             task = {
                 "id": "demo_001",
+                "task_id": "demo_001",
                 "type": "ml_inference",
                 "priority": 5,
                 "deferrable": True,
                 "model": "llama-7b",
+                "model_name": "llama-7b",
                 "input_size_mb": 128,
             }
         try:
@@ -497,23 +521,25 @@ async def _run(args: argparse.Namespace) -> int:
         except Exception as exc:
             logger.error("Task execution failed: %s", exc, exc_info=True)
             return 1
-        _print_result(result)
+        _print_result(result, task_id=task["id"])
 
         # Temporal observation --------------------------------------------
         if temporal_monitor is not None:
             # carbon_intensity_g_per_kwh is grid-level; carbon_emitted is
             # per-task kg. The default temporal rule uses grid intensity.
-            carbon_value = getattr(result, "carbon_intensity_g_per_kwh", None)
+            carbon_value = _result_value(
+                result, "carbon_intensity_g_per_kwh",
+            )
             if carbon_value is None:
                 carbon_value = float(
                     (config.get("carbon_context", {}) or {})
                     .get("grid_intensity_g_kwh", 400.0)
                 )
-            action = getattr(result, "action", "execute")
+            action = _result_value(result, "action") or "execute"
             temporal_monitor.add_observation(
                 {"carbon": carbon_value, "action": action}, step=1,
             )
-            violations = temporal_monitor.evaluate_rules()
+            violations = await _maybe_await(temporal_monitor.evaluate_rules())
             if violations:
                 logger.warning("Temporal rule violations: %s", violations)
             else:

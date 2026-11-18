@@ -41,8 +41,8 @@
 #   • **Image tag mismatch.** `LOCAL_IMAGE=green-agent:test` but the overlay
 #     uses `green-agent:v5.0.0-dev` → `ImagePullBackOff`. Both now use the
 #     same tag.
-#   • **Ray version mismatch.** `RAY_VERSION=2.7.0` but Dockerfile / build
-#     workflows use `ray[default]>=2.9.0` → cluster join fails. Now 2.9.0.
+#   • **Ray version mismatch.** The image and RayCluster must use the same
+#     supported Ray release. Both now pin to 2.60.0.
 #   • **Bundled kustomize too old.** `kubectl v1.28.0` ships kustomize 5.0.4
 #     which rejects `labels: includeSelectors: false` (the pattern in
 #     `config/base/kustomization.yaml` v5.0). Standalone kustomize v5.4.3
@@ -73,7 +73,7 @@
 #   docker build -t green-agent:v5.0.0-dev .
 #   kind load docker-image green-agent:v5.0.0-dev --name green-agent-test
 #   kustomize build config/overlays/development | kubectl apply -f -
-#   kubectl rollout status deployment/green-agent -n dev-green-agent --timeout=300s
+#   kubectl rollout status deployment/dev-green-agent -n dev-green-agent --timeout=300s
 #   pytest tests/k8s/ -v
 #
 # ── Changelog ────────────────────────────────────────────────────────────
@@ -84,7 +84,7 @@
 #       • TEST_NAMESPACE: green-agent-test → dev-green-agent (matches overlay)
 #       • LOCAL_IMAGE tag: test → v5.0.0-dev (matches overlay)
 #       • kubectl wait label: app=green-agent → app.kubernetes.io/*
-#       • RAY_VERSION: 2.7.0 → 2.9.0 (matches Dockerfile)
+#       • Ray 2.9.0 → 2.60.0 (matches the runtime dependency pin)
 #       • Bundled kustomize (5.0.4) → standalone v5.4.3 (required by v5.0 manifests)
 #       • Waits for Deployment rollout + RayCluster ready, not raw pods
 #       • imagePullPolicy guard so the loaded image is actually used
@@ -149,8 +149,8 @@ env:
   TEST_NAMESPACE: dev-green-agent
   # MUST match config/overlays/development/kustomization.yaml `images: newTag:`
   LOCAL_IMAGE: green-agent:v5.0.0-dev
-  # MUST match Dockerfile / build-and-push.yml ray[default] version
-  RAY_VERSION: '2.9.0'
+  # MUST match requirements.txt and config/base/ray-cluster.yaml
+  RAY_VERSION: '2.60.0'
   KIND_VERSION: 'v0.23.0'
   KUBECTL_VERSION: 'v1.30.0'
   HELM_VERSION: 'v3.15.0'
@@ -184,11 +184,13 @@ jobs:
           required=(
             Dockerfile
             config/overlays/development/kustomization.yaml
-            config/overlays/development/namespace.yaml
             config/base/kustomization.yaml
             config/base/deployment.yaml
             config/base/ray-cluster.yaml
             config/base/namespace.yaml
+            config/base/serviceaccount.yaml
+            config/base/poddisruptionbudget.yaml
+            config/base/network-policy.yaml
             tests/requirements-tests.txt
             tests/k8s
           )
@@ -229,6 +231,16 @@ jobs:
           # The bundled kustomize in kubectl v1.30 is v5.0.x, which does NOT
           # support `labels: includeSelectors: false` used by the v5.0 manifests.
           # The standalone binary above is v5.4.3+ and is required.
+
+      - name: Install yq
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            "https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64" \
+            -o /tmp/yq
+          sudo install -m 0755 /tmp/yq /usr/local/bin/yq
+          yq --version
 
       - name: Install Kind
         shell: bash
@@ -326,6 +338,14 @@ jobs:
           cache-from: type=gha,scope=k8s-tests
           cache-to: type=gha,mode=max,scope=k8s-tests
 
+      - name: Verify container runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm "${LOCAL_IMAGE}" python run_agent.py --help >/dev/null
+          docker run --rm "${LOCAL_IMAGE}" python -c \
+            "import os, ray; assert ray.__version__ == os.environ['RAY_VERSION'], (ray.__version__, os.environ['RAY_VERSION'])"
+
       - name: Load image into Kind
         shell: bash
         run: |
@@ -375,7 +395,7 @@ jobs:
 
           # imagePullPolicy guard — must be IfNotPresent so Kind uses the
           # loaded image (not a registry pull)
-          POLICY="$(kubectl get deployment green-agent -n "${TEST_NAMESPACE}" \
+          POLICY="$(kubectl get deployment dev-green-agent -n "${TEST_NAMESPACE}" \
             -o jsonpath='{.spec.template.spec.containers[0].imagePullPolicy}')"
           echo "  imagePullPolicy: ${POLICY}"
           if [ "${POLICY}" = "Always" ]; then
@@ -394,8 +414,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::group::Wait for deployment/green-agent"
-          kubectl rollout status deployment/green-agent \
+          echo "::group::Wait for deployment/dev-green-agent"
+          kubectl rollout status deployment/dev-green-agent \
             -n "${TEST_NAMESPACE}" \
             --timeout=300s
           kubectl get deployment -n "${TEST_NAMESPACE}"
@@ -410,7 +430,7 @@ jobs:
 
           # RayCluster CR reports readiness via .status.state = ready
           for i in $(seq 1 60); do
-            STATE="$(kubectl get raycluster green-agent-cluster \
+            STATE="$(kubectl get raycluster dev-green-agent-cluster \
               -n "${TEST_NAMESPACE}" \
               -o jsonpath='{.status.state}' 2>/dev/null || echo "")"
             if [ "${STATE}" = "ready" ]; then
@@ -421,12 +441,12 @@ jobs:
             sleep 5
           done
 
-          FINAL_STATE="$(kubectl get raycluster green-agent-cluster \
+          FINAL_STATE="$(kubectl get raycluster dev-green-agent-cluster \
             -n "${TEST_NAMESPACE}" \
             -o jsonpath='{.status.state}' 2>/dev/null || echo "")"
           if [ "${FINAL_STATE}" != "ready" ]; then
             echo "::error::RayCluster did not become ready (state: ${FINAL_STATE:-unknown})"
-            kubectl describe raycluster green-agent-cluster -n "${TEST_NAMESPACE}" || true
+            kubectl describe raycluster dev-green-agent-cluster -n "${TEST_NAMESPACE}" || true
             kubectl logs -n "${TEST_NAMESPACE}" -l app.kubernetes.io/component=head --tail=200 || true
             exit 1
           fi
@@ -473,6 +493,8 @@ jobs:
         shell: bash
         env:
           KUBECONFIG: ${{ env.KUBECONFIG }}
+          GREEN_AGENT_NAMESPACE: ${{ env.TEST_NAMESPACE }}
+          GREEN_AGENT_RESOURCE_PREFIX: dev-
         run: |
           set -euo pipefail
           echo "::group::pytest tests/k8s/"
@@ -505,7 +527,7 @@ jobs:
 
           echo "::group::Full state"
           kubectl get all -A >> diagnostics/get-all.txt 2>&1
-          kubectl describe raycluster green-agent-cluster -n "${TEST_NAMESPACE}" >> diagnostics/raycluster.txt 2>&1
+          kubectl describe raycluster dev-green-agent-cluster -n "${TEST_NAMESPACE}" >> diagnostics/raycluster.txt 2>&1
           echo "::endgroup::"
 
           echo "::group::Diagnostics collected"
@@ -566,7 +588,7 @@ jobs:
             echo "docker build -t ${LOCAL_IMAGE} ."
             echo "kind load docker-image ${LOCAL_IMAGE} --name ${CLUSTER_NAME}"
             echo "kustomize build config/overlays/development | kubectl apply -f -"
-            echo "kubectl rollout status deployment/green-agent -n ${TEST_NAMESPACE} --timeout=300s"
+            echo "kubectl rollout status deployment/dev-green-agent -n ${TEST_NAMESPACE} --timeout=300s"
             echo "pytest tests/k8s/ -v"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

@@ -166,7 +166,7 @@ spec:
             - name: AGENT_PORT
               value: "8000"
             - name: AGENT_HEALTH_PATH
-              value: "/health"
+              value: "/metrics"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: PYTHONDONTWRITEBYTECODE
@@ -210,7 +210,7 @@ spec:
           # Startup: allow up to 2 min for Ray init + Python import warm-up.
           startupProbe:
             httpGet:
-              path: /health
+              path: /metrics
               port: http
             initialDelaySeconds: 5
             periodSeconds: 5
@@ -220,7 +220,7 @@ spec:
           # Liveness: restart the pod if the app stops responding.
           livenessProbe:
             httpGet:
-              path: /health
+              path: /metrics
               port: http
             initialDelaySeconds: 30       # after startupProbe succeeds
             periodSeconds: 30
@@ -230,7 +230,7 @@ spec:
           # Readiness: stop routing traffic if the app is temporarily unavailable.
           readinessProbe:
             httpGet:
-              path: /health
+              path: /metrics
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
@@ -264,10 +264,6 @@ spec:
             - name: out
               mountPath: /out
 
-            # cgroup metrics — mirrors Dockerfile VOLUME + Guide v5.0 run flag
-            - name: cgroup
-              mountPath: /sys/fs/cgroup
-              readOnly: true
 
       volumes:
         # Mount only the YAML config file (skip env-var keys)
@@ -276,7 +272,7 @@ spec:
             name: green-agent-config
             items:
               - key: green_agent.yaml
-                path: green_agent.yaml
+                path: base/green_agent_config.yaml
 
         # Mount the two policy files
         - name: policies
@@ -303,11 +299,6 @@ spec:
           emptyDir:
             sizeLimit: 1Gi
 
-        # cgroup metrics (host read-only)
-        - name: cgroup
-          hostPath:
-            path: /sys/fs/cgroup
-            type: Directory
 
 # ── Companion: PodDisruptionBudget (minAvailable 1) ─────────────────────
 # apiVersion: policy/v1

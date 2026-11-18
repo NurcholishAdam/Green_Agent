@@ -348,12 +348,13 @@ jobs:
           set -euo pipefail
           required=(
             Dockerfile
+            config/base/green_agent_config.yaml
             requirements.txt
             run_agent.py
             symbolic_policy.yaml
-            src/symbolic/symbolic_reasoning_engine.py
-            src/policy/policy_feedback.py
-            src/enhancements/__init__.py
+            quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/symbolic/symbolic_reasoning_engine.py
+            quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/policy/policy_feedback.py
+            quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/__init__.py
             test_symbolic_oversight.py
           )
           for f in "${required[@]}"; do
@@ -437,6 +438,7 @@ jobs:
           assert spec is not None, 'run_agent.py not importable'
           print('  ✓ run_agent module found')
           "
+          docker run --rm "${VERIFY_TAG}" python run_agent.py --help >/dev/null
 
           echo "▶ [8d] agentbeats.json baked in"
           docker run --rm "${VERIFY_TAG}" test -f agentbeats.json
