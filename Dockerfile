@@ -29,7 +29,24 @@ WORKDIR /build
 
 COPY requirements*.txt ./
 COPY pyproject.toml ./
+
+# Copy the application source
 COPY src/ ./src/
+
+# Copy the enhancements source from the nested LIMIT Graph integration tree.
+# This is required for `import src.enhancements.core`.
+COPY quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/enhancements/ \
+     ./src/enhancements/
+
+# Ensure every package directory is importable.
+RUN set -e; \
+    touch src/__init__.py; \
+    touch src/enhancements/__init__.py; \
+    if [ ! -f src/enhancements/core/__init__.py ]; then \
+        echo "ERROR: src/enhancements/core/__init__.py is missing" >&2; \
+        find src/enhancements -maxdepth 2 -type f -print >&2; \
+        exit 1; \
+    fi
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir --upgrade pip && \
@@ -68,8 +85,8 @@ WORKDIR /app
 COPY --chown=appuser:appuser src/ ./src/
 COPY --chown=appuser:appuser run_agent.py ./run_agent.py
 
-RUN touch /app/src/__init__.py \
-    && chown appuser:appuser /app/src/__init__.py
+# Fail the image build if the required module is absent.
+RUN python -c "import src.enhancements.core; print('src.enhancements.core import OK')"
 
 # Copy optional repository files only when they exist.
 RUN --mount=type=bind,source=.,target=/ctx,ro \
@@ -148,6 +165,35 @@ ENV ENHANCEMENTS_ENABLED=${ENHANCEMENTS_ENABLED} \
 RUN cat > /usr/local/bin/docker-entrypoint.sh <<'ENTRYPOINT_EOF'
 #!/bin/bash
 set -euo pipefail
+
+echo "[entrypoint] Verifying required Green Agent modules..." >&2
+
+python - <<'PY'
+import importlib
+import sys
+
+required_modules = [
+    "src.enhancements.core",
+]
+
+missing = []
+
+for module_name in required_modules:
+    try:
+        importlib.import_module(module_name)
+        print(f"[entrypoint] OK: {module_name}")
+    except Exception as error:
+        missing.append(module_name)
+        print(f"[entrypoint] MISSING: {module_name}: {error}", file=sys.stderr)
+
+if missing:
+    print(
+        "[entrypoint] Fatal: required Green Agent modules are unavailable: "
+        + ", ".join(missing),
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
 
 if [[ -n "${MODP_WEIGHTS:-}" ]]; then
     if ! python - <<'PY'
