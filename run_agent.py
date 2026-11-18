@@ -97,7 +97,7 @@ except ImportError:  # pragma: no cover
 # Core imports — expect `pip install -e . --no-deps`
 # =============================================================================
 try:
-    from src.core.graph_registry import GraphRegistry, GraphType
+    from src.enhancements.core.graph_registry import GraphRegistry, GraphType
     from src.carbon.helium_monitor import HeliumMonitor
     from src.monitoring.graph_metrics_exporter import GraphMetricsExporter
 except ImportError as exc:  # pragma: no cover - environment error path
@@ -663,3 +663,5 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
