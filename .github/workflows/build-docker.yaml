@@ -1,62 +1,12 @@
-# .github/workflows/build-and-push.yml
+# .github/workflows/build-docker.yaml
 #
-# Green Agent v5.0.0 — Build & Push to GHCR
+# Green Agent — Build, Verify & Push to GHCR
 # ==========================================
 #
-# | Field | Value |
-# |---|---|
-# | Version | 5.0.1 |
-# | Last Updated | 2026-11-16 |
-# | Status | Production Ready |
-# | Trigger | push to `main` · `v*` tags · PR to `main` · manual |
-# | Output | immutable `ghcr.io/nurcholishadam/green-agent:<tag>` |
-#
-# ── What this workflow does ───────────────────────────────────────────────
-#   1. Validates `agentbeats.json` (auto-detects JSON vs YAML by content)
-#   2. Guards required files (Dockerfile, src/, symbolic_policy.yaml, …)
-#   3. Builds via `docker/build-push-action@v6` with GHA layer cache
-#   4. Verifies the image (non-root + imports + `agentbeats.json` baked in)
-#   5. Logs in to GHCR **only after** verification passes
-#   6. Pushes the image and captures the immutable digest
-#   7. Emits digest + pull command in the job summary
-#   8. Uploads `agentbeats.json` as a provenance artifact
-#
-# ── Fix in 5.0.1 ─────────────────────────────────────────────────────────
-#   • `jq . agentbeats.json` gave a cryptic `Invalid numeric literal at
-#     line 1, column 3` error when the file was YAML-in-a-.json or had a
-#     BOM / Markdown fences / trailing commas.
-#   • The validation step now:
-#       – Tries JSON first (jq)
-#       – Falls back to YAML (yq) and warns if content is YAML but the file
-#         is named `.json` (many editors export YAML with a .json name)
-#       – Dumps the first 20 lines + full diagnosis on failure
-#       – Emits copy-paste fix commands for BOM / fences / comments / commas
-#   • All downstream steps use a single `extract_field()` helper that works
-#     for both formats, so tags and image references stay consistent.
-#
-# ── Required repository permissions ──────────────────────────────────────
-#   Settings → Actions → General → Workflow permissions:
-#     ✅ Read and write permissions
-#
-# ── Changelog ────────────────────────────────────────────────────────────
-#   5.0.1 (2026-11-16)
-#     Fixed:
-#       • Cryptic `jq: Invalid numeric literal` error
-#       • Auto-detect JSON vs YAML content (fallback to yq)
-#       • Dump file contents + diagnosis on parse failure
-#       • Copy-paste fix commands (BOM, fences, comments, commas)
-#     Added:
-#       • `format` output (`json` or `yaml`) from validation step
-#       • Job summary includes detected format
-#   5.0.0 (2026-11-16)
-#       Initial consolidated workflow (replaces broken docker-build.yml).
-#
-# ── What's Not in Scope ──────────────────────────────────────────────────
-#   • Multi-arch manifest (linux/arm64) — AgentBeats runs amd64.
-#   • Cosign signing / SLSA attestation — add `id-token: write` + step.
-#   • Automatic conversion of YAML→JSON — use `yq -o=json`.
+# Standalone Green Agent CI workflow.
+# No AgentBeats configuration or event integration.
 
-name: Build & Push Green Agent (AgentBeats)
+name: Build & Push Green Agent
 
 on:
   push:
@@ -67,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Build + verify only — do NOT push to GHCR'
+        description: 'Build and verify only; do not push to GHCR'
         required: false
         default: 'false'
         type: choice
@@ -83,7 +33,6 @@ concurrency:
 
 env:
   PYTHON_IMAGE: python:3.12.3-slim
-  AGENTBEATS_FILE: agentbeats.json
   IMAGE_NAME: ghcr.io/nurcholishadam/green-agent
 
 jobs:
@@ -98,254 +47,49 @@ jobs:
         with:
           fetch-depth: 1
 
-      # ═══════════════════════════════════════════════════════════════════
-      # 2. Validate agentbeats config — auto-detect JSON vs YAML
-      #    Falls back to yq if jq fails, and emits actionable errors when
-      #    the file is genuinely broken (BOM, fences, comments, commas).
-      # ═══════════════════════════════════════════════════════════════════
-      - name: Validate agentbeats config
-        id: agentbeats
+      - name: Compute version and tags
+        id: meta
         shell: bash
         run: |
           set -euo pipefail
 
-          FILE="${AGENTBEATS_FILE}"
-          echo "▶ Validating ${FILE}"
-
-          # ── 2.0 File exists? ────────────────────────────────────────────
-          if [ ! -f "${FILE}" ]; then
-            echo "::error::${FILE} not found at repo root"
-            echo ""
-            echo "Files in repo root:"
-            ls -la
-            echo ""
-            echo "Expected: ${FILE} (JSON) or agentbeats.yml (YAML)"
-            exit 1
-          fi
-          echo "  size: $(wc -c < "${FILE}") bytes"
-          echo "  sha:  $(sha256sum "${FILE}" | cut -d' ' -f1 | head -c 16)…"
-
-          # ── 2.1 Format auto-detect by content ──────────────────────────
-          FORMAT=""
-          if jq . "${FILE}" > /dev/null 2>&1; then
-            FORMAT="json"
-            echo "  ✓ Parsed as JSON"
-          elif command -v yq >/dev/null 2>&1 && yq . "${FILE}" > /dev/null 2>&1; then
-            FORMAT="yaml"
-            echo "::warning::${FILE} is valid YAML but not JSON — treating as YAML"
-            echo "          Fix: git mv ${FILE} agentbeats.yml"
-            echo "          (then set AGENTBEATS_FILE: agentbeats.yml in this workflow)"
-          else
-            # Neither works — emit full diagnostics and exit
-            echo "::error::${FILE} is neither valid JSON nor valid YAML"
-            echo ""
-
-            JQ_ERR="$(jq . "${FILE}" 2>&1 || true)"
-            YQ_ERR="$(command -v yq >/dev/null 2>&1 && yq . "${FILE}" 2>&1 || echo "(yq not available)")
-            echo "  jq error: ${JQ_ERR}"
-            echo "  yq error: ${YQ_ERR}"
-            echo ""
-
-            echo "::group::Full contents of ${FILE}"
-            cat "${FILE}" || true
-            echo "::endgroup::"
-            echo ""
-
-            echo "::group::Diagnosis"
-            # BOM
-            HEAD3="$(head -c 3 "${FILE}" 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo "")"
-            if [ "${HEAD3}" = "efbbbf" ]; then
-              echo "❌ UTF-8 BOM detected at byte 0"
-              echo "   Fix: sed -i '1s/^\\xEF\\xBB\\xBF//' ${FILE}"
-            fi
-
-            # Leading char
-            FIRST_CHAR="$(head -c 1 "${FILE}" 2>/dev/null || echo "")"
-            case "${FIRST_CHAR}" in
-              '`')
-                echo "❌ File starts with a backtick — remove Markdown code fences"
-                echo "   Delete the opening \`\`\`json and the closing \`\`\` lines"
-                ;;
-              '#')
-                echo "❌ File starts with # — remove the leading comment"
-                ;;
-              '/')
-                echo "❌ File starts with / — remove // comments (JSON forbids them)"
-                ;;
-            esac
-
-            # Trailing comma
-            if grep -qE ',\s*[}\]]' "${FILE}" 2>/dev/null; then
-              echo "❌ Trailing comma before } or ] — JSON forbids these"
-            fi
-
-            # Unquoted keys (YAML-in-disguise)
-            if grep -qE '^[a-zA-Z_][a-zA-Z0-9_]*\s*:' "${FILE}" 2>/dev/null; then
-              echo "❌ File has unquoted keys on line start — looks like YAML"
-              echo "   Either rename to agentbeats.yml, or convert:"
-              echo "     yq -o=json '.' ${FILE} > /tmp/ab.json && mv /tmp/ab.json ${FILE}"
-            fi
-
-            # Single quotes
-            if grep -qE "'[^']*'\s*:" "${FILE}" 2>/dev/null; then
-              echo "❌ File uses single-quoted keys ('key':) — JSON requires double quotes"
-            fi
-            echo "::endgroup::"
-            echo ""
-            echo "::error::Common fixes:"
-            echo "          • YAML content → rename to agentbeats.yml"
-            echo "          • Copy-paste template from job summary"
-            echo "          • Run locally: jq . ${FILE}"
-            exit 1
-          fi
-
-          # ── 2.2 Field extraction (works for both formats) ──────────────
-          extract_field() {
-            local field="$1"
-            if [ "${FORMAT}" = "json" ]; then
-              jq -er ".${field}" "${FILE}"
-            else
-              yq -er ".${field}" "${FILE}"
-            fi
-          }
-
-          check_field() {
-            local field="$1"
-            local cond="$2"
-            if [ "${FORMAT}" = "json" ]; then
-              jq -e ".${field} | ${cond}" "${FILE}" > /dev/null 2>&1
-            else
-              yq -e ".${field} | ${cond}" "${FILE}" > /dev/null 2>&1
-            fi
-          }
-
-          has_field() {
-            local field="$1"
-            if [ "${FORMAT}" = "json" ]; then
-              jq -e --arg f "${field}" 'has($f) and (.[$f] != null)' "${FILE}" > /dev/null 2>&1
-            else
-              yq -e "has(\"${field}\") and .${field} != null" "${FILE}" > /dev/null 2>&1
-            fi
-          }
-
-          # ── 2.3 Required fields ────────────────────────────────────────
-          echo "▶ Required fields"
-          for field in name version image entrypoint description; do
-            if ! has_field "${field}"; then
-              echo "::error::${FILE} is missing required field: .${field}"
-              echo ""
-              echo "Expected shape:"
-              echo '  {'
-              echo '    "name":        "green-agent",'
-              echo '    "version":     "5.0.0",'
-              echo '    "image":       "ghcr.io/nurcholishadam/green-agent:5.0.0",'
-              echo '    "entrypoint":  ["python", "run_agent.py"],'
-              echo '    "description": "..."'
-              echo '  }'
-              exit 1
-            fi
-            echo "  ✓ .${field}"
-          done
-
-          # ── 2.4 Field types ────────────────────────────────────────────
-          echo "▶ Field types"
-          for field in name version image description; do
-            if ! check_field "${field}" 'type == "string" and length > 0'; then
-              echo "::error::.${field} must be a non-empty string"
-              exit 1
-            fi
-          done
-          if ! check_field entrypoint 'type == "array" and length > 0'; then
-            echo "::error::.entrypoint must be a non-empty array"
-            exit 1
-          fi
-          echo "  ✓ All field types valid"
-
-          # ── 2.5 Version is semver ──────────────────────────────────────
-          AB_VERSION="$(extract_field version)"
-          if ! [[ "${AB_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-            echo "::error::.version must be semver (e.g. 5.0.0) — got: ${AB_VERSION}"
-            exit 1
-          fi
-          echo "  ✓ .version = ${AB_VERSION}"
-
-          # ── 2.6 Image format + immutability ────────────────────────────
-          AB_IMAGE="$(extract_field image)"
-          if ! [[ "${AB_IMAGE}" =~ ^ghcr\.io/[a-z0-9._-]+/[a-z0-9._-]+:[a-zA-Z0-9._-]+$ ]]; then
-            echo "::error::.image must match 'ghcr.io/<owner>/<repo>:<tag>'"
-            echo "          got: ${AB_IMAGE}"
-            exit 1
-          fi
-          AB_TAG="${AB_IMAGE##*:}"
-          if [[ "${AB_TAG}" =~ ^(latest|main|master|dev|stable|edge|test)$ ]]; then
-            echo "::error::.image tag '${AB_TAG}' is mutable — AgentBeats requires immutable tags"
-            echo "          Use a version (5.0.0), git SHA (sha-abc1234), or date (2026-11-16)"
-            exit 1
-          fi
-          echo "  ✓ .image = ${AB_IMAGE} (tag: ${AB_TAG})"
-
-          # ── 2.7 Emit outputs ────────────────────────────────────────────
-          {
-            echo "format=${FORMAT}"
-            echo "version=${AB_VERSION}"
-            echo "image=${AB_IMAGE}"
-          } >> "$GITHUB_OUTPUT"
-
-          echo "✓ agentbeats config valid (format: ${FORMAT})"
-
-      # ═══════════════════════════════════════════════════════════════════
-      # 3. Compute tags
-      # ═══════════════════════════════════════════════════════════════════
-      - name: Compute tags
-        id: tags
-        shell: bash
-        run: |
-          set -euo pipefail
-          AB_VERSION="${{ steps.agentbeats.outputs.version }}"
           SHA_SHORT="${GITHUB_SHA:0:7}"
-          REF_NAME="${GITHUB_REF_NAME}"
-          tags="${IMAGE_NAME}:${AB_VERSION}"
-          tags="${tags}"$'\n'"${IMAGE_NAME}:sha-${SHA_SHORT}"
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            tags="${tags}"$'\n'"${IMAGE_NAME}:${REF_NAME}"
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0-dev.${SHA_SHORT}"
           fi
+
+          TAGS="${IMAGE_NAME}:${VERSION}"
+          TAGS="${TAGS}"$'\n'"${IMAGE_NAME}:sha-${SHA_SHORT}"
+
           if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
-            tags="${tags}"$'\n'"${IMAGE_NAME}:latest"
+            TAGS="${TAGS}"$'\n'"${IMAGE_NAME}:latest"
           fi
-          primary_tag="${IMAGE_NAME}:${AB_VERSION}"
-          echo "Tags to push:"
-          echo "${tags}" | sed 's/^/  /'
-          echo "Primary: ${primary_tag}"
+
+          PRIMARY_TAG="${IMAGE_NAME}:${VERSION}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "primary=${PRIMARY_TAG}" >> "$GITHUB_OUTPUT"
+
           {
-            echo "list<<EOF"
-            echo "${tags}"
+            echo "tags<<EOF"
+            echo "${TAGS}"
             echo "EOF"
-            echo "primary=${primary_tag}"
           } >> "$GITHUB_OUTPUT"
 
-      # ═══════════════════════════════════════════════════════════════════
-      # 4. Cross-check agentbeats.json .image ↔ primary tag
-      # ═══════════════════════════════════════════════════════════════════
-      - name: Cross-check agentbeats.json .image
-        shell: bash
-        run: |
-          set -euo pipefail
-          AB_IMAGE="${{ steps.agentbeats.outputs.image }}"
-          PRIMARY="${{ steps.tags.outputs.primary }}"
-          if [ "${AB_IMAGE}" != "${PRIMARY}" ]; then
-            echo "::warning::agentbeats.json .image (${AB_IMAGE}) does not match primary tag (${PRIMARY})"
-            echo "          Reviewers pulling .image will not get this build."
-          else
-            echo "✓ agentbeats.json .image matches primary tag"
-          fi
+          echo "Green Agent version: ${VERSION}"
+          echo "Primary image tag:   ${PRIMARY_TAG}"
+          echo ""
+          echo "Tags:"
+          echo "${TAGS}" | sed 's/^/  - /'
 
-      # ═══════════════════════════════════════════════════════════════════
-      # 5. Guard required files
-      # ═══════════════════════════════════════════════════════════════════
       - name: Guard required files
         shell: bash
         run: |
           set -euo pipefail
+
           required=(
             Dockerfile
             requirements.txt
@@ -356,31 +100,20 @@ jobs:
             src/enhancements/__init__.py
             test_symbolic_oversight.py
           )
-          for f in "${required[@]}"; do
-            if [ ! -f "${f}" ] && [ ! -d "${f}" ]; then
-              echo "::error::Required file or directory missing: ${f}"
+
+          for file in "${required[@]}"; do
+            if [[ ! -e "${file}" ]]; then
+              echo "::error::Required file or directory is missing: ${file}"
               exit 1
             fi
-            echo "  ✓ ${f}"
+            echo "✓ ${file}"
           done
-          # agentbeats file checked separately (JSON or YAML)
-          if [ ! -f "${AGENTBEATS_FILE}" ] && [ ! -f agentbeats.yml ]; then
-            echo "::error::Neither ${AGENTBEATS_FILE} nor agentbeats.yml found"
-            exit 1
-          fi
-          echo "✓ All required files present"
 
-      # ═══════════════════════════════════════════════════════════════════
-      # 6. Set up Docker Buildx
-      # ═══════════════════════════════════════════════════════════════════
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           driver: docker-container
 
-      # ═══════════════════════════════════════════════════════════════════
-      # 7. Build image
-      # ═══════════════════════════════════════════════════════════════════
       - name: Build image
         uses: docker/build-push-action@v6
         with:
@@ -395,179 +128,129 @@ jobs:
             PYTHON_IMAGE=${{ env.PYTHON_IMAGE }}
             BUILD_DATE=${{ github.event.head_commit.timestamp || github.run_started_at }}
             VCS_REF=${{ github.sha }}
-            BUILD_VERSION=${{ steps.agentbeats.outputs.version }}
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
             ENHANCEMENTS_ENABLED=true
           tags: |
-            ${{ steps.tags.outputs.primary }}
+            ${{ steps.meta.outputs.primary }}
             green-agent:build-verify
-          cache-from: type=gha,scope=build-push
-          cache-to: type=gha,mode=max,scope=build-push
+          cache-from: type=gha,scope=green-agent-build
+          cache-to: type=gha,mode=max,scope=green-agent-build
 
-      # ═══════════════════════════════════════════════════════════════════
-      # 8. Verify image
-      # ═══════════════════════════════════════════════════════════════════
       - name: Verify image
         shell: bash
         run: |
           set -euo pipefail
-          VERIFY_TAG="green-agent:build-verify"
 
-          echo "▶ [8a] Non-root user"
-          uid=$(docker run --rm "${VERIFY_TAG}" id -u)
-          if [ "${uid}" = "0" ]; then
-            echo "::error::Image runs as root (uid=0)"
+          IMAGE="green-agent:build-verify"
+
+          echo "▶ Verifying non-root runtime"
+          uid="$(docker run --rm "${IMAGE}" id -u)"
+
+          if [[ "${uid}" == "0" ]]; then
+            echo "::error::Container runs as root (uid=0)"
             exit 1
           fi
-          echo "  ✓ uid=${uid}"
 
-          echo "▶ [8b] Core imports"
-          docker run --rm "${VERIFY_TAG}" python -c "
+          echo "✓ Container runs as non-root (uid=${uid})"
+
+          echo "▶ Verifying Green core imports"
+          docker run --rm "${IMAGE}" python - <<'PY'
           import src
           from src.symbolic.symbolic_reasoning_engine import SymbolicReasoningEngine
           from src.policy.policy_feedback import PolicyFeedback
           from src.enhancements.schemas.node_descriptor import NodeDescriptor
           from src.enhancements.schemas.workload_descriptor import WorkloadDescriptor
-          print('  ✓ all core imports OK')
-          "
 
-          echo "▶ [8c] Entrypoint module"
-          docker run --rm "${VERIFY_TAG}" python -c "
+          print("✓ Green core imports OK")
+          PY
+
+          echo "▶ Verifying entrypoint module"
+          docker run --rm "${IMAGE}" python - <<'PY'
           import importlib.util
-          spec = importlib.util.find_spec('run_agent')
-          assert spec is not None, 'run_agent.py not importable'
-          print('  ✓ run_agent module found')
-          "
 
-          echo "▶ [8d] agentbeats.json baked in"
-          docker run --rm "${VERIFY_TAG}" test -f agentbeats.json
-          echo "  ✓ agentbeats.json present in image"
+          spec = importlib.util.find_spec("run_agent")
+          assert spec is not None, "run_agent.py is not importable"
 
-          echo "✓ Image verified"
+          print("✓ run_agent module found")
+          PY
 
-      # ═══════════════════════════════════════════════════════════════════
-      # 9. Symbolic test suite (advisory)
-      # ═══════════════════════════════════════════════════════════════════
-      - name: Run symbolic test suite (advisory)
+          echo "✓ Green image verified"
+
+      - name: Run symbolic test suite
         continue-on-error: true
         shell: bash
         run: |
-          echo "Running test_symbolic_oversight.py inside the image…"
+          echo "▶ Running symbolic oversight tests inside the image"
           docker run --rm green-agent:build-verify python test_symbolic_oversight.py || {
-            echo "::warning::Some tests failed — see logs. Not blocking the push."
+            echo "::warning::One or more symbolic tests failed. See logs above."
           }
 
-      # ═══════════════════════════════════════════════════════════════════
-      # 10. Login to GHCR (only after verification)
-      # ═══════════════════════════════════════════════════════════════════
-      - name: Login to GHCR
-        if: |
-          github.event_name == 'push'
-          && github.event.inputs.dry_run != 'true'
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.event.inputs.dry_run != 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ═══════════════════════════════════════════════════════════════════
-      # 11. Push image
-      # ═══════════════════════════════════════════════════════════════════
       - name: Push image
         id: push
-        if: |
-          github.event_name == 'push'
-          && github.event.inputs.dry_run != 'true'
+        if: github.event_name == 'push' && github.event.inputs.dry_run != 'true'
         shell: bash
         run: |
           set -euo pipefail
-          PRIMARY="${{ steps.tags.outputs.primary }}"
-          echo "▶ Pushing ${PRIMARY} and additional tags…"
+
+          PRIMARY="${{ steps.meta.outputs.primary }}"
+
+          echo "▶ Pushing Green Agent image tags"
+
           while IFS= read -r tag; do
-            if [ -z "${tag}" ]; then continue; fi
+            [[ -z "${tag}" ]] && continue
+
             docker tag "${PRIMARY}" "${tag}"
-            echo "  → docker push ${tag}"
             docker push "${tag}"
-          done <<< "${{ steps.tags.outputs.list }}"
+            echo "✓ Pushed ${tag}"
+          done <<< "${{ steps.meta.outputs.tags }}"
+
           DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${PRIMARY}")"
-          echo "✓ Pushed: ${DIGEST}"
-          {
-            echo "digest=${DIGEST}"
-          } >> "$GITHUB_OUTPUT"
 
-      # ═══════════════════════════════════════════════════════════════════
-      # 12. Upload agentbeats artifact
-      # ═══════════════════════════════════════════════════════════════════
-      - name: Upload agentbeats config
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: agentbeats-${{ steps.agentbeats.outputs.version || 'unknown' }}
-          path: |
-            agentbeats.json
-            agentbeats.yml
-            agentbeats.yaml
-          retention-days: 90
-          overwrite: true
-          if-no-files-found: warn
-          compression-level: 6
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "✓ Published digest: ${DIGEST}"
 
-      # ═══════════════════════════════════════════════════════════════════
-      # 13. Job summary
-      # ═══════════════════════════════════════════════════════════════════
       - name: Write job summary
         if: always()
         shell: bash
         run: |
-          FORMAT="${{ steps.agentbeats.outputs.format || 'n/a' }}"
-          PRIMARY="${{ steps.tags.outputs.primary || 'n/a' }}"
-          AB_IMAGE="${{ steps.agentbeats.outputs.image || 'n/a' }}"
-          AB_VERSION="${{ steps.agentbeats.outputs.version || 'n/a' }}"
+          VERSION="${{ steps.meta.outputs.version || 'unknown' }}"
+          PRIMARY="${{ steps.meta.outputs.primary || 'not-built' }}"
           DIGEST="${{ steps.push.outputs.digest || 'not-pushed' }}"
+
           {
-            echo "## Green Agent — Build & Push Summary"
+            echo "## Green Agent build summary"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Trigger | \`${{ github.event_name }}\` |"
-            echo "| Ref | \`${{ github.ref_name }}\` |"
-            echo "| Commit | \`${GITHUB_SHA:0:7}\` |"
-            echo "| agentbeats format | \`${FORMAT}\` |"
-            echo "| Primary image | \`${PRIMARY}\` |"
-            echo "| agentbeats.json .image | \`${AB_IMAGE}\` |"
-            echo "| agentbeats.json .version | \`${AB_VERSION}\` |"
-            echo "| Digest | \`${DIGEST}\` |"
+            echo "| Trigger | `${{ github.event_name }}` |"
+            echo "| Ref | `${{ github.ref_name }}` |"
+            echo "| Commit | `${GITHUB_SHA:0:7}` |"
+            echo "| Version | `${VERSION}` |"
+            echo "| Primary image | `${PRIMARY}` |"
+            echo "| Published digest | `${DIGEST}` |"
             echo ""
-            if [ "${DIGEST}" != "not-pushed" ]; then
-              echo "### Pull command"
+
+            if [[ "${DIGEST}" != "not-pushed" ]]; then
+              echo "### Pull by digest"
               echo '```bash'
               echo "docker pull ${DIGEST}"
               echo '```'
             fi
-            echo ""
-            echo "### Canonical \`agentbeats.json\` template"
-            echo '```json'
-            echo '{'
-            echo '  "name": "green-agent",'
-            echo '  "version": "5.0.0",'
-            echo '  "image": "ghcr.io/nurcholishadam/green-agent:5.0.0",'
-            echo '  "entrypoint": ["python", "run_agent.py"],'
-            echo '  "description": "Green Agent v5.0.0 — 4-layer feedback architecture"'
-            echo '}'
-            echo '```'
-            echo ""
-            echo "### If validation failed"
-            echo "- Check the **Validate agentbeats config** step logs."
-            echo "- The step dumps the first 20 lines and common-fix commands."
-            echo "- Run locally: \`jq . agentbeats.json\` (or \`yq . agentbeats.yml\`)"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ═══════════════════════════════════════════════════════════════════
-      # 14. Cleanup
-      # ═══════════════════════════════════════════════════════════════════
-      - name: Cleanup local images
+      - name: Clean up local images
         if: always()
         shell: bash
         run: |
           set +e
-          docker rmi "${{ steps.tags.outputs.primary }}" 2>/dev/null || true
+
+          docker rmi "${{ steps.meta.outputs.primary }}" 2>/dev/null || true
           docker rmi green-agent:build-verify 2>/dev/null || true
