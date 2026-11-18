@@ -1,14 +1,25 @@
-# Green Agent v5.0.0 — dev/test dependencies
-# Install with: pip install -r requirements-dev.txt
+# Green Agent — development and test dependencies
+# ===============================================
+#
+# Install locally with:
+#   pip install -r requirements-dev.txt
+#
+# Do not install this file in the production Docker image.
+# Runtime dependencies live in requirements.txt.
+
 -r requirements.txt
 
-# ---- Test framework (fixes the pytest==9.0.3 vs pytest-asyncio 0.24 conflict) ----
+# ---- Test framework ----
 pytest>=8.2,<9
 pytest-asyncio>=0.24,<1
+pytest-cov>=5.0,<8
 
-# ---- Coverage + lint ----
-pytest-cov>=5.0
-coverage>=7.0
-mypy>=1.8
-ruff>=0.3
-shellcheck-py>=0.9
+# ---- Coverage ----
+coverage>=7.0,<8
+
+# ---- Static analysis and formatting ----
+mypy>=1.8,<2
+ruff>=0.3,<1
+
+# ---- Shell linting ----
+shellcheck-py>=0.9,<1
