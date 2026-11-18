@@ -3,10 +3,8 @@
 # Green Agent — Kubernetes Integration Tests
 # ==========================================
 #
-# Builds the Green Agent image, loads it into a Kind cluster, deploys the
-# development Kustomize overlay, and performs a basic smoke test.
-#
-# This workflow is AgentBeats-free.
+# Builds the Green Agent image, loads it into Kind, deploys the development
+# Kustomize overlay, diagnoses the workload, and performs a smoke test.
 
 name: Kubernetes Integration Tests
 
@@ -25,7 +23,6 @@ on:
     paths:
       - 'Dockerfile'
       - 'requirements*.txt'
-      - 'run_agent.py'
       - 'src/**'
       - 'config/**'
       - '.github/workflows/k8s-tests.yml'
@@ -65,6 +62,9 @@ jobs:
 
           required=(
             Dockerfile
+            config/base/kustomization.yaml
+            config/base/deployment.yaml
+            config/base/service.yaml
             config/overlays/development/kustomization.yaml
           )
 
@@ -75,8 +75,6 @@ jobs:
             fi
             echo "✓ ${path}"
           done
-
-          echo "✓ Required Kubernetes test files present"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -142,7 +140,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           kubectl cluster-info
           kubectl get nodes
           kind version
@@ -165,10 +162,9 @@ jobs:
           set -euo pipefail
 
           if kubectl get namespace "${KUBE_NAMESPACE}" >/dev/null 2>&1; then
-            echo "✓ Namespace ${KUBE_NAMESPACE} already exists"
+            echo "✓ Namespace already exists"
           else
             kubectl create namespace "${KUBE_NAMESPACE}"
-            echo "✓ Created namespace ${KUBE_NAMESPACE}"
           fi
 
       - name: Deploy development overlay
@@ -176,32 +172,79 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "▶ Applying development Kustomize overlay"
+          echo "▶ Rendered Kubernetes resources"
+          kubectl kustomize config/overlays/development
+
+          echo "▶ Applying development overlay"
           kubectl apply -k config/overlays/development -n "${KUBE_NAMESPACE}"
 
-          echo "▶ Kubernetes resources"
           kubectl get all -n "${KUBE_NAMESPACE}" -o wide
 
-      - name: Wait for deployments
+      - name: Diagnose deployment
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "▶ Waiting for deployments in ${KUBE_NAMESPACE}"
+          echo "▶ Initial deployment status"
+          kubectl get deployment green-agent -n "${KUBE_NAMESPACE}" -o wide || true
+          kubectl get pods -n "${KUBE_NAMESPACE}" -o wide || true
 
-          if ! kubectl get deployments -n "${KUBE_NAMESPACE}" --no-headers 2>/dev/null | grep -q .; then
-            echo "::warning::No Deployment resources were created by the development overlay."
-            echo "Skipping deployment wait; continuing with namespace-level smoke test."
-            exit 0
+          echo "▶ Deployment description"
+          kubectl describe deployment green-agent -n "${KUBE_NAMESPACE}" || true
+
+          echo "▶ Pod description"
+          kubectl describe pods \
+            -l app.kubernetes.io/name=green-agent \
+            -n "${KUBE_NAMESPACE}" || true
+
+          echo "▶ Kubernetes events"
+          kubectl get events -n "${KUBE_NAMESPACE}" \
+            --sort-by=.lastTimestamp || true
+
+          echo "▶ Container logs"
+          kubectl logs \
+            -l app.kubernetes.io/name=green-agent \
+            --all-containers \
+            --prefix \
+            --tail=200 \
+            -n "${KUBE_NAMESPACE}" || true
+
+      - name: Wait for deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "▶ Waiting up to 180 seconds for Green Agent deployment"
+
+          if ! kubectl rollout status \
+            deployment/green-agent \
+            --namespace="${KUBE_NAMESPACE}" \
+            --timeout=180s; then
+
+            echo "::error::Green Agent deployment did not become available"
+
+            echo "▶ Final pod status"
+            kubectl get pods -n "${KUBE_NAMESPACE}" -o wide || true
+
+            echo "▶ Final pod description"
+            kubectl describe pods \
+              -l app.kubernetes.io/name=green-agent \
+              -n "${KUBE_NAMESPACE}" || true
+
+            echo "▶ Final events"
+            kubectl get events -n "${KUBE_NAMESPACE}" \
+              --sort-by=.lastTimestamp || true
+
+            echo "▶ Final container logs"
+            kubectl logs \
+              -l app.kubernetes.io/name=green-agent \
+              --all-containers \
+              --prefix \
+              --tail=300 \
+              -n "${KUBE_NAMESPACE}" || true
+
+            exit 1
           fi
-
-          kubectl wait \
-            --for=condition=available \
-            --timeout=300s \
-            deployment --all \
-            -n "${KUBE_NAMESPACE}"
-
-          kubectl get deployments -n "${KUBE_NAMESPACE}"
 
       - name: Run smoke test
         shell: bash
@@ -210,34 +253,18 @@ jobs:
 
           echo "▶ Kubernetes smoke test"
 
-          if kubectl get deployments -n "${KUBE_NAMESPACE}" --no-headers 2>/dev/null | grep -q .; then
-            kubectl get pods -n "${KUBE_NAMESPACE}" -o wide
-            kubectl get services -n "${KUBE_NAMESPACE}" -o wide
-          else
-            echo "::warning::No Deployment resources found; Kubernetes smoke test is limited to namespace validation."
-          fi
+          kubectl get deployment green-agent -n "${KUBE_NAMESPACE}" -o wide
+          kubectl get pods -n "${KUBE_NAMESPACE}" -o wide
+          kubectl get service green-agent -n "${KUBE_NAMESPACE}" -o wide
 
-          kubectl get namespace "${KUBE_NAMESPACE}"
-
-      - name: Collect diagnostics on failure
-        if: failure()
-        shell: bash
-        run: |
-          set +e
-
-          echo "▶ Collecting Kubernetes diagnostics"
-
-          kubectl get nodes -o wide || true
-          kubectl get namespaces || true
-          kubectl get all -n "${KUBE_NAMESPACE}" -o wide || true
-          kubectl get events -n "${KUBE_NAMESPACE}" --sort-by=.lastTimestamp || true
-
-          echo "▶ Pod logs"
-          kubectl logs \
-            --all-containers \
-            --prefix \
+          POD="$(kubectl get pods \
+            -l app.kubernetes.io/name=green-agent \
             -n "${KUBE_NAMESPACE}" \
-            --tail=200 || true
+            -o jsonpath='{.items[0].metadata.name}')"
+
+          echo "▶ Testing Green Agent inside the cluster"
+          kubectl exec -n "${KUBE_NAMESPACE}" "${POD}" -- \
+            python -c "import run_agent; print('Green Agent import OK')"
 
       - name: Write job summary
         if: always()
