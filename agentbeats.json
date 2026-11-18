@@ -1,7 +1,0 @@
-{
-  "name": "green-agent",
-  "version": "5.0.0",
-  "image": "ghcr.io/nurcholishadam/green-agent:5.0.0",
-  "entrypoint": ["python", "run_agent.py"],
-  "description": "Green Agent v5.0.0 — 4-layer feedback architecture"
-}
