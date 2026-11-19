@@ -1,5 +1,5 @@
 """Core enhancement components for Green Agent."""
 
-from .graph_registry import Graph, GraphRegistry, GraphType
+from .graph_registry import GraphRegistry, GraphType
 
-__all__ = ["Graph", "GraphRegistry", "GraphType"]
+__all__ = ["GraphRegistry", "GraphType"]
