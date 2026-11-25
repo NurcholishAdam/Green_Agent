@@ -477,6 +477,7 @@ async def _run(args: argparse.Namespace) -> int:
                 return 2
         else:
             task = {
+                "task_id": "demo_001",
                 "id": "demo_001",
                 "type": "ml_inference",
                 "priority": 5,
