@@ -1,6 +1,6 @@
-# .github/workflows/k8s-tests.yml
+﻿# .github/workflows/k8s-tests.yml
 #
-# Green Agent — Kubernetes Integration Tests
+# Green Agent â€” Kubernetes Integration Tests
 # ==========================================
 #
 # Builds the Green Agent image, loads it into Kind, deploys the development
@@ -45,7 +45,7 @@ env:
 
 jobs:
   kubernetes-tests:
-    name: Build · Deploy · Smoke test
+    name: Build Â· Deploy Â· Smoke test
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -73,7 +73,7 @@ jobs:
               echo "::error::Required path missing: ${path}"
               exit 1
             fi
-            echo "✓ ${path}"
+            echo "âœ“ ${path}"
           done
 
       - name: Set up Docker Buildx
@@ -109,7 +109,7 @@ jobs:
 
           IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
 
-          echo "▶ Verifying non-root runtime"
+          echo "â–¶ Verifying non-root runtime"
           uid="$(docker run --rm "${IMAGE}" id -u)"
 
           if [[ "${uid}" == "0" ]]; then
@@ -117,16 +117,16 @@ jobs:
             exit 1
           fi
 
-          echo "✓ Container runs as non-root (uid=${uid})"
+          echo "âœ“ Container runs as non-root (uid=${uid})"
 
-          echo "▶ Verifying entrypoint module"
+          echo "â–¶ Verifying entrypoint module"
           docker run --rm "${IMAGE}" python - <<'PY'
           import importlib.util
 
           spec = importlib.util.find_spec("run_agent")
           assert spec is not None, "run_agent.py is not importable"
 
-          print("✓ run_agent module found")
+          print("âœ“ run_agent module found")
           PY
 
       - name: Create Kind cluster
@@ -162,7 +162,7 @@ jobs:
           set -euo pipefail
 
           if kubectl get namespace "${KUBE_NAMESPACE}" >/dev/null 2>&1; then
-            echo "✓ Namespace already exists"
+            echo "âœ“ Namespace already exists"
           else
             kubectl create namespace "${KUBE_NAMESPACE}"
           fi
@@ -172,10 +172,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "▶ Rendered Kubernetes resources"
+          echo "â–¶ Rendered Kubernetes resources"
           kubectl kustomize config/overlays/development
 
-          echo "▶ Applying development overlay"
+          echo "â–¶ Applying development overlay"
           kubectl apply -k config/overlays/development -n "${KUBE_NAMESPACE}"
 
           kubectl get all -n "${KUBE_NAMESPACE}" -o wide
@@ -185,23 +185,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "▶ Initial deployment status"
+          echo "â–¶ Initial deployment status"
           kubectl get deployment green-agent -n "${KUBE_NAMESPACE}" -o wide || true
           kubectl get pods -n "${KUBE_NAMESPACE}" -o wide || true
 
-          echo "▶ Deployment description"
+          echo "â–¶ Deployment description"
           kubectl describe deployment green-agent -n "${KUBE_NAMESPACE}" || true
 
-          echo "▶ Pod description"
+          echo "â–¶ Pod description"
           kubectl describe pods \
             -l app.kubernetes.io/name=green-agent \
             -n "${KUBE_NAMESPACE}" || true
 
-          echo "▶ Kubernetes events"
+          echo "â–¶ Kubernetes events"
           kubectl get events -n "${KUBE_NAMESPACE}" \
             --sort-by=.lastTimestamp || true
 
-          echo "▶ Container logs"
+          echo "â–¶ Container logs"
           kubectl logs \
             -l app.kubernetes.io/name=green-agent \
             --all-containers \
@@ -214,7 +214,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "▶ Waiting up to 180 seconds for Green Agent deployment"
+          echo "â–¶ Waiting up to 180 seconds for Green Agent deployment"
 
           if ! kubectl rollout status \
             deployment/green-agent \
@@ -223,19 +223,19 @@ jobs:
 
             echo "::error::Green Agent deployment did not become available"
 
-            echo "▶ Final pod status"
+            echo "â–¶ Final pod status"
             kubectl get pods -n "${KUBE_NAMESPACE}" -o wide || true
 
-            echo "▶ Final pod description"
+            echo "â–¶ Final pod description"
             kubectl describe pods \
               -l app.kubernetes.io/name=green-agent \
               -n "${KUBE_NAMESPACE}" || true
 
-            echo "▶ Final events"
+            echo "â–¶ Final events"
             kubectl get events -n "${KUBE_NAMESPACE}" \
               --sort-by=.lastTimestamp || true
 
-            echo "▶ Final container logs"
+            echo "â–¶ Final container logs"
             kubectl logs \
               -l app.kubernetes.io/name=green-agent \
               --all-containers \
@@ -251,7 +251,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "▶ Kubernetes smoke test"
+          echo "â–¶ Kubernetes smoke test"
 
           kubectl get deployment green-agent -n "${KUBE_NAMESPACE}" -o wide
           kubectl get pods -n "${KUBE_NAMESPACE}" -o wide
@@ -262,7 +262,7 @@ jobs:
             -n "${KUBE_NAMESPACE}" \
             -o jsonpath='{.items[0].metadata.name}')"
 
-          echo "▶ Testing Green Agent inside the cluster"
+          echo "â–¶ Testing Green Agent inside the cluster"
           kubectl exec -n "${KUBE_NAMESPACE}" "${POD}" -- \
             python -c "import run_agent; print('Green Agent import OK')"
 
@@ -289,3 +289,4 @@ jobs:
         run: |
           set +e
           kind delete cluster --name "${KIND_CLUSTER_NAME}" || true
+

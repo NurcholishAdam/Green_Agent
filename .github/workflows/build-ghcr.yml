@@ -1,6 +1,6 @@
-# .github/workflows/build-ghcr.yml
+﻿# .github/workflows/build-ghcr.yml
 #
-# Green Agent — Docker Build & Export
+# Green Agent â€” Docker Build & Export
 # ===================================
 #
 # Builds and verifies the Green Agent image, then optionally exports it
@@ -92,9 +92,9 @@ jobs:
               exit 1
             fi
 
-            echo "✓ Digest format valid"
+            echo "âœ“ Digest format valid"
           else
-            echo "✓ Using tag-pinned base image"
+            echo "âœ“ Using tag-pinned base image"
           fi
 
       - name: Set up Docker Buildx
@@ -131,7 +131,7 @@ jobs:
 
           IMAGE="${IMAGE_NAME}:build-verify"
 
-          echo "▶ Verifying non-root runtime"
+          echo "â–¶ Verifying non-root runtime"
           uid="$(docker run --rm "${IMAGE}" id -u)"
 
           if [[ "${uid}" == "0" ]]; then
@@ -139,9 +139,9 @@ jobs:
             exit 1
           fi
 
-          echo "✓ Container runs as non-root (uid=${uid})"
+          echo "âœ“ Container runs as non-root (uid=${uid})"
 
-          echo "▶ Verifying Green core imports"
+          echo "â–¶ Verifying Green core imports"
           docker run --rm "${IMAGE}" python - <<'PY'
           import src
           from src.symbolic.symbolic_reasoning_engine import SymbolicReasoningEngine
@@ -149,14 +149,14 @@ jobs:
           from src.enhancements.schemas.node_descriptor import NodeDescriptor
           from src.enhancements.schemas.workload_descriptor import WorkloadDescriptor
 
-          print("✓ Green core imports OK")
+          print("âœ“ Green core imports OK")
           PY
 
       - name: Run symbolic test suite
         continue-on-error: true
         shell: bash
         run: |
-          echo "▶ Running symbolic oversight tests"
+          echo "â–¶ Running symbolic oversight tests"
           docker run --rm "${IMAGE_NAME}:build-verify" python test_symbolic_oversight.py || {
             echo "::warning::One or more symbolic tests failed. See logs above."
           }
@@ -172,7 +172,7 @@ jobs:
           FILENAME="green-agent-${VERSION}-linux-amd64.tar.gz"
           OUTPUT="/tmp/${FILENAME}"
 
-          echo "▶ Exporting ${IMAGE_NAME}:${VERSION}"
+          echo "â–¶ Exporting ${IMAGE_NAME}:${VERSION}"
           docker save "${IMAGE_NAME}:${VERSION}" | gzip -9 > "${OUTPUT}"
 
           SIZE="$(stat -c%s "${OUTPUT}")"
@@ -183,7 +183,7 @@ jobs:
           fi
 
           echo "filename=${FILENAME}" >> "$GITHUB_OUTPUT"
-          echo "✓ Exported ${FILENAME} ($(du -h "${OUTPUT}" | cut -f1))"
+          echo "âœ“ Exported ${FILENAME} ($(du -h "${OUTPUT}" | cut -f1))"
 
       - name: Upload image artifact
         if: github.event.inputs.export_image != 'false'
@@ -233,3 +233,4 @@ jobs:
 
           docker rmi "${IMAGE_NAME}:${{ steps.meta.outputs.version }}" 2>/dev/null || true
           docker rmi "${IMAGE_NAME}:build-verify" 2>/dev/null || true
+

@@ -1,6 +1,6 @@
-# .github/workflows/docker-build.yml
+﻿# .github/workflows/docker-build.yml
 #
-# Green Agent — Build, Verify & Push to GHCR
+# Green Agent â€” Build, Verify & Push to GHCR
 # ==========================================
 #
 # Standalone Green Agent CI workflow.
@@ -37,7 +37,7 @@ env:
 
 jobs:
   docker:
-    name: Build · Verify · Push
+    name: Build Â· Verify Â· Push
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -102,10 +102,10 @@ jobs:
               echo "::error::Required path missing: ${path}"
               exit 1
             fi
-            echo "✓ ${path}"
+            echo "âœ“ ${path}"
           done
 
-          echo "✓ Core Green files present"
+          echo "âœ“ Core Green files present"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -141,7 +141,7 @@ jobs:
 
           IMAGE="green-agent:build-verify"
 
-          echo "▶ Verifying non-root runtime"
+          echo "â–¶ Verifying non-root runtime"
           uid="$(docker run --rm "${IMAGE}" id -u)"
 
           if [[ "${uid}" == "0" ]]; then
@@ -149,25 +149,25 @@ jobs:
             exit 1
           fi
 
-          echo "✓ Container runs as non-root (uid=${uid})"
+          echo "âœ“ Container runs as non-root (uid=${uid})"
 
-          echo "▶ Verifying entrypoint module"
+          echo "â–¶ Verifying entrypoint module"
           docker run --rm "${IMAGE}" python - <<'PY'
           import importlib.util
 
           spec = importlib.util.find_spec("run_agent")
           assert spec is not None, "run_agent.py is not importable"
 
-          print("✓ run_agent module found")
+          print("âœ“ run_agent module found")
           PY
 
-          echo "✓ Green image verified"
+          echo "âœ“ Green image verified"
 
       - name: Run test suite
         continue-on-error: true
         shell: bash
         run: |
-          echo "▶ Running test suite inside the image"
+          echo "â–¶ Running test suite inside the image"
           docker run --rm green-agent:build-verify python test_symbolic_oversight.py || {
             echo "::warning::One or more tests failed. See logs above."
           }
@@ -189,20 +189,20 @@ jobs:
 
           PRIMARY="${{ steps.meta.outputs.primary }}"
 
-          echo "▶ Pushing Green Agent image tags"
+          echo "â–¶ Pushing Green Agent image tags"
 
           while IFS= read -r tag; do
             [[ -z "${tag}" ]] && continue
 
             docker tag "${PRIMARY}" "${tag}"
             docker push "${tag}"
-            echo "✓ Pushed ${tag}"
+            echo "âœ“ Pushed ${tag}"
           done <<< "${{ steps.meta.outputs.tags }}"
 
           DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${PRIMARY}")"
 
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "✓ Published digest: ${DIGEST}"
+          echo "âœ“ Published digest: ${DIGEST}"
 
       - name: Write job summary
         if: always()
@@ -241,3 +241,4 @@ jobs:
 
           docker rmi "${{ steps.meta.outputs.primary }}" 2>/dev/null || true
           docker rmi green-agent:build-verify 2>/dev/null || true
+
