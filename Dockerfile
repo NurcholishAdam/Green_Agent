@@ -269,13 +269,13 @@ VOLUME ["/sys/fs/cgroup"]
 EXPOSE 8000
 STOPSIGNAL SIGTERM
 
+RUN printf '#!/bin/sh\nset -e\nexec "$@"\n' > /usr/local/bin/docker-entrypoint.sh && chmod +x /usr/local/bin/docker-entrypoint.sh
 USER appuser
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD python -c "import os,sys,urllib.request; port=os.environ.get('AGENT_PORT','8000'); path=os.environ.get('AGENT_HEALTH_PATH','/health'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}{path}', timeout=3).status==200 else 1)"
 
-RUN printf '#!/bin/sh\nset -e\nexec "$@"\n' > /tmp/docker-entrypoint.sh && chmod +x /tmp/docker-entrypoint.sh
 
-ENTRYPOINT ["/tmp/docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 CMD ["python", "run_agent.py"]
