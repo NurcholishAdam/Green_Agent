@@ -1215,6 +1215,10 @@ class IdempotencyStore:
 # =============================================================================
 
 class UnifiedGreenAgent:
+    async def initialize(self) -> None:
+        """Compatibility alias expected by run_agent.py."""
+        await self.start()
+
     """Enhanced central orchestrator (v5.1)."""
 
     DEFAULT_FEATURES = {
