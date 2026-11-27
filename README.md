@@ -1,175 +1,260 @@
-# 🌱 Green Agent
+# Green Agent
 
-**A sustainability-first, carbon-aware orchestration framework for AI workloads.**
+**A sustainability-first, carbon-aware orchestration runtime for AI workloads.**
 
-Green Agent is an open-source agentic AI runtime that decides *when, where, and how* to execute AI computation — continuously optimizing for energy, carbon, latency, cost, and quality, then **proving** what it achieved. It sits between AI workloads and the infrastructure that runs them: observing live signals, consulting specialized expert engines, learning from verified operational history, and recording every decision on an auditable governance trail.
+![Status: alpha](https://img.shields.io/badge/status-alpha-orange)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-Traditional green-software tools measure emissions *after* the job. Green Agent acts *before and during* execution — and grows measurably better at being green with every run.
+Green Agent decides *when, where and how* AI computation should run. It balances energy, carbon, helium dependency, latency, cost and quality, then records what it did so the decision can be audited afterwards.
 
----
+Most green-software tools report emissions after a job has finished. Green Agent acts before and during execution: it reads live signals, consults specialist experts, picks a policy-compliant route, and learns from the measured outcome.
 
-## ✨ Highlights
-
-- 🌍 **Carbon-aware routing** — live grid-intensity forecasting, eco-mode control, temporal shifting to greener windows, and Pareto-optimal route selection across edge INT8, cloud low-carbon regions, and deferred execution.
-- 🧠 **Learning decision core** — LIMIT Graph reasoning, Multi-Objective Decision Processes (MODP), Multi-Teacher On-Policy Distillation (MOPD), Mixture-of-Experts gating, RLHF, and bio-inspired optimization — fused into one control loop.
-- 🗂️ **Governed memory layer** — a 13-module, Supermemory-backed memory & context layer: recall-before-route, structured decision records, truth levels, bounded recall, write governance, feedback-loop protection, and MCP-exposed tools.
-- 🛡️ **Proof-of-Green governance** — event-sourced decision log, append-only carbon ledger, human-review approvals, policy versioning, enforcement, verification, and accountability subsystems — audit-ready by construction.
-- 📊 **Measurement & transparency** — efficiency accounting, metric governance, reproducibility rules, sustainable benchmarking, and a green leaderboard.
-- 🔌 **Open interfaces** — FastAPI server, Streamlit dashboards, telemetry loader, and Model Context Protocol (MCP) tools.
+> **Status:** alpha pre-release (`v0.1.0-alpha.1`). The platform is a working system and an experimental testbed. Public benchmark results are on the [roadmap](#roadmap) and are not yet published.
 
 ---
 
-## 🆕 Recent upgrades
+## Contents
 
-| When | What landed |
+- [Key capabilities](#key-capabilities)
+- [How it works](#how-it-works)
+- [Architecture](#architecture)
+- [Sustainability signals](#sustainability-signals)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Testing](#testing)
+- [Deployment and observability](#deployment-and-observability)
+- [Repository layout](#repository-layout)
+- [Documentation](#documentation)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## Key capabilities
+
+| Area | What it provides |
 |---|---|
-| **Nov 10, 2026** | Ops hardening: `QUICK_START.md`, containerized benchmarking (`Dockerfile.benchmark`), dependency automation (Renovate / Digestabot), GPG-signed commits across the tree |
-| **Oct 28–30, 2026** | Governance & measurement sprint — `workload_interpreter`, `efficiency_calculator`, `metric_governance`, `reproducibility_rules`, `policy_decision`, `governance_event`, `human_review`, `green_leaderboard`, `helium_profile` |
-| **Oct 5, 2026** | Runtime expanded to 30+ module domains — orchestration, policy, scoring, reporting, runtime, retrieval, distributed execution, monitoring |
-| **Sep 19, 2026** | **Memory layer shipped** — 13 modules (~718 KB): Supermemory adapter v6.0.0, schemas, bounded recall, write governor, feedback-loop guard, memory tiers, policy memory, MCP tools, self-audit benchmark |
-| **Sep 17, 2026** | Lightweight `sustainability` package (carbon forecast → intensity provider → eco-mode controller → Pareto frontier → temporal shifter) + symbolic reasoning + dashboard revamp |
+| **Carbon-aware routing** | Grid-intensity forecasting, an eco-mode controller, temporal shifting to greener time windows, and Pareto-optimal route selection |
+| **Learning decision core** | LIMIT Graph reasoning, Multi-Objective Decision Processes (MODP), Multi-Teacher On-Policy Distillation (MOPD), Mixture-of-Experts (MoE) gating, RLHF and bio-inspired optimization in one control loop |
+| **Efficient execution** | Adaptive numeric precision and optional FlexGen offloaded inference, chosen by the decision core |
+| **Governed memory** | A Supermemory-backed memory layer with bounded recall, write governance, truth levels and feedback-loop protection. It falls back to a local mirror when the SDK is absent |
+| **Proof-of-Green governance** | Event-sourced decision log, append-only carbon ledger, human-review approvals, policy versioning, enforcement and verification |
+| **Measurement** | Efficiency accounting, metric governance, reproducibility rules, sustainable benchmarking and a green leaderboard |
+| **Open interfaces** | FastAPI server, Streamlit dashboards, Prometheus metrics and Model Context Protocol (MCP) tools |
 
 ---
 
-## 🧭 How it works
+## How it works
 
-Green Agent runs a continuous six-step loop on every routing event:
+Green Agent runs a six-step loop on every routing event:
 
-    1. OBSERVE   workload intent · device capacity · Arm Helium telemetry · grid carbon · latency targets
-    2. RECALL    3–5 comparable historical runs retrieved as cited evidence (bounded top-k recall)
-    3. PLAN      MoE expert panel + Pareto frontier compare routes: edge INT8 · cloud low-carbon · deferral · quantization
-    4. ACT       execute the policy-compliant route; human approval gates costly / irreversible actions
-    5. EVALUATE  predicted vs measured energy, CO2e, latency, cost, quality
-    6. REMEMBER  validated results promoted to durable memory — the system learns what actually worked
+1. **Observe** the workload intent, device capacity, helium dependency, grid carbon and latency targets.
+2. **Recall** three to five comparable historical runs as cited evidence (bounded top-k recall).
+3. **Plan** by comparing routes with an MoE expert panel and a Pareto frontier: edge INT8, low-carbon cloud, deferral or quantization.
+4. **Act** by executing the policy-compliant route. Human approval gates costly or irreversible actions.
+5. **Evaluate** predicted against measured energy, CO2e, latency, cost and quality.
+6. **Remember** by promoting validated results to durable memory.
 
-Recalled evidence is *re-checked* against live telemetry before it can steer a decision — remembered recommendations are evidence, never ground truth.
-
----
-
-## 🏗️ Architecture
-
-    ┌──────────────────────────────────────────────────────────────────────┐
-    │ INTERFACE      FastAPI server · Streamlit dashboards · MCP tools       │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │ GOVERNANCE     governance/ — carbon ledger · approvals · enforcement · │
-    │                verification · accountability · policy versions ·       │
-    │                human review                                            │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │ MEMORY         memory/ — supermemory adapter v6.0.0 · schemas ·        │
-    │                bounded recall · write governor · feedback guard ·      │
-    │                memory tiers · policy memory · benchmark (13 modules)   │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │ INTELLIGENCE   enhancements/ — LIMIT Graph · MODP · MOPD              │
-    │                distillation · MoE gating · RLHF · bio-inspired         │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │ CARBON CORE    sustainability/ — carbon forecast · intensity         │
-    │                provider · eco-mode controller · Pareto frontier ·      │
-    │                temporal shifter        (+ legacy carbon/ module)         │
-    ├──────────────────────────────────────────────────────────────────────┤
-    │ DATA           telemetry · Arm Helium · grid carbon APIs ·              │
-    │                cloud / instance signals · device & helium profiles     │
-    └──────────────────────────────────────────────────────────────────────┘
-
-### Repository layout
-
-    quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/
-    ├── enhancements/      # Learning core: LIMIT Graph, MODP, MOPD distillation, MoE, RLHF
-    ├── sustainability/    # Lightweight carbon-aware stack (the primary routing API surface)
-    ├── memory/            # 13-module governed memory layer (Supermemory-backed, offline fallback)
-    ├── governance/        # Proof-of-Green: carbon ledger, approvals, enforcement,
-    │                      # verification, accountability, contracts, benchmarks, policies
-    ├── decision/          # carbon_aware_decision_core · decision_request · policy_decision
-    ├── carbon/            # Legacy carbon module: telemetry, helium monitor, task profiling
-    ├── dashboard/         # FastAPI server · green + Streamlit dashboards · telemetry loader
-    ├── optimization/      # ML optimizers · synthetic-data optimizers
-    ├── symbolic/          # Symbolic reasoning engine + visualizer
-    ├── benchmarking/      # Sustainable benchmarking · efficiency accounting
-    ├── leaderboard/       # Green leaderboard
-    ├── ml_governance/     # Metric governance
-    ├── core/ · r1/ · rlhf/ · cognition/ · rewards/ · agentbeats/ · dpq/ · scripts/ · ...
-    └── ...                # 30+ module domains: orchestration, policy, scoring, reporting,
-                           # runtime, retrieval, distributed, monitoring, metrics,
-                           # instrumentation, integration, interpretation, visualization
+Recalled evidence is re-checked against live telemetry before it can influence a decision. A remembered recommendation is evidence, never ground truth.
 
 ---
 
-## 🚀 Quick start
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ INTERFACE     FastAPI server · Streamlit dashboards · MCP tools      │
+├──────────────────────────────────────────────────────────────────────┤
+│ GOVERNANCE    carbon ledger · approvals · enforcement · verification │
+│               accountability · policy versions · human review        │
+├──────────────────────────────────────────────────────────────────────┤
+│ MEMORY        Supermemory adapter · schemas · bounded recall ·       │
+│               write governor · feedback guard · tiers · policy memory │
+├──────────────────────────────────────────────────────────────────────┤
+│ INTELLIGENCE  LIMIT Graph · MODP · MOPD · MoE gating · FlexGen ·     │
+│               RLHF · bio-inspired optimization                       │
+├──────────────────────────────────────────────────────────────────────┤
+│ CARBON CORE   carbon forecast · intensity provider · eco-mode ·      │
+│               Pareto frontier · temporal shifter                     │
+├──────────────────────────────────────────────────────────────────────┤
+│ DATA          telemetry · grid carbon APIs · cloud and instance      │
+│               signals · device and helium profiles                   │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+The intelligence layer is partitioned by when each decision is made:
+
+| Component | Decision time | Role |
+|---|---|---|
+| **MODP** | Run time | Weighted multi-objective scoring with per-workload `carbon_weight`, `latency_weight`, `cost_weight`, `energy_weight` and `security_weight` |
+| **MoE gating** | Run time | A gating network routes each workload to specialist experts (energy, data, IoT, federated-learning energy, helium-IoT, sustainability) |
+| **FlexGen** | Execution time | Optional high-throughput offloaded inference. Disabled by default |
+| **MOPD** | Training time | Multi-teacher on-policy distillation orchestrator |
+| **Memory** | Across all stages | Recall before routing, remember after evaluation |
+
+---
+
+## Sustainability signals
+
+- **Carbon:** live grid intensity and forecasts drive scheduling, deferral and region choice.
+- **Energy:** adaptive precision, sparse expert activation and energy-budget enforcement reduce consumption per task.
+- **Helium:** the repository models helium as a constrained physical resource. It classifies hardware by helium dependency, monitors supply conditions, and maps scarcity levels (normal, caution, critical, severe) to actions such as throttling, deferral, redirecting to CPU or blocking a job.
+
+---
+
+## Quick start
 
 ### Install
 
-    git clone https://github.com/NurcholishAdam/Green_Agent.git
-    cd Green_Agent
-    pip install -r requirements.txt
+```bash
+git clone https://github.com/NurcholishAdam/Green_Agent.git
+cd Green_Agent
+pip install -r requirements.txt     # or: pip install -e .   (Python 3.10+)
+```
 
-The Supermemory SDK is **optional** — the memory layer automatically falls back to a local mirror when the SDK is absent. Point it at a local Supermemory instance (`:6767`, embedded graph engine, data stays on-device under `./.supermemory`) or a cloud endpoint via `supermemory_config`.
+The Supermemory SDK is optional. Without it, the memory layer uses a local mirror.
 
-### Run a module smoke test
+### Run
 
-Every module ships an executable smoke test:
+```bash
+python demo_meta_cognitive.py       # guided demo of the meta-cognitive architecture
+python run_agent.py                 # main entry point: runs one task and exposes metrics
+```
 
-    cd quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src
-    python -m memory.supermemory_adapter        # bridge + offline mirror
-    python -m memory.memory_schemas             # record schema round-trips
-    python -m governance.carbon_ledger          # append-only carbon ledger
+See [`QUICK_START.md`](QUICK_START.md) for output interpretation, advanced usage and troubleshooting.
 
-### Launch the control plane & dashboards
+### Run with Docker
 
-    python src/dashboard/api_server.py             # FastAPI server
-    streamlit run src/dashboard/streamlit_dashboard.py
+```bash
+docker build -t green-agent:full .                                  # all enhancements
+docker build --build-arg ENHANCEMENTS_ENABLED=false -t green-agent:lean .
+docker build -f Dockerfile.benchmark -t green-agent-benchmark .     # containerized benchmarking
+```
 
-### Containerized benchmarking
+The image runs as a non-root user and listens on port 8000 (`AGENT_PORT`).
 
-    docker build -f Dockerfile.benchmark -t green-agent-benchmark .
+### Dashboards and module smoke tests
 
----
+```bash
+cd quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src
 
-## ⚙️ Configuration
+python dashboard/api_server.py                      # FastAPI server (GREEN_AGENT_DASHBOARD_PORT, default 8000)
+streamlit run dashboard/streamlit_dashboard.py      # Streamlit dashboard
 
-Key knobs live in `src/config.py`, `src/user_preferences.py`, and `src/memory/supermemory_config.py`:
-
-    from memory.supermemory_config import SupermemoryConfig
-
-    SupermemoryConfig(
-        mode="local",                        # or "cloud"
-        default_container_tag="org:green-agent",
-        recall_top_k=5,                      # bounded recall per decision
-        ttl_seconds={"grid_forecast": 3600}, # TTL per record kind; policies persist
-        write_retries=3,
-    )
-
-Decision objective weights (MODP) are tunable per workload via metadata — `carbon_weight`, `latency_weight`, `cost_weight`, `energy_weight`, `security_weight` — and the MoE gating network learns which expert to trust under each state.
+python -m memory.supermemory_adapter                # memory bridge and offline mirror
+python -m memory.memory_schemas                     # record schema round-trips
+python -m governance.carbon_ledger                  # append-only carbon ledger
+```
 
 ---
 
-## 🧪 Testing
+## Configuration
 
-    cd quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench
-    python -m unittest discover -s src -p "*_test.py"
+| File | Purpose |
+|---|---|
+| `green_policy.yaml` | Sustainability policy |
+| `symbolic_policy.yaml` | Symbolic and neuro-symbolic oversight rules |
+| `moe_config.json` | MoE gating and expert settings |
+| `example_config.json` | Example runtime configuration |
+| `config/base`, `config/overlays/*` | Kubernetes Kustomize base and development, staging and production overlays |
 
-Or run any module directly — each validates its own happy paths, error handling, and edge cases:
+Feature flags are build arguments and environment variables in the `Dockerfile`: `ENHANCEMENTS_ENABLED`, `LIMIT_GRAPH_ENABLED`, `MODP_ENABLED`, `RLHF_ENABLED`, `DISTILLATION_ENABLED`, `MOE_ENABLED`, `EVOLUTIONARY_ENABLED`, `FLEXGEN_ENABLED` (default off), `ZERO_TRUST_ENABLED` (default off), `DIFFERENTIAL_PRIVACY_ENABLED` (default off) and `TRAINING_ENABLED` (default off).
 
-    python -m enhancements.schemas.node_descriptor
+Memory settings live in `src/memory/supermemory_config.py`:
+
+```python
+from memory.supermemory_config import SupermemoryConfig
+
+SupermemoryConfig(
+    mode="local",                         # or "cloud"
+    default_container_tag="org:green-agent",
+    recall_top_k=5,                       # bounded recall per decision
+    ttl_seconds={"grid_forecast": 3600},  # TTL per record kind; policies persist
+    write_retries=3,
+)
+```
 
 ---
 
-## 🗺️ Roadmap
+## Testing
 
-- [ ] Orchestrator recall-before-route GA
-- [ ] Public benchmark results (memory-on vs baseline)
-- [ ] Enterprise audit pack (governance export, ESG reporting templates)
-- [ ] ASEAN data-centre & telco pilots
+```bash
+pip install -r requirements-dev.txt
+pytest tests/unit
+```
+
+Most modules also include an executable smoke test, for example `python -m enhancements.schemas.node_descriptor`.
 
 ---
 
-## 🤝 Contributing
+## Deployment and observability
 
-Contributions are welcome — from new domain engines to governance adapters and memory tooling. Please open an issue or pull request; commits should be GPG-signed.
+- **Containers:** multi-stage `Dockerfile` with a pinned base image, a non-root runtime and build-time feature flags.
+- **Kubernetes:** Kustomize base and overlays, with an autoscaler, network policy and service account. CI runs the Kubernetes tests (`.github/workflows/k8s-tests.yml`).
+- **Metrics and alerts:** `prometheus.yml`, `green_agent_alerts.yml` and `alertmanager_templates/`.
+- **Supply chain:** Renovate and Digestabot for dependency updates, and GPG-signed commits.
 
-## 📄 License
+---
 
-MIT — see [LICENSE](LICENSE).
+## Repository layout
 
-## 🙏 Credits
+The repository has two source trees. `src/` holds the core runtime used by `run_agent.py`. The nested `limit-agentbench/src/` holds the full set of module domains.
 
-**Green Agent** is founded and led by **Nurcholish Adam** — *AI Research Agent* team.
-Co-created with the international open-source and research community.
+```
+Green_Agent/
+├── run_agent.py · run_enhanced_agent.py · run_enhanced_agent_with_moe.py
+├── app.py                     # status service: /healthz, /readyz, /metrics, /version
+├── src/                       # core runtime: carbon, core, enhancements, integration, monitoring
+├── config/                    # Kubernetes base and overlays
+├── docs/                      # ARCHITECTURE.md, MODULE_GUIDE.md
+├── tests/                     # unit, e2e, k8s
+└── quantum_integration/quantum-limit-graph-v2.4.0/limit-agentbench/src/
+    ├── enhancements/          # LIMIT Graph, MODP, MOPD, MoE, FlexGen, RLHF, bio-inspired
+    ├── sustainability/        # carbon forecast, eco-mode, Pareto frontier, temporal shifter
+    ├── memory/                # governed Supermemory layer
+    ├── governance/            # carbon ledger, approvals, enforcement, verification
+    ├── decision/              # carbon-aware decision core, policy decision
+    ├── carbon/                # telemetry, helium monitor, task profiling
+    ├── dashboard/             # FastAPI server, Streamlit dashboards, telemetry loader
+    ├── benchmarking/ · leaderboard/ · ml_governance/ · rewards/ · symbolic/
+    └── ...                    # 30+ module domains in total
+```
+
+---
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [`QUICK_START.md`](QUICK_START.md) | Installation, basic usage, metrics reference, troubleshooting |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | System architecture |
+| [`docs/MODULE_GUIDE.md`](docs/MODULE_GUIDE.md) | Module reference |
+| [`INTEGRATION_GUIDE.md`](INTEGRATION_GUIDE.md) | Integrating the v5.0 modules |
+| [`META_COGNITIVE_ARCHITECTURE.md`](META_COGNITIVE_ARCHITECTURE.md) | Meta-cognitive layer |
+| [`SYMBOLIC_OVERSIGHT_README.md`](SYMBOLIC_OVERSIGHT_README.md), [`NEURO_SYMBOLIC_OVERSIGHT_GUIDE.md`](NEURO_SYMBOLIC_OVERSIGHT_GUIDE.md) | Symbolic and neuro-symbolic oversight |
+
+---
+
+## Roadmap
+
+- [ ] Public, reproducible benchmark results (energy and accuracy against a baseline)
+- [ ] Orchestrator recall-before-route general availability
+- [ ] Helium-aware cost in FlexGen policy selection and in the MOPD objective
+- [ ] Consolidate duplicated enhancement code into one shared package
+- [ ] Enterprise audit pack (governance export and ESG reporting templates)
+
+---
+
+## Contributing
+
+Contributions are welcome, from new domain engines to governance adapters and memory tooling. Please open an issue or pull request. Commits should be GPG-signed.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+## Credits
+
+Green Agent is founded and led by **Nurcholish Adam**.
